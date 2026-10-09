@@ -147,13 +147,17 @@ class VertexGraphWindow(QtWidgets.QWidget):
                 self.count_label.setObjectName("value")
                 bar.addWidget(self.count_label)
         bar.addSpacing(10)
-        self.detrend_button = QtWidgets.QPushButton("")
-        self.detrend_button.setToolTip(
-            "Polynomial taken out of every line before drawing (d cycles)"
+        bar.addWidget(QtWidgets.QLabel(theme.key_label("detrend", "d")))
+        self.detrend_box = QtWidgets.QComboBox()
+        self.detrend_box.setToolTip("Polynomial taken out of every line before drawing (d steps)")
+        self.detrend_box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        for order, name in DETREND_LABELS:
+            self.detrend_box.addItem(name, userData=order)
+        self.detrend_box.setCurrentIndex(self.detrend_box.findData(self.detrend))
+        self.detrend_box.activated.connect(
+            lambda i: self.set_detrend(int(self.detrend_box.itemData(i)))
         )
-        self.detrend_button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        self.detrend_button.clicked.connect(self.cycle_detrend)
-        bar.addWidget(self.detrend_button)
+        bar.addWidget(self.detrend_box)
         self.shared_check = QtWidgets.QCheckBox(theme.key_label("shared scale", "s"))
         self.shared_check.setChecked(True)
         self.shared_check.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
@@ -188,6 +192,10 @@ class VertexGraphWindow(QtWidgets.QWidget):
                 Binding("=", "one mesh ring more", lambda: self.step_rings(1), group="patch"),
                 Binding("-", "one mesh ring fewer", lambda: self.step_rings(-1), group="patch"),
                 Binding("d", "next detrend order", self.cycle_detrend, group="lines"),
+                Binding("Right", "next time point", lambda: self.step_time(1), group="time"),
+                Binding("Left", "previous time point", lambda: self.step_time(-1), group="time"),
+                Binding(".", "next time point", lambda: self.step_time(1), group="time"),
+                Binding(",", "previous time point", lambda: self.step_time(-1), group="time"),
                 Binding("s", "shared scale on / off", self.shared_check.toggle, group="lines"),
                 Binding("o", "overlay colour on / off", self.tint_check.toggle, group="lines"),
                 Binding("click", "go to that time point", None, group="lines"),
@@ -203,10 +211,22 @@ class VertexGraphWindow(QtWidgets.QWidget):
         self.rings = int(np.clip(self.rings + delta, 1, MAX_RINGS))
         self.refresh()
 
+    def set_detrend(self, order: int) -> None:
+        self.detrend = int(order)
+        self.refresh()
+
     def cycle_detrend(self) -> None:
         orders = [k for k, _ in DETREND_LABELS]
-        self.detrend = orders[(orders.index(self.detrend) + 1) % len(orders)]
-        self.refresh()
+        self.set_detrend(orders[(orders.index(self.detrend) + 1) % len(orders)])
+
+    def step_time(self, delta: int) -> None:
+        """Step the shared volume index, wrapping, as , and . do everywhere."""
+        from fastfuncstuff.viewer.vocab import SetIndex
+
+        st = self.session.state
+        hi = st.max_time_index()
+        if hi > 0:
+            self.surface._dispatch(SetIndex((st.time_index + delta) % (hi + 1)))
 
     def _scrub(self, index: int) -> None:
         from fastfuncstuff.viewer.vocab import SetIndex
@@ -267,8 +287,7 @@ class VertexGraphWindow(QtWidgets.QWidget):
         from fastfuncstuff.viewer.derive import detrend_trace
         from fastfuncstuff.viewer.vertexpatch import vertex_patch
 
-        label = dict(DETREND_LABELS).get(self.detrend, str(self.detrend))
-        self.detrend_button.setText(f"{theme.key_label('detrend', 'd')}: {label}")
+        self.detrend_box.setCurrentIndex(self.detrend_box.findData(self.detrend))
         session, canvas = self.session, self.surface.canvas
         st = session.state
         mm = st.crosshair_mm

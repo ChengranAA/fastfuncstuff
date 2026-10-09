@@ -103,3 +103,21 @@ def test_cells_sit_at_their_page_positions(graphed):
     fit, *_ = np.linalg.lstsq(a, centres, rcond=None)
     np.testing.assert_allclose(a @ fit, centres, atol=1e-6)
     assert fit[0, 0] > 0 and fit[1, 1] > 0 and abs(fit[0, 0] - fit[1, 1]) < 1e-9
+
+
+def test_detrend_is_a_dropdown_and_the_arrows_step_time(graphed):
+    session, _, graph = graphed
+    box = graph.detrend_box
+    box.setCurrentIndex(box.findData(1))
+    box.activated.emit(box.currentIndex())
+    assert graph.detrend == 1
+    # Linear out of a ramp leaves nothing.
+    (_, values), *_ = graph.graph._cells[0].traces
+    assert np.abs(values).max() < 1e-3
+    graph.cycle_detrend()
+    assert box.currentData() == graph.detrend == 2
+    start = session.state.time_index
+    graph.step_time(1)
+    assert session.state.time_index == start + 1
+    graph.step_time(-2)
+    assert session.state.time_index == 5  # wraps to the last of six

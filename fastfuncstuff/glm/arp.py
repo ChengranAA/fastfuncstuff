@@ -508,7 +508,10 @@ def _hessian(theta: Tensor, st: Stats, h: float = 1e-4) -> Tensor:
 def theta_covariance(theta: Tensor, st: Stats) -> Tensor:
     """Asymptotic covariance of θ̂ per voxel: the criterion is −2·log-likelihood
     (up to a constant), so the information is half its Hessian."""
-    return torch.linalg.inv(0.5 * _hessian(theta, st))
+    cov, info = torch.linalg.inv_ex(0.5 * _hessian(theta, st))
+    # A voxel whose fit never left a non-finite point has a zero Hessian: no
+    # information, so no covariance — NaN rather than failing the batch.
+    return torch.where((info != 0)[:, None, None], torch.full_like(cov, float("nan")), cov)
 
 
 def fit_ar_reml(

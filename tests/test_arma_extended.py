@@ -311,7 +311,7 @@ class TestPrecomputeRemlGrid:
         assert len(grid) > 0
         # Each entry should have the whitening inverse and whitened design
         first_key = next(iter(grid))
-        assert "L_inv" in grid[first_key]
+        assert "whitener" in grid[first_key]
         assert "X_w" in grid[first_key]
 
     def test_with_qr(self):

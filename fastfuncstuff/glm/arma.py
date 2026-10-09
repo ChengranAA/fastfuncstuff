@@ -36,6 +36,13 @@ from tqdm.auto import tqdm
 from fastfuncstuff.memory import bytes_per_voxel_arma, make_vram_debugger
 from fastfuncstuff.utils import get_device, to_tensor, warn_mps_float32_precision
 
+from .whiten import (
+    RunWhitener,
+    arma11_whitener,
+    arma11_whiteners,
+    stack_cols,
+    whitener_elements,
+)
 from .xval import compute_r2_metric
 
 
@@ -399,6 +406,7 @@ def calculate_grid_memory_footprint(
     n_timepoints: int,
     n_regressors: int,
     use_double: bool = False,
+    whitener_elems: int | None = None,
 ) -> int:
     """
     Calculate exact memory footprint of REML grid precomputation.
@@ -420,6 +428,9 @@ def calculate_grid_memory_footprint(
         Number of regressors in design matrix
     use_double : bool, default=False
         If True, use float64 precision (8 bytes per element)
+    whitener_elems : int, optional
+        Elements stored per pair for the run-block whitener
+        (``whiten.whitener_elements``); defaults to the dense n².
 
     Returns
     -------
@@ -429,7 +440,9 @@ def calculate_grid_memory_footprint(
     bytes_per_element = 8 if use_double else 4
 
     # Memory per (a,b) pair
-    L_size = n_timepoints * n_timepoints * bytes_per_element  # Cholesky factor
+    if whitener_elems is None:
+        whitener_elems = n_timepoints * n_timepoints
+    L_size = whitener_elems * bytes_per_element
     X_w_size = n_timepoints * n_regressors * bytes_per_element
     XwTXw_size = n_regressors * n_regressors * bytes_per_element
     scalars_size = 2 * bytes_per_element  # logdet_R + logdet_XwTXw
@@ -1359,145 +1372,54 @@ def precompute_autocorr_grid(
     run_starts: list[int] | torch.Tensor | None = None,
     tau: torch.Tensor | None = None,
 ) -> dict:
-    """Design-independent half of the REML grid: per-(a,b) L⁻¹ and logdet(R).
+    """Design-independent half of the REML grid: per-(a,b) whitener and logdet(R).
 
     These quantities depend ONLY on the autocorrelation structure (a, b,
     run_starts, n_timepoints) — not on the design matrix X. Computing them once
     and reusing them across multiple designs (e.g., per-voxel HRFs) saves a full
     Cholesky pass per design.
 
+    The whiteners are per run (:mod:`fastfuncstuff.glm.whiten`): Σ n_r² per pair,
+    not T², which is what keeps a many-run fit linear in the number of runs.
+
     Returns
     -------
     dict
-        ``{"param_list": [(a,b), ...], "L_inv_batch": (n_valid, n, n) tensor,
+        ``{"param_list": [(a,b), ...], "whiteners": [RunWhitener, ...],
         "logdet_Rcorr_batch": (n_valid,) tensor, "dtype": torch.dtype}``.
-        Tensors are on CPU when ``cholesky_on_cpu=True``.
+        On CPU when ``cholesky_on_cpu=True``.
     """
     import time as _time
 
-    build_device = torch.device("cpu") if (cholesky_on_cpu or device.type == "mps") else device
-    a_grid = a_grid.to(build_device)
-    b_grid = b_grid.to(build_device)
-    a_grid, b_grid = ensure_zero_in_grid(a_grid, b_grid)
+    from fastfuncstuff.utils import cpu_if_mps
 
-    if verbose:
-        n_total_grid = len(a_grid) * len(b_grid)
-        print("  Building ALL covariance matrices (vectorized)...")
-        print(f"    Initial grid: {len(a_grid)} a × {len(b_grid)} b = {n_total_grid} combinations")
-
-    R_batch, _params_tensor, param_list = build_arma11_covariance_batch(
-        a_grid,
-        b_grid,
-        n_timepoints,
-        build_device,
-        dtype,
-        run_starts=run_starts,
-        tau=tau,
-    )
-    n_valid = len(param_list)
-    if n_valid == 0:
-        if verbose:
-            print("  Warning: No valid (a,b) parameters in grid!")
-        return {
-            "param_list": [],
-            "L_inv_batch": None,
-            "logdet_Rcorr_batch": None,
-            "dtype": dtype,
-        }
-
-    # GPU streaming Cholesky: when the all-at-once GPU path doesn't fit but
-    # device is CUDA, process the (a,b) grid in chunks on the GPU and stream
-    # L⁻¹ back to CPU. Much faster than CPU Cholesky on the same workload.
-    use_chunked_gpu = (
-        cholesky_on_cpu  # all-at-once was rejected
-        and device.type == "cuda"
-        and build_device.type == "cpu"
-    )
+    build_device = torch.device("cpu") if cholesky_on_cpu else cpu_if_mps(device, "cholesky")
+    a_grid, b_grid = ensure_zero_in_grid(a_grid.to(build_device), b_grid.to(build_device))
 
     chol_start = _time.time()
-    if use_chunked_gpu:
-        # Pick chunk size by GPU free memory. Per-chunk peak ≈ 3·chunk·n² bytes/elem
-        # (R_chunk, L_chunk, L_inv_chunk all coexist). Add 1.5× safety for PyTorch
-        # workspace and the persistent eye/run_block_mask tensors.
-        bpe = dtype.itemsize if hasattr(dtype, "itemsize") else 4
-        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
-        per_pair_bytes = n_timepoints * n_timepoints * bpe
-        # Cap chunk: cuSOLVER workspace grows with batch — empirically batches of
-        # ~32 give the best amortization without ballooning workspace.
-        chunk_size = max(
-            1,
-            min(32, int(free_bytes * 0.5 / (per_pair_bytes * 3))),
-        )
-
-        if verbose:
-            n_filtered = len(a_grid) * len(b_grid) - n_valid
-            print(f"  ✓ Built {n_valid} covariance matrices (filtered {n_filtered} with λ ≤ 0)")
-            print(
-                f"  🚀 Streaming Cholesky on GPU in chunks of {chunk_size} "
-                f"(per-chunk peak ≈ {per_pair_bytes * chunk_size * 3 / 1e9:.2f} GB)..."
-            )
-
-        L_inv_batch = torch.empty(
-            (n_valid, n_timepoints, n_timepoints), dtype=dtype, device=build_device
-        )
-        logdet_Rcorr_batch = torch.empty(n_valid, dtype=dtype, device=build_device)
-        eye_gpu = torch.eye(n_timepoints, dtype=dtype, device=device)
-        try:
-            for start in range(0, n_valid, chunk_size):
-                end = min(start + chunk_size, n_valid)
-                R_chunk_gpu = R_batch[start:end].to(device, non_blocking=True)
-                L_chunk = torch.linalg.cholesky(R_chunk_gpu)
-                diag = torch.diagonal(L_chunk, dim1=1, dim2=2)
-                logdet_Rcorr_batch[start:end] = (
-                    2 * torch.sum(torch.log(diag + 1e-10), dim=1)
-                ).cpu()
-                L_inv_chunk = torch.linalg.solve_triangular(
-                    L_chunk,
-                    eye_gpu.unsqueeze(0).expand(end - start, -1, -1),
-                    upper=False,
-                )
-                L_inv_batch[start:end] = L_inv_chunk.cpu()
-                del R_chunk_gpu, L_chunk, L_inv_chunk
-            del eye_gpu
-            torch.cuda.empty_cache()
-        except (torch.linalg.LinAlgError, RuntimeError) as _e:
-            # GPU chunk failed — fall back to all-at-once CPU
-            if verbose:
-                print(f"  ⚠️  GPU chunked Cholesky failed ({_e}); falling back to CPU.")
-            del L_inv_batch
-            torch.cuda.empty_cache()
-            L_batch_cpu = torch.linalg.cholesky(R_batch)
-            logdet_Rcorr_batch = 2 * torch.sum(
-                torch.log(torch.diagonal(L_batch_cpu, dim1=1, dim2=2) + 1e-10), dim=1
-            )
-            eye_cpu = torch.eye(n_timepoints, dtype=dtype, device=R_batch.device)
-            L_inv_batch = torch.linalg.solve_triangular(
-                L_batch_cpu, eye_cpu.unsqueeze(0).expand(n_valid, -1, -1), upper=False
-            )
-            del L_batch_cpu, eye_cpu
-    else:
-        if verbose:
-            n_filtered = len(a_grid) * len(b_grid) - n_valid
-            chol_location = "CPU" if cholesky_on_cpu else "GPU (all-at-once)"
-            print(f"  ✓ Built {n_valid} covariance matrices (filtered {n_filtered} with λ ≤ 0)")
-            print(f"  Computing ALL Cholesky factorizations (batched on {chol_location})...")
-        L_batch = torch.linalg.cholesky(R_batch)
-        logdet_Rcorr_batch = 2 * torch.sum(
-            torch.log(torch.diagonal(L_batch, dim1=1, dim2=2) + 1e-10), dim=1
-        )
-        eye_n = torch.eye(n_timepoints, dtype=dtype, device=L_batch.device)
-        L_inv_batch = torch.linalg.solve_triangular(
-            L_batch, eye_n.unsqueeze(0).expand(n_valid, -1, -1), upper=False
-        )
-        del L_batch, eye_n
-
+    whiteners, logdet_Rcorr_batch, param_list = arma11_whiteners(
+        a_grid.to(dtype),
+        b_grid.to(dtype),
+        n_timepoints,
+        run_starts=run_starts,
+        tau=tau,
+        device=build_device,
+        dtype=dtype,
+    )
     if verbose:
-        print(f"  ✓ Computed {n_valid} Cholesky factorizations! ({_time.time() - chol_start:.1f}s)")
-    del R_batch
-
+        n_total = len(a_grid) * len(b_grid)
+        if param_list:
+            per = whiteners[0].nbytes / 1024**2
+            print(
+                f"  ✓ {len(param_list)} run-block whiteners ({n_total - len(param_list)} "
+                f"filtered, {per:.1f} MiB each) in {_time.time() - chol_start:.1f}s "
+                f"on {build_device.type}"
+            )
+        else:
+            print("  Warning: No valid (a,b) parameters in grid!")
     return {
         "param_list": param_list,
-        "L_inv_batch": L_inv_batch,
+        "whiteners": whiteners,
         "logdet_Rcorr_batch": logdet_Rcorr_batch,
         "dtype": dtype,
     }
@@ -1554,7 +1476,7 @@ def precompute_reml_grid(
     -------
     precomputed : dict
         Contains pre-computed matrices for each valid (a,b):
-        - 'L_inv': lower Cholesky inverse — use L_inv @ Y for GEMM-based whitening
+        - 'whitener': RunWhitener — ``.rows(Y)`` / ``.cols(M)`` apply L⁻¹ per run
         - 'X_w': prewhitened design matrix — kept for GLS fitting path
         - 'Q': orthonormal columns of X_w — use Q'Y_w for Pythagorean RSS
         - 'logdet_Rcorr': log(det(R))
@@ -1562,7 +1484,6 @@ def precompute_reml_grid(
     """
     # Ensure X has the correct dtype for all operations
     X = X.to(dtype=dtype)
-    n_regressors = X.shape[1]
     precomputed = {}
 
     # Phases 1-3 (build R, Cholesky, L_inv, logdet_Rcorr) depend ONLY on (a,b)
@@ -1586,294 +1507,59 @@ def precompute_reml_grid(
         )
 
     param_list = autocorr_cache["param_list"]
-    L_inv_batch = autocorr_cache["L_inv_batch"]
+    whiteners = autocorr_cache["whiteners"]
     logdet_Rcorr_batch = autocorr_cache["logdet_Rcorr_batch"]
     n_valid = len(param_list)
     if n_valid == 0:
         return precomputed
 
+    # Whiten the design for every pair at once. Small now that the whiteners are
+    # per run, so do it on the accelerator when there is one and store on the
+    # whiteners' device (CPU by default; the caller moves the grid if it fits).
+    storage = whiteners[0].device
+    work = device if device.type == "cuda" else storage
     if verbose:
-        print("  Prewhitening design matrix for all parameters...")
-
+        print(f"  Prewhitening design matrix for all parameters (on {work.type})...")
+    X_w_batch = stack_cols(whiteners, X.to(device=work, dtype=dtype))  # (n_valid, T, K)
     try:
-        if debug_memory:
-            _debug_memory_snapshot(
-                "Grid: Entering design-dependent phase",
-                device,
-                {"L_inv_batch": L_inv_batch},
-            )
-
-        # PHASE 4-5: prewhiten design + compute Q.
-        # When L_inv lives on CPU but a CUDA device is available, stream chunks
-        # to GPU: phase 4 is a (n_valid, n_t, n_reg) bmm that's wildly slow on
-        # CPU for big n_t (the 16 s CPU usage you noticed). On GPU it's
-        # milliseconds. Storage remains CPU to keep the policy unchanged.
-        n_regressors_x = X.shape[1]
-        gpu_stream_design = L_inv_batch.device.type == "cpu" and device.type == "cuda"
-
-        if gpu_stream_design:
-            bpe = dtype.itemsize if hasattr(dtype, "itemsize") else 4
-            free_bytes, _ = torch.cuda.mem_get_info(device)
-            # Per-chunk peak ≈ L_inv (n_t²) + X_w (n_t · n_reg) + Q (n_t · n_reg)
-            #                + XtX (n_reg²) + 2× workspace ≈ ~2× L_inv chunk.
-            per_pair_bytes = n_timepoints * n_timepoints * bpe * 2
-            chunk_size = max(1, min(32, int(free_bytes * 0.5 / per_pair_bytes)))
-            if verbose:
-                print(f"  🚀 Streaming design prewhitening on GPU in chunks of {chunk_size}...")
-
-            X_gpu = X.to(device=device, dtype=dtype)
-            X_w_batch = torch.empty(
-                (n_valid, n_timepoints, n_regressors_x), dtype=dtype, device="cpu"
-            )
-            Q_batch = torch.empty_like(X_w_batch)
-            logdet_XwTXw_batch = torch.empty(n_valid, dtype=dtype, device="cpu")
-
-            cholesky_q_failed = False
-            for start in range(0, n_valid, chunk_size):
-                end = min(start + chunk_size, n_valid)
-                L_inv_chunk = L_inv_batch[start:end].to(device, non_blocking=True)
-                X_w_chunk = torch.bmm(L_inv_chunk, X_gpu.unsqueeze(0).expand(end - start, -1, -1))
-                # Cholesky-of-XtX path for Q. If it fails, mark and fall back below.
-                try:
-                    XtX_chunk = torch.bmm(X_w_chunk.transpose(1, 2), X_w_chunk)
-                    L_xtx_chunk = torch.linalg.cholesky(XtX_chunk)
-                    Q_chunk = torch.linalg.solve_triangular(
-                        L_xtx_chunk, X_w_chunk.transpose(1, 2), upper=False
-                    ).transpose(1, 2)
-                    logdet_chunk = 2 * torch.sum(
-                        torch.log(torch.abs(torch.diagonal(L_xtx_chunk, dim1=1, dim2=2)) + 1e-10),
-                        dim=1,
-                    )
-                    del XtX_chunk, L_xtx_chunk
-                except (torch.linalg.LinAlgError, RuntimeError):
-                    Q_chunk, R_qr_chunk = torch.linalg.qr(X_w_chunk)
-                    logdet_chunk = 2 * torch.sum(
-                        torch.log(torch.abs(torch.diagonal(R_qr_chunk, dim1=1, dim2=2)) + 1e-10),
-                        dim=1,
-                    )
-                    del R_qr_chunk
-                    cholesky_q_failed = True
-                X_w_batch[start:end] = X_w_chunk.cpu()
-                Q_batch[start:end] = Q_chunk.cpu()
-                logdet_XwTXw_batch[start:end] = logdet_chunk.cpu()
-                del L_inv_chunk, X_w_chunk, Q_chunk, logdet_chunk
-            del X_gpu
-            torch.cuda.empty_cache()
-            if cholesky_q_failed and verbose:
-                print(
-                    "  ⚠️  Cholesky-of-XtX failed on some chunks; "
-                    "fell back to QR for those (still on GPU)."
-                )
-
-        else:
-            # Original path: build_device == device (both CPU or both GPU all-at-once).
-            X_cpu = X.to(L_inv_batch.device)
-            X_w_batch = torch.bmm(
-                L_inv_batch, X_cpu.unsqueeze(0).expand(n_valid, -1, -1)
-            )  # (n_valid, n_timepoints, n_regressors)
-            del X_cpu
-
-        # PHASE 5 (non-streamed path): the streaming path computed Q + logdet
-        # inline above. Only execute when we didn't stream.
-        if not gpu_stream_design:
-            try:
-                XtX_batch = torch.bmm(X_w_batch.transpose(1, 2), X_w_batch)
-                L_xtx = torch.linalg.cholesky(XtX_batch)
-                Q_batch = torch.linalg.solve_triangular(
-                    L_xtx,
-                    X_w_batch.transpose(1, 2),
-                    upper=False,
-                ).transpose(1, 2)
-                logdet_XwTXw_batch = 2 * torch.sum(
-                    torch.log(torch.abs(torch.diagonal(L_xtx, dim1=1, dim2=2)) + 1e-10),
-                    dim=1,
-                )
-                del XtX_batch, L_xtx
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-            except (torch.linalg.LinAlgError, RuntimeError) as e:
-                is_oom = isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
-                is_linalg = isinstance(e, torch.linalg.LinAlgError)
-                if not (is_oom or is_linalg):
-                    raise
-                if verbose:
-                    reason = "OOM" if is_oom else "Cholesky failed (rank-deficient X)"
-                    print(
-                        f"  Fast Q path failed ({reason}); falling back to "
-                        f"torch.linalg.qr — slower but more numerically robust."
-                    )
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-                Q_batch, R_qr_batch = torch.linalg.qr(X_w_batch)
-                logdet_XwTXw_batch = 2 * torch.sum(
-                    torch.log(torch.abs(torch.diagonal(R_qr_batch, dim1=1, dim2=2)) + 1e-10),
-                    dim=1,
-                )
-                del R_qr_batch
-
+        XtX_batch = torch.bmm(X_w_batch.transpose(1, 2), X_w_batch)
+        L_xtx = torch.linalg.cholesky(XtX_batch)
+        Q_batch = torch.linalg.solve_triangular(
+            L_xtx, X_w_batch.transpose(1, 2), upper=False
+        ).transpose(1, 2)
+        diag = torch.diagonal(L_xtx, dim1=1, dim2=2)
+        del XtX_batch, L_xtx
+    except torch.linalg.LinAlgError:
         if verbose:
-            print("  ✓ Precomputed all matrices!")
-            print(f"  Storing {n_valid} parameter sets...")
+            print("  Cholesky of X'X failed (rank-deficient X); using QR.")
+        Q_batch, R_qr_batch = torch.linalg.qr(X_w_batch)
+        diag = torch.diagonal(R_qr_batch, dim1=1, dim2=2)
+        del R_qr_batch
+    logdet_XwTXw_batch = 2 * torch.sum(torch.log(torch.abs(diag) + 1e-10), dim=1)
+    X_w_batch, Q_batch = X_w_batch.to(storage), Q_batch.to(storage)
+    logdet_XwTXw_batch = logdet_XwTXw_batch.to(storage)
+    logdet_Rcorr_batch = logdet_Rcorr_batch.to(storage)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-        # PHASE 6: Store per grid point on CPU
-        # L_inv: GEMM-based whitening in search (no triangular solve in hot path)
-        # X_w: kept for GLS fitting (design is constant across all voxels in a group)
-        # Q: orthonormal cols for Pythagorean RSS = ||Y_w||² - ||Q'Y_w||²
-        for i, (a_val, b_val) in enumerate(param_list):
-            precomputed[(a_val, b_val)] = {
-                "L_inv": L_inv_batch[i],  # (n, n) - lower Cholesky inverse
-                "X_w": X_w_batch[i],  # (n, n_reg) - prewhitened design
-                "Q": Q_batch[i],  # (n, n_reg) - orthonormal cols for RSS
-                "logdet_Rcorr": logdet_Rcorr_batch[i],
-                "logdet_XwTXw": logdet_XwTXw_batch[i],
-                "a": a_val,
-                "b": b_val,
-            }
-
-    except RuntimeError as e:
-        # Fallback to sequential if batch fails
-        if verbose:
-            warnings.warn(
-                f"Batch Cholesky failed ({e}), falling back to sequential...", stacklevel=2
-            )
-
-        # CRITICAL: Clean up GPU memory from failed batch attempt!
-        _local_names = locals()
-        if "L_inv_batch" in _local_names:
-            del L_inv_batch
-        if "X_w_batch" in _local_names:
-            del X_w_batch
-        if "Q_batch" in _local_names:
-            del Q_batch
-
-        # Force GPU memory release
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-
-        if verbose:
-            print("  ✓ Cleared GPU memory from failed batch attempt")
-
-        # Fall back to old sequential method
-        grid_pairs = (
-            tqdm(param_list, desc="Precomputing REML grid (sequential)", unit="pair")
-            if verbose
-            else param_list
-        )
-
-        for a_val, b_val in grid_pairs:
-            R = build_arma11_covariance(
-                a_val,
-                b_val,
-                n_timepoints,
-                device,
-                dtype,
-                run_starts=run_starts,
-                tau=tau,
-            )
-            if R is None:
-                continue
-
-            try:
-                # Compute Cholesky on CPU
-                if cholesky_on_cpu or device.type == "mps":
-                    R_cpu = R.cpu()
-                    L = torch.linalg.cholesky(R_cpu)
-                    del R_cpu
-                else:
-                    L = torch.linalg.cholesky(R).cpu()
-
-                logdet_Rcorr = 2 * torch.sum(torch.log(torch.diag(L) + 1e-10))
-
-                # Compute L_inv — GEMM-based whitening avoids per-voxel triangular solve
-                n_t = L.shape[0]
-                L_inv = torch.linalg.solve_triangular(
-                    L, torch.eye(n_t, dtype=dtype, device=L.device), upper=False
-                )
-                del L  # L no longer needed; L_inv replaces it
-
-                X_cpu = X.cpu() if X.device.type != "cpu" else X
-                X_w = L_inv @ X_cpu  # GEMM: (n_time, n_reg)
-
-                # QR always — eliminates slogdet/DLASWP, enables Pythagorean RSS
-                Q, R_qr = torch.linalg.qr(X_w)
-                logdet_XwTXw = 2 * torch.sum(torch.log(torch.abs(torch.diag(R_qr)) + 1e-10))
-                del R_qr  # Not stored; GLS path recomputes fresh QR from X_w
-
-                precomputed[(a_val, b_val)] = {
-                    "L_inv": L_inv,
-                    "X_w": X_w,
-                    "Q": Q,
-                    "logdet_Rcorr": logdet_Rcorr,
-                    "logdet_XwTXw": logdet_XwTXw,
-                    "a": a_val,
-                    "b": b_val,
-                }
-            except RuntimeError as e2:
-                if verbose:
-                    warnings.warn(
-                        f"Cholesky failed for (a={a_val:.3f}, b={b_val:.3f}): {e2}", stacklevel=2
-                    )
-                continue
-
-    # CRITICAL: Delete batch tensors to free memory before GPU transfer
+    # One entry per pair. X_w is kept for the GLS fit; Q gives the Pythagorean
+    # RSS = ||Y_w||² - ||Q'Y_w||² in the search.
+    for i, (a_val, b_val) in enumerate(param_list):
+        precomputed[(a_val, b_val)] = {
+            "whitener": whiteners[i],
+            "X_w": X_w_batch[i],
+            "Q": Q_batch[i],
+            "logdet_Rcorr": logdet_Rcorr_batch[i],
+            "logdet_XwTXw": logdet_XwTXw_batch[i],
+            "a": a_val,
+            "b": b_val,
+        }
     if debug_memory:
-        _debug_memory_snapshot(
-            "Grid: Before deleting batch tensors",
-            device,
-            {
-                "L_inv_batch": locals().get("L_inv_batch"),
-                "X_w_batch": locals().get("X_w_batch"),
-                "Q_batch": locals().get("Q_batch"),
-            },
+        total = sum(w.nbytes for w in whiteners) + X_w_batch.nbytes + Q_batch.nbytes
+        print(
+            f"\nGRID SIZE: {n_valid} pairs, {total / 1024**3:.3f} GiB "
+            f"(whiteners {sum(w.nbytes for w in whiteners) / 1024**3:.3f} GiB)"
         )
-
-        if "L_inv_batch" in locals():
-            n_pairs = len(param_list)
-            n_regs = X.shape[1]
-            bytes_per_elem = L_inv_batch.element_size()
-
-            expected_L_inv = n_pairs * n_timepoints * n_timepoints * bytes_per_elem
-            expected_X_w = n_pairs * n_timepoints * n_regs * bytes_per_elem
-            expected_Q = n_pairs * n_timepoints * n_regs * bytes_per_elem
-            expected_scalars = n_pairs * 2 * bytes_per_elem
-            expected_total = expected_L_inv + expected_X_w + expected_Q + expected_scalars
-
-            actual_L_inv = L_inv_batch.element_size() * L_inv_batch.nelement()
-            actual_X_w = X_w_batch.element_size() * X_w_batch.nelement()
-            actual_Q = Q_batch.element_size() * Q_batch.nelement()
-            actual_total = actual_L_inv + actual_X_w + actual_Q
-
-            print("\nGRID SIZE VERIFICATION:")
-            print(
-                f"  n_pairs={n_pairs}, n_timepoints={n_timepoints}, n_regressors={n_regs}, dtype={dtype}"
-            )
-            print(f"  Expected grid size: {expected_total / 1024**3:.3f} GiB")
-            print(f"    - L_inv: {expected_L_inv / 1024**3:.3f} GiB")
-            print(f"    - X_w:   {expected_X_w / 1024**3:.3f} GiB")
-            print(f"    - Q:     {expected_Q / 1024**3:.3f} GiB")
-            print(f"  Actual batch tensors: {actual_total / 1024**3:.3f} GiB")
-            print(
-                f"  Match: {'✅ YES' if abs(actual_total - expected_total) < 1024**2 else '❌ NO'}"
-            )
-
-    # `del` only frees if the name is bound; ``in locals()`` guards the names
-    # that the fallback path may have left unset.
-    _local_names = locals()
-    if "L_inv_batch" in _local_names:
-        del L_inv_batch
-    if "X_w_batch" in _local_names:
-        del X_w_batch
-    if "Q_batch" in _local_names:
-        del Q_batch
-    if "logdet_Rcorr_batch" in _local_names:
-        del logdet_Rcorr_batch
-    if "logdet_XwTXw_batch" in _local_names:
-        del logdet_XwTXw_batch
-
-    if debug_memory:
-        _debug_memory_snapshot("Grid: After deleting batch tensors (grid in dict only)", device, {})
-
     return precomputed
 
 
@@ -2109,9 +1795,6 @@ def batch_reml_grid_search(
         # PHASE 1: Stack precomputed matrices for THIS CHUNK only
         chunk_keys = [param_list[i] for i in chunk_indices]
 
-        L_inv_stack = torch.stack([precomputed[k]["L_inv"] for k in chunk_keys]).to(
-            device
-        )  # (n_chunk, n_time, n_time) - lower Cholesky inverses
         Q_stack = torch.stack([precomputed[k]["Q"] for k in chunk_keys]).to(
             device
         )  # (n_chunk, n_time, n_regressors) - orthonormal cols for RSS
@@ -2122,13 +1805,9 @@ def batch_reml_grid_search(
             device
         )  # (n_chunk,)
 
-        # PHASE 2: Prewhiten data via batched GEMM: Y_w = L_inv @ Y  (no triangular solve!)
-        # Y_batch: (n_time, n_voxels)  →  expand to (n_chunk, n_time, n_voxels)
-        Y_batch_expanded = Y_batch.unsqueeze(0).expand(
-            len(chunk_indices), -1, -1
-        )  # VIEW - no VRAM copy
-        Y_w_all = torch.bmm(L_inv_stack, Y_batch_expanded)  # (n_chunk, n_time, n_voxels)
-        del Y_batch_expanded, L_inv_stack
+        # PHASE 2: Prewhiten data: Y_w = L⁻¹ Y per pair, run by run, batched over
+        # the chunk. Y_batch: (n_time, n_voxels) → (n_chunk, n_time, n_voxels).
+        Y_w_all = stack_cols([precomputed[k]["whitener"] for k in chunk_keys], Y_batch)
 
         # PHASE 3: Pythagorean RSS = ||Y_w||² - ||Q'Y_w||²  (no betas needed!)
         # Q_stack: (n_chunk, n_time, n_reg), Y_w_all: (n_chunk, n_time, n_vox)
@@ -2284,17 +1963,16 @@ def search_voxels_precomputed_grid(
     for _grid_idx, (a, b) in grid_iter:
         with profile_section("1_get_grid_data", enabled=enable_timing):
             grid_data = precomputed_grid[(a, b)]
-            L_inv = grid_data["L_inv"].to(device)  # (n_time, n_time)
+            whitener = grid_data["whitener"].to(device)
             Q = grid_data["Q"].to(device)  # (n_time, n_reg) orthonormal
             # Keep scalar terms on the compute device. ``.item()`` forces an
             # accelerator synchronization once per grid point.
             logdet_Rcorr = grid_data["logdet_Rcorr"].to(device)
             logdet_XwTXw = grid_data["logdet_XwTXw"].to(device)
 
-        # Prewhiten data via GEMM: Y_w = L_inv @ Y  (no triangular solve!)
-        # Y_batch: (n_voxels, n_time) → transpose for matmul → transpose back
+        # Prewhiten data: Y_w = Y L⁻ᵀ, one GEMM per run-length group.
         with profile_section("2_prewhiten_data", enabled=enable_timing):
-            Y_w_batch = (L_inv @ Y_batch.T).T  # (n_voxels, n_timepoints)
+            Y_w_batch = whitener.rows(Y_batch)  # (n_voxels, n_timepoints)
 
         # Pythagorean RSS = ||Y_w||² - ||Q'Y_w||²  (no betas, no residuals!)
         # Accumulate in float64: for high-R² task voxels the two terms nearly
@@ -2449,13 +2127,13 @@ def search_voxels_precomputed_grid_hierarchical(
         if key is None:
             return
         gd = precomputed_grid[key]
-        L_inv = gd["L_inv"].to(device)
+        whitener = gd["whitener"].to(device)
         Q = gd["Q"].to(device)
         logdet_Rcorr = gd["logdet_Rcorr"].item()
         logdet_XwTXw = gd["logdet_XwTXw"].item()
 
         Y_sub = Y_batch.index_select(0, active_idx)  # (n_active, T)
-        Y_w = Y_sub @ L_inv.T  # (n_active, T)
+        Y_w = whitener.rows(Y_sub)  # (n_active, T)
         Qt_Yw = Y_w @ Q  # (n_active, K)
         # float64 accumulation — see search_voxels_precomputed_grid: the
         # Pythagorean cancellation in float32 corrupts high-R² voxels.
@@ -3024,39 +2702,33 @@ def reml_grid_search_batched(
             b = b_valid[grid_idx].item()
 
             try:
-                # Build covariance matrix for this (a,b) - do on CPU to save GPU memory
-                R = build_arma11_covariance(
-                    torch.tensor(a, dtype=dtype),
-                    torch.tensor(b, dtype=dtype),
+                # Per-run whitener for this (a,b); Cholesky on CPU as before
+                ws, logdets, _ = arma11_whiteners(
+                    torch.tensor([a], dtype=dtype),
+                    torch.tensor([b], dtype=dtype),
                     n_timepoints,
-                    device=torch.device("cpu"),
-                    dtype=dtype,
                     run_starts=run_starts,
                     tau=tau,
+                    device=torch.device("cpu"),
+                    dtype=dtype,
                 )
+                if not ws:
+                    continue
+                W = ws[0].to(device)
 
-                # Compute Cholesky
-                L = torch.linalg.cholesky(R)  # On CPU
-
-                # Move L to GPU for triangular solve
-                L_dev = L.to(device)
-
-                # Prewhiten design via triangular solve (no explicit inverse!)
-                X_w = torch.linalg.solve_triangular(L_dev, design_dev, upper=False)  # (n_tp, n_reg)
+                X_w = W.cols(design_dev)  # (n_tp, n_reg)
                 XwTXw = X_w.T @ X_w
                 XwTXw_reg = XwTXw + 1e-6 * torch.eye(n_regressors, device=device, dtype=dtype)
 
                 # Log determinants for REML
-                logdet_R = 2.0 * torch.sum(torch.log(torch.diag(L)))
+                logdet_R = logdets[0].to(device)
                 logdet_XwTXw = torch.logdet(XwTXw_reg)
 
                 # Process voxels (either all at once or in batches)
                 if load_all_data:
                     # All data already on device - process at once
                     # Prewhiten ALL voxels via triangular solve
-                    y_w = torch.linalg.solve_triangular(
-                        L_dev, data_dev.T, upper=False
-                    ).T  # (n_voxels, n_tp)
+                    y_w = W.rows(data_dev)  # (n_voxels, n_tp)
 
                     # Solve for ALL voxels: beta = (X'X)^-1 X'y
                     XwTy_w = X_w.T @ y_w.T  # (n_reg, n_voxels)
@@ -3103,9 +2775,7 @@ def reml_grid_search_batched(
                             ).unsqueeze(1)
 
                         # Prewhiten this batch via triangular solve
-                        y_w = torch.linalg.solve_triangular(
-                            L_dev, data_batch.T, upper=False
-                        ).T  # (batch_voxels, n_tp)
+                        y_w = W.rows(data_batch)  # (batch_voxels, n_tp)
 
                         # Solve for this batch: beta = (X'X)^-1 X'y
                         XwTy_w = X_w.T @ y_w.T  # (n_reg, batch_voxels)
@@ -3142,7 +2812,7 @@ def reml_grid_search_batched(
                         del data_batch, y_w, betas, resid_w, sse, likelihoods
 
                 # Free common GPU memory before next iteration
-                del L_dev, X_w, XwTXw, XwTXw_reg
+                del W, X_w, XwTXw, XwTXw_reg
 
             except (torch.linalg.LinAlgError, RuntimeError) as e:
                 # Skip this (a,b) if Cholesky fails
@@ -3670,10 +3340,12 @@ def _fit_dsort_gls_pass(
         b_opt = float(unique_pairs[g_idx, 1])
         voxel_indices = sort_perm[group_starts[g_idx] : group_starts[g_idx + 1]]
 
-        # Whiten the base design once for this (a, b); L is its Cholesky factor.
-        X_w, _, L_chol = prewhiten_with_arma11(
-            design, design[:, 0], a_opt, b_opt, run_starts=run_starts, tau=tau
-        )
+        # Whiten the base design once for this (a, b).
+        whitener = arma11_whitener(
+            a_opt, b_opt, n_timepoints, run_starts=run_starts, tau=tau,
+            device=design.device, dtype=design.dtype,
+        )  # fmt: skip
+        X_w = whitener.cols(design)
 
         n_group = voxel_indices.numel()
         sub = max(1, min(sub_batch, n_group))
@@ -3685,7 +3357,7 @@ def _fit_dsort_gls_pass(
             Y = data[idx].T.to(device)
             if y_norm_scale is not None:
                 Y = Y / y_norm_scale[idx].to(device).unsqueeze(0)
-            Yw = torch.linalg.solve_triangular(L_chol, Y, upper=False)  # (n_time, B)
+            Yw = whitener.cols(Y)  # (n_time, B)
 
             # This batch's dsort columns (B, n_dsort, n_time). With run_bounds the
             # stored form is compact (B, n_sets, n_time); expand each set into one
@@ -3702,7 +3374,7 @@ def _fit_dsort_gls_pass(
                 D = dsort[idx].to(device)  # (B, n_dsort, n_time)
             # Whiten: (B, n_dsort, n_time) -> (n_time, B*n_dsort).
             Dmat = D.permute(2, 0, 1).reshape(n_timepoints, B * n_dsort)
-            Dw = torch.linalg.solve_triangular(L_chol, Dmat, upper=False)
+            Dw = whitener.cols(Dmat)
             Dw = Dw.reshape(n_timepoints, B, n_dsort).permute(1, 0, 2)  # (B,n_time,q)
 
             # Extended whitened design per voxel: (B, n_time, p+q).
@@ -4214,7 +3886,11 @@ def fit_glm_arma11(
 
             # Calculate grid memory
             grid_memory_bytes = calculate_grid_memory_footprint(
-                n_valid_pairs, n_timepoints, n_regressors, use_double
+                n_valid_pairs,
+                n_timepoints,
+                n_regressors,
+                use_double,
+                whitener_elems=whitener_elements(n_timepoints, run_starts, tau),
             )
 
             # Auto-detect whether to use grid batching
@@ -4250,13 +3926,15 @@ def fit_glm_arma11(
                 print(f"  dtype:         {'float64' if use_double else 'float32'}")
                 print(f"  bytes_per_element: {8 if use_double else 4}")
                 bytes_elem = 8 if use_double else 4
-                L_inv_bytes = n_valid_pairs * n_timepoints * n_timepoints * bytes_elem
+                L_inv_bytes = (
+                    n_valid_pairs * whitener_elements(n_timepoints, run_starts, tau) * bytes_elem
+                )
                 X_w_bytes = n_valid_pairs * n_timepoints * n_regressors * bytes_elem
                 XwTXw_bytes = n_valid_pairs * n_regressors * n_regressors * bytes_elem
                 scalars_bytes = n_valid_pairs * 2 * bytes_elem
                 print("  Expected grid memory:")
                 print(
-                    f"    L_inv:   {L_inv_bytes / 1024**3:.3f} GiB  ({n_valid_pairs} × {n_timepoints} × {n_timepoints})"
+                    f"    whiteners: {L_inv_bytes / 1024**3:.3f} GiB  ({n_valid_pairs} pairs, run blocks)"
                 )
                 print(
                     f"    X_w:     {X_w_bytes / 1024**3:.3f} GiB  ({n_valid_pairs} × {n_timepoints} × {n_regressors})"
@@ -4644,14 +4322,13 @@ def fit_glm_arma11(
 
             for params in unique_params:
                 a_opt, b_opt = params[0].item(), params[1].item()
-                X_w, _, L = prewhiten_with_arma11(
-                    design, design[:, 0], a_opt, b_opt, run_starts=run_starts, tau=tau
-                )
-                # CRITICAL: Store L on CPU to save GPU memory (1.1 GB per matrix for 17k timepoints!)
-                # Move to GPU only when needed for batch computation
+                W = arma11_whitener(
+                    a_opt, b_opt, n_timepoints, run_starts=run_starts, tau=tau,
+                    device=torch.device("cpu"), dtype=design.dtype,
+                )  # fmt: skip
                 precomputed_grid[(a_opt, b_opt)] = {
-                    "X_w": X_w.cpu(),  # Store on CPU
-                    "L": L.cpu(),  # Store on CPU - lower Cholesky factor
+                    "X_w": W.cols(design.cpu()),
+                    "whitener": W,
                     "a": a_opt,
                     "b": b_opt,
                 }
@@ -4748,7 +4425,7 @@ def fit_glm_arma11(
                     # Estimate PEAK GPU memory during batch Cholesky
                     # (R_batch + L_batch + L_inv_batch + X_w_batch + R_qr_batch + workspace ≈ 6×)
                     n_grid_estimate = len(a_grid) * len(b_grid)  # upper bound before λ filter
-                    bytes_per_matrix = n_timepoints * n_timepoints * 4  # float32
+                    bytes_per_matrix = whitener_elements(n_timepoints, run_starts, tau) * 4
                     cholesky_peak_gb = (bytes_per_matrix * n_grid_estimate * 6) / 1e9
 
                     # Get available GPU memory
@@ -4806,7 +4483,6 @@ def fit_glm_arma11(
                         "AFTER grid precomputation (on CPU)",
                         device,
                         {
-                            "sample_L_inv": precomputed_grid[sample_key]["L_inv"],
                             "sample_X_w": precomputed_grid[sample_key]["X_w"],
                             "sample_Q": precomputed_grid[sample_key]["Q"],
                         },
@@ -4818,9 +4494,11 @@ def fit_glm_arma11(
 
                 _grid_resident_bytes = sum(
                     value.numel() * value.element_size()
+                    if isinstance(value, torch.Tensor)
+                    else value.nbytes
                     for entry in precomputed_grid.values()
                     for value in entry.values()
-                    if isinstance(value, torch.Tensor)
+                    if isinstance(value, (torch.Tensor, RunWhitener))
                 )
                 _grid_resident_budget = int(get_available_memory(device) * 0.40)
                 _keep_grid_on_accelerator = (
@@ -4830,7 +4508,9 @@ def fit_glm_arma11(
                     if verbose:
                         print(f"  Loading grid to {device.type.upper()} (one-time cost)...")
                     for key in precomputed_grid:
-                        precomputed_grid[key]["L_inv"] = precomputed_grid[key]["L_inv"].to(device)
+                        precomputed_grid[key]["whitener"] = precomputed_grid[key]["whitener"].to(
+                            device
+                        )
                         precomputed_grid[key]["X_w"] = precomputed_grid[key]["X_w"].to(device)
                         precomputed_grid[key]["Q"] = precomputed_grid[key]["Q"].to(device)
                         precomputed_grid[key]["logdet_Rcorr"] = precomputed_grid[key][
@@ -4856,7 +4536,6 @@ def fit_glm_arma11(
                             "AFTER grid loaded to GPU",
                             device,
                             {
-                                "sample_L_inv": precomputed_grid[sample_key]["L_inv"],
                                 "sample_X_w": precomputed_grid[sample_key]["X_w"],
                                 "sample_Q": precomputed_grid[sample_key]["Q"],
                             },
@@ -5045,20 +4724,18 @@ def fit_glm_arma11(
             # Get L and X_w for this (a,b) pair
             # If precomputed_grid exists (from precomputed ARMA params or non-batched grid search),
             # reuse cached values. Otherwise compute on-demand.
-            if use_precomputed_arma and (a_opt, b_opt) in precomputed_grid:
-                # Reuse the cached Cholesky factor L and X_w (stored on CPU to save
-                # GPU memory); move to GPU only when needed for this group. The cache
-                # holds L (not its inverse), so whiten via triangular solve.
-                L_chol = precomputed_grid[(a_opt, b_opt)]["L"].to(device)
-                X_w = precomputed_grid[(a_opt, b_opt)]["X_w"].to(device)
-                _using_l_inv = False  # L_chol is the lower-triangular Cholesky factor
+            # The search grid (when there was one) holds this pair's whitener and
+            # whitened design already; precomputed params build their own above.
+            cached = precomputed_grid.get((a_opt, b_opt)) if precomputed_grid else None
+            if cached is not None and "whitener" in cached:
+                whitener = cast(RunWhitener, cached["whitener"]).to(device)
+                X_w = cast(torch.Tensor, cached["X_w"]).to(device)
             else:
-                # Compute L ONCE for this (a,b) group, keep on GPU
-                y_dummy = data[voxel_indices[0]].to(device)
-                X_w, _, L_chol = prewhiten_with_arma11(
-                    design, y_dummy, a_opt, b_opt, run_starts=run_starts, tau=tau
-                )
-                _using_l_inv = False  # L_chol is actual Cholesky factor here
+                whitener = arma11_whitener(
+                    a_opt, b_opt, n_timepoints, run_starts=run_starts, tau=tau,
+                    device=device, dtype=design.dtype,
+                )  # fmt: skip
+                X_w = whitener.cols(design)
 
             # OPTIMIZATION: Precompute group-level matrices ONCE per (a,b)
             # X_w is the same for all voxels in this group, so derivatives are constant
@@ -5128,9 +4805,10 @@ def fit_glm_arma11(
 
             # Process voxels in this group using sub-batches (memory-aware)
             # Determine sub-batch size based on available GPU memory
-            # CRITICAL: Pass persistent tensors that stay on GPU (L_chol, X_w, design, etc)
+            # CRITICAL: Pass persistent tensors that stay on GPU (whitener, X_w, design, etc)
             persistent_gpu_tensors = {
-                "L_chol": L_chol,
+                # the largest block; per-run blocks of shorter runs are views of it
+                "whitener": max((g.block for g in whitener.groups), key=lambda t: t.numel()),
                 "X_w": X_w,
                 "design": design if design.device.type == "cuda" else None,
             }
@@ -5195,17 +4873,9 @@ def fit_glm_arma11(
                 # Store λ for these voxels (pre-computed above, reuse for all sub-batches)
                 results.arma_lambda[sub_voxel_indices] = lambda_val_cpu
 
-                # Prewhiten data (L_chol on GPU from group computation)
-                # All voxels in this sub-batch have the same (a,b), so same whitening
+                # All voxels in this sub-batch share (a,b), so one whitener
                 t_pw_start = time.time()
-                if _using_l_inv:
-                    # Precomputed path: L_chol is L_inv — use GEMM (faster on GPU)
-                    y_w_batch = (L_chol @ Y_batch_dev).T  # (batch_voxels, n_timepoints)
-                else:
-                    # On-demand path: L_chol is lower triangular — triangular solve
-                    y_w_batch = torch.linalg.solve_triangular(
-                        L_chol, Y_batch_dev, upper=False
-                    ).T  # (batch_voxels, n_timepoints)
+                y_w_batch = whitener.cols(Y_batch_dev).T  # (batch_voxels, n_timepoints)
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 t_prewhiten_total += time.time() - t_pw_start
@@ -5811,7 +5481,7 @@ def fit_glm_arma11(
             # End of sub-batch loop - all voxels for this (a,b) group processed
 
             # Delete group-level precomputed matrices to free GPU memory for next group
-            del L_chol, X_w
+            del whitener, X_w
             if use_qr:
                 del Q_group, R_qr_group, R_inv_group, XwTXw_inv_group
             if device.type == "cuda":

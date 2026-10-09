@@ -2805,13 +2805,13 @@ def estimate_arma11_per_voxel(
         if verbose:
             print("  per-voxel ARMA: loading grid to GPU (one-time cost)…")
         for key in grid:
-            for field in ("L_inv", "X_w", "Q", "logdet_Rcorr", "logdet_XwTXw"):
+            for field in ("whitener", "X_w", "Q", "logdet_Rcorr", "logdet_XwTXw"):
                 if field in grid[key]:
                     grid[key][field] = grid[key][field].to(device)
         torch.cuda.empty_cache()
 
     # The actual device the grid sits on — informs where Y must live.
-    grid_device = next(iter(grid.values()))["L_inv"].device
+    grid_device = next(iter(grid.values()))["whitener"].device
     Y_search = Y_full.to(grid_device) if Y_full.device != grid_device else Y_full
     X_search = X_full.to(grid_device) if X_full.device != grid_device else X_full
 

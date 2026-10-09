@@ -335,3 +335,21 @@ def test_a_surface_series_is_shown_through_its_time_view(world):
     rm = s.surfaces.ribbon_map("lh", layer.shape, layer.affine)
     vol = s.shown_volume(layer.key, 5)
     np.testing.assert_allclose(vol.reshape(-1)[rm.flat], want[rm.vertex], atol=1e-3)
+
+
+def test_unticking_the_selected_surface_layer_hands_the_surface_to_the_next(world):
+    from fastfuncstuff.viewer.vocab import Load, SelectLayer, SetLayerVisible
+
+    s, tmp_path, *_ = world
+    s.do(Load(str(tmp_path / "s.lh.func.gii")))
+    below = list(s.state.layers)[-1].key
+    s.do(Load(str(tmp_path / "s.lh.func.gii")))
+    top = list(s.state.layers)[-1].key
+    s.do(SelectLayer(top))
+    assert s.surface_vertex_rgba("lh")[1].key == top
+    before = s.surface_display_token("lh")
+    s.do(SetLayerVisible(top, False))
+    # Still selected, but hidden: the surface shows the one below, and the
+    # token a 3-D window recolours on has changed with it.
+    assert s.surface_vertex_rgba("lh")[1].key == below
+    assert s.surface_display_token("lh") != before

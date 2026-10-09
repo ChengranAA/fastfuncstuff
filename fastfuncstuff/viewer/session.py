@@ -402,10 +402,16 @@ class ViewerSession:
 
     def _surface_choice(self, hemi: str) -> Layer | None:
         """The surface layer the 3-D window shows on ``hemi``: the selected one when it
-        is a surface layer there, else the top-most visible one."""
+        is a visible surface layer there, else the top-most visible one. Unticking
+        the selected one hands the surface to the next, as on the slices."""
         selected = self.state.selected_layer()
         on_selected = self.surface_layers.get(selected.key) if selected is not None else None
-        if selected is not None and on_selected is not None and hemi in on_selected.parts:
+        if (
+            selected is not None
+            and selected.visible
+            and on_selected is not None
+            and hemi in on_selected.parts
+        ):
             return selected
         for layer in reversed(list(self.state.layers)):
             sld = self.surface_layers.get(layer.key)

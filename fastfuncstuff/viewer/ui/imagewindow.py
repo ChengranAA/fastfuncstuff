@@ -99,10 +99,23 @@ class ImageWindow(QtWidgets.QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
+        # Two rows along the top: what is shown (plane, solo, lock, strip),
+        # then the surface tools -- the second only while there are surfaces
+        # to edit. One row held the window at ~600 px before labels shed.
         self.header = QtWidgets.QWidget()
-        bar = QtWidgets.QHBoxLayout(self.header)
-        bar.setContentsMargins(6, 4, 6, 4)
+        rows = QtWidgets.QVBoxLayout(self.header)
+        rows.setContentsMargins(6, 4, 6, 4)
+        rows.setSpacing(3)
+        bar = QtWidgets.QHBoxLayout()
         bar.setSpacing(4)
+        rows.addLayout(bar)
+        self._view_row = bar
+        self.edit_row = QtWidgets.QWidget()
+        tools = QtWidgets.QHBoxLayout(self.edit_row)
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.setSpacing(4)
+        rows.addWidget(self.edit_row)
+        self._tools_row = tools
         #: (button, full label, key-only label), walked on every resize.
         self._labels: list[tuple[QtWidgets.QPushButton, str, str]] = []
         self._plane_buttons: dict[Plane, QtWidgets.QPushButton] = {}
@@ -138,7 +151,7 @@ class ImageWindow(QtWidgets.QWidget):
             "( ) brush radius, ctrl+Z undo, Esc cancel a drag.",
         )
         self.edit_button.clicked.connect(self._toggle_grab)
-        bar.addWidget(self.edit_button)
+        tools.addWidget(self.edit_button)
 
         self.draw_button = self._button(
             "DRAW",
@@ -149,7 +162,7 @@ class ImageWindow(QtWidgets.QWidget):
             "surface around follows, over the brush radius in 3-D.",
         )
         self.draw_button.clicked.connect(self._toggle_draw)
-        bar.addWidget(self.draw_button)
+        tools.addWidget(self.draw_button)
 
         self.point_button = self._button(
             "POINT",
@@ -160,7 +173,7 @@ class ImageWindow(QtWidgets.QWidget):
             "fold needs them.",
         )
         self.point_button.clicked.connect(self._toggle_point)
-        bar.addWidget(self.point_button)
+        tools.addWidget(self.point_button)
 
         self.nudge_button = self._button(
             "NUDGE",
@@ -170,7 +183,7 @@ class ImageWindow(QtWidgets.QWidget):
             "hold to keep pushing. Always by hand (no snap). ( ) brush radius.",
         )
         self.nudge_button.clicked.connect(self._toggle_nudge)
-        bar.addWidget(self.nudge_button)
+        tools.addWidget(self.nudge_button)
 
         self.highlight_button = self._button(
             "MARK",
@@ -182,7 +195,8 @@ class ImageWindow(QtWidgets.QWidget):
             "turns it into an ROI.",
         )
         self.highlight_button.clicked.connect(self._toggle_highlight_tool)
-        bar.addWidget(self.highlight_button)
+        tools.addWidget(self.highlight_button)
+        tools.addStretch(1)
         bar.addSpacing(6)
 
         self.strip_button = self._button(
@@ -527,9 +541,18 @@ class ImageWindow(QtWidgets.QWidget):
         width = event.size().width()
         self.header.setVisible(width >= BARE_WIDTH)
         compact = width < COMPACT_WIDTH
-        for button, full, bare in self._labels:
-            button.setText(bare if compact else full)
         self.slice_label.setVisible(not compact)
+        labels = {b: (full, bare) for b, full, bare in self._labels}
+        room = width - 12  # the header's margins
+        # Row by row: full labels where they fit, the keys alone where not.
+        for row in (self._view_row, self._tools_row):
+            buttons = [w for i in range(row.count()) if (w := row.itemAt(i).widget()) in labels]
+            for b in buttons:
+                b.setText(labels[b][0])
+            row.invalidate()
+            if compact or row.sizeHint().width() > room:
+                for b in buttons:
+                    b.setText(labels[b][1])
         super().resizeEvent(event)
 
     # -- input ---------------------------------------------------------
@@ -843,6 +866,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.setWindowTitle(viewport.title)
         for plane, button in self._plane_buttons.items():
             button.setChecked(plane is viewport.plane)
+        self.edit_row.setVisible(bool(self.session.surfaces.hemis))
         self.solo_button.setChecked(viewport.solo)
         self.lock_button.setChecked(viewport.locked)
         self.strip_button.setChecked(viewport.strip > 0)
@@ -888,6 +912,7 @@ class ImageWindow(QtWidgets.QWidget):
         self._sync_opacity()
         state = self.session.state
         self._redraw_outlines(vp)
+        self.edit_row.setVisible(bool(self.session.surfaces.hemis))
         self.edit_button.setChecked(state.surface_editing and state.surface_tool == "grab")
         self.draw_button.setChecked(state.surface_editing and state.surface_tool == "draw")
         self.point_button.setChecked(state.surface_editing and state.surface_tool == "point")

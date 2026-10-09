@@ -332,7 +332,7 @@ class ViewerSession:
             shape, affine = self.state.grid.shape, np.asarray(self.state.grid.affine)
         else:
             shape, affine = self.surfaces.mesh_grid(list(parts))
-        maps = {h: self.surfaces.ribbon_map(h, shape, affine) for h in parts}
+        maps = self.surfaces.ribbon_maps(list(parts), shape, affine)
         sld = SurfaceLayerData(parts, maps)
         self.surface_layers[key] = sld
         first = next(iter(parts.values()))

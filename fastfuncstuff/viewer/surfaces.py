@@ -294,25 +294,39 @@ class SurfaceStore:
 
     def ribbon_map(self, hemi: str, shape, affine):
         """Which vertex of ``hemi`` owns each ribbon voxel of the grid ``(shape, affine)``."""
+        return self.ribbon_maps([hemi], shape, affine)[hemi]
+
+    def ribbon_maps(self, hemis, shape, affine) -> dict:
+        """:meth:`ribbon_map` of several hemispheres, the missing ones built side by side.
+
+        Threads only build; the cache is written here, so no thread iterates it
+        while another inserts.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
         from fastfuncstuff.surface.ribbon import build_ribbon_map
 
         aff = np.asarray(affine, np.float64)
-        key = (
-            hemi,
-            self.version.get(hemi, 0),
-            tuple(int(x) for x in shape),
-            aff.round(6).tobytes(),
-        )
-        hit = self._ribbons.get(key)
-        if hit is None:
+        grid = (tuple(int(x) for x in shape), aff.round(6).tobytes())
+        keys = {h: (h, self.version.get(h, 0), *grid) for h in hemis}
+        missing = [h for h in hemis if keys[h] not in self._ribbons]
+
+        def build(hemi):
             h = self.hemis[hemi]
             white = h.states["white"]
             pial = h.states.get("pial", white)
-            hit = build_ribbon_map(white, pial, h.faces, aff, shape, self.device)
+            return build_ribbon_map(white, pial, h.faces, aff, shape, self.device)
+
+        if len(missing) > 1:
+            with ThreadPoolExecutor(len(missing)) as pool:
+                built = dict(zip(missing, pool.map(build, missing), strict=True))
+        else:
+            built = {h: build(h) for h in missing}
+        for hemi, hit in built.items():
             for stale in [k for k in self._ribbons if k[0] == hemi]:
                 del self._ribbons[stale]
-            self._ribbons[key] = hit
-        return hit
+            self._ribbons[keys[hemi]] = hit
+        return {h: self._ribbons[keys[h]] for h in hemis}
 
     def load(
         self, subject_dir: str | Path, hemis: tuple[str, ...] = ("lh", "rh"), space: str = "native"

@@ -77,9 +77,9 @@ from fastfuncstuff.viewer.vocab import (
 )
 
 _STAGE = Binding.StageFlag
-_ATTRS = ("posA", "posB", "nrmA", "nrmB", "white", "pial", "curv", "vcolor", "areas")
+_ATTRS = ("posA", "posB", "nrmA", "nrmB", "white", "pial", "curv", "vcolor", "areas", "mark")
 #: Bytes per vertex and vertex format of each attribute; Float3 unless listed.
-_STRIDE = {"curv": 4, "vcolor": 4, "areas": 8}
+_STRIDE = {"curv": 4, "vcolor": 4, "areas": 8, "mark": 4}
 
 
 def _shader(name: str) -> QShader:
@@ -294,6 +294,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         curv: np.ndarray | None = None,
         vcolor: np.ndarray | None = None,
         areas: np.ndarray | None = None,
+        mark: np.ndarray | None = None,
         faces: np.ndarray | None = None,
         flat_faces: np.ndarray | None = None,
     ) -> None:
@@ -308,12 +309,13 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             "curv": curv,
             "vcolor": vcolor,
             "areas": areas,
+            "mark": mark,
         }
         pend = self._pending.setdefault(hemi, {})
         cpu = self._cpu.setdefault(hemi, {})
         for k, v in given.items():
             if v is not None:
-                kind = np.uint8 if k == "vcolor" else np.float32
+                kind = np.uint8 if k in ("vcolor", "mark") else np.float32
                 arr = np.ascontiguousarray(v, dtype=kind)
                 pend[k] = arr
                 cpu[k] = arr
@@ -499,9 +501,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 QRhiVertexInputAttribute(
                     i,
                     i,
-                    {"curv": fmt.Float, "vcolor": fmt.UNormByte4, "areas": fmt.Float2}.get(
-                        a, fmt.Float3
-                    ),
+                    {
+                        "curv": fmt.Float,
+                        "vcolor": fmt.UNormByte4,
+                        "mark": fmt.UNormByte4,
+                        "areas": fmt.Float2,
+                    }.get(a, fmt.Float3),
                     0,
                 )
                 for i, a in enumerate(_ATTRS)
@@ -526,13 +531,19 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         if marker is None:
             return None
         centre, axes = marker
+        # On the anatomy, where folds hide the crosshair. A laid-out shape has
+        # no folds to see into, and lines from a point on its convex surface
+        # would run in front of it; the point alone, lifted off the surface.
+        assert self.cross_at is not None
+        anatomical = self.cross_at[2] is not None and self.morph >= 1.0
         tris = s3.crosshair_geometry(
             centre,
             axes,
             self.camera,
             height,
             tuple(theme.palette().crosshair[:3]),
-            lines=self.cross_style == "lines",
+            lines=self.cross_style == "lines" and anatomical,
+            lift_mm=0.0 if anatomical else 2.0,
         )
         return tris[: self.MARKER_VERTICES]
 
@@ -1826,15 +1837,15 @@ class SurfaceWindow(QtWidgets.QWidget):
                     np.uint8
                 )
                 colours[roi, 3] = np.maximum(colours[roi, 3], 170)
+            # The highlight, solid in the warn colour, in its own attribute: the
+            # shader draws it over the volume overlays, which drew over the map.
+            mark = np.zeros((hemi.n_vertices, 4), np.uint8)
             lit = surfaces.highlight.get(h)
             if lit is not None and lit.any():
-                # The highlight, solid in the warn colour: it is a selection
-                # being acted on, and must read over any map.
                 warn = QtGui.QColor(theme.palette().warn)
-                colours[lit, :3] = (warn.red(), warn.green(), warn.blue())
-                colours[lit, 3] = 255
+                mark[lit] = (warn.red(), warn.green(), warn.blue(), 255)
             self.canvas.set_hemisphere(
-                h, pos_a=None, pos_b=None, nrm_a=None, nrm_b=None, vcolor=colours
+                h, pos_a=None, pos_b=None, nrm_a=None, nrm_b=None, vcolor=colours, mark=mark
             )
         self._built_map = key
         self._map_hemis = set(surfaces.hemis)

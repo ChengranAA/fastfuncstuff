@@ -12,6 +12,7 @@ layout(location = 5) in vec3 pial;
 layout(location = 6) in float fold;     // folding shade, [-1, 1]
 layout(location = 7) in vec4 vcolor;   // per-vertex map (thickness, parcellation...)
 layout(location = 8) in vec2 areas;    // white and pial vertex areas, for equivolume
+layout(location = 9) in vec4 mark;     // the highlight: drawn over every overlay
 
 layout(location = 0) out vec3 vWhite;
 layout(location = 1) out vec3 vPial;
@@ -19,6 +20,7 @@ layout(location = 2) out vec3 vNormal;
 layout(location = 3) out float vFold;
 layout(location = 4) out vec4 vColor;
 layout(location = 5) out vec2 vAreas;
+layout(location = 6) out vec4 vMark;
 
 // Identical to the fragment stage's block: GL links a named block only if
 // every stage declares it the same.
@@ -53,5 +55,6 @@ void main()
     vFold = fold;
     vColor = vcolor;
     vAreas = areas;
+    vMark = mark;
     gl_Position = mvp * vec4(pos, 1.0);
 }

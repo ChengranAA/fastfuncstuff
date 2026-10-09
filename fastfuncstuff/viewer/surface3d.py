@@ -323,6 +323,7 @@ def crosshair_geometry(
     line_mm: float = 150.0,
     width_px: float = 2.5,
     point_px: float = 5.0,
+    lift_mm: float = 0.0,
 ) -> np.ndarray:
     """Triangles for the crosshair as world geometry: ``(N, MARKER_FLOATS)`` float32.
 
@@ -331,10 +332,11 @@ def crosshair_geometry(
     then in ``rgb``. They are drawn depth-tested in the surface's own pass, so
     the brain hides what is behind or inside it: from a crosshair down a sulcus
     the lines are seen coming out of the cortex, never painted across it.
-    Sizes are pixels at the camera's target distance.
+    Sizes are pixels at the camera's target distance. ``lift_mm`` moves the
+    point toward the camera, for a centre that lies on the surface itself.
     """
-    c = np.asarray(centre, np.float64)
     toward = camera.rotation[2]
+    c = np.asarray(centre, np.float64) + lift_mm * toward
     right, up = camera.rotation[0], camera.rotation[1]
     mm = 1.0 / camera.px_per_mm(height)
     rim = (0.0, 0.0, 0.0, 0.8)

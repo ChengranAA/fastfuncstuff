@@ -14,6 +14,7 @@ layout(location = 2) in vec3 vNormal;
 layout(location = 3) in float vFold;
 layout(location = 4) in vec4 vColor;
 layout(location = 5) in vec2 vAreas;
+layout(location = 6) in vec4 vMark;
 
 layout(location = 0) out vec4 fragColor;
 
@@ -290,6 +291,10 @@ void main()
     if (layers[1].modes.w > 0.5) col = over(col, light, layers[1], value1, stat1, dx, dy);
     if (layers[2].modes.w > 0.5) col = over(col, light, layers[2], value2, stat2, dx, dy);
     if (layers[3].modes.w > 0.5) col = over(col, light, layers[3], value3, stat3, dx, dy);
+
+    // The highlight is a selection being acted on: over every overlay, or
+    // painting under a stat map would draw nothing you could see.
+    col = mix(col, vMark.rgb * light, vMark.a);
 
     if (cross.w > 0.0) {
         // A dot in the crosshair colour with a dark rim, so it reads over

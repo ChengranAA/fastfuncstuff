@@ -547,3 +547,18 @@ def test_header_buttons_do_what_their_keys_do_and_say_where_they_are(window):
     win.refresh(Aspect.ALL)
     now = session.state.viewports.get("S1").folding
     assert now != folding and win.fold_button.text().endswith(now)
+
+
+def test_the_highlight_has_its_own_attribute_so_it_draws_over_overlays(window):
+    """Baked into the vertex map, a highlight sat under every volume overlay and
+    painting over a stat map showed nothing; the shader draws ``mark`` last."""
+    session, win = window
+    c = win.canvas
+    before = c._cpu["lh"]["vcolor"].copy()
+    lit = np.zeros(session.surfaces.hemis["lh"].n_vertices, bool)
+    lit[:5] = True
+    session.surfaces.set_highlight("lh", np.flatnonzero(lit), "add")
+    win.refresh(Aspect.ALL)
+    mark = c._cpu["lh"]["mark"]
+    assert (mark[lit, 3] == 255).all() and (mark[~lit, 3] == 0).all()
+    np.testing.assert_array_equal(c._cpu["lh"]["vcolor"], before)

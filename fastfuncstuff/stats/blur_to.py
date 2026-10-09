@@ -311,11 +311,12 @@ class AdaptiveDiffusion:
         self.h2 = [abs(float(v)) ** 2 for v in voxdims]
         # Explicit Euler is stable for dt * sum(2 / h^2) <= 1 at unit diffusivity.
         self.dt_max = 0.9 / sum(2.0 / h for h in self.h2)
-        self.steps: list[tuple[float, object]] = []  # (dt, bool map: who still diffuses)
+        self.steps: list[tuple[float, object]] = []  # (dt, map of who diffuses, how fast)
         self._idx = torch.as_tensor(np.flatnonzero(np.asarray(mask, bool)), device=self.device)
 
     def step(self, u, dt: float, d):
-        """One step on ``(k, *shape)`` torch ``u``; ``d`` marks the voxels still diffusing."""
+        """One step on ``(k, *shape)`` torch ``u``; ``d`` (bool, or a 0..1 diffusivity)
+        marks the voxels still diffusing."""
         import torch
 
         du = torch.zeros_like(u)
@@ -432,3 +433,97 @@ def volume_blur_to_fwhm_local(
             break
     local = local_volume_fwhm(u.reshape(u.shape[0], -1).T, mask, voxdims, radius_mm, device)
     return ad, float(start), float(achieved), local
+
+
+# ---------------------------------------------------------------------------
+# Blur to a residual tSNR: as much smoothing as each place needs, up to a cap
+# ---------------------------------------------------------------------------
+
+
+def local_volume_tsnr(u, mean, mask, voxdims, radius_mm: float):
+    """Per-voxel residual tSNR from ``(k, *shape)`` residual volumes ``u`` and the
+    ``mask``-shaped temporal ``mean``: ``|mean| / sd``, the residual variance pooled over
+    a Gaussian neighbourhood of ``radius_mm`` inside the mask (an SD from k points
+    alone is ~1/sqrt(2k) noisy per voxel)."""
+    import torch
+
+    from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox, gaussian3d_batched
+
+    m = mask.float()
+    sig = fwhm_mm_to_sigma_vox(radius_mm, tuple(abs(float(v)) for v in voxdims))
+    var = u.var(dim=0) * m
+    pooled = gaussian3d_batched(torch.stack([var, m]), sig)
+    sd = torch.sqrt(pooled[0] / pooled[1].clamp_min(1e-12))
+    tsnr = mean.abs() / sd.clamp_min(1e-12)
+    return torch.where(mask, tsnr, torch.full_like(tsnr, float("nan")))
+
+
+def volume_blur_to_tsnr(
+    master: np.ndarray,
+    mean: np.ndarray,
+    mask: np.ndarray,
+    voxdims,
+    target: float,
+    max_fwhm: float,
+    radius_mm: float = 8.0,
+    device=None,
+    growth: float = 0.25,
+    min_gain: float = 0.03,
+    max_steps: int = 60,
+):
+    """Diffuse each voxel only until its residual tSNR reaches ``target`` -- or its
+    local FWHM reaches ``max_fwhm``, where smoothing has stopped paying (structured,
+    physiological noise is spatially smooth and does not average down). Noisy places
+    get more blur, clean ones little or none.
+
+    Steps are geometric: each voxel's diffusivity is its own local FWHM^2, so every
+    step grows every active voxel's FWHM^2 by about ``growth`` (~12% in FWHM) whatever
+    its starting smoothness. A fixed step overshoots on white-ish noise (tSNR 25 -> 71
+    against a target of 60, in one step) and crawls on noise that is already smooth.
+
+    A voxel also stops for good once a step raised its tSNR by less than ``min_gain``:
+    white noise in 3-D gains ~18% per such step, noise that is spatially structured
+    almost nothing, and the FWHM cap alone misses it where a pooled local FWHM reads
+    low (a narrow smooth slab whose true 19 mm read as 9 kept creeping).
+
+    ``master`` is ``(V, k)`` residuals and ``mean`` ``(V,)`` the temporal mean, both on
+    ``mask``'s grid; the mean goes through the same operator. Returns ``(diffusion |
+    None, tsnr_before, tsnr_after, local_fwhm_after)`` (``mask``-shaped tensors).
+    """
+    import math
+
+    import torch
+
+    from fastfuncstuff.utils import get_device
+
+    device = device if device is not None else get_device()
+    mask = np.asarray(mask, bool)
+    ad = AdaptiveDiffusion(mask, voxdims, device=device)
+    u = ad._volumes(master)
+    mu = ad._volumes(np.asarray(mean, np.float32).reshape(-1, 1))
+    m_t = ad.m
+
+    def fwhm_map(u_):
+        return local_volume_fwhm(u_.reshape(u_.shape[0], -1).T, mask, voxdims, radius_mm, device)
+
+    tsnr0 = local_volume_tsnr(u, mu[0], m_t, voxdims, radius_mm)
+    tsnr, local = tsnr0, fwhm_map(u)
+    stalled = torch.zeros_like(m_t)
+    for _ in range(max_steps):
+        active = (tsnr < target) & (local < max_fwhm) & torch.isfinite(local) & ~stalled
+        if not bool(active.any()):
+            break
+        lmax = float(local[active].max())
+        # Heat time t adds 16 ln2 t to FWHM^2 at full diffusivity.
+        t_step = growth * lmax**2 / (16 * math.log(2))
+        d = torch.where(active, (local / lmax) ** 2, torch.zeros_like(local))
+        n_sub = max(1, math.ceil(t_step / ad.dt_max))
+        for _ in range(n_sub):
+            ad.steps.append((t_step / n_sub, d))
+            u = ad.step(u, t_step / n_sub, d)
+            mu = ad.step(mu, t_step / n_sub, d)
+        prev = tsnr
+        tsnr = local_volume_tsnr(u, mu[0], m_t, voxdims, radius_mm)
+        local = fwhm_map(u)
+        stalled |= active & (tsnr < prev * (1 + min_gain))
+    return (ad if ad.steps else None), tsnr0, tsnr, local

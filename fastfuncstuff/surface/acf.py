@@ -34,6 +34,7 @@ __all__ = [
     "SurfaceAdaptiveDiffusion",
     "blur_to_fwhm",
     "blur_to_fwhm_local",
+    "blur_to_tsnr",
     "detrend",
     "fit_surface_acf",
     "local_surface_fwhm",
@@ -268,9 +269,11 @@ class SurfaceAdaptiveDiffusion:
         self._ops: list = []
 
     def operator(self, dt: float, d: np.ndarray):
-        """The solve for one step; ``d`` is a bool per masked vertex (who diffuses)."""
+        """The solve for one step; ``d`` per masked vertex: bool (who diffuses) or a
+        0..1 diffusivity. An edge diffuses at the smaller of its two ends'."""
         n = len(self._idx)
-        w = self._w * (d[self._r] & d[self._c])
+        d = np.asarray(d, np.float64)
+        w = self._w * np.minimum(d[self._r], d[self._c])
         weights = sparse.csr_matrix((w, (self._r, self._c)), shape=(n, n))
         lap = sparse.diags(np.asarray(weights.sum(axis=1)).ravel()) - weights
         a = (sparse.diags(self._mass) + dt * lap).tocsr()
@@ -383,3 +386,64 @@ def blur_to_fwhm_local(
             break
     local = local_surface_fwhm(full(u), vertices, faces, sad.mask, radius_mm, device)
     return sad, float(start), float(achieved), local
+
+
+def blur_to_tsnr(
+    master: np.ndarray,
+    mean: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target: float,
+    max_fwhm: float,
+    mask: np.ndarray | None = None,
+    radius_mm: float = 8.0,
+    device=None,
+    growth: float = 0.25,
+    min_gain: float = 0.03,
+    max_steps: int = 60,
+):
+    """The surface twin of ``stats.blur_to.volume_blur_to_tsnr``: heat steps that stop,
+    per vertex, at a residual tSNR of ``target``, a local FWHM of ``max_fwhm``, or once a
+    step (~12% more FWHM) buys under ``min_gain`` of tSNR. Each vertex diffuses at its
+    own local FWHM^2, so steps are geometric. ``master`` ``(V, k)`` residuals, ``mean``
+    ``(V,)``. Returns ``(diffusion | None, tsnr_before, tsnr_after, local_fwhm_after)``
+    as ``(V,)`` arrays, NaN outside the mask."""
+    sad = SurfaceAdaptiveDiffusion(vertices, faces, mask, device=device)
+    idx = sad._idx
+    pool = HeatSmoother(vertices, faces, radius_mm, mask=sad.mask)
+
+    def full(u):
+        out = np.zeros((len(sad.mask), u.shape[1]))
+        out[idx] = u if device is None else u.cpu().numpy()
+        return out
+
+    def tsnr_of(u, mu):
+        var = np.zeros(len(sad.mask))
+        var[idx] = full(u)[idx].var(axis=1)
+        sd = np.sqrt(np.maximum(np.asarray(pool(var), np.float64), 1e-24))
+        out = np.abs(full(mu)[:, 0]) / sd
+        out[~sad.mask] = np.nan
+        return out
+
+    u = sad._rows(master)
+    mu = sad._rows(np.asarray(mean, np.float64).reshape(-1, 1))
+    tsnr0 = tsnr_of(u, mu)
+    tsnr = tsnr0
+    local = local_surface_fwhm(full(u), vertices, faces, sad.mask, radius_mm)
+    stalled = np.zeros(len(idx), bool)
+    for _ in range(max_steps):
+        t_i, l_i = tsnr[idx], local[idx]
+        active = (t_i < target) & np.isfinite(l_i) & (l_i < max_fwhm) & ~stalled
+        if not active.any():
+            break
+        lmax = float(l_i[active].max())
+        t_step = growth * lmax**2 / (16 * np.log(2))
+        d = np.where(active, (np.nan_to_num(l_i) / lmax) ** 2, 0.0)
+        op = sad.operator(t_step, d)
+        sad.record(t_step, d, op)
+        u, mu = sad.apply(op, u), sad.apply(op, mu)
+        prev = t_i
+        tsnr = tsnr_of(u, mu)
+        local = local_surface_fwhm(full(u), vertices, faces, sad.mask, radius_mm)
+        stalled |= active & (tsnr[idx] < prev * (1 + min_gain))
+    return (sad if sad.steps else None), tsnr0, tsnr, local

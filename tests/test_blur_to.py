@@ -363,3 +363,68 @@ def test_surface_local_blur_to_evens_out_a_sheet_that_is_rough_on_one_side(sheet
     l_hs, r_hs = halves(hs(held))
     assert abs(l_ad - r_ad) < 0.5 * abs(l_hs - r_hs)
     assert surface_fwhm(sad(held), v, f, inner)[0] == pytest.approx(7.0, rel=0.04)
+
+
+# ---------------------------------------------------------------------------
+# Blur to a residual tSNR
+# ---------------------------------------------------------------------------
+
+
+def test_volume_blur_to_tsnr_blurs_noisy_white_noise_not_clean_or_structured():
+    import torch
+
+    from fastfuncstuff.stats.blur_to import volume_blur_to_tsnr
+
+    cpu = torch.device("cpu")
+    shape, vox, t_n = (48, 40, 20), (2.0, 2.0, 2.0), 320
+    mask = np.ones(shape, bool)
+    mask[[0, -1]] = mask[:, [0, -1]] = mask[:, :, [0, -1]] = False
+    white = _smooth_noise_vol(shape, t_n, 0.8, 1).reshape(*shape, t_n)
+    smooth = _smooth_noise_vol(shape, t_n, 4.0, 2).reshape(*shape, t_n)
+    noise = white / white.std() * np.where(np.arange(48) < 20, 40.0, 10.0)[:, None, None, None]
+    noise[20:28] = 40 * smooth[20:28] / smooth.std()  # noisy, but spatially structured
+    y = (1000 + noise).reshape(-1, t_n)
+    mean = y.mean(1)
+    ad, t0, t1, _ = volume_blur_to_tsnr(
+        (y - mean[:, None])[:, :160], mean, mask, vox, 60.0, 10.0, device=cpu
+    )
+    assert ad is not None
+
+    def region(a, sl):
+        m = np.zeros(shape, bool)
+        m[sl] = mask[sl]
+        return float(np.nanmedian(np.asarray(a).reshape(shape)[m]))
+
+    assert region(t0, slice(4, 16)) == pytest.approx(25, rel=0.1)
+    assert 60 <= region(t1, slice(4, 16)) < 70  # reached, ~one geometric step over
+    assert region(t1, slice(32, 44)) == pytest.approx(region(t0, slice(32, 44)), rel=0.02)
+    assert region(t1, slice(21, 27)) < 55  # gave up where blur stopped paying
+    held = ad(y[:, 160:])
+    held_tsnr = held.mean(1) / held.std(1)
+    assert 57 < region(held_tsnr, slice(4, 16)) < 70  # the replay does what was measured
+
+
+def test_surface_blur_to_tsnr_blurs_noisy_white_noise_not_clean_or_structured(sheet):
+    from fastfuncstuff.surface.acf import blur_to_tsnr
+
+    v, f, inner = sheet
+    w = _noise(v, f, 320, 1.0, 1)
+    w /= w[inner].std()
+    sm = _noise(v, f, 320, 6.0, 2)
+    sm /= sm[inner].std()
+    x = v[:, 0]
+    noise = np.where((x < 30)[:, None], 40 * w, np.where((x < 50)[:, None], 40 * sm, 10 * w))
+    y = 1000 + noise
+    mean = y.mean(1)
+    sad, t0, t1, _ = blur_to_tsnr((y - mean[:, None])[:, :160], mean, v, f, 60.0, 10.0, inner)
+    assert sad is not None
+    white, smooth, clean = (
+        inner & (x > 12) & (x < 26),
+        inner & (x > 34) & (x < 46),
+        inner & (x > 54),
+    )
+    assert 60 <= np.nanmedian(t1[white]) < 70
+    assert np.nanmedian(t1[clean]) == pytest.approx(np.nanmedian(t0[clean]), rel=0.02)
+    assert np.nanmedian(t1[smooth]) < 40
+    held = sad(y[:, 160:])
+    assert 57 < np.median((held.mean(1) / held.std(1))[white]) < 72

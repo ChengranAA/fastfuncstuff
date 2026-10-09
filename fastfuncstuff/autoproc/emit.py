@@ -3612,6 +3612,18 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             "\n# stage10 stays unsmoothed, so re-running this stage at another FWHM re-does"
             "\n# nothing upstream, and each FWHM's buckets carry their own blur token."
         )
+    if opt.glm_blur_to or opt.glm_blur_tsnr:
+        what = (
+            f"to residual tSNR {opt.glm_blur_tsnr:g}"
+            if opt.glm_blur_tsnr
+            else f"to {opt.glm_blur_to:g} mm FWHM"
+            + (", spatially varying" if opt.glm_blur_local else "")
+        )
+        out.append(
+            f"# Smoothed inside the GLM {what} (ffs_reml -blur_to_*), measured on the"
+            "\n# residuals of each task's own model inside the GLM mask. The blurfwhm map"
+            "\n# beside each bucket shows how smooth each place ended up."
+        )
     if opt.glm_label:
         out.append(
             f"# These buckets carry the '{opt.glm_label}' variant token, so this fit does not"
@@ -3627,7 +3639,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
         # -glm_label only names a TOML you edited yourself. Per task, because the
         # blur is: two tasks smoothed differently must not share a bucket name.
         blur = blurs[task]
-        tag = glm_tag(blur, opt.glm_label)
+        tag = glm_tag(blur, opt.glm_label, smooth=_volume_smooth_tag(opt))
         stem = f"stage12.{tag}." if tag else "stage12."
         rbuck = f"{stem}stats-reml.task-{task}.nii$GLM_FMT"
         # Same guard every other stage has, and the toggle it reads was already in
@@ -3639,9 +3651,18 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             f'-Rbuck "{rbuck}"',
             *(['-mask "$GLM_MASK"'] if _glm_mask(plan) else []),
             *([f"-do_blur {blur:g}"] if blur else []),
+            *_target_blur_flags(
+                to=opt.glm_blur_to,
+                tsnr=opt.glm_blur_tsnr,
+                local=opt.glm_blur_local,
+                max_fwhm=opt.glm_blur_max_fwhm,
+                nbhd=opt.glm_blur_nbhd,
+                fwhm_map=f"{stem}blurfwhm.task-{task}.nii.gz",
+            ),
             # The ACF comes from the residuals this fit already has in memory,
             # so this needs no -Rerrts and no second pass over the data.
             *(["-clustsim"] if opt.clustsim else []),
+            *(["-clustsim_null resid"] if opt.clustsim and opt.clustsim_null == "resid" else []),
             *([f'-adjust_dof "{_task_dofloss(task)}"'] if _dof_adjust_on(opt) else []),
             *_reml_shared(opt, task),
         ]
@@ -3734,12 +3755,14 @@ def _reml_shared(opt, task: str) -> list[str]:
 def _surface_glm_tag(opt) -> str:
     """``blur4`` / ``blurto6`` (and the -glm_label), or ``""``: the surface buckets'
     variant token, so fits at different smoothings coexist."""
-    from fastfuncstuff.autoproc.naming import blur_tag
+    from fastfuncstuff.autoproc.naming import smooth_tag
 
-    if opt.surface_glm_blur_to:
-        smooth = blur_tag(opt.surface_glm_blur_to).replace("blur", "blurto", 1)
-    else:
-        smooth = blur_tag(opt.surface_glm_blur)
+    smooth = smooth_tag(
+        by=opt.surface_glm_blur,
+        to=opt.surface_glm_blur_to,
+        tsnr=opt.surface_glm_blur_tsnr,
+        local=opt.surface_glm_blur_local,
+    )
     return ".".join(t for t in (smooth, (opt.glm_label or "").strip()) if t)
 
 
@@ -3792,14 +3815,22 @@ def _stage_surface_stats(plan: Plan, bids_root: str | None) -> str:
                     f'-Rbuck "{rbuck}"',
                     f'-mask "{_surface_mask(space, hemi)}"',
                     *([f"-do_blur {opt.surface_glm_blur:g}"] if opt.surface_glm_blur else []),
-                    *(
-                        [f"-blur_to_fwhm {opt.surface_glm_blur_to:g}"]
-                        if opt.surface_glm_blur_to
-                        else []
+                    *_target_blur_flags(
+                        to=opt.surface_glm_blur_to,
+                        tsnr=opt.surface_glm_blur_tsnr,
+                        local=opt.surface_glm_blur_local,
+                        max_fwhm=opt.surface_glm_blur_max_fwhm,
+                        nbhd=opt.surface_glm_blur_nbhd,
+                        fwhm_map=f"{stem}blurfwhm.{where}.shape.gii",
                     ),
                     *(
                         ["-clustsim", f'-save_acf "{stem}resid.{where}"']
                         if opt.surface_clustsim
+                        else []
+                    ),
+                    *(
+                        ["-clustsim_null resid"]
+                        if opt.surface_clustsim and opt.clustsim_null == "resid"
                         else []
                     ),
                     *(
@@ -3837,6 +3868,32 @@ def _concat_censor(task: str, prs) -> str:
         f'cat {srcs} > "{dest}"\n'
         f'echo "task-{task}: censoring $(grep -c \'^0\' "{dest}") of $(wc -l < "{dest}") TRs"'
     )
+
+
+def _volume_smooth_tag(opt) -> str | None:
+    """stage12's smoothing token when it smooths TO a target (``blurto6local``,
+    ``tsnr80``), else None: the per-task ``-glm_blur`` kernel names the bucket."""
+    from fastfuncstuff.autoproc.naming import smooth_tag
+
+    if not (opt.glm_blur_to or opt.glm_blur_tsnr):
+        return None
+    return smooth_tag(to=opt.glm_blur_to, tsnr=opt.glm_blur_tsnr, local=opt.glm_blur_local)
+
+
+def _target_blur_flags(*, to, tsnr, local, max_fwhm, nbhd, fwhm_map: str) -> list[str]:
+    """ffs_reml's blur-to flags for one fit, and the map of how smooth each place
+    ended up (-save_blur_fwhm), which a target blur always writes: the per-place
+    parameter a spatially varying smoothing chose is a diagnostic worth keeping."""
+    if not (to or tsnr):
+        return []
+    flags = [f"-blur_to_tsnr {tsnr:g}"] if tsnr else [f"-blur_to_fwhm {to:g}"]
+    if local and not tsnr:
+        flags.append("-blur_to_local")
+    if tsnr and max_fwhm:
+        flags.append(f"-blur_tsnr_max_fwhm {max_fwhm:g}")
+    if nbhd and (local or tsnr):
+        flags.append(f"-blur_to_nbhd {nbhd:g}")
+    return [*flags, f'-save_blur_fwhm "{fwhm_map}"']
 
 
 def _task_blur(opt, task: str) -> float | None:

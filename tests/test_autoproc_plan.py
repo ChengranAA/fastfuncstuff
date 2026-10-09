@@ -2815,3 +2815,59 @@ def test_surface_glm_fits_each_target_and_hemisphere_with_its_own_options():
     # the voxel fit keeps its own smoothing
     vol = _reml_calls(s.split("stage12s: surface GLM")[0], "stage12: GLM")
     assert vol and all("-do_blur" in c and "-blur_to_fwhm" not in c for c in vol)
+
+
+def test_glm_blur_to_targets_reach_ffs_reml_with_their_own_tokens_and_maps():
+    from fastfuncstuff.autoproc.naming import smooth_tag
+    from fastfuncstuff.cli.reml import create_parser
+
+    assert smooth_tag(to=6.0) == "blurto6" and smooth_tag(to=6.0, local=True) == "blurto6local"
+    assert smooth_tag(tsnr=80.0) == "tsnr80" and smooth_tag(by=2.5) == "blur2p5"
+    assert smooth_tag() == ""
+    parser = create_parser()
+
+    s = _skull_script(events=["/e/ev.tsv"], glm_mask="brain", glm_blur_to=6.0,
+                      glm_blur_local=True, glm_blur_nbhd=5.0, clustsim=True,
+                      clustsim_null="resid")  # fmt: skip
+    (argv,) = _reml_calls(s, "stage12: GLM")
+    a = parser.parse_args(argv)
+    assert a.blur_to_fwhm == 6.0 and a.blur_to_local and a.blur_to_nbhd == 5.0
+    assert a.do_blur is None and a.mask and a.clustsim and a.clustsim_null == "resid"
+    assert a.Rbuck.startswith("stage12.blurto6local.stats-reml.task-foo.")
+    assert a.save_blur_fwhm == "stage12.blurto6local.blurfwhm.task-foo.nii.gz"
+
+    s = _skull_script(events=["/e/ev.tsv"], glm_mask="brain", glm_blur_tsnr=80.0,
+                      glm_blur_max_fwhm=6.0, clustsim=True)  # fmt: skip
+    (argv,) = _reml_calls(s, "stage12: GLM")
+    a = parser.parse_args(argv)
+    assert a.blur_to_tsnr == 80.0 and a.blur_tsnr_max_fwhm == 6.0 and not a.blur_to_local
+    assert a.clustsim_null is None  # the safe default: ffs_reml's acf
+    assert a.Rbuck.startswith("stage12.tsnr80.stats-reml.")
+
+    s = _skull_script(
+        surface_target=["native"], fs_subject="/fs/sub-X", events=["/e/ev.tsv"],
+        surface_glm=True, surface_glm_blur_tsnr=60.0, surface_glm_blur_nbhd=6.0,
+        surface_glm_blur_max_fwhm=7.0, surface_clustsim=True, clustsim_null="resid",
+    )  # fmt: skip
+    for argv in _reml_calls(s, "stage12s: surface GLM"):
+        a = parser.parse_args(argv)
+        assert a.blur_to_tsnr == 60.0 and a.blur_to_nbhd == 6.0 and a.blur_tsnr_max_fwhm == 7.0
+        assert a.clustsim_null == "resid" and a.save_blur_fwhm.endswith(".shape.gii")
+        assert a.Rbuck.startswith("stage12s.tsnr60.stats-reml.")
+
+
+def test_target_blur_flag_consistency():
+    from fastfuncstuff.cli.autoproc import _target_blur_errors
+
+    def errs(**kw):
+        base = dict(by=False, to=None, tsnr=None, local=False, max_fwhm=None, nbhd=None)
+        return _target_blur_errors("-glm_blur", **{**base, **kw})
+
+    assert errs(to=6.0, local=True, nbhd=5.0) == []
+    assert errs(tsnr=80.0, max_fwhm=6.0, nbhd=5.0) == []
+    assert any("alternatives" in e for e in errs(by=True, to=6.0))
+    assert any("alternatives" in e for e in errs(to=6.0, tsnr=80.0))
+    assert any("needs -glm_blur_to" in e for e in errs(local=True, tsnr=80.0))
+    assert any("needs -glm_blur_tsnr" in e for e in errs(to=6.0, max_fwhm=6.0))
+    assert any("_nbhd is for" in e for e in errs(to=6.0, nbhd=5.0))
+    assert any("positive" in e for e in errs(tsnr=-1.0))

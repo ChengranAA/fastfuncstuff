@@ -127,6 +127,18 @@ class Options:
     # -clustsim). Opt-in: the inputs are all there and it costs ~100 s a task,
     # but a cluster-correction table is a statistical claim, not a default.
     clustsim: bool = False
+    # The null behind -clustsim / -surface_clustsim: "acf" (3dClustSim-compatible,
+    # the safe default) or "resid" (the residuals' own spatial covariance; recommended,
+    # and all but required with a blur that varies smoothness on purpose).
+    clustsim_null: str = "acf"
+    # Smoothing TO a target instead of BY a kernel (exclusive with glm_blur): a FWHM
+    # (-blur_to_fwhm, spatially varying with glm_blur_local) or a residual tSNR
+    # (-blur_to_tsnr, capped at glm_blur_max_fwhm). Dataset-wide, not per task.
+    glm_blur_to: float | None = None
+    glm_blur_local: bool = False
+    glm_blur_tsnr: float | None = None
+    glm_blur_max_fwhm: float | None = None
+    glm_blur_nbhd: float | None = None
     # Write the design TOML even if one is already there (an edited spec is
     # otherwise never clobbered — that is the whole point of generating it).
     glm_spec_overwrite: bool = False
@@ -242,6 +254,10 @@ class Options:
     surface_glm: bool = False
     surface_glm_blur: float | None = None  # heat smoothing BY this FWHM (-do_blur)
     surface_glm_blur_to: float | None = None  # ... or TO it (-blur_to_fwhm)
+    surface_glm_blur_local: bool = False  # ... spatially varying (-blur_to_local)
+    surface_glm_blur_tsnr: float | None = None  # ... or to a residual tSNR (-blur_to_tsnr)
+    surface_glm_blur_max_fwhm: float | None = None  # its cap (-blur_tsnr_max_fwhm)
+    surface_glm_blur_nbhd: float | None = None  # local-estimate neighbourhood (-blur_to_nbhd)
     surface_clustsim: bool = False  # SurfClustSim area tables (-clustsim on vertices)
     surface_clustsim_niter: int | None = None
     surface_glm_opts: str = ""  # extra ffs_reml flags for the surface fits only

@@ -177,13 +177,37 @@ def stem(key: NameKey) -> str:
     return f"{prefix}.{c}" if c else prefix
 
 
-def glm_tag(fwhm: float | None, label: str | None = None) -> str:
+def glm_tag(fwhm: float | None, label: str | None = None, smooth: str | None = None) -> str:
     """The variant token for a GLM run's outputs (``blur6.noloco``), or ``""``.
 
     Both halves are optional and they compose in a fixed order so the same two
     settings always produce the same name, whichever order they were typed in.
+    ``smooth`` (from :func:`smooth_tag`) replaces the ``blur<FWHM>`` half when the
+    smoothing is to a target rather than by a kernel.
     """
-    return ".".join(t for t in (blur_tag(fwhm), (label or "").strip()) if t)
+    first = smooth if smooth is not None else blur_tag(fwhm)
+    return ".".join(t for t in (first, (label or "").strip()) if t)
+
+
+def smooth_tag(
+    by: float | None = None,
+    to: float | None = None,
+    tsnr: float | None = None,
+    local: bool = False,
+) -> str:
+    """The smoothing token: ``blur4`` (BY a kernel), ``blurto6`` / ``blurto6local``
+    (TO a FWHM, one kernel / spatially varying), ``tsnr80`` (to a residual tSNR), or
+    ``""``. Each kind is its own token so fits that differ only in how they smoothed
+    coexist in one directory."""
+    if tsnr:
+        return "tsnr" + _num(tsnr)
+    if to:
+        return "blurto" + _num(to) + ("local" if local else "")
+    return blur_tag(by)
+
+
+def _num(x: float) -> str:
+    return f"{float(x):g}".replace(".", "p").replace("-", "m")
 
 
 def blur_tag(fwhm: float | None) -> str:

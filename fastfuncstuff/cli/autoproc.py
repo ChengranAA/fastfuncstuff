@@ -205,6 +205,37 @@ def build_parser() -> argparse.ArgumentParser:
         "-target_fwhm). Exclusive with -surface_glm_blur.",
     )
     g.add_argument(
+        "-surface_glm_blur_local",
+        action="store_true",
+        help="with -surface_glm_blur_to: spatially varying heat diffusion that stops "
+        "wherever the local smoothness has reached the target (ffs_reml -blur_to_local). "
+        "Buckets: stage12s.blurto<F>local.*. Pair with -clustsim_null resid.",
+    )
+    g.add_argument(
+        "-surface_glm_blur_tsnr",
+        type=float,
+        default=None,
+        metavar="TSNR",
+        help="surface GLM smoothing per vertex until its residual tSNR reaches TSNR "
+        "(ffs_reml -blur_to_tsnr), up to -surface_glm_blur_max_fwhm. Buckets: "
+        "stage12s.tsnr<T>.*. Exclusive with -surface_glm_blur / -surface_glm_blur_to.",
+    )
+    g.add_argument(
+        "-surface_glm_blur_max_fwhm",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="-surface_glm_blur_tsnr: no vertex smoothed past this local FWHM (default 8).",
+    )
+    g.add_argument(
+        "-surface_glm_blur_nbhd",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="-surface_glm_blur_local / _tsnr: neighbourhood (mm along the cortex) of "
+        "each local estimate (default 8).",
+    )
+    g.add_argument(
         "-surface_clustsim",
         "-surface-clustsim",
         action="store_true",
@@ -744,6 +775,63 @@ def build_parser() -> argparse.ArgumentParser:
         "Adds roughly a minute or two per task.",
     )
     g.add_argument(
+        "-clustsim_null",
+        choices=("acf", "resid"),
+        default="acf",
+        help="the null fields behind -clustsim and -surface_clustsim (ffs_reml "
+        "-clustsim_null). acf (default, 3dClustSim-compatible): noise with the residuals' "
+        "mixed ACF, stationary by construction. resid -- RECOMMENDED: Gaussian sums of "
+        "each fit's own residual time points, with their real spatial covariance. On a "
+        "half-rough, half-smooth null field the ACF table's real false-positive rate was "
+        "0.17 at a nominal 0.05 (resid: 0.050); on real cortex the tables differed ~3x at "
+        "p=0.01. Above all use it with -glm_blur_local / -glm_blur_tsnr (and their "
+        "-surface_ twins), which make smoothness vary on purpose.",
+    )
+    g.add_argument(
+        "-glm_blur_to",
+        type=float,
+        default=None,
+        metavar="FWHM",
+        help="smooth at GLM time TO this FWHM instead of BY a kernel (ffs_reml "
+        "-blur_to_fwhm; 3dBlurToFWHM): the in-mask Gaussian is chosen so the residuals of "
+        "an OLS fit of the task's own model measure FWHM mm. Needs -glm_mask (the "
+        "smoothness is measured inside it). Buckets: stage12.blurto<F>[local].*. "
+        "Exclusive with -glm_blur and -glm_blur_tsnr.",
+    )
+    g.add_argument(
+        "-glm_blur_local",
+        action="store_true",
+        help="with -glm_blur_to: spatially varying (ffs_reml -blur_to_local) -- diffuse "
+        "and stop wherever the LOCAL smoothness reached the target, so rough places get "
+        "more blur than smooth ones. Pair with -clustsim_null resid.",
+    )
+    g.add_argument(
+        "-glm_blur_tsnr",
+        type=float,
+        default=None,
+        metavar="TSNR",
+        help="smooth each voxel only until its residual tSNR reaches TSNR (ffs_reml "
+        "-blur_to_tsnr): noisy places get more blur, clean ones none, nothing past "
+        "-glm_blur_max_fwhm, and a place stops once more blur stops buying tSNR "
+        "(structured noise). Needs -glm_mask. Buckets: stage12.tsnr<T>.*. Pair with "
+        "-clustsim_null resid. Exclusive with -glm_blur and -glm_blur_to.",
+    )
+    g.add_argument(
+        "-glm_blur_max_fwhm",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="-glm_blur_tsnr: no voxel smoothed past this local FWHM (default ffs_reml's, 8).",
+    )
+    g.add_argument(
+        "-glm_blur_nbhd",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="-glm_blur_local / -glm_blur_tsnr: the neighbourhood each local smoothness "
+        "or tSNR estimate is pooled over (default ffs_reml's, 8).",
+    )
+    g.add_argument(
         "-glm_spec_overwrite",
         "-glm-spec-overwrite",
         action="store_true",
@@ -1120,6 +1208,10 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         for f, on in (
             ("-surface_glm_blur", opt.surface_glm_blur is not None),
             ("-surface_glm_blur_to", opt.surface_glm_blur_to is not None),
+            ("-surface_glm_blur_local", opt.surface_glm_blur_local),
+            ("-surface_glm_blur_tsnr", opt.surface_glm_blur_tsnr is not None),
+            ("-surface_glm_blur_max_fwhm", opt.surface_glm_blur_max_fwhm is not None),
+            ("-surface_glm_blur_nbhd", opt.surface_glm_blur_nbhd is not None),
             ("-surface_clustsim", opt.surface_clustsim),
             ("-surface_clustsim_niter", opt.surface_clustsim_niter is not None),
             ("-surface_glm_opts", bool(opt.surface_glm_opts)),
@@ -1130,8 +1222,49 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         errors.append("-surface_glm fits the surface projection: it needs -surface_target.")
     elif surf_glm_flags and not opt.surface_glm:
         errors.append(f"{', '.join(surf_glm_flags)} configure the surface GLM: add -surface_glm.")
-    if opt.surface_glm_blur is not None and opt.surface_glm_blur_to is not None:
-        errors.append("-surface_glm_blur smooths BY, -surface_glm_blur_to smooths TO: pick one.")
+    errors += _target_blur_errors(
+        "-surface_glm_blur",
+        by=opt.surface_glm_blur is not None,
+        to=opt.surface_glm_blur_to,
+        tsnr=opt.surface_glm_blur_tsnr,
+        local=opt.surface_glm_blur_local,
+        max_fwhm=opt.surface_glm_blur_max_fwhm,
+        nbhd=opt.surface_glm_blur_nbhd,
+    )
+    errors += _target_blur_errors(
+        "-glm_blur",
+        by=opt.glm_blur is not None or bool(opt.sep_glm_blur),
+        to=opt.glm_blur_to,
+        tsnr=opt.glm_blur_tsnr,
+        local=opt.glm_blur_local,
+        max_fwhm=opt.glm_blur_max_fwhm,
+        nbhd=opt.glm_blur_nbhd,
+    )
+    if (opt.glm_blur_to or opt.glm_blur_tsnr) and opt.glm_mask == "none":
+        errors.append(
+            "-glm_blur_to / -glm_blur_tsnr measure smoothness inside the GLM mask, and "
+            "-glm_mask is none: pick -glm_mask brain (or epi / anat). Air would read as "
+            "white noise and drag the measurement down."
+        )
+    varying_vol = opt.clustsim and (opt.glm_blur_local or opt.glm_blur_tsnr)
+    varying_surf = opt.surface_clustsim and (
+        opt.surface_glm_blur_local or opt.surface_glm_blur_tsnr
+    )
+    if opt.clustsim_null == "acf" and (varying_vol or varying_surf):
+        warnings.append(
+            "cluster tables with the ACF null on a blur that varies smoothness on purpose "
+            "(-*_blur_local / -*_blur_tsnr): one ACF cannot describe it -- its real "
+            "false-positive rate was 0.17 at a nominal 0.05 on a half-rough, half-smooth "
+            "field. Strongly recommended: -clustsim_null resid (0.050 there)."
+        )
+    elif opt.clustsim_null == "acf" and (opt.clustsim or opt.surface_clustsim):
+        warnings.append(
+            "cluster tables use the ACF null (3dClustSim-compatible). -clustsim_null resid "
+            "is recommended: it uses the residuals' real spatial covariance (on real cortex "
+            "the tables differed ~3x at p=0.01)."
+        )
+    if opt.clustsim_null == "resid" and not (opt.clustsim or opt.surface_clustsim):
+        warnings.append("-clustsim_null resid does nothing without -clustsim / -surface_clustsim.")
     if opt.surface_target:
         if not opt.go_to_anat or opt.grand_reference or opt.ref_file:
             errors.append(
@@ -1509,6 +1642,37 @@ def _resolve_round_modes(
         for task in entry[1:]:
             per_task[task[len("task-") :] if task.startswith("task-") else task] = mode
     return wide, per_task
+
+
+def _target_blur_errors(
+    what: str,
+    *,
+    by: bool,
+    to: float | None,
+    tsnr: float | None,
+    local: bool,
+    max_fwhm: float | None,
+    nbhd: float | None,
+) -> list[str]:
+    """Consistency of one GLM's smoothing flags (``what`` = -glm_blur or
+    -surface_glm_blur): BY a kernel, TO a FWHM, or TO a tSNR -- one of them -- with
+    the modifiers only where they mean something."""
+    errors = []
+    kinds = [f for f, on in ((what, by), (f"{what}_to", to is not None),
+                             (f"{what}_tsnr", tsnr is not None)) if on]  # fmt: skip
+    if len(kinds) > 1:
+        errors.append(f"{' and '.join(kinds)} are alternatives: pick one.")
+    if local and to is None:
+        errors.append(f"{what}_local makes {what}_to spatially varying: it needs {what}_to.")
+    if max_fwhm is not None and tsnr is None:
+        errors.append(f"{what}_max_fwhm caps {what}_tsnr: it needs {what}_tsnr.")
+    if nbhd is not None and not (local or tsnr is not None):
+        errors.append(f"{what}_nbhd is for {what}_local / {what}_tsnr.")
+    for flag, val in ((f"{what}_to", to), (f"{what}_tsnr", tsnr),
+                      (f"{what}_max_fwhm", max_fwhm), (f"{what}_nbhd", nbhd)):  # fmt: skip
+        if val is not None and val <= 0:
+            errors.append(f"{flag} must be positive (got {val:g}).")
+    return errors
 
 
 def _resolve_glm_blur(args) -> tuple[float | None, dict[str, float]]:
@@ -1924,6 +2088,12 @@ def main(argv: list[str] | None = None) -> int:
         glm_label=args.glm_label,
         glm_mask=args.glm_mask,
         clustsim=args.clustsim,
+        clustsim_null=args.clustsim_null,
+        glm_blur_to=args.glm_blur_to,
+        glm_blur_local=args.glm_blur_local,
+        glm_blur_tsnr=args.glm_blur_tsnr,
+        glm_blur_max_fwhm=args.glm_blur_max_fwhm,
+        glm_blur_nbhd=args.glm_blur_nbhd,
         glm_spec_overwrite=args.glm_spec_overwrite,
         spec_event_cols=event_cols,
         sep_spec_event_cols=event_cols_by_task,
@@ -1978,6 +2148,10 @@ def main(argv: list[str] | None = None) -> int:
         surface_glm=args.surface_glm,
         surface_glm_blur=args.surface_glm_blur,
         surface_glm_blur_to=args.surface_glm_blur_to,
+        surface_glm_blur_local=args.surface_glm_blur_local,
+        surface_glm_blur_tsnr=args.surface_glm_blur_tsnr,
+        surface_glm_blur_max_fwhm=args.surface_glm_blur_max_fwhm,
+        surface_glm_blur_nbhd=args.surface_glm_blur_nbhd,
         surface_clustsim=args.surface_clustsim,
         surface_clustsim_niter=args.surface_clustsim_niter,
         surface_glm_opts=args.surface_glm_opts,

@@ -161,7 +161,13 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.processing.segment import load_tpm
 
     args = parse_args(argv)
-    device = setup_device(args.device)
+    device_spec = args.device
+    # as ffs_segment: "auto" must not land on MPS, which cannot run the fit
+    if (
+        device_spec is None or str(device_spec).lower() == "auto"
+    ) and not torch.cuda.is_available():
+        device_spec = "cpu"
+    device = setup_device(device_spec)
     if device.type == "mps":
         raise SystemExit("ffs_util_presurf: segmentation needs float64 geometry; use -device cpu")
     verbose = not args.quiet

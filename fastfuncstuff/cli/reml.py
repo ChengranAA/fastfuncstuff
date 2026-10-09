@@ -448,8 +448,9 @@ Examples:
         "covariance -- the heavy tail, and smoothness that varies across the brain. On "
         "a half-rough, half-smooth null field the ACF table's real false-positive rate "
         "was 0.17 at a nominal 0.05, the residual table's 0.050; on a stationary field "
-        "both were ~0.05. Default: resid under -blur_to_local / -blur_to_tsnr (which "
-        "make smoothness vary on purpose), acf otherwise.",
+        "both were ~0.05; on real cortex the two tables differed ~3x at p=0.01. "
+        "RECOMMENDED: resid -- above all with -blur_to_local / -blur_to_tsnr, which make "
+        "smoothness vary on purpose. Default acf, for 3dClustSim compatibility.",
     )
     diag_out.add_argument(
         "-clustsim_niter",
@@ -904,7 +905,7 @@ Examples:
         "ones none. A place also stops at -blur_tsnr_max_fwhm, or once a step that grew "
         "its smoothness ~12%% bought under 3%% of tSNR -- spatially structured noise "
         "(physiological, vascular) does not average down. Diffusion, as -blur_to_local; "
-        "-clustsim then defaults to the residual null, since smoothness varies by design. "
+        "pair -clustsim with -clustsim_null resid, since smoothness varies by design. "
         "Volume input needs -mask. Exclusive with -do_blur / -blur_to_fwhm.",
     )
     proc_opts.add_argument(
@@ -1590,6 +1591,7 @@ def _run_surface_clustsim(args, diag, device) -> None:
         return
     a = info["acf"]
     noise = None
+    _encourage_residual_null(args, indent="  ")
     if _clustsim_null(args) == "resid":
         noise = _residual_null(diag, info["mask"], _surface_device(device) or torch.device("cpu"))
         print(
@@ -4895,10 +4897,28 @@ def _resolve_written_bucket(buck: str | None) -> str | None:
 
 
 def _clustsim_null(args) -> str:
-    """-clustsim_null as given, else resid when the blur made smoothness vary on purpose."""
-    if args.clustsim_null:
-        return args.clustsim_null
-    return "resid" if _blur_varies(args) else "acf"
+    """-clustsim_null; acf (3dClustSim-compatible) unless resid is asked for."""
+    return args.clustsim_null or "acf"
+
+
+def _encourage_residual_null(args, indent: str = "    ") -> None:
+    """The ACF null is the safe, AFNI-comparable default; say plainly when it is the
+    weaker choice -- and loudly when this fit's blur made smoothness vary on purpose."""
+    if _clustsim_null(args) != "acf":
+        return
+    if _blur_varies(args):
+        print(
+            f"{indent}⚠️  -blur_to_local / -blur_to_tsnr make smoothness vary across the brain, "
+            "and one ACF cannot describe that: on a half-rough, half-smooth null field the "
+            "ACF table's real false-positive rate was 0.17 at a nominal 0.05.\n"
+            f"{indent}   Strongly recommended: rerun with -clustsim_null resid (0.050 there)."
+        )
+    else:
+        print(
+            f"{indent}ℹ️  null: the residuals' mixed ACF (3dClustSim-compatible). "
+            "-clustsim_null resid uses their real spatial covariance instead -- recommended "
+            "(on real cortex it moved thresholds ~3x at p=0.01)."
+        )
 
 
 def _residual_null(diag, mask, device):
@@ -4962,6 +4982,7 @@ def _run_clustsim(args, diag, device) -> None:
             f"FWHM {fwhm:.2f} mm; {int(mask.sum()):,} voxels; {args.clustsim_niter} iterations"
         )
         simulator = None
+        _encourage_residual_null(args)
         if _clustsim_null(args) == "resid":
             simulator = _residual_null(diag, mask, device)
             print(

@@ -297,8 +297,10 @@ def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, m
     run(*common, "-mask", str(tmp_path / "mask.nii"), "-Rbuck", str(tmp_path / "l.nii"),
         "-blur_to_local", "-save_blur_fwhm", str(tmp_path / "loc.nii"),
         "-save_acf", str(tmp_path / "acfl"), "-clustsim", "-clustsim_niter", "200")  # fmt: skip
-    # -blur_to_local makes smoothness vary on purpose: the table comes from the residuals
-    assert "Gaussian sums of the residuals" in capsys.readouterr().out
+    # the safe default stays the ACF null, but a varying blur is told plainly to switch
+    out = capsys.readouterr().out
+    assert "Strongly recommended: rerun with -clustsim_null resid" in out
+    assert "Gaussian sums of the residuals" not in out
     assert list((tmp_path / "l_clustsim").glob("*.NN1_bisided.1D"))
     assert classic("acfl") == pytest.approx(6.0, rel=0.05)
     fmap = np.asarray(nib.load(str(tmp_path / "loc.nii")).dataobj)
@@ -464,6 +466,7 @@ def test_reml_volume_blur_to_tsnr_end_to_end(tmp_path, monkeypatch, capsys):
         "-polort", "2", "-mask", str(tmp_path / "mask.nii"), "-blur_to_tsnr", "60",
         "-Rbuck", str(tmp_path / "s.nii"), "-save_tsnr", str(tmp_path / "tsnr.nii"),
         "-save_blur_fwhm", str(tmp_path / "fw.nii"), "-clustsim", "-clustsim_niter", "100",
+        "-clustsim_null", "resid",
         "-device", "cpu", "-verb", "0",
     ])  # fmt: skip
     reml.main()

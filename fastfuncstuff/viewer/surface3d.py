@@ -308,6 +308,67 @@ class Camera:
         return max(int(height), 1) / (2 * self.distance * np.tan(np.radians(self.fov_deg) / 2))
 
 
+#: Floats per crosshair-marker vertex: xyz, rgba. Must match marker.vert.
+MARKER_FLOATS = 7
+
+
+def crosshair_geometry(
+    centre: np.ndarray,
+    axes: np.ndarray,
+    camera: Camera,
+    height: int,
+    rgb: tuple[float, float, float],
+    *,
+    lines: bool = True,
+    line_mm: float = 150.0,
+    width_px: float = 2.5,
+    point_px: float = 5.0,
+) -> np.ndarray:
+    """Triangles for the crosshair as world geometry: ``(N, MARKER_FLOATS)`` float32.
+
+    Axis lines through ``centre`` along ``axes``' columns, as quads facing the
+    camera, and a disc at ``centre`` -- each first in a dark rim a little wider,
+    then in ``rgb``. They are drawn depth-tested in the surface's own pass, so
+    the brain hides what is behind or inside it: from a crosshair down a sulcus
+    the lines are seen coming out of the cortex, never painted across it.
+    Sizes are pixels at the camera's target distance.
+    """
+    c = np.asarray(centre, np.float64)
+    toward = camera.rotation[2]
+    right, up = camera.rotation[0], camera.rotation[1]
+    mm = 1.0 / camera.px_per_mm(height)
+    rim = (0.0, 0.0, 0.0, 0.8)
+    out: list[np.ndarray] = []
+
+    def emit(tris: np.ndarray, rgba) -> None:
+        out.append(np.c_[tris.reshape(-1, 3), np.tile(rgba, (tris.size // 3, 1))])
+
+    def segments(half: float, rgba) -> None:
+        for i in range(3):
+            d = np.asarray(axes[:, i], np.float64)
+            a, b = c - line_mm * d, c + line_mm * d
+            side = np.cross(d, toward)
+            n = np.linalg.norm(side)
+            if n < 1e-3:
+                continue  # along the line of sight: nothing to see but the point
+            s = side / n * half
+            emit(np.array([[a - s, a + s, b + s], [a - s, b + s, b - s]]), rgba)
+
+    def disc(radius: float, rgba, k: int = 20) -> None:
+        t = np.linspace(0, 2 * np.pi, k + 1)
+        ring = c + radius * (np.cos(t)[:, None] * right + np.sin(t)[:, None] * up)
+        emit(np.stack([np.broadcast_to(c, (k, 3)), ring[:-1], ring[1:]], 1), rgba)
+
+    colour = (*rgb, 1.0)
+    if lines:
+        segments((width_px / 2 + 1.0) * mm, rim)
+    disc((point_px + 1.0) * mm, rim)
+    if lines:
+        segments(width_px / 2 * mm, colour)
+    disc(point_px * mm, colour)
+    return np.concatenate(out).astype(np.float32)
+
+
 # -- picking -------------------------------------------------------------------
 
 

@@ -264,10 +264,10 @@ def _overlay_pixels(c, rgb, tol=40):
     return near
 
 
-def test_the_crosshair_lines_go_through_the_crosshair_itself_and_are_drawn_on_top(window):
+def test_the_crosshair_lines_go_through_the_crosshair_itself(window):
     """Off the surface (in white matter, say) the lines still meet at the crosshair
-    on an anatomical shape, and the overlay draws them whatever the mesh hides."""
-    from fastfuncstuff.viewer.ui import theme
+    on an anatomical shape; they are scene geometry, so the brain can hide them."""
+    from fastfuncstuff.viewer import surface3d as s3
     from fastfuncstuff.viewer.vocab import SetSurfaceShape, SetXYZ
 
     session, win = window
@@ -277,7 +277,6 @@ def test_the_crosshair_lines_go_through_the_crosshair_itself_and_are_drawn_on_to
     c._anim.stop()
     c.morph = 1.0
     win._reset_camera()
-    c._overlay.resize(c.size())
     session.do(SetXYZ(5.0, -7.0, 9.0))
     win.refresh(Aspect.ALL)
     centre, axes = c.cross_marker()
@@ -285,17 +284,36 @@ def test_the_crosshair_lines_go_through_the_crosshair_itself_and_are_drawn_on_to
     np.testing.assert_allclose(centre, m[:3, :3] @ [5.0, -7.0, 9.0] + m[:3, 3], atol=1e-6)
     np.testing.assert_allclose(axes, m[:3, :3])
 
-    rgb = np.round(np.asarray(theme.palette().crosshair[:3]) * 255)
-    lines = _overlay_pixels(c, rgb).sum()
-    win._cycle_cross()  # off
-    assert _overlay_pixels(c, rgb).sum() == 0
-    win._cycle_cross()  # dot: the ring alone
-    ring = _overlay_pixels(c, rgb).sum()
-    assert 0 < ring < lines
-    # The ring sits where the crosshair projects.
-    x, y = c.camera.to_widget(centre, c._overlay.width(), c._overlay.height())[0][0]
-    ys, xs = np.nonzero(_overlay_pixels(c, rgb))
-    assert abs(xs.mean() - x) < 2 and abs(ys.mean() - y) < 2
+    lines = c._marker_geometry(320)
+    assert lines is not None and lines.shape[1] == s3.MARKER_FLOATS
+    win._cycle_cross()  # off: nothing to draw
+    assert c._marker_geometry(320) is None
+    win._cycle_cross()  # dot: the point alone
+    dot = c._marker_geometry(320)
+    assert dot is not None and len(dot) < len(lines)
+
+
+def test_crosshair_geometry_is_lines_along_the_axes_and_a_point_on_top():
+    from fastfuncstuff.viewer import surface3d as s3
+
+    cam = s3.Camera()
+    cam.rotation = s3.VIEWS["left lateral"].copy()
+    centre = np.array([10.0, -20.0, 30.0])
+    tris = s3.crosshair_geometry(centre, np.eye(3), cam, 400, (0.2, 0.9, 0.8))
+    xyz, rgba = tris[:, :3].astype(np.float64), tris[:, 3:]
+    assert len(tris) % 3 == 0
+    # Every vertex is near one of the three axis lines through the centre.
+    d = xyz - centre
+    off_axis = np.stack([np.linalg.norm(np.delete(d, i, axis=1), axis=1) for i in range(3)], 1)
+    assert off_axis.min(1).max() < 6.0 / cam.px_per_mm(400)
+    # Seen side on, the left-right axis points at the eye and is left out.
+    assert np.abs(d[:, 0]).max() < 6.0 / cam.px_per_mm(400)
+    assert np.abs(d[:, 1]).max() == pytest.approx(150.0, abs=1.0)
+    # Drawn rim first, colour last: the point in colour ends the list.
+    assert np.allclose(rgba[-1], (0.2, 0.9, 0.8, 1.0))
+    assert np.allclose(rgba[0, :3], 0.0)
+    only_point = s3.crosshair_geometry(centre, np.eye(3), cam, 400, (1, 1, 1), lines=False)
+    assert np.linalg.norm(only_point[:, :3] - centre, axis=1).max() < 7.0 / cam.px_per_mm(400)
 
 
 def test_camera_puts_its_target_at_the_middle_and_px_per_mm_matches_projection():

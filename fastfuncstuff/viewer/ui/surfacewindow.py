@@ -125,12 +125,12 @@ class _HemiGPU:
 
 
 class _Overlay(QtWidgets.QWidget):
-    """Marks drawn over the render, never hidden by the surface: the crosshair
-    (axis lines and a ring) and the paint brush's outline at the cursor."""
+    """The paint brush's outline at the cursor, over the render.
 
-    #: Half-length of each axis line, mm: across a hemisphere from anywhere in it.
-    LINE_MM = 90.0
-    RING_PX = 9.0
+    Screen-space on purpose: it is where the next stroke lands, not a thing in
+    the scene. The crosshair is scene geometry and hides behind the brain; see
+    :func:`viewer.surface3d.crosshair_geometry`.
+    """
 
     def __init__(self, canvas: SurfaceCanvas) -> None:
         super().__init__(canvas)
@@ -140,45 +140,22 @@ class _Overlay(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
         c = self.canvas
-        w, h = self.width(), self.height()
+        if not (c.paint_mode and c.brush_mm > 0 and c._hover is not None):
+            return
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        colour = QtGui.QColor.fromRgbF(*theme.palette().crosshair[:3])
-        halo = QtGui.QColor(0, 0, 0, 170)
-
-        def stroke(draw, pen_colour, width: float, dash_px: float = 0.0) -> None:
-            # A dark halo under every mark, so it reads over any overlay colour.
-            for col, wd in ((halo, width + 2.5), (pen_colour, width)):
-                pen = QtGui.QPen(col, wd)
-                pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-                if dash_px:
-                    # Qt counts dashes in pen widths: in pixels, halo and line agree.
-                    pen.setDashPattern([dash_px / wd, 0.6 * dash_px / wd])
-                p.setPen(pen)
-                p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-                draw()
-
-        marker = None if c.cross_style == "off" else c.cross_marker()
-        if marker is not None:
-            centre, axes = marker
-            ends = [centre + sign * self.LINE_MM * axes[:, i] for i in range(3) for sign in (-1, 1)]
-            xy, front = c.camera.to_widget(np.vstack([centre, *ends]), w, h)
-            if front[0]:
-                o = QtCore.QPointF(*xy[0])
-                if c.cross_style == "lines":
-                    for (x, y), ok in zip(xy[1:], front[1:], strict=True):
-                        d = np.array([x, y]) - xy[0]
-                        n = float(np.hypot(*d))
-                        if not ok or n <= self.RING_PX:
-                            continue  # pointing at the eye: nothing to draw
-                        a = QtCore.QPointF(*(xy[0] + d / n * self.RING_PX))
-                        b = QtCore.QPointF(x, y)
-                        stroke(lambda a=a, b=b: p.drawLine(a, b), colour, 1.5)
-                stroke(lambda: p.drawEllipse(o, self.RING_PX, self.RING_PX), colour, 2.0)
-        if c.paint_mode and c.brush_mm > 0 and c._hover is not None:
-            r = c.brush_mm * c.camera.px_per_mm(h)
-            white = QtGui.QColor(255, 255, 255, 220)
-            stroke(lambda: p.drawEllipse(c._hover, r, r), white, 1.2, dash_px=6.0)
+        r = c.brush_mm * c.camera.px_per_mm(self.height())
+        # A dark halo under the line, so it reads over any overlay colour; Qt
+        # counts dashes in pen widths, so in pixels halo and line agree.
+        for col, width in (
+            (QtGui.QColor(0, 0, 0, 170), 3.7),
+            (QtGui.QColor(255, 255, 255, 220), 1.2),
+        ):
+            pen = QtGui.QPen(col, width)
+            pen.setDashPattern([6.0 / width, 3.6 / width])
+            p.setPen(pen)
+            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            p.drawEllipse(c._hover, r, r)
         p.end()
 
 
@@ -257,6 +234,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._rebind = True
         self._gpu: dict[str, _HemiGPU] = {}
         self._rhi_ready = False
+        #: The crosshair's buffers and pipeline, made on first use per RHI.
+        self._marker: dict | None = None
         self._press: QtCore.QPointF | None = None
         self._last: QtCore.QPointF | None = None
         self._moved = False
@@ -480,6 +459,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._palette_bytes = None
         self._rebind = True
         self._pipeline = None
+        self._marker = None
         self._rhi_ready = True
 
     def _new_3d(self, data: np.ndarray) -> QRhiTexture:
@@ -536,6 +516,69 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         ps.setRenderPassDescriptor(self.renderTarget().renderPassDescriptor())
         ps.create()
         self._pipeline = ps
+
+    #: Marker vertices the dynamic buffer holds; crosshair_geometry makes ~200.
+    MARKER_VERTICES = 512
+
+    def _marker_geometry(self, height: int) -> np.ndarray | None:
+        """The crosshair's triangles this frame, or None when it is not drawn."""
+        marker = None if self.cross_style == "off" else self.cross_marker()
+        if marker is None:
+            return None
+        centre, axes = marker
+        tris = s3.crosshair_geometry(
+            centre,
+            axes,
+            self.camera,
+            height,
+            tuple(theme.palette().crosshair[:3]),
+            lines=self.cross_style == "lines",
+        )
+        return tris[: self.MARKER_VERTICES]
+
+    def _ensure_marker(self) -> None:
+        if self._marker is not None:
+            return
+        rhi = self.rhi()
+        stride = 4 * s3.MARKER_FLOATS
+        vbuf = rhi.newBuffer(
+            QRhiBuffer.Type.Dynamic,
+            QRhiBuffer.UsageFlag.VertexBuffer,
+            self.MARKER_VERTICES * stride,
+        )
+        vbuf.create()
+        ubuf = rhi.newBuffer(QRhiBuffer.Type.Dynamic, QRhiBuffer.UsageFlag.UniformBuffer, 64)
+        ubuf.create()
+        srb = rhi.newShaderResourceBindings()
+        srb.setBindings([Binding.uniformBuffer(0, _STAGE.VertexStage | _STAGE.FragmentStage, ubuf)])
+        srb.create()
+        ps = rhi.newGraphicsPipeline()
+        ps.setShaderStages(
+            [
+                QRhiShaderStage(QRhiShaderStage.Type.Vertex, _shader("marker.vert")),
+                QRhiShaderStage(QRhiShaderStage.Type.Fragment, _shader("marker.frag")),
+            ]
+        )
+        layout = QRhiVertexInputLayout()
+        layout.setBindings([QRhiVertexInputBinding(stride)])
+        fmt = QRhiVertexInputAttribute.Format
+        layout.setAttributes(
+            [
+                QRhiVertexInputAttribute(0, 0, fmt.Float3, 0),
+                QRhiVertexInputAttribute(0, 1, fmt.Float4, 12),
+            ]
+        )
+        ps.setVertexInputLayout(layout)
+        ps.setDepthTest(True)
+        # Not written: the rim and the colour over it are ordered by drawing,
+        # and only the surface decides what hides them.
+        ps.setDepthWrite(False)
+        ps.setCullMode(QRhiGraphicsPipeline.CullMode.None_)
+        ps.setSampleCount(self.sampleCount())
+        ps.setShaderResourceBindings(srb)
+        ps.setRenderPassDescriptor(self.renderTarget().renderPassDescriptor())
+        ps.create()
+        self._marker = {"vbuf": vbuf, "ubuf": ubuf, "srb": srb, "pipeline": ps}
 
     def _bindings(self, gpu: _HemiGPU) -> None:
         rhi = self.rhi()
@@ -711,6 +754,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 ),
             )
             draws.append((gpu, index, count))
+        marks = self._marker_geometry(size.height())
+        if marks is not None and draws:
+            self._ensure_marker()
+            vbuf, ubuf = self._marker["vbuf"], self._marker["ubuf"]
+            batch.updateDynamicBuffer(ubuf, 0, s3._mat(proj @ view))
+            batch.updateDynamicBuffer(vbuf, 0, marks.tobytes())
         bg = QtGui.QColor(theme.palette().bg)
         cb.beginPass(self.renderTarget(), bg, QRhiDepthStencilClearValue(1.0, 0), batch)
         if draws:
@@ -727,6 +776,12 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                     QRhiCommandBuffer.IndexFormat.IndexUInt32,
                 )
                 cb.drawIndexed(count)
+            if marks is not None:
+                # After the surface, against its depth: hidden where the brain is in front.
+                cb.setGraphicsPipeline(self._marker["pipeline"])
+                cb.setShaderResources(self._marker["srb"])
+                cb.setVertexInput(0, [(self._marker["vbuf"], 0)])
+                cb.draw(len(marks))
         cb.endPass()
         # Every frame, so the marks follow a turn, a zoom or a morph.
         self._overlay.update()
@@ -734,6 +789,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     def releaseResources(self) -> None:  # noqa: N802 (Qt)
         self._rhi_ready = False
         self._pipeline = None
+        self._marker = None
         self._gpu.clear()
 
     # -- input -----------------------------------------------------------------

@@ -124,6 +124,64 @@ class _HemiGPU:
         self.srb = None
 
 
+class _Overlay(QtWidgets.QWidget):
+    """Marks drawn over the render, never hidden by the surface: the crosshair
+    (axis lines and a ring) and the paint brush's outline at the cursor."""
+
+    #: Half-length of each axis line, mm: across a hemisphere from anywhere in it.
+    LINE_MM = 90.0
+    RING_PX = 9.0
+
+    def __init__(self, canvas: SurfaceCanvas) -> None:
+        super().__init__(canvas)
+        self.canvas = canvas
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_NoSystemBackground)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
+        c = self.canvas
+        w, h = self.width(), self.height()
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        colour = QtGui.QColor.fromRgbF(*theme.palette().crosshair[:3])
+        halo = QtGui.QColor(0, 0, 0, 170)
+
+        def stroke(draw, pen_colour, width: float, dash_px: float = 0.0) -> None:
+            # A dark halo under every mark, so it reads over any overlay colour.
+            for col, wd in ((halo, width + 2.5), (pen_colour, width)):
+                pen = QtGui.QPen(col, wd)
+                pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+                if dash_px:
+                    # Qt counts dashes in pen widths: in pixels, halo and line agree.
+                    pen.setDashPattern([dash_px / wd, 0.6 * dash_px / wd])
+                p.setPen(pen)
+                p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                draw()
+
+        marker = None if c.cross_style == "off" else c.cross_marker()
+        if marker is not None:
+            centre, axes = marker
+            ends = [centre + sign * self.LINE_MM * axes[:, i] for i in range(3) for sign in (-1, 1)]
+            xy, front = c.camera.to_widget(np.vstack([centre, *ends]), w, h)
+            if front[0]:
+                o = QtCore.QPointF(*xy[0])
+                if c.cross_style == "lines":
+                    for (x, y), ok in zip(xy[1:], front[1:], strict=True):
+                        d = np.array([x, y]) - xy[0]
+                        n = float(np.hypot(*d))
+                        if not ok or n <= self.RING_PX:
+                            continue  # pointing at the eye: nothing to draw
+                        a = QtCore.QPointF(*(xy[0] + d / n * self.RING_PX))
+                        b = QtCore.QPointF(x, y)
+                        stroke(lambda a=a, b=b: p.drawLine(a, b), colour, 1.5)
+                stroke(lambda: p.drawEllipse(o, self.RING_PX, self.RING_PX), colour, 2.0)
+        if c.paint_mode and c.brush_mm > 0 and c._hover is not None:
+            r = c.brush_mm * c.camera.px_per_mm(h)
+            white = QtGui.QColor(255, 255, 255, 220)
+            stroke(lambda: p.drawEllipse(c._hover, r, r), white, 1.2, dash_px=6.0)
+        p.end()
+
+
 class SurfaceCanvas(QtWidgets.QRhiWidget):
     """The GPU side. Holds CPU copies of what it uploads, and uploads on render."""
 
@@ -165,6 +223,14 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         #: Overlay layers, bottom to top (at most MAX_LAYERS are drawn).
         self.overlays: list[OverlaySlot] = []
         self.cross: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        #: The crosshair as the overlay draws it: (hemi, nearest vertex, scanner
+        #: mm or None on a laid-out shape), or None when hidden.
+        self.cross_at: tuple[str, int, np.ndarray | None] | None = None
+        #: "lines" (axes through it), "dot", or "off"; see SurfaceWindow.CROSS_STYLES.
+        self.cross_style = "lines"
+        #: Paint brush radius to outline at the cursor, mm; 0 shows none.
+        self.brush_mm = 0.0
+        self._hover: QtCore.QPointF | None = None
         #: nearest / linear / cubic, as surface.sampling.MODES. Nearest by
         #: default: the voxels themselves.
         self.sampling = "nearest"
@@ -198,6 +264,42 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._anim.setDuration(450)
         self._anim.setEasingCurve(QtCore.QEasingCurve.Type.InOutCubic)
         self._anim.valueChanged.connect(self._on_morph)
+        self._overlay = _Overlay(self)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 (Qt)
+        self._overlay.resize(event.size())
+        super().resizeEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802 (Qt)
+        self._hover = None
+        self._overlay.update()
+        super().leaveEvent(event)
+
+    def set_paint_mode(self, on: bool) -> None:
+        self.paint_mode = bool(on)
+        # Hover moves only matter for the brush outline.
+        self.setMouseTracking(self.paint_mode)
+        if not self.paint_mode:
+            self._hover = None
+        self._overlay.update()
+
+    def cross_marker(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """The crosshair as drawn (world point) and the scanner axes there (columns).
+
+        On an anatomical shape it is the crosshair itself, which is usually off
+        the surface; on a laid-out one (or mid-morph) its nearest vertex, since
+        scanner mm means nothing on an inflated or flat brain.
+        """
+        if self.cross_at is None:
+            return None
+        hemi, k, mm = self.cross_at
+        m = self.model(hemi)
+        if mm is not None and self.morph >= 1.0:
+            return m[:3, :3] @ np.asarray(mm, np.float64) + m[:3, 3], m[:3, :3]
+        drawn = self.drawn_positions(hemi)
+        if drawn is None or k >= len(drawn):
+            return None
+        return drawn[k].astype(np.float64), m[:3, :3]
 
     # -- content -----------------------------------------------------------
     def set_hemisphere(
@@ -626,6 +728,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
                 )
                 cb.drawIndexed(count)
         cb.endPass()
+        # Every frame, so the marks follow a turn, a zoom or a morph.
+        self._overlay.update()
 
     def releaseResources(self) -> None:  # noqa: N802 (Qt)
         self._rhi_ready = False
@@ -658,6 +762,9 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             self._grabbed = None if hit is None else hit[0]
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self.paint_mode:
+            self._hover = event.position()
+            self._overlay.update()
         if self._last is None:
             return
         d = event.position() - self._last
@@ -901,6 +1008,10 @@ class SurfaceWindow(QtWidgets.QWidget):
 
     #: Radius of the crosshair's mark on the surface, mm.
     CROSS_MM = 2.0
+    #: What ``x`` cycles through. Lines first: the dot alone sat on the vertex
+    #: nearest the crosshair, which on a folded pial is usually down a sulcus
+    #: behind a gyrus, so it was mostly not there to see.
+    CROSS_STYLES = ("lines", "off", "dot")
 
     _SHAPE_KEYS = {
         "mid": "1",
@@ -930,7 +1041,6 @@ class SurfaceWindow(QtWidgets.QWidget):
         #: Texture-ready voxels per overlay key, so a redraw that changes only
         #: a threshold does not re-read or re-transpose a volume.
         self._slot_cache: dict[tuple, tuple[np.ndarray, np.ndarray | None]] = {}
-        self.show_cross = True
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -1033,7 +1143,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("d", "depth statistic: mean, median, max, min, max_abs, nzmean", self._cycle_depth_stat, group="depth"),
                 Key("m", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
                 Key("c", "centre the view on the crosshair (c c: every window)", double_tap(self._centre_view, self.centre_all_requested.emit), group="view"),
-                Key("x", "show / hide the crosshair", self._toggle_cross, group="view"),
+                Key("x", "crosshair: axis lines / off / dot", self._cycle_cross, group="view"),
                 Key("k", "folding shade: curv / sulc / binary / off", self._cycle_folding, group="view"),
                 Key("n", "voxels: nearest / linear / cubic", self._cycle_sampling, group="view"),
                 Key("v", "next view (top, lateral, medial, front...)", lambda: self._cycle_view(1), group="view"),
@@ -1113,8 +1223,9 @@ class SurfaceWindow(QtWidgets.QWidget):
             self._dispatch(SetSurfaceHemis(self.vid, vp.hemis, max(0.0, vp.split + delta)))
 
     def _toggle_paint(self) -> None:
-        self.canvas.paint_mode = not self.canvas.paint_mode
+        self.canvas.set_paint_mode(not self.canvas.paint_mode)
         r = self.session.state.surface_brush[0]
+        self.canvas.brush_mm = r
         self.depth_label.setText(
             f"paint r={r:g} mm (ctrl erases)" if self.canvas.paint_mode else "paint off"
         )
@@ -1125,6 +1236,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         r, snap, smooth, search, sign = self.session.state.surface_brush
         r = float(np.clip(r * factor, 0.5, 30.0))
         self._dispatch(SetSurfaceBrush(round(r, 2), snap, smooth, search, sign))
+        self.canvas.brush_mm = self.session.state.surface_brush[0]
+        self.canvas.update()
         self.depth_label.setText(f"paint r={r:g} mm")
 
     def _paint_highlight(self, hemi: str, vertex: int, erase: bool) -> None:
@@ -1295,8 +1408,9 @@ class SurfaceWindow(QtWidgets.QWidget):
             self.canvas.camera.target = drawn[k].astype(np.float64)
             self.canvas.update()
 
-    def _toggle_cross(self) -> None:
-        self.show_cross = not self.show_cross
+    def _cycle_cross(self) -> None:
+        styles = self.CROSS_STYLES
+        self.canvas.cross_style = styles[(styles.index(self.canvas.cross_style) + 1) % len(styles)]
         self._refresh_cross()
         self.canvas.update()
 
@@ -1434,6 +1548,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         c.depth_stat = vp.depth_stat
         self._refresh_data()
         self._refresh_cross()
+        # The 2-D windows' ( ) change the same brush.
+        c.brush_mm = self.session.state.surface_brush[0]
         self._sync_header(vp)
         c.update()
 
@@ -1760,14 +1876,19 @@ class SurfaceWindow(QtWidgets.QWidget):
         surface, so the mark shows wherever the crosshair is.
         """
         mm = self.session.state.crosshair_mm
-        found = None if mm is None or not self.show_cross else self.canvas.nearest_vertex(mm)
+        shown = self.canvas.cross_style != "off"
+        found = None if mm is None or not shown else self.canvas.nearest_vertex(mm)
         if found is None:
             self.canvas.cross = (0.0, 0.0, 0.0, 0.0)
+            self.canvas.cross_at = None
             return
         hemi, k = found
         cpu = self.canvas._cpu[hemi]
         mid = 0.5 * (cpu["white"][k] + cpu["pial"][k])
         self.canvas.cross = (float(mid[0]), float(mid[1]), float(mid[2]), self.CROSS_MM)
+        vp = self._viewport()
+        anatomical = vp is not None and vp.shape in s3.ANATOMICAL_SHAPES
+        self.canvas.cross_at = (hemi, k, np.asarray(mm, np.float64) if anatomical else None)
 
 
 __all__ = ["SurfaceCanvas", "SurfaceWindow"]

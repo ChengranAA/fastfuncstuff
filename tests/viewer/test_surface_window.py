@@ -11,6 +11,8 @@ import pytest
 import torch
 
 QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+QtGui = pytest.importorskip("PySide6.QtGui")
+QtCore = pytest.importorskip("PySide6.QtCore")
 nib = pytest.importorskip("nibabel")
 
 from fastfuncstuff.viewer.commands import Aspect  # noqa: E402
@@ -238,8 +240,78 @@ def test_the_crosshair_marks_its_nearest_vertex_and_c_aims_the_camera_there(wind
     win._centre_view()
     assert np.allclose(c.camera.target, c.drawn_positions(hemi)[k], atol=1e-4)
 
-    win._toggle_cross()
-    assert c.cross[3] == 0.0
+    # On a laid-out shape the overlay marks the nearest vertex as drawn.
+    centre, _ = c.cross_marker()
+    np.testing.assert_allclose(centre, c.drawn_positions(hemi)[k], atol=1e-4)
+
+    assert c.cross_style == "lines"
+    win._cycle_cross()
+    assert c.cross_style == "off" and c.cross[3] == 0.0 and c.cross_marker() is None
+    win._cycle_cross()
+    assert c.cross_style == "dot" and c.cross[3] > 0 and c.cross_marker() is not None
+    win._cycle_cross()
+    assert c.cross_style == "lines"
+
+
+def _overlay_pixels(c, rgb, tol=40):
+    """How many of the overlay's pixels are near ``rgb`` (0-255)."""
+    # Onto a clear image: grab() lays the overlay over an opaque background.
+    img = QtGui.QImage(c._overlay.size(), QtGui.QImage.Format.Format_RGBA8888)
+    img.fill(QtCore.Qt.GlobalColor.transparent)
+    c._overlay.render(img)
+    a = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.bytesPerLine() // 4, 4)
+    near = (np.abs(a[..., :3].astype(int) - np.asarray(rgb)) < tol).all(-1) & (a[..., 3] > 0)
+    return near
+
+
+def test_the_crosshair_lines_go_through_the_crosshair_itself_and_are_drawn_on_top(window):
+    """Off the surface (in white matter, say) the lines still meet at the crosshair
+    on an anatomical shape, and the overlay draws them whatever the mesh hides."""
+    from fastfuncstuff.viewer.ui import theme
+    from fastfuncstuff.viewer.vocab import SetSurfaceShape, SetXYZ
+
+    session, win = window
+    session.do(SetSurfaceShape("S1", "white"))
+    win.apply(session.state.viewports.get("S1"))
+    c = win.canvas
+    c._anim.stop()
+    c.morph = 1.0
+    win._reset_camera()
+    c._overlay.resize(c.size())
+    session.do(SetXYZ(5.0, -7.0, 9.0))
+    win.refresh(Aspect.ALL)
+    centre, axes = c.cross_marker()
+    m = c.model("lh")
+    np.testing.assert_allclose(centre, m[:3, :3] @ [5.0, -7.0, 9.0] + m[:3, 3], atol=1e-6)
+    np.testing.assert_allclose(axes, m[:3, :3])
+
+    rgb = np.round(np.asarray(theme.palette().crosshair[:3]) * 255)
+    lines = _overlay_pixels(c, rgb).sum()
+    win._cycle_cross()  # off
+    assert _overlay_pixels(c, rgb).sum() == 0
+    win._cycle_cross()  # dot: the ring alone
+    ring = _overlay_pixels(c, rgb).sum()
+    assert 0 < ring < lines
+    # The ring sits where the crosshair projects.
+    x, y = c.camera.to_widget(centre, c._overlay.width(), c._overlay.height())[0][0]
+    ys, xs = np.nonzero(_overlay_pixels(c, rgb))
+    assert abs(xs.mean() - x) < 2 and abs(ys.mean() - y) < 2
+
+
+def test_camera_puts_its_target_at_the_middle_and_px_per_mm_matches_projection():
+    from fastfuncstuff.viewer.surface3d import Camera
+
+    cam = Camera()
+    cam.target = np.array([3.0, -4.0, 5.0])
+    xy, front = cam.to_widget(cam.target, 400, 300)
+    x, y = xy[0]
+    assert front[0] and x == pytest.approx(200) and y == pytest.approx(150)
+    # 10 mm along the screen's up axis at the target: 10 * px_per_mm pixels.
+    up = cam.rotation[1]
+    y2 = cam.to_widget(cam.target + 10 * up, 400, 300)[0][0, 1]
+    assert y - y2 == pytest.approx(10 * cam.px_per_mm(300), rel=1e-6)
+    behind = cam.target + cam.rotation[2] * (cam.distance + 10)
+    assert not cam.to_widget(behind, 400, 300)[1][0]
 
 
 def test_a_shape_change_keeps_the_zoom_relative_to_the_brain(window):
@@ -406,3 +478,37 @@ def test_a_surface_layer_draws_on_its_vertices_with_the_layer_controls(window, t
     np.testing.assert_array_equal(win.canvas._cpu["lh"]["vcolor"][:, 3] > 0, t > 6.0)
     # drawn per vertex, so never also sampled from the ribbon it is painted into
     assert key not in [ly.key for ly in win._overlay_layers()]
+
+
+def test_paint_mode_outlines_the_brush_at_the_cursor_at_its_size(window):
+    session, win = window
+    c = win.canvas
+    c._overlay.resize(c.size())
+    win._cycle_cross()  # crosshair off: only the brush is drawn
+    win._toggle_paint()
+    pos = QtCore.QPointF(150.0, 170.0)
+    hover = QtGui.QMouseEvent(
+        QtCore.QEvent.Type.MouseMove,
+        pos,
+        pos,
+        QtCore.Qt.MouseButton.NoButton,
+        QtCore.Qt.MouseButton.NoButton,
+        QtCore.Qt.KeyboardModifier.NoModifier,
+    )
+    QtWidgets.QApplication.sendEvent(c, hover)
+
+    def radius():
+        ys, xs = np.nonzero(_overlay_pixels(c, (255, 255, 255)))
+        assert xs.size, "no brush outline drawn"
+        return float(np.median(np.hypot(xs - pos.x(), ys - pos.y())))
+
+    def expected():
+        # At the overlay's height as painted: it follows the canvas's.
+        return session.state.surface_brush[0] * c.camera.px_per_mm(c._overlay.height())
+
+    assert radius() == pytest.approx(expected(), abs=2.0)
+    r0 = expected()
+    win._brush_by(2.0)
+    assert radius() == pytest.approx(2 * r0, abs=2.0)
+    win._toggle_paint()  # off: no outline
+    assert not _overlay_pixels(c, (255, 255, 255)).any()

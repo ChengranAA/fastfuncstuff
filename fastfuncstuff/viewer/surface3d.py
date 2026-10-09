@@ -294,6 +294,19 @@ class Camera:
         d = far - near
         return near, d / np.linalg.norm(d)
 
+    def to_widget(self, points, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
+        """World points (N, 3) as widget pixels (N, 2), y down, and which are in front."""
+        p = np.atleast_2d(np.asarray(points, np.float64))
+        w, h = max(int(width), 1), max(int(height), 1)
+        clip = np.c_[p, np.ones(len(p))] @ (self.projection(w / h) @ self.view()).T
+        front = clip[:, 3] > 1e-6
+        ndc = clip[:, :2] / np.where(front, clip[:, 3], 1.0)[:, None]
+        return np.c_[(ndc[:, 0] + 1) * w / 2, (1 - ndc[:, 1]) * h / 2], front
+
+    def px_per_mm(self, height: int) -> float:
+        """Pixels per mm at the target's distance: a size on the surface, roughly."""
+        return max(int(height), 1) / (2 * self.distance * np.tan(np.radians(self.fov_deg) / 2))
+
 
 # -- picking -------------------------------------------------------------------
 

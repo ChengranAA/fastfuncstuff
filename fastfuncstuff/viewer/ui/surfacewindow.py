@@ -1069,8 +1069,98 @@ class SurfaceWindow(QtWidgets.QWidget):
             b.clicked.connect(lambda _=False, h=hemi: self._toggle_hemi(h))
             bar.addWidget(b)
             self._hemi_buttons[hemi] = b
+        bar.addSpacing(8)
+        self._tool(
+            bar,
+            "VIEW",
+            "v",
+            "Next standard view: top, lateral, medial, front...",
+            lambda: self._cycle_view(1),
+        )
+        self._tool(bar, "RESET", "0", "Reset the camera", self._reset_camera)
+        self.open_button = self._tool(
+            bar,
+            "OPEN",
+            "o",
+            "Open the hemispheres: closed, nose to nose, occipital to occipital",
+            self._cycle_hinge,
+        )
         bar.addStretch(1)
         v.addLayout(bar)
+        # What used to live only in the help list (h): a button per key, the
+        # cycles labelled with where they are now.
+        bar = QtWidgets.QHBoxLayout()
+        bar.setContentsMargins(6, 0, 6, 4)
+        bar.setSpacing(4)
+        self.cross_button = self._tool(
+            bar,
+            "CROSS",
+            "x",
+            "Crosshair: axis lines through it, off, or a dot (drawn over the surface, never hidden by it)",
+            self._cycle_cross,
+        )
+        self.fold_button = self._tool(
+            bar,
+            "FOLD",
+            "k",
+            "Folding shade under the data: curv, sulc, binary, off",
+            self._cycle_folding,
+        )
+        self.voxel_button = self._tool(
+            bar, "VOXEL", "n", "How voxels are read: nearest, linear, cubic", self._cycle_sampling
+        )
+        self.equivolume_button = self._tool(
+            bar,
+            "EQUIVOL",
+            "e",
+            "Equivolume depth (on) or equidistant (off)",
+            self._toggle_equivolume,
+            checkable=True,
+        )
+        self.stat_button = self._tool(
+            bar,
+            "DEPTH",
+            "d",
+            "How depth samples reduce: mean, median, max, min, max_abs, nzmean.\n[ ] move the depth, { } fewer / more samples.",
+            self._cycle_depth_stat,
+        )
+        bar.addSpacing(8)
+        self.paint_button = self._tool(
+            bar,
+            "PAINT",
+            "p",
+            "Paint mode: drag highlights cortex, ctrl+drag erases, shift+drag fills a drawn shape",
+            self._toggle_paint,
+            checkable=True,
+        )
+        bar.addStretch(1)
+        v.addLayout(bar)
+        # Paint's own tools, only while painting.
+        self.paint_row = QtWidgets.QWidget()
+        bar = QtWidgets.QHBoxLayout(self.paint_row)
+        bar.setContentsMargins(6, 0, 6, 4)
+        bar.setSpacing(4)
+        self._tool(bar, "BRUSH -", "(", "Smaller paint brush", lambda: self._brush_by(1 / 1.25))
+        self._tool(bar, "BRUSH +", ")", "Larger paint brush", lambda: self._brush_by(1.25))
+        self._tool(bar, "CLEAR", "P", "Clear the highlight", self._clear_highlight)
+        self._tool(
+            bar,
+            "SAVE",
+            "s",
+            "Save the highlight as an ROI: ?h.label + the volume it spans",
+            self._save_roi,
+        )
+        self._tool(bar, "LOAD", "l", "Load ROI labels into the highlight", self._load_roi)
+        self._tool(
+            bar,
+            "ROI",
+            "r",
+            "The highlighted cortex as an ROI layer, white to pial",
+            self._highlight_roi,
+        )
+        bar.addStretch(1)
+        self.paint_row.setVisible(False)
+        v.addWidget(self.paint_row)
         bar = QtWidgets.QHBoxLayout()
         bar.setContentsMargins(6, 0, 6, 4)
         bar.setSpacing(4)
@@ -1179,6 +1269,37 @@ class SurfaceWindow(QtWidgets.QWidget):
         )  # fmt: skip
         keep_keys_for_shortcuts(self)
 
+    def _tool(
+        self, bar, text: str, key: str, tip: str, slot, checkable: bool = False
+    ) -> QtWidgets.QPushButton:
+        """A header button doing what its key does; the window keeps the keyboard."""
+        b = QtWidgets.QPushButton(theme.key_label(text, key))
+        b.setToolTip(f"{tip}  ({key})")
+        b.setCheckable(checkable)
+        b.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 2px 5px; }}")
+        b.clicked.connect(lambda _=False: slot())
+        bar.addWidget(b)
+        return b
+
+    def _sync_buttons(self) -> None:
+        """Cycle buttons say where they are; toggles show whether they are on."""
+        vp = self._viewport()
+        c = self.canvas
+        self.cross_button.setText(f"{theme.key_label('CROSS', 'x')} {c.cross_style}")
+        self.voxel_button.setText(f"{theme.key_label('VOXEL', 'n')} {c.sampling}")
+        self.paint_button.setChecked(c.paint_mode)
+        self.paint_row.setVisible(c.paint_mode)
+        if vp is None:
+            return
+        self.fold_button.setText(f"{theme.key_label('FOLD', 'k')} {vp.folding}")
+        self.stat_button.setText(f"{theme.key_label('DEPTH', 'd')} {vp.depth_stat}")
+        self.equivolume_button.setChecked(vp.equivolume)
+        hinge = {0.0: "closed", 180.0: "nose", -180.0: "occipital"}.get(
+            float(vp.hinge), f"{vp.hinge:g}°"
+        )
+        self.open_button.setText(f"{theme.key_label('OPEN', 'o')} {hinge}")
+
     def _combo(self, tip: str) -> QtWidgets.QComboBox:
         box = QtWidgets.QComboBox()
         box.setToolTip(tip)
@@ -1226,6 +1347,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.set_paint_mode(not self.canvas.paint_mode)
         r = self.session.state.surface_brush[0]
         self.canvas.brush_mm = r
+        self._sync_buttons()
         self.depth_label.setText(
             f"paint r={r:g} mm (ctrl erases)" if self.canvas.paint_mode else "paint off"
         )
@@ -1375,6 +1497,7 @@ class SurfaceWindow(QtWidgets.QWidget):
 
         nxt = MODES[(MODES.index(self.canvas.sampling) + 1) % len(MODES)]
         self.canvas.set_sampling(nxt)
+        self._sync_buttons()
 
     def _cycle_view(self, step: int) -> None:
         names = list(s3.VIEWS)
@@ -1412,6 +1535,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         styles = self.CROSS_STYLES
         self.canvas.cross_style = styles[(styles.index(self.canvas.cross_style) + 1) % len(styles)]
         self._refresh_cross()
+        self._sync_buttons()
         self.canvas.update()
 
     def _reset_camera(self) -> None:
@@ -1675,6 +1799,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.legend.set_scale((lo, hi, name), unit)
 
     def _sync_header(self, vp: Viewport) -> None:
+        self._sync_buttons()
         lo, hi = vp.depth
         how = "equivol" if vp.equivolume else "linear"
         self.depth_label.setText(

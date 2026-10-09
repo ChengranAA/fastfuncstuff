@@ -1513,31 +1513,51 @@ def precompute_reml_grid(
     if n_valid == 0:
         return precomputed
 
-    # Whiten the design for every pair at once. Small now that the whiteners are
-    # per run, so do it on the accelerator when there is one and store on the
-    # whiteners' device (CPU by default; the caller moves the grid if it fits).
+    # Whiten the design for every pair, on the accelerator when there is one,
+    # storing on the whiteners' device (CPU by default; the caller moves the grid
+    # if it fits). Chunked over pairs: X_w and Q are n_pairs × T × K each, which
+    # for 100 runs × 164 TRs × 401 columns is GBs — no longer the whiteners, but
+    # still more than one batch should hold.
     storage = whiteners[0].device
     work = device if device.type == "cuda" else storage
+    n_t, n_k = X.shape
+    bpe = torch.empty(0, dtype=dtype).element_size()
+    per_pair = n_t * n_k * bpe * 4  # X_w, Q, the triangular-solve workspace, margin
+    if work.type == "cuda":
+        free, _ = torch.cuda.mem_get_info(work)
+        chunk = max(1, min(n_valid, int(free * 0.5 // per_pair)))
+    else:
+        chunk = n_valid
     if verbose:
-        print(f"  Prewhitening design matrix for all parameters (on {work.type})...")
-    X_w_batch = stack_cols(whiteners, X.to(device=work, dtype=dtype))  # (n_valid, T, K)
-    try:
-        XtX_batch = torch.bmm(X_w_batch.transpose(1, 2), X_w_batch)
-        L_xtx = torch.linalg.cholesky(XtX_batch)
-        Q_batch = torch.linalg.solve_triangular(
-            L_xtx, X_w_batch.transpose(1, 2), upper=False
-        ).transpose(1, 2)
-        diag = torch.diagonal(L_xtx, dim1=1, dim2=2)
-        del XtX_batch, L_xtx
-    except torch.linalg.LinAlgError:
-        if verbose:
-            print("  Cholesky of X'X failed (rank-deficient X); using QR.")
-        Q_batch, R_qr_batch = torch.linalg.qr(X_w_batch)
-        diag = torch.diagonal(R_qr_batch, dim1=1, dim2=2)
-        del R_qr_batch
-    logdet_XwTXw_batch = 2 * torch.sum(torch.log(torch.abs(diag) + 1e-10), dim=1)
-    X_w_batch, Q_batch = X_w_batch.to(storage), Q_batch.to(storage)
-    logdet_XwTXw_batch = logdet_XwTXw_batch.to(storage)
+        print(
+            f"  Prewhitening design matrix for all parameters (on {work.type}, {chunk} pairs/batch)..."
+        )
+    X_work = X.to(device=work, dtype=dtype)
+    X_w_batch = torch.empty(n_valid, n_t, n_k, dtype=dtype, device=storage)
+    Q_batch = torch.empty_like(X_w_batch)
+    logdet_XwTXw_batch = torch.empty(n_valid, dtype=dtype, device=storage)
+    used_qr = False
+    for c0 in range(0, n_valid, chunk):
+        c1 = min(c0 + chunk, n_valid)
+        Xw = stack_cols(whiteners[c0:c1], X_work)  # (c, T, K)
+        try:
+            L_xtx = torch.linalg.cholesky(torch.bmm(Xw.transpose(1, 2), Xw))
+            Q = torch.linalg.solve_triangular(L_xtx, Xw.transpose(1, 2), upper=False).transpose(
+                1, 2
+            )
+            diag = torch.diagonal(L_xtx, dim1=1, dim2=2)
+        except torch.linalg.LinAlgError:
+            used_qr = True
+            Q, R_qr = torch.linalg.qr(Xw)
+            diag = torch.diagonal(R_qr, dim1=1, dim2=2)
+        logdet_XwTXw_batch[c0:c1] = (2 * torch.sum(torch.log(torch.abs(diag) + 1e-10), dim=1)).to(
+            storage
+        )
+        X_w_batch[c0:c1] = Xw.to(storage)
+        Q_batch[c0:c1] = Q.to(storage)
+        del Xw, Q, diag
+    if used_qr and verbose:
+        print("  Cholesky of X'X failed (rank-deficient X); used QR.")
     logdet_Rcorr_batch = logdet_Rcorr_batch.to(storage)
     if device.type == "cuda":
         torch.cuda.empty_cache()

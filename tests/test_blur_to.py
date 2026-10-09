@@ -273,3 +273,45 @@ def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, m
     avg = (tmp_path / "acf.fwhmx_reml.txt").read_text().splitlines()[-1].split()
     classic = float(np.exp(np.mean(np.log([float(v) for v in avg[1:4]]))))
     assert classic == pytest.approx(6.0, rel=0.05)
+
+
+def test_local_blur_to_evens_out_a_volume_that_is_rough_on_one_side():
+    import torch
+
+    from fastfuncstuff.stats.blur_to import (
+        local_volume_fwhm,
+        volume_blur_to_fwhm,
+        volume_blur_to_fwhm_local,
+        volume_fwhm,
+    )
+
+    cpu = torch.device("cpu")
+    shape, vox = (48, 40, 20), (2.0, 2.0, 2.0)
+    mask = np.ones(shape, bool)
+    mask[[0, -1]] = mask[:, [0, -1]] = mask[:, :, [0, -1]] = False
+    rough = _smooth_noise_vol(shape, 320, 1.0, 1).reshape(*shape, -1)
+    smooth = _smooth_noise_vol(shape, 320, 3.0, 2).reshape(*shape, -1)
+    smooth /= smooth.std()
+    rough /= rough.std()
+    y = np.concatenate([rough[:24], smooth[24:]], axis=0).reshape(-1, 320)
+    left, right = np.zeros(shape, bool), np.zeros(shape, bool)
+    left[4:20] = mask[4:20]
+    right[28:44] = mask[28:44]
+
+    def halves(x):
+        loc = local_volume_fwhm(x, mask, vox, 8.0, cpu).numpy()
+        return float(np.nanmedian(loc[left])), float(np.nanmedian(loc[right]))
+
+    master, held = y[:, :160], y[:, 160:]
+    ad, start, achieved, _ = volume_blur_to_fwhm_local(master, mask, vox, 9.0, device=cpu)
+    assert ad is not None and achieved == pytest.approx(9.0, rel=0.03)
+    g, _, _ = volume_blur_to_fwhm(master, mask, vox, 9.0, device=cpu)
+    l_ad, r_ad = halves(ad(held))
+    l_g, r_g = halves(g(held))
+    # one kernel keeps the rough side rough; diffusion that stops where the target is
+    # reached brings the two sides together, and the replay lands on held-out data
+    assert abs(l_ad - r_ad) < 0.5 * abs(l_g - r_g)
+    assert volume_fwhm(ad(held), mask, vox, cpu) == pytest.approx(9.0, rel=0.04)
+    # outside the mask nothing moves
+    out = ~mask.reshape(-1)
+    np.testing.assert_allclose(ad(held)[out], held[out], rtol=1e-6)

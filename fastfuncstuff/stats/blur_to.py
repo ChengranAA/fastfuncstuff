@@ -196,12 +196,7 @@ def volume_fwhm(x: np.ndarray, mask: np.ndarray, voxdims, device=None) -> float:
 
     device = device if device is not None else torch.device("cpu")
     m = torch.as_tensor(np.asarray(mask, bool), device=device)
-    z = torch.as_tensor(np.asarray(x, np.float32), device=device)
-    z = z - z.mean(1, keepdim=True)
-    sd = z.norm(dim=1, keepdim=True)
-    z = torch.where(sd > 0, z / sd.clamp_min(1e-30), torch.zeros_like(z))
-    z = z.T.reshape(z.shape[1], *m.shape)  # (k, s0, s1, s2), unit norm over time
-    ok = m & (sd.reshape(m.shape) > 0)
+    z, ok = _unit_rows(torch.as_tensor(np.asarray(x, np.float32), device=device), m)
     out = []
     for ax, width in enumerate(abs(float(v)) for v in voxdims):
         lo = [slice(None)] * 3
@@ -239,3 +234,198 @@ def volume_blur_to_fwhm(
         return volume_fwhm(g(master), mask, voxdims, device), g
 
     return bisect_kernel(measure, target, tol)
+
+
+# ---------------------------------------------------------------------------
+# Spatially varying: diffuse until each place reaches the target (3dBlurToFWHM)
+# ---------------------------------------------------------------------------
+
+
+def _unit_rows(x, m):
+    """``(V, k)`` -> ``(k, *m.shape)`` torch, each voxel centred to unit norm over time."""
+    import torch
+
+    z = x - x.mean(1, keepdim=True)
+    sd = z.norm(dim=1, keepdim=True)
+    z = torch.where(sd > 0, z / sd.clamp_min(1e-30), torch.zeros_like(z))
+    return z.T.reshape(z.shape[1], *m.shape), m & (sd.reshape(m.shape) > 0)
+
+
+def local_volume_fwhm(x, mask, voxdims, radius_mm: float, device=None):
+    """Per-voxel FWHM (mm, ``mask``-shaped torch, NaN outside): :func:`volume_fwhm`'s
+    neighbour correlation, pooled per axis over a Gaussian neighbourhood of
+    ``radius_mm`` (its FWHM) inside the mask, then combined. 3dLocalstat -stat FWHM's
+    role, scale-free like the global estimate."""
+    import torch
+
+    from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox, gaussian3d_batched
+
+    device = device if device is not None else torch.device("cpu")
+    m = torch.as_tensor(np.asarray(mask, bool), device=device)
+    xt = torch.as_tensor(np.asarray(x, np.float32), device=device) if not torch.is_tensor(x) else x
+    z, ok = _unit_rows(xt, m)
+    widths = [abs(float(v)) for v in voxdims]
+    sig = fwhm_mm_to_sigma_vox(radius_mm, tuple(widths))
+    logs = torch.zeros(m.shape, device=device)
+    n_ax = torch.zeros(m.shape, device=device)
+    for ax, width in enumerate(widths):
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[ax], hi[ax] = slice(0, -1), slice(1, None)
+        pair = (ok[tuple(lo)] & ok[tuple(hi)]).float()
+        c = (z[(slice(None), *lo)] * z[(slice(None), *hi)]).sum(0) * pair
+        # Each pair counts at both of its voxels.
+        num = torch.zeros(m.shape, device=device)
+        den = torch.zeros(m.shape, device=device)
+        num[tuple(lo)] += c
+        num[tuple(hi)] += c
+        den[tuple(lo)] += pair
+        den[tuple(hi)] += pair
+        stack = torch.stack([num, den])
+        num, den = gaussian3d_batched(stack, sig)
+        rho = (num / den.clamp_min(1e-12)).clamp(1e-6, 1 - 1e-6)
+        f = 2.35482 * width * torch.sqrt(-1.0 / (4.0 * torch.log(rho)))
+        good = den > 1e-3
+        logs += torch.where(good, torch.log(f), torch.zeros_like(f))
+        n_ax += good.float()
+    out = torch.exp(logs / n_ax.clamp_min(1))
+    return torch.where(m & (n_ax > 0), out, torch.full_like(out, float("nan")))
+
+
+class AdaptiveDiffusion:
+    """A recorded sequence of explicit diffusion steps with a per-voxel diffusivity,
+    inside a mask (no flux across its edge -- 3dBlurToFWHM's Neumann wall). Replaying
+    it on any ``(V, T)`` rows applies exactly the operator the search measured."""
+
+    def __init__(self, mask: np.ndarray, voxdims, device=None):
+        import torch
+
+        from fastfuncstuff.utils import get_device
+
+        self.device = device if device is not None else get_device()
+        self.shape = tuple(int(n) for n in mask.shape)
+        self.m = torch.as_tensor(np.asarray(mask, bool), device=self.device)
+        self.h2 = [abs(float(v)) ** 2 for v in voxdims]
+        # Explicit Euler is stable for dt * sum(2 / h^2) <= 1 at unit diffusivity.
+        self.dt_max = 0.9 / sum(2.0 / h for h in self.h2)
+        self.steps: list[tuple[float, object]] = []  # (dt, bool map: who still diffuses)
+        self._idx = torch.as_tensor(np.flatnonzero(np.asarray(mask, bool)), device=self.device)
+
+    def step(self, u, dt: float, d):
+        """One step on ``(k, *shape)`` torch ``u``; ``d`` marks the voxels still diffusing."""
+        import torch
+
+        du = torch.zeros_like(u)
+        dm = d.float() * self.m
+        for ax, h2 in enumerate(self.h2):
+            lo = [slice(None)] * 3
+            hi = [slice(None)] * 3
+            lo[ax], hi[ax] = slice(0, -1), slice(1, None)
+            # Face diffusivity: the smaller side's, so a frozen voxel neither takes
+            # nor gives -- and zero across the mask edge.
+            face = torch.minimum(dm[tuple(lo)], dm[tuple(hi)])
+            flux = face * (u[(slice(None), *hi)] - u[(slice(None), *lo)]) / h2
+            du[(slice(None), *lo)] += flux
+            du[(slice(None), *hi)] -= flux
+        return u + dt * du
+
+    def _volumes(self, x):
+        import torch
+
+        k = x.shape[1]
+        vol = torch.zeros((k, *self.shape), device=self.device)
+        vol.reshape(k, -1)[:, self._idx] = torch.as_tensor(
+            np.ascontiguousarray(np.asarray(x)[self._idx.cpu().numpy()].T, np.float32),
+            device=self.device,
+        )
+        return vol
+
+    def __call__(self, data: np.ndarray) -> np.ndarray:
+        from fastfuncstuff.memory import get_available_memory
+
+        x = np.asarray(data)
+        out = np.array(x, dtype=np.float32, copy=True)
+        if not self.steps:
+            return out
+        idx = self._idx.cpu().numpy()
+        per_t = 6 * int(np.prod(self.shape)) * 4
+        chunk = max(1, min(x.shape[1], int(get_available_memory(self.device) // per_t)))
+        for t0 in range(0, x.shape[1], chunk):
+            u = self._volumes(x[:, t0 : t0 + chunk])
+            for dt, d in self.steps:
+                u = self.step(u, dt, d)
+            out[idx, t0 : t0 + chunk] = u.reshape(u.shape[0], -1)[:, self._idx].T.cpu().numpy()
+        return out
+
+
+def volume_blur_to_fwhm_local(
+    master: np.ndarray,
+    mask: np.ndarray,
+    voxdims,
+    target: float,
+    radius_mm: float = 8.0,
+    device=None,
+    max_steps: int = 400,
+    tol: float = 0.02,
+) -> tuple[AdaptiveDiffusion | None, float, float, object]:
+    """Spatially varying blur-to (3dBlurToFWHM's method): diffuse the master in small
+    steps, re-measure each voxel's local FWHM (:func:`local_volume_fwhm`, pooled over
+    ``radius_mm``) after each, and stop diffusing wherever it has reached ``target``.
+    Done when the global FWHM reaches it -- the last step trimmed so it lands -- or
+    nothing is left to diffuse. Rough places get more blur than smooth ones, so the
+    result is closer to stationary, which is what a single cluster table assumes.
+
+    Returns ``(diffusion, start_fwhm, achieved_fwhm, local_fwhm_map)``; ``diffusion``
+    is None when the master is already that smooth. Local estimates need more time
+    points than the global one: ~160 keeps the 90th-percentile error near 3%.
+    """
+    import torch
+
+    from fastfuncstuff.utils import get_device
+
+    device = device if device is not None else get_device()
+    mask = np.asarray(mask, bool)
+    ad = AdaptiveDiffusion(mask, voxdims, device=device)
+    u = ad._volumes(master)
+
+    def glob(u_):
+        return volume_fwhm(u_.reshape(u_.shape[0], -1).T.cpu().numpy(), mask, voxdims, device)
+
+    start = glob(u)
+    if not np.isfinite(start) or start >= target:
+        return (
+            None,
+            float(start),
+            float(start),
+            local_volume_fwhm(u.reshape(u.shape[0], -1).T, mask, voxdims, radius_mm, device),
+        )
+    # Small steps: about a tenth of the remaining FWHM^2 per step, never past stability.
+    dt_goal = ((target**2 - start**2) / (8 * np.log(2)) / 2.0) / 10.0
+    dt = min(ad.dt_max, max(dt_goal, 1e-4))
+    achieved = start
+    for _ in range(max_steps):
+        local = local_volume_fwhm(u.reshape(u.shape[0], -1).T, mask, voxdims, radius_mm, device)
+        d = (local < target) & torch.isfinite(local)
+        if not bool(d.any()):
+            break
+        nxt = ad.step(u, dt, d)
+        f = glob(nxt)
+        if f >= target * (1 + tol):
+            # Trim the last step: the global FWHM is monotone in dt.
+            lo, hi = 0.0, dt
+            for _ in range(12):
+                mid = 0.5 * (lo + hi)
+                if glob(ad.step(u, mid, d)) >= target:
+                    hi = mid
+                else:
+                    lo = mid
+            ad.steps.append((hi, d))
+            u = ad.step(u, hi, d)
+            achieved = glob(u)
+            break
+        ad.steps.append((dt, d))
+        u, achieved = nxt, f
+        if achieved >= target:
+            break
+    local = local_volume_fwhm(u.reshape(u.shape[0], -1).T, mask, voxdims, radius_mm, device)
+    return ad, float(start), float(achieved), local

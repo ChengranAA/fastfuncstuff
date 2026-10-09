@@ -161,17 +161,11 @@ def _build_crit(st: LagStats) -> _Crit:
         @ Fm
     )
     # per-run coefficients on local columns, features folded
-    Ag = torch.einsum(
-        "vrfk,fs->vrsk",
-        torch.cat(
-            [
-                st.SXr.reshape(V, R, P1 * P1, kl),
-                torch.einsum("rsK,vrt->vrstK", xh, rh).reshape(V, R, P * P, kl),
-            ],
-            dim=2,
-        ),
-        Fm,
-    )  # (V, R, F, kl)
+    # Fold each feature block separately: concatenating first doubles the
+    # largest tensor here (V × R × F × kl), which is what limits the batch.
+    n1 = P1 * P1
+    Ag = torch.einsum("vrfk,fs->vrsk", st.SXr.reshape(V, R, n1, kl), Fm[:n1])
+    Ag += torch.einsum("rsK,vrt,stf->vrfK", xh, rh, Fm[n1:].reshape(P, P, F))  # (V, R, F, kl)
     Am = torch.einsum(
         "rfx,fs->rsx",
         torch.cat(

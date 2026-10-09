@@ -278,3 +278,34 @@ def test_ribbon_map_comes_back_from_disk_until_the_mesh_changes(world, monkeypat
     s.surfaces.version["lh"] = s.surfaces.version.get("lh", 0) + 1
     with pytest.raises(AssertionError, match="rebuilt"):
         s.surfaces.ribbon_map("lh", base.shape, base.affine)
+
+
+def test_launch_command_reopens_what_is_loaded(world):
+    import shlex
+
+    from fastfuncstuff.cli.viewer import build_parser
+    from fastfuncstuff.viewer.vocab import Load
+
+    s, tmp_path, _, _, _ = world
+    s.read_directory(str(tmp_path))
+    s.do(Load(str(tmp_path / "s.lh.func.gii")))
+    gone = tmp_path / "gone.nii.gz"
+    gone.write_bytes((tmp_path / "anat.nii.gz").read_bytes())
+    s.do(Load(str(gone)))
+    gone.unlink()  # loaded, then deleted: nothing left to name
+
+    line = s.launch_command()
+    command, _, note = line.partition("  # not reloaded: ")
+    assert note == "gone.nii.gz"
+    argv = shlex.split(command)
+    assert argv[0] == "ffs_viewer"
+    args = build_parser().parse_args(argv[1:])
+    assert args.read == str(tmp_path.resolve())
+    assert args.datasets == [str((tmp_path / "anat.nii.gz").resolve())]
+    assert args.surf_data == [str((tmp_path / "s.lh.func.gii").resolve())]
+    assert sorted(args.mesh) == sorted(
+        str((tmp_path / f"{h}.{k}.surf.gii").resolve())
+        for h in ("lh", "rh")
+        for k in ("white", "pial")
+    )
+    assert args.surfaces is None

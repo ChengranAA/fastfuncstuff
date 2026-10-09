@@ -1541,6 +1541,44 @@ class ViewerSession:
     def to_script(self, *, header: str | None = None) -> str:
         return self.bus.to_script(header=header)
 
+    def launch_command(self) -> str:
+        """The ``ffs_viewer`` command line that opens what is loaded now.
+
+        What is on disk, by absolute path: the directory read, the stack's files
+        bottom first, the subject's surfaces (and any meshes added beside them),
+        and surface results. Not edits, display settings or windows -- that is
+        the session script -- and not layers computed here (a mode's overlay, a
+        DERIVE), which have no file to name; those are listed after a ``#``.
+        """
+        import shlex
+
+        def full(p) -> str:
+            return str(Path(p).expanduser().resolve())
+
+        args = ["ffs_viewer"]
+        if self.catalog_dir is not None:
+            args += ["-read", full(self.catalog_dir)]
+        surfaces = self.surfaces
+        surf_dir = None
+        if surfaces.subject is not None:
+            args += ["-surfaces", full(surfaces.subject)]
+            if surfaces.space != "native":
+                args += ["-surf_space", surfaces.space]
+            surf_dir = Path(surfaces.subject).resolve() / "surf"
+        for m in surfaces.meshes:
+            if m.path is not None and Path(m.path).resolve().parent != surf_dir:
+                args += ["-mesh", full(m.path)]
+        files, surf_data, skipped = [], [], []
+        for layer in self.state.layers:
+            if layer.source == "file" and Path(layer.path).exists():
+                files.append(full(layer.path))
+            elif layer.source.startswith("surface:") and Path(layer.path).exists():
+                surf_data += ["-surf_data", full(layer.path)]
+            else:
+                skipped.append(layer.name)
+        line = shlex.join(args + surf_data + files)
+        return line + (f"  # not reloaded: {', '.join(skipped)}" if skipped else "")
+
     def save_script(self, path: str | Path, *, header: str | None = None) -> Path:
         out = Path(path)
         out.write_text(self.to_script(header=header))

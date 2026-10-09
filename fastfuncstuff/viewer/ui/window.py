@@ -658,6 +658,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 self._cascade,
             ),
             ("RAISE", "r", "Bring every companion window to the front", self._raise_all),
+            (
+                "CMD",
+                "ctrl+P",
+                "Print the ffs_viewer command that reopens what is loaded (files, "
+                "directory, surfaces) to the terminal, and copy it",
+                self._print_launch_command,
+            ),
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
             b.setObjectName("tool")
@@ -1758,9 +1765,22 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     group="session",
                 ),
                 Binding("ctrl+s", "save session script", self._save_script_dialog, group="session"),
+                Binding(
+                    "ctrl+p",
+                    "print the command that reopens what is loaded",
+                    self._print_launch_command,
+                    group="session",
+                ),
                 Binding("h", "this list", self.help.toggle, group="session"),
             ]
         )
+
+    def _print_launch_command(self) -> None:
+        """To the terminal it was started from, and the clipboard: close, paste, back."""
+        line = self.session.launch_command()
+        print(line, flush=True)
+        QtGui.QGuiApplication.clipboard().setText(line.split("  # not reloaded:")[0])
+        self.statusBar().showMessage("reopen command printed to the terminal and copied", 6000)
 
     def _activate_letter(self, letter: str) -> None:
         found = next((c for c in self.controllers if c.letter == letter), None)
@@ -2431,10 +2451,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
         taller by hand is not pulled back every time a layer loads.
         """
         scroll = self.centralWidget()
-        panel = scroll.widget() if isinstance(scroll, QtWidgets.QScrollArea) else None
-        if panel is None or panel.layout() is None:
+        if not isinstance(scroll, QtWidgets.QScrollArea):
             return
-        panel.layout().activate()
+        panel = scroll.widget()
+        layout = panel.layout() if panel is not None else None
+        if panel is None or layout is None:
+            return
+        layout.activate()
         screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
         frame = self.frameGeometry().height() - self.height()
         cap = screen.availableGeometry().height() - frame if screen is not None else 10**6

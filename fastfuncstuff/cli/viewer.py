@@ -56,6 +56,8 @@ keys (main window)
   a  alpha mode        s  sign mode       b  boxed      c  colormap
   D                    denoise the selected run into a new layer
   ctrl+O  open         ctrl+S  save session script       h  this list
+  ctrl+P               print (and copy) the ffs_viewer command that reopens
+                       what is loaded -- files, directory, surfaces; not edits
   O                    cycle surface outlines (white+pial / white / pial / off)
   ctrl+shift+S         save edited surfaces as ?h.<surf>.<suffix> copies
   ctrl+shift+I         install edits over the originals (asks; keeps backups)

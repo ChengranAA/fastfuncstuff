@@ -192,6 +192,19 @@ def test_surface_chain_blur_to_acf_and_clustsim(tmp_path, monkeypatch):
     area = np.asarray(table["area_mm2"])
     assert area.shape == (9, 4) and (np.diff(area, axis=0) <= 1e-9).all()  # stricter p, smaller
     assert (tmp_path / "s_clustsim" / "surfclustsim.2-sided.1D").exists()
+    # the same fit, the null from its residuals instead of the ACF
+    _reml(
+        monkeypatch,
+        "-input", str(tmp_path / "raw.func.gii"), "-events", str(tmp_path / "ev.tsv"),
+        "-mask", str(tmp_path / "m.shape.gii"), "-blur_to_fwhm", "5",
+        "-Rbuck", str(tmp_path / "r.func.gii"), "-tout",
+        "-clustsim", "-clustsim_niter", "200", "-clustsim_null", "resid",
+    )  # fmt: skip
+    resid = json.loads(nib.load(str(tmp_path / "r.func.gii")).meta["ClustSim_bi-sided"])
+    r_area = np.asarray(resid["area_mm2"])
+    assert r_area.shape == (9, 4) and (np.diff(r_area, axis=0) <= 1e-9).all()
+    # stationary noise: the two nulls agree to Monte-Carlo error at the loosest p
+    assert r_area[0, 1] == pytest.approx(area[0, 1], rel=0.5)
     assert bucket.meta["mesh_fingerprint"] == fp
     # and the data really were blurred to the target before the fit
     assert surface_fwhm(noise, verts, faces)[0] < 3.0

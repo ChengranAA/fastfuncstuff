@@ -315,12 +315,15 @@ def surface_clustsim(
     cache_dir: str | os.PathLike | None | bool = None,
     n_basis: int = 10,
     verb: int = 1,
+    noise=None,
 ) -> SurfClustSimResult:
     """Simulate ``niter`` null fields and record the largest cluster area per threshold.
 
     ``cache_dir``: None uses the default cache, False disables it. The result is a pure
     function of (geometry, mask, ACF, niter, pthr, sideds, seed), so a hit returns the
-    stored maxima without simulating.
+    stored maxima without simulating. ``noise`` replaces the mixed-ACF generator (e.g.
+    ``stats.clustsim.ResidualSignFlipNull``); its fields depend on the data, so they are
+    never cached.
     """
     from tqdm import tqdm
 
@@ -328,7 +331,7 @@ def surface_clustsim(
     f = np.asarray(faces, np.int64)
     m = np.ones(len(v), bool) if mask is None else np.asarray(mask, bool)
     path = None
-    if cache_dir is not False:
+    if cache_dir is not False and noise is None:
         base = default_cache_dir() if cache_dir is None else Path(cache_dir)
         key = _cache_key(v, f, m, acf, niter, pthr, sideds, seed, n_basis)
         path = base / f"{key}.npz"
@@ -338,7 +341,8 @@ def surface_clustsim(
                 tuple(pthr), {s: z[s] for s in sideds}, niter, acf,
                 list(z["weights"]), float(z["fit_rms"]), cached=True,
             )  # fmt: skip
-    noise = MixedNoise(v, f, acf, m, n_basis=n_basis, device=device)
+    if noise is None:
+        noise = MixedNoise(v, f, acf, m, n_basis=n_basis, device=device)
     edges = mesh_edges(f)
     edges = edges[m[edges[:, 0]] & m[edges[:, 1]]]
     area = np.where(m, vertex_areas(v, f), 0.0)
@@ -351,10 +355,12 @@ def surface_clustsim(
         fields = noise.sample(n, rng)
         for s in sideds:
             out[s][start : start + n] = max_cluster_areas(fields, edges, area, zthr[s], s)
-    res = SurfClustSimResult(tuple(pthr), out, niter, acf, list(noise.weights), noise.fit_rms)
+    weights = list(getattr(noise, "weights", []))
+    fit_rms = float(getattr(noise, "fit_rms", float("nan")))
+    res = SurfClustSimResult(tuple(pthr), out, niter, acf, weights, fit_rms)
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(path, weights=noise.weights, fit_rms=noise.fit_rms, **out)
+        np.savez(path, weights=weights, fit_rms=fit_rms, **out)
     return res
 
 

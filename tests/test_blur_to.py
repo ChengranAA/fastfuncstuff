@@ -247,7 +247,7 @@ def test_volume_blur_to_lands_on_the_target_on_the_whole_data():
     assert none is None and start > 2.0
 
 
-def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, monkeypatch):
+def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, monkeypatch, capsys):
     import nibabel as nib
 
     from fastfuncstuff.cli import reml
@@ -288,7 +288,10 @@ def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, m
     assert classic("acf") == pytest.approx(6.0, rel=0.05)
     run(*common, "-mask", str(tmp_path / "mask.nii"), "-Rbuck", str(tmp_path / "l.nii"),
         "-blur_to_local", "-save_blur_fwhm", str(tmp_path / "loc.nii"),
-        "-save_acf", str(tmp_path / "acfl"))  # fmt: skip
+        "-save_acf", str(tmp_path / "acfl"), "-clustsim", "-clustsim_niter", "200")  # fmt: skip
+    # -blur_to_local makes smoothness vary on purpose: the table comes from the residuals
+    assert "sign-flipped residuals" in capsys.readouterr().out
+    assert list((tmp_path / "l_clustsim").glob("*.NN1_bisided.1D"))
     assert classic("acfl") == pytest.approx(6.0, rel=0.05)
     fmap = np.asarray(nib.load(str(tmp_path / "loc.nii")).dataobj)
     assert fmap.shape == shape and np.median(fmap[mask]) == pytest.approx(6.0, rel=0.1)

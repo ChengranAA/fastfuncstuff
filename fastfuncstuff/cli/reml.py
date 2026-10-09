@@ -439,6 +439,19 @@ Examples:
         "parsed back in. Needs a mask (-mask, else the automask of the grand mean).",
     )
     diag_out.add_argument(
+        "-clustsim_null",
+        choices=("acf", "resid"),
+        default=None,
+        help="-clustsim's null fields. acf: noise with the residuals' mixed ACF "
+        "(3dClustSim; stationary by construction). resid: random sign-flipped sums of "
+        "this fit's own residual time points, which carry their real spatial "
+        "covariance -- the heavy tail, and smoothness that varies across the brain. On "
+        "a half-rough, half-smooth null field the ACF table's real false-positive rate "
+        "was 0.17 at a nominal 0.05, the residual table's 0.050; on a stationary field "
+        "both were ~0.05. Default: resid under -blur_to_local / -blur_to_tsnr (which "
+        "make smoothness vary on purpose), acf otherwise.",
+    )
+    diag_out.add_argument(
         "-clustsim_niter",
         "-clustsim-niter",
         dest="clustsim_niter",
@@ -1510,10 +1523,18 @@ def _run_surface_clustsim(args, diag, device) -> None:
         print("  ⚠️  skipped: no bucket to attach the tables to.")
         return
     a = info["acf"]
+    noise = None
+    if _clustsim_null(args) == "resid":
+        noise = _residual_null(diag, info["mask"], _surface_device(device) or torch.device("cpu"))
+        print(
+            "  null: sign-flipped residuals (their own spatial covariance, no ACF model)"
+            if noise is not None
+            else "  ⚠️  no residuals kept for -clustsim_null resid: using the ACF null"
+        )
     try:
         res = surface_clustsim(
             info["vertices"], info["faces"], ACF(a.a, a.b, max(a.c, 1e-3)), info["mask"],
-            niter=args.clustsim_niter, device=_surface_device(device), verb=1,
+            niter=args.clustsim_niter, device=_surface_device(device), verb=1, noise=noise,
         )  # fmt: skip
         stem = str(buck).removesuffix(".gii").removesuffix(".func").removesuffix(".shape")
         out_dir = Path(args.clustsim_prefix or f"{stem}_clustsim")
@@ -3915,6 +3936,13 @@ def main():
                     # compute device. Index with a CPU mask to avoid a CPU/CUDA
                     # index mismatch. observe_residuals re-homes _dmask itself.
                     _dmf = _dmask.reshape(-1).bool().cpu()
+                    if args.clustsim and _clustsim_null(args) == "resid":
+                        # Kept for the sign-flip null, which runs after the buckets
+                        # are written; ResidualSignFlipNull uses at most 1000 points.
+                        _keep_t = np.sort(
+                            np.random.default_rng(0).choice(_nt, size=min(_nt, 1000), replace=False)
+                        )
+                        diag.null_resid = _full[_dmf][:, torch.as_tensor(_keep_t)].clone()
                     diag.observe_residuals(
                         {_label: _full[_dmf]},
                         _dmask,
@@ -4788,6 +4816,24 @@ def _resolve_written_bucket(buck: str | None) -> str | None:
     return None
 
 
+def _clustsim_null(args) -> str:
+    """-clustsim_null as given, else resid when the blur made smoothness vary on purpose."""
+    if args.clustsim_null:
+        return args.clustsim_null
+    local = args.blur_to_local or getattr(args, "blur_to_tsnr", None) is not None
+    return "resid" if local else "acf"
+
+
+def _residual_null(diag, mask, device):
+    """The sign-flip null from the residuals the diagnostics kept, or None."""
+    from fastfuncstuff.stats.clustsim import ResidualSignFlipNull
+
+    rows = getattr(diag, "null_resid", None)
+    if rows is None:
+        return None
+    return ResidualSignFlipNull(mask, rows, device=device, seed=0)
+
+
 def _run_clustsim(args, diag, device) -> None:
     """Attach Monte-Carlo cluster-size tables to the stat bucket(s) (-clustsim).
 
@@ -4838,11 +4884,20 @@ def _run_clustsim(args, diag, device) -> None:
             f"    ACF({a:.4f}, {b:.4f}, {c:.4f}) from the {label.upper()} residuals, "
             f"FWHM {fwhm:.2f} mm; {int(mask.sum()):,} voxels; {args.clustsim_niter} iterations"
         )
+        simulator = None
+        if _clustsim_null(args) == "resid":
+            simulator = _residual_null(diag, mask, device)
+            print(
+                "    null: sign-flipped residuals (their own spatial covariance, no ACF model)"
+                if simulator is not None
+                else "    ⚠️  no residuals kept for -clustsim_null resid: using the ACF null"
+            )
         try:
             attach_clustsim_tables(
                 mask,
                 voxmm,
                 ACF(a, b, c),
+                simulator=simulator,
                 prefix=Path(prefix),
                 refit=target,
                 n_iter=args.clustsim_niter,

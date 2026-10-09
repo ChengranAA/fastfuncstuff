@@ -359,3 +359,78 @@ def test_reml_clustsim_attaches_tables_and_survives_adjust_dof(tmp_path):
     adjusted = tmp_path / "s2.nii.gz"
     run(adjusted, "-adjust_dof", "5")
     assert clustsim_attrs(adjusted) == attrs
+
+
+# ---------------------------------------------------------------------------
+# The residual sign-flip null
+# ---------------------------------------------------------------------------
+
+
+def _two_sided_field(rng, shape, mask, n):
+    """Null fields rough on one side (sigma 1 voxel) and smooth on the other (3)."""
+    from scipy.ndimage import gaussian_filter
+
+    half = shape[0] // 2
+    out = []
+    for _ in range(n):
+        w = rng.normal(size=shape)
+        r = gaussian_filter(w, 1.0, mode="wrap")
+        s = gaussian_filter(w, 3.0, mode="wrap")
+        f = np.concatenate([r[:half] / r[:half].std(), s[half:] / s[half:].std()], 0)
+        out.append(f[mask])
+    return np.stack(out, 1)
+
+
+def test_sign_flip_null_has_unit_variance_and_the_residual_correlation():
+    from fastfuncstuff.stats.clustsim import ResidualSignFlipNull
+
+    rng = np.random.default_rng(0)
+    shape = (16, 12, 10)
+    mask = np.ones(shape, bool)
+    e = _two_sided_field(rng, shape, mask, 200) * rng.uniform(0.5, 3.0, size=(mask.sum(), 1))
+    null = ResidualSignFlipNull(mask, e, seed=1)
+    f = null.generate(4000).numpy()  # (n, n_mask)
+    np.testing.assert_allclose(f.var(0), 1.0, atol=0.08)  # whatever each voxel's scale
+    ec = e - e.mean(1, keepdims=True)
+    ec /= np.linalg.norm(ec, axis=1, keepdims=True)
+    i, j = 5, 6  # neighbours along the last axis, on the rough side
+    np.testing.assert_allclose(np.corrcoef(f[:, i], f[:, j])[0, 1], ec[i] @ ec[j], atol=0.04)
+    v = null.sample(3)  # the surface interface: (V, n), zero outside the mask
+    assert v.shape == (mask.size, 3)
+
+
+@pytest.mark.slow
+def test_sign_flip_table_holds_its_false_positive_rate_where_one_acf_cannot():
+    # Measured once at full size: FWER 0.050 (residual) vs 0.171 (global ACF).
+    from scipy.ndimage import label
+
+    from fastfuncstuff.stats.clustsim import ResidualSignFlipNull
+    from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
+
+    rng = np.random.default_rng(0)
+    shape, vox = (40, 32, 24), (2.0, 2.0, 2.0)
+    mask = np.ones(shape, bool)
+    mask[[0, -1]] = mask[:, [0, -1]] = mask[:, :, [0, -1]] = False
+    e = _two_sided_field(rng, shape, mask, 300)
+    kw = dict(n_iter=1000, pthr=(0.001,), athr=(0.05,), nns=(1,), sideds=("1-sided",),
+              n_jobs=4, verbose=False)  # fmt: skip
+    null_r = simulate_cluster_null(mask, vox, None, simulator=ResidualSignFlipNull(mask, e), **kw)
+    est = estimate_fwhmx_run(
+        torch.as_tensor(e.astype(np.float32)), torch.as_tensor(mask), shape, vox,
+        unif=True, unif_scale="sd", progress=False,
+    )  # fmt: skip
+    null_a = simulate_cluster_null(mask, vox, ACF(est.a, est.b, est.c), seed=1, **kw)
+    k_r = gumbel_extent_table(null_r.max_extent[("1-sided", 1)], (0.05,), 1000)[0, 0]
+    k_a = gumbel_extent_table(null_a.max_extent[("1-sided", 1)], (0.05,), 1000)[0, 0]
+    z = zthresholds((0.001,), ("1-sided",))["1-sided"][0]
+    fresh = _two_sided_field(rng, shape, mask, 600)
+    hits_r = hits_a = 0
+    for i in range(fresh.shape[1]):
+        vol = np.zeros(shape)
+        vol[mask] = fresh[:, i]
+        lab, n = label(vol > z)
+        big = np.bincount(lab.ravel())[1:].max() if n else 0
+        hits_r += big >= k_r
+        hits_a += big >= k_a
+    assert 0.02 < hits_r / 600 < 0.085
+    assert hits_a / 600 > 0.10

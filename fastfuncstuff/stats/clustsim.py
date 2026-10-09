@@ -336,6 +336,80 @@ class NullFieldSimulator:
         return crop[:, self.mask_idx]
 
 
+class ResidualSignFlipNull:
+    """Null fields from the fit's own residuals, with no ACF model.
+
+    Each field is ``sum_t w_t e_t`` with independent random signs ``w_t``, every voxel's
+    residual series scaled to unit norm first. Over the signs, the field's covariance
+    between two voxels is exactly their residual correlation (``sum_t e_t e_t^T``), so
+    every voxel has variance 1 and the field carries the residuals' real spatial
+    structure: the heavy tail no mixed ACF fits perfectly, and smoothness that varies
+    across the brain (``-blur_to_local``, ``-blur_to_tsnr``, vessels), which any
+    stationary ACF null averages away. Temporal autocorrelation does not matter -- the
+    signs are independent whatever the residuals are. 3dttest++ -Clustsim's
+    sign-flipping, applied to one subject's residuals.
+
+    ``mask`` (any shape, bool) and ``residuals`` (``(n_mask, T)``, rows in mask order).
+    At most ``max_timepoints`` random time points are kept: past a few hundred, more
+    terms only make each field's marginal more exactly Gaussian. Serves both drivers:
+    ``generate(n) -> (n, n_mask)`` torch (volume) and ``sample(n, rng) -> (V, n)``
+    (surface, zero outside the mask).
+    """
+
+    def __init__(
+        self,
+        mask: np.ndarray,
+        residuals,
+        *,
+        device: torch.device | None = None,
+        seed: int | None = None,
+        max_timepoints: int = 1000,
+    ) -> None:
+        self.mask = np.ascontiguousarray(np.asarray(mask, bool))
+        self.device = device if device is not None else torch.device("cpu")
+        e = torch.as_tensor(np.asarray(residuals) if not torch.is_tensor(residuals) else residuals)
+        e = e.to(torch.float32)
+        if e.shape[0] != int(self.mask.sum()):
+            raise ValueError(f"{e.shape[0]} residual rows for {int(self.mask.sum())} mask voxels")
+        rng = np.random.default_rng(seed)
+        if e.shape[1] > max_timepoints:
+            cols = np.sort(rng.choice(e.shape[1], size=max_timepoints, replace=False))
+            e = e[:, torch.as_tensor(cols)]
+        e = e - e.mean(dim=1, keepdim=True)
+        norm = e.norm(dim=1, keepdim=True)
+        self.e = torch.where(norm > 0, e / norm.clamp_min(1e-30), torch.zeros_like(e)).to(
+            self.device
+        )
+        self.n_time = int(self.e.shape[1])
+        self.gen = torch.Generator(device=self.device)
+        self.gen.manual_seed(int(rng.integers(2**31)))
+        self.acf = None
+
+    @property
+    def fwhm(self) -> float:
+        return float("nan")
+
+    def bytes_per_field(self) -> int:
+        return int(self.e.shape[0]) * 4 * 2 + self.n_time * 4
+
+    def _signs(self, n: int) -> torch.Tensor:
+        w = torch.randint(0, 2, (self.n_time, n), generator=self.gen, device=self.device)
+        return w.to(torch.float32).mul_(2.0).sub_(1.0)
+
+    def generate(self, n: int) -> torch.Tensor:
+        """``[n, n_mask]`` float32 null fields on ``self.device``."""
+        return (self.e @ self._signs(n)).T.contiguous()
+
+    def sample(self, n: int, rng: np.random.Generator | None = None):
+        """``(V, n)`` fields, zero outside the mask (the surface driver's interface)."""
+        if rng is not None:
+            self.gen.manual_seed(int(rng.integers(2**31)))
+        rows = self.e @ self._signs(n)
+        out = torch.zeros((self.mask.size, n), dtype=torch.float32, device=self.device)
+        out[torch.as_tensor(np.flatnonzero(self.mask.ravel()), device=self.device)] = rows
+        return out.cpu().numpy() if self.device.type == "cpu" else out
+
+
 # ---------------------------------------------------------------------------
 # Alpha table
 # ---------------------------------------------------------------------------
@@ -436,7 +510,7 @@ def zthresholds(
 def simulate_cluster_null(
     mask: np.ndarray,
     voxmm: tuple[float, float, float],
-    acf: ACF,
+    acf: ACF | None,
     *,
     n_iter: int = 10000,
     pthr: tuple[float, ...] = DEFAULT_CS_PTHR,
@@ -449,6 +523,7 @@ def simulate_cluster_null(
     seed: int | None = None,
     on_device: bool | None = None,
     verbose: bool = True,
+    simulator: NullFieldSimulator | ResidualSignFlipNull | None = None,
 ) -> ClusterNull:
     """Run the Monte-Carlo simulation and return the accumulated null.
 
@@ -467,7 +542,9 @@ def simulate_cluster_null(
     Monte-Carlo error either way; pin ``batch`` when you need the same
     numbers twice.
     """
-    sim = NullFieldSimulator(mask, voxmm, acf, device=device, seed=seed)
+    if simulator is None and acf is None:
+        raise ValueError("simulate_cluster_null needs an ACF or a simulator")
+    sim = simulator or NullFieldSimulator(mask, voxmm, acf, device=device, seed=seed)
     tcrits = zthresholds(pthr, sideds)
 
     null = ClusterNull(pthr=pthr, athr=athr, nns=nns, sideds=sideds)
@@ -544,7 +621,7 @@ def simulate_cluster_null(
 
 
 def _simulate_on_device(
-    sim: NullFieldSimulator,
+    sim: NullFieldSimulator | ResidualSignFlipNull,
     null: ClusterNull,
     tcrits: dict[str, np.ndarray],
     n_iter: int,
@@ -591,7 +668,7 @@ def _simulate_on_device(
     return null
 
 
-def _plan_batch(sim: NullFieldSimulator, n_iter: int) -> int:
+def _plan_batch(sim: NullFieldSimulator | ResidualSignFlipNull, n_iter: int) -> int:
     """Fields per generation batch, from free memory on the target device."""
     from fastfuncstuff.memory import get_available_memory
 
@@ -720,6 +797,7 @@ def attach_clustsim_tables(
     mask_idcode: str | None = None,
     summary: bool = True,
     verbose: bool = True,
+    simulator: NullFieldSimulator | ResidualSignFlipNull | None = None,
 ) -> dict:
     """Simulate the null, write the ``.1D``/``.niml``/``.mask`` set, and refit.
 
@@ -756,6 +834,7 @@ def attach_clustsim_tables(
         seed=seed,
         on_device=on_device,
         verbose=verbose,
+        simulator=simulator,
     )
 
     mask_b64 = out_dir / f"{base}.mask"

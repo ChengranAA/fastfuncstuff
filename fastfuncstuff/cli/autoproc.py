@@ -1078,7 +1078,7 @@ def anat_group(subject, bids_dir: str | None = None) -> list[Path]:
 
     def key(p: Path) -> tuple[str | None, ...]:
         ent = parse_entities(p.name)
-        return tuple(ent.get(e) for e in ("acq", "rec", "echo"))
+        return tuple((ent.get(e) or "").lower() or None for e in ("acq", "rec", "echo"))
 
     want = key(primary)
     # The picked one leads: it is the base every other is aligned to.

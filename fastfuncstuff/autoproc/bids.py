@@ -875,9 +875,11 @@ def _scan_anats(sdir: Path) -> list[Path]:
         return []
     return [
         p
-        for p in sorted(anat_dir.glob("*_T1w.nii*"))
+        for p in sorted(anat_dir.glob("*.nii*"))
+        # Case-blind: scanner exports and hand-renamed trees write _t1w / acq-UNI.
+        if (parse_suffix(p.name) or "").lower() == "t1w"
         # quirk: skip non-BIDS derivatives (denoised/border/ROI) that lack sidecars.
-        if not any(tok in p.name for tok in ("_denoised", "_border", "_ROI"))
+        and not any(tok in p.name.lower() for tok in ("_denoised", "_border", "_roi"))
     ]
 
 
@@ -893,7 +895,7 @@ def _anat_rank(p: Path) -> tuple[int, int, int, str]:
     ent = parse_entities(p.name)
     rec = (ent.get("rec") or "").lower()
     return (
-        0 if ent.get("acq") == "uni" else 1,  # the MP2RAGE UNI image
+        0 if (ent.get("acq") or "").lower() == "uni" else 1,  # the MP2RAGE UNI image
         # A multi-echo MPRAGE files each echo AND the combined image under _T1w;
         # the one without an `echo` entity is the combination, and is the anat.
         0 if "echo" not in ent else 1,
@@ -906,7 +908,7 @@ def _pick_anat(t1s: list[Path]) -> Path | None:
     return min(t1s, key=_anat_rank) if t1s else None
 
 
-_ACQ_UNI = re.compile(r"(?<=_)acq-uni(?=_)")
+_ACQ = re.compile(r"(?<=_)acq-[a-zA-Z0-9]+(?=_)")
 
 
 def mp2rage_partners(uni: Path) -> tuple[Path | None, Path | None]:
@@ -914,10 +916,12 @@ def mp2rage_partners(uni: Path) -> tuple[Path | None, Path | None]:
 
     Same name with only the ``acq`` label swapped, so a run/rec/ses entity pairs
     each UNI with its own inversions and never with another repeat's."""
-    if parse_entities(uni.name).get("acq") != "uni":
+    if (parse_entities(uni.name).get("acq") or "").lower() != "uni":
         return None, None
-    found = []
-    for inv in ("inv2", "inv1"):
-        p = uni.with_name(_ACQ_UNI.sub(f"acq-{inv}", uni.name, count=1))
-        found.append(p if p.exists() else None)
-    return found[0], found[1]
+    rest = _ACQ.sub("acq-", uni.name, count=1).lower()
+    found: dict[str, Path] = {}
+    for p in sorted(uni.parent.glob("*.nii*")):
+        acq = (parse_entities(p.name).get("acq") or "").lower()
+        if acq in ("inv1", "inv2") and _ACQ.sub("acq-", p.name, count=1).lower() == rest:
+            found.setdefault(acq, p)
+    return found.get("inv2"), found.get("inv1")

@@ -597,3 +597,22 @@ def test_presurf_resolves_only_for_scanned_mp2rage(tmp_path: Path, monkeypatch):
     # no template anywhere → falls back to UNI, and says so
     triples, _, note = _resolve_presurf(_presurf_args(presurf_tpm=None), uni, from_bids=True)
     assert triples == [] and "FFS_TPM" in note
+
+
+def test_anat_scan_is_case_blind(tmp_path: Path):
+    """Scanner exports and hand-renamed trees write _t1w and acq-UNI; neither may
+    hide the anat, and the UNI must still find its inversions."""
+    from fastfuncstuff.autoproc.bids import mp2rage_partners
+
+    ses = tmp_path / "sub-ME1" / "ses-WB"
+    _touch(ses / "func" / "sub-ME1_ses-WB_task-x_run-01_bold.nii.gz", {"RepetitionTime": 1.5})
+    _touch(ses / "anat" / "sub-ME1_ses-WB_acq-inv2_T1w.nii.gz", {})
+    _touch(ses / "anat" / "sub-ME1_ses-WB_acq-INV1_t1w.nii.gz", {})
+    _touch(ses / "anat" / "sub-ME1_ses-WB_acq-UNI_t1w.nii.gz", {})
+    _touch(ses / "anat" / "sub-ME1_ses-WB_acq-UNI_t1w_Denoised.nii.gz", {})
+    anat = scan_subject(tmp_path, "ME1").sessions[0].anat
+    assert anat is not None and anat.name == "sub-ME1_ses-WB_acq-UNI_t1w.nii.gz"
+    inv2, inv1 = mp2rage_partners(anat)
+    assert inv2 is not None and inv2.name == "sub-ME1_ses-WB_acq-inv2_T1w.nii.gz"
+    assert inv1 is not None and inv1.name == "sub-ME1_ses-WB_acq-INV1_t1w.nii.gz"
+

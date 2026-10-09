@@ -118,8 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-anat",
         nargs="+",
         metavar="FILE",
-        help="T1w to align to (e.g. SUMA brain.nii.gz); add -anat_skull yes if it "
-        "still has a skull. Several files are aligned to the first and averaged "
+        help="T1w to align to; it is skull-stripped in-script unless you add "
+        "-anat_skull no (e.g. for a SUMA brain.nii.gz). Several files are aligned to the first and averaged "
         "(they must be the same contrast). Omit it and every T1w in the in-scope "
         "sessions is used the same way.",
     )
@@ -127,12 +127,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "-anat_skull",
         "-anat-skull",
-        choices=["no", "yes"],
-        default="no",
-        help="does -anat still have a skull? no (default) = it is already stripped "
-        "(a SUMA brain.nii.gz). yes = strip it in-script with FreeSurfer's "
+        choices=["auto", "yes", "no"],
+        default="auto",
+        help="does the anat still have a skull? auto (default) = yes, unless it is "
+        "-suma's brain.nii.gz. yes = strip it in-script with FreeSurfer's "
         "mri_synthstrip (FreeSurfer >= 8 required on $PATH), so a T1w straight off "
-        "the scanner can be the alignment target with no recon-all. Both images are "
+        "the scanner can be the alignment target with no recon-all. no = it is "
+        "already stripped (e.g. -anat a SUMA brain.nii.gz). Both images are "
         "written: stage09.anat_head (as given) and stage09.anat_brain (stripped, "
         "what everything aligns to). This gives no tissue priors, so -anat_nonlin "
         "still needs -tpm.",
@@ -1169,14 +1170,6 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "-anat_nonlin (ffs_segment) needs a subject TPM: pass -tpm FILE, or -suma DIR "
             "to build one from FreeSurfer (aseg.auto + SurfVol)." + skull
         )
-    if not opt.anat_skull and anat_path and not args.anat and not args.suma:
-        # Scanned out of the BIDS tree: a bare T1w there is raw off the scanner far
-        # more often than it is stripped, and an unstripped alignment target sends
-        # cross-modal lpc to the skull.
-        warnings.append(
-            f"the anat was found in the BIDS tree ({anat_path}) and is assumed to be "
-            "skull-stripped. If it is not, pass -anat_skull yes."
-        )
     if opt.anat_extra and (opt.grand_reference or opt.ref_file):
         borrowed = "-grand_reference" if opt.grand_reference else "-ref_file"
         warnings.append(
@@ -1873,6 +1866,16 @@ def _report_fmap_assignment(subject) -> None:
             )
 
 
+def _resolve_anat_skull(args, presurf: bool) -> bool:
+    """Strip the anat in-script? A T1w off the scanner has a skull far more often
+    than not, and an unstripped target sends cross-modal lpc to the scalp; -suma's
+    brain.nii.gz is the one input known to be stripped already. presurf's head
+    always has one, whatever -anat_skull says."""
+    if presurf or args.anat_skull == "yes":
+        return True
+    return args.anat_skull == "auto" and not args.suma
+
+
 def _resolve_presurf(
     args, anat_paths: list[str], from_bids: bool
 ) -> tuple[list[tuple[str, str, str | None]], str | None, str]:
@@ -2212,7 +2215,7 @@ def main(argv: list[str] | None = None) -> int:
         # the anat step alone.
         anat_source=args.anat_source or args.ref_image or "auto",
         # presurf's head still has a skull; synthstrip is what makes the brain.
-        anat_skull=args.anat_skull == "yes" or bool(presurf and go_to_anat),
+        anat_skull=_resolve_anat_skull(args, bool(presurf and go_to_anat)),
         presurf=presurf if go_to_anat else [],
         presurf_denoise=args.presurf_denoise,
         presurf_tpm=presurf_tpm,

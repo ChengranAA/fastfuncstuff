@@ -616,3 +616,16 @@ def test_anat_scan_is_case_blind(tmp_path: Path):
     assert inv2 is not None and inv2.name == "sub-ME1_ses-WB_acq-inv2_T1w.nii.gz"
     assert inv1 is not None and inv1.name == "sub-ME1_ses-WB_acq-INV1_t1w.nii.gz"
 
+
+def test_anat_skull_defaults_to_stripping_all_but_the_suma_brain():
+    from argparse import Namespace
+
+    from fastfuncstuff.cli.autoproc import _resolve_anat_skull
+
+    def strip(skull, suma=None, presurf=False):
+        return _resolve_anat_skull(Namespace(anat_skull=skull, suma=suma), presurf)
+
+    assert strip("auto")  # BIDS-scanned or -anat FILE: assume a skull
+    assert not strip("auto", suma="/fs/SUMA")  # brain.nii.gz is already stripped
+    assert not strip("no")
+    assert strip("no", presurf=True)  # the MPRAGEised head always has one

@@ -111,7 +111,9 @@ class SurfaceStore:
     #: Display grids whose slice indices are kept (see ``_grids``).
     MAX_GRIDS = 4
 
-    def __init__(self) -> None:
+    def __init__(self, device=None) -> None:
+        #: Where ribbon maps are built (winding numbers, the CUDA brick search).
+        self.device = device
         self.subject: Path | None = None
         #: "native", or the template mesh the subject is shown on (view-only).
         self.space = "native"
@@ -306,7 +308,7 @@ class SurfaceStore:
             h = self.hemis[hemi]
             white = h.states["white"]
             pial = h.states.get("pial", white)
-            hit = build_ribbon_map(white, pial, h.faces, aff, shape)
+            hit = build_ribbon_map(white, pial, h.faces, aff, shape, self.device)
             for stale in [k for k in self._ribbons if k[0] == hemi]:
                 del self._ribbons[stale]
             self._ribbons[key] = hit

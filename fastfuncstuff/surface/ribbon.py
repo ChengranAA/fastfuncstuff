@@ -94,11 +94,13 @@ def build_ribbon_map(
     inside &= ~(winding_number(w, f, sub_aff, sub_shape, device) > 0)
     local = np.argwhere(inside)
     pts = local @ sub_aff[:3, :3].T + sub_aff[:3, 3]
+    # ~4 voxels a side, as volume_depth sizes it: the CUDA brick search, ignored elsewhere.
+    brick_mm = 4.0 * float(np.abs(np.linalg.det(aff[:3, :3])) ** (1 / 3))
     mid = 0.5 * (w + p)
-    near = MeshDistance(mid, f)(pts)
+    near = MeshDistance(mid, f)(pts, device, brick_mm=brick_mm)
     owner = f[near.face, np.argmax(near.bary, axis=1)]
-    dw = MeshDistance(w, f)(pts).distance
-    dp = MeshDistance(p, f)(pts).distance
+    dw = MeshDistance(w, f)(pts, device, brick_mm=brick_mm).distance
+    dp = MeshDistance(p, f)(pts, device, brick_mm=brick_mm).distance
     depth = (dw / np.maximum(dw + dp, 1e-6)).astype(np.float32)
     g = local + lo
     flat = np.ravel_multi_index((g[:, 0], g[:, 1], g[:, 2]), shape).astype(np.int64)

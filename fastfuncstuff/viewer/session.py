@@ -237,7 +237,7 @@ class ViewerSession:
         )
         #: FreeSurfer meshes. Beside the layer stack, not in it: see
         #: :mod:`viewer.surfaces` for why a surface is not a layer.
-        self.surfaces = SurfaceStore()
+        self.surfaces = SurfaceStore(device=self.display_device)
         self.catalog: list[CatalogEntry] = []
         self.catalog_dir: Path | None = None
         self.catalog_recursive = False

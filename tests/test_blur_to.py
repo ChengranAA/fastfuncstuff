@@ -298,7 +298,7 @@ def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, m
         "-blur_to_local", "-save_blur_fwhm", str(tmp_path / "loc.nii"),
         "-save_acf", str(tmp_path / "acfl"), "-clustsim", "-clustsim_niter", "200")  # fmt: skip
     # -blur_to_local makes smoothness vary on purpose: the table comes from the residuals
-    assert "sign-flipped residuals" in capsys.readouterr().out
+    assert "Gaussian sums of the residuals" in capsys.readouterr().out
     assert list((tmp_path / "l_clustsim").glob("*.NN1_bisided.1D"))
     assert classic("acfl") == pytest.approx(6.0, rel=0.05)
     fmap = np.asarray(nib.load(str(tmp_path / "loc.nii")).dataobj)
@@ -468,7 +468,7 @@ def test_reml_volume_blur_to_tsnr_end_to_end(tmp_path, monkeypatch, capsys):
     ])  # fmt: skip
     reml.main()
     out = capsys.readouterr().out
-    assert "Blurring TO residual tSNR 60" in out and "sign-flipped residuals" in out
+    assert "Blurring TO residual tSNR 60" in out and "Gaussian sums of the residuals" in out
     fw = np.asarray(nib.load(str(tmp_path / "fw.nii")).dataobj)
     noisy, clean = mask.copy(), mask.copy()
     noisy[14:], clean[:18] = False, False

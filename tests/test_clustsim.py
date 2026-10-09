@@ -362,7 +362,7 @@ def test_reml_clustsim_attaches_tables_and_survives_adjust_dof(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# The residual sign-flip null
+# The residual null
 # ---------------------------------------------------------------------------
 
 
@@ -381,16 +381,17 @@ def _two_sided_field(rng, shape, mask, n):
     return np.stack(out, 1)
 
 
-def test_sign_flip_null_has_unit_variance_and_the_residual_correlation():
-    from fastfuncstuff.stats.clustsim import ResidualSignFlipNull
+def test_residual_null_has_unit_variance_and_the_residual_correlation():
+    from fastfuncstuff.stats.clustsim import ResidualNull
 
     rng = np.random.default_rng(0)
     shape = (16, 12, 10)
     mask = np.ones(shape, bool)
     e = _two_sided_field(rng, shape, mask, 200) * rng.uniform(0.5, 3.0, size=(mask.sum(), 1))
-    null = ResidualSignFlipNull(mask, e, seed=1)
+    null = ResidualNull(mask, e, seed=1)
     f = null.generate(4000).numpy()  # (n, n_mask)
-    np.testing.assert_allclose(f.var(0), 1.0, atol=0.08)  # whatever each voxel's scale
+    # whatever each voxel's scale; the worst of 1920 sample variances at n=4000 sits ~4 SD
+    np.testing.assert_allclose(f.var(0), 1.0, atol=0.1)
     ec = e - e.mean(1, keepdims=True)
     ec /= np.linalg.norm(ec, axis=1, keepdims=True)
     i, j = 5, 6  # neighbours along the last axis, on the rough side
@@ -400,11 +401,11 @@ def test_sign_flip_null_has_unit_variance_and_the_residual_correlation():
 
 
 @pytest.mark.slow
-def test_sign_flip_table_holds_its_false_positive_rate_where_one_acf_cannot():
+def test_residual_null_table_holds_its_false_positive_rate_where_one_acf_cannot():
     # Measured once at full size: FWER 0.050 (residual) vs 0.171 (global ACF).
     from scipy.ndimage import label
 
-    from fastfuncstuff.stats.clustsim import ResidualSignFlipNull
+    from fastfuncstuff.stats.clustsim import ResidualNull
     from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
 
     rng = np.random.default_rng(0)
@@ -414,7 +415,7 @@ def test_sign_flip_table_holds_its_false_positive_rate_where_one_acf_cannot():
     e = _two_sided_field(rng, shape, mask, 300)
     kw = dict(n_iter=1000, pthr=(0.001,), athr=(0.05,), nns=(1,), sideds=("1-sided",),
               n_jobs=4, verbose=False)  # fmt: skip
-    null_r = simulate_cluster_null(mask, vox, None, simulator=ResidualSignFlipNull(mask, e), **kw)
+    null_r = simulate_cluster_null(mask, vox, None, simulator=ResidualNull(mask, e), **kw)
     est = estimate_fwhmx_run(
         torch.as_tensor(e.astype(np.float32)), torch.as_tensor(mask), shape, vox,
         unif=True, unif_scale="sd", progress=False,

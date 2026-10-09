@@ -322,7 +322,7 @@ def surface_clustsim(
     ``cache_dir``: None uses the default cache, False disables it. The result is a pure
     function of (geometry, mask, ACF, niter, pthr, sideds, seed), so a hit returns the
     stored maxima without simulating. ``noise`` replaces the mixed-ACF generator (e.g.
-    ``stats.clustsim.ResidualSignFlipNull``); its fields depend on the data, so they are
+    ``stats.clustsim.ResidualNull``); its fields depend on the data, so they are
     never cached.
     """
     from tqdm import tqdm

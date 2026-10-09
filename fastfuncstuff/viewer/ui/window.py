@@ -2234,6 +2234,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.mode_head.setVisible(has)
         self.mode_panel.setVisible(has)
         self._sync_input_box()
+        # After the layout has taken the rebuild in.
+        changed = mode.name != getattr(self, "_fitted_mode", None)
+        self._fitted_mode = mode.name
+        if self.isVisible():
+            QtCore.QTimer.singleShot(0, lambda: self.fit_to_content(shrink=changed))
         idx = self.mode_box.findData(mode.name)
         if idx >= 0 and idx != self.mode_box.currentIndex():
             self.mode_box.blockSignals(True)
@@ -2404,7 +2409,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.value_label.setText("   ".join(parts[:3]))
 
     def dock_left(self) -> None:
-        """Park the controller at the left edge of its screen, full height.
+        """Park the controller at the top-left of its screen, as tall as it needs.
 
         Left rather than wherever the window system drops it, so tiling always
         has one contiguous region to its right to fill.
@@ -2413,8 +2418,30 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if screen is None:
             return
         area = screen.availableGeometry()
-        self.resize(self.width(), area.height() - (self.frameGeometry().height() - self.height()))
         self.move(area.topLeft())
+        # Sized once shown: before that the toolbars have no real geometry.
+        QtCore.QTimer.singleShot(0, lambda: self.fit_to_content(shrink=True))
+
+    def fit_to_content(self, shrink: bool = False) -> None:
+        """As tall as the panel holds, up to the screen.
+
+        Full height left View mode -- no parameters -- as a column of empty
+        stretch between the stack and the status bar. Grows whenever there is
+        more to show; shrinks only when asked (a mode change), so a window made
+        taller by hand is not pulled back every time a layer loads.
+        """
+        scroll = self.centralWidget()
+        panel = scroll.widget() if isinstance(scroll, QtWidgets.QScrollArea) else None
+        if panel is None or panel.layout() is None:
+            return
+        panel.layout().activate()
+        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+        frame = self.frameGeometry().height() - self.height()
+        cap = screen.availableGeometry().height() - frame if screen is not None else 10**6
+        chrome = self.height() - scroll.viewport().height()
+        want = min(panel.sizeHint().height() + chrome, cap)
+        if want > self.height() or (shrink and want < self.height()):
+            self.resize(self.width(), want)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
         # The controller is the session; closing it closes the companions too,

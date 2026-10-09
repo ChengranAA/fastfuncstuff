@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["VertexPatch", "vertex_patch"]
+__all__ = ["VertexPatch", "hex_layout", "vertex_patch"]
 
 
 @dataclass
@@ -128,3 +128,40 @@ def vertex_patch(
     angle = np.arctan2(d @ y, d @ x)
     xy = np.c_[dist * np.cos(angle), dist * np.sin(angle)]
     return VertexPatch(hemi, int(centre), ids, xy, edges, outline, ring_all[ids])
+
+
+def hex_layout(xy: np.ndarray) -> np.ndarray:
+    """``xy`` moved onto a hexagonal lattice, one vertex per site, none dropped.
+
+    The lattice spacing is the patch's typical neighbour distance. Vertices are
+    placed from the centre outward, each on the free site nearest its own
+    position, so the middle stays exact and the rings keep their order; where a
+    dense stretch wants more sites than the lattice has there, the overflow
+    lands on the next-nearest free one rather than on top of a neighbour.
+    """
+    from scipy.spatial import KDTree
+
+    xy = np.asarray(xy, np.float64)
+    if len(xy) < 2:
+        return xy.copy()
+    d, _ = KDTree(xy).query(xy, k=2)
+    s = float(np.median(d[:, 1])) or 1.0
+    reach = float(np.abs(xy).max()) + 2 * s * np.sqrt(len(xy))
+    n = int(np.ceil(reach / s)) + 1
+    i, j = np.meshgrid(np.arange(-n, n + 1), np.arange(-n, n + 1), indexing="ij")
+    sites = np.c_[(i + 0.5 * j).ravel() * s, (j * np.sqrt(3) / 2).ravel() * s]
+    sites = sites[np.linalg.norm(sites, axis=1) <= reach]
+    tree = KDTree(sites)
+    taken = np.zeros(len(sites), bool)
+    out = np.empty_like(xy)
+    for row in np.argsort(np.linalg.norm(xy, axis=1), kind="stable"):
+        k = 8
+        while True:
+            _, near = tree.query(xy[row], k=min(k, len(sites)))
+            free = [int(c) for c in np.atleast_1d(near) if not taken[c]]
+            if free:
+                taken[free[0]] = True
+                out[row] = sites[free[0]]
+                break
+            k *= 4
+    return out

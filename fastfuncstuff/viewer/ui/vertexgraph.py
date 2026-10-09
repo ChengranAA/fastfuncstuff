@@ -125,6 +125,8 @@ class VertexGraphWindow(QtWidgets.QWidget):
         self.hidden: set[str] = set()
         self.patch = None
         self._patch_key: tuple | None = None
+        #: The patch's hex positions, made once per patch.
+        self._hex: tuple[object, np.ndarray] | None = None
         self._legend: tuple | None = None
 
         v = QtWidgets.QVBoxLayout(self)
@@ -170,6 +172,14 @@ class VertexGraphWindow(QtWidgets.QWidget):
         self.tint_check.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.tint_check.toggled.connect(lambda _: self.refresh())
         bar.addWidget(self.tint_check)
+        self.hex_check = QtWidgets.QCheckBox(theme.key_label("hex", "x"))
+        self.hex_check.setToolTip(
+            "Cells on a hexagonal lattice, each vertex on the free site nearest its\n"
+            "own place: tidier, every vertex still shown. Off: exact positions."
+        )
+        self.hex_check.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.hex_check.toggled.connect(lambda _: self.refresh())
+        bar.addWidget(self.hex_check)
         bar.addStretch(1)
         v.addLayout(bar)
 
@@ -198,6 +208,9 @@ class VertexGraphWindow(QtWidgets.QWidget):
                 Binding(",", "previous time point", lambda: self.step_time(-1), group="time"),
                 Binding("s", "shared scale on / off", self.shared_check.toggle, group="lines"),
                 Binding("o", "overlay colour on / off", self.tint_check.toggle, group="lines"),
+                Binding(
+                    "x", "hexagonal lattice / exact positions", self.hex_check.toggle, group="patch"
+                ),
                 Binding("click", "go to that time point", None, group="lines"),
                 Binding("double-click", "move the crosshair to that vertex", None, group="patch"),
                 Binding("h", "this list", self.help.toggle, group="window"),
@@ -359,10 +372,17 @@ class VertexGraphWindow(QtWidgets.QWidget):
             )
             for row, v in enumerate(patch.vertices)
         ]
+        xy = patch.xy
+        if self.hex_check.isChecked():
+            from fastfuncstuff.viewer.vertexpatch import hex_layout
+
+            if self._hex is None or self._hex[0] is not patch:
+                self._hex = (patch, hex_layout(patch.xy))
+            xy = self._hex[1]
         self.graph.set_tinting(tints is not None)
         self.graph.set_patch(
             cells,
-            patch.xy,
+            xy,
             patch.edges,
             st.time_index,
             colors=colours,

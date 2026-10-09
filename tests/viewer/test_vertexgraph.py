@@ -121,3 +121,14 @@ def test_detrend_is_a_dropdown_and_the_arrows_step_time(graphed):
     assert session.state.time_index == start + 1
     graph.step_time(-2)
     assert session.state.time_index == 5  # wraps to the last of six
+
+
+def test_hex_puts_the_same_vertices_on_a_lattice(graphed):
+    _, _, graph = graphed
+    exact = graph.graph._xy.copy()
+    cells = len(graph.graph._cells)
+    graph.hex_check.setChecked(True)
+    assert len(graph.graph._cells) == cells  # every vertex still drawn
+    assert not np.allclose(graph.graph._xy, exact)
+    graph.hex_check.setChecked(False)
+    np.testing.assert_allclose(graph.graph._xy, exact)

@@ -283,8 +283,8 @@ def arma11_whitener(
 ) -> RunWhitener:
     """The whitener for one (a, b) — the GLS step after the search has chosen it."""
     ws, _, _ = arma11_whiteners(
-        torch.tensor([a], dtype=dtype),
-        torch.tensor([b], dtype=dtype),
+        torch.tensor([a], dtype=dtype, device=device),
+        torch.tensor([b], dtype=dtype, device=device),
         n,
         run_starts=run_starts,
         tau=tau,

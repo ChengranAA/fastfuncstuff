@@ -66,3 +66,14 @@ def test_storage_is_per_run_not_total_length():
 def test_run_bounds_tolerates_missing_zero_and_single_run():
     assert run_bounds(10, None) == [(0, 10)]
     assert run_bounds(10, [4]) == [(0, 4), (4, 10)]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_single_pair_whitener_builds_on_the_requested_device():
+    """The GLS step builds one whitener per (a,b) on the compute device when the
+    search grid was too large to keep; its parameter tensors must live there too."""
+    from fastfuncstuff.glm.whiten import arma11_whitener
+
+    w = arma11_whitener(0.4, -0.1, 60, run_starts=[0, 30], device=torch.device("cuda"))
+    assert w.device.type == "cuda"

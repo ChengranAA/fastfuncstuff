@@ -149,6 +149,13 @@ class DatasetInfo:
     #: bucket already says. Empty when the dataset carries no stat metadata.
     stataux: dict[int, tuple[int, tuple[float, ...]]] = field(default_factory=dict)
     history: str = ""
+    #: A GIfTI file's own metadata (mesh fingerprint, subject, mesh, TR...);
+    #: empty for a volume.
+    surface_meta: dict[str, str] = field(default_factory=dict)
+    #: For a GIfTI: "mesh" (vertices + triangles), "series" or "maps"; else "".
+    surface_kind: str = ""
+    #: Triangles in a GIfTI mesh.
+    n_faces: int = 0
     descrip: str = ""
     scl_slope: float = 1.0
     scl_inter: float = 0.0
@@ -391,7 +398,11 @@ def _read_gifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
     pairs = [
         (html.unescape(k.decode()), html.unescape(v.decode()))
         for k, v in re.findall(
-            rb"<Name>" + cdata + rb"</Name>\s*<Value>" + cdata + rb"</Value>", raw
+            # DOTALL: a value can span lines (history does), and a pair that
+            # failed to match would shift every file-level key after it.
+            rb"<Name>" + cdata + rb"</Name>\s*<Value>" + cdata + rb"</Value>",
+            raw,
+            re.DOTALL,
         )
     ]
     first_array = raw.find(b"<DataArray")
@@ -401,6 +412,17 @@ def _read_gifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
         info.tr = float(file_md.get("TR_seconds", 0.0))
     except ValueError:
         info.tr = 0.0
+    info.surface_meta = file_md
+    info.history = file_md.get("history", "")
+    intents = re.findall(rb'Intent="(\w+)"', raw)
+    dims = re.findall(rb'Dim0="(\d+)"', raw)
+    if b"NIFTI_INTENT_POINTSET" in intents:
+        info.surface_kind = "mesh"
+        tri = intents.index(b"NIFTI_INTENT_TRIANGLE") if b"NIFTI_INTENT_TRIANGLE" in intents else -1
+        info.n_faces = int(dims[tri]) if 0 <= tri < len(dims) else 0
+        info.shape = (int(dims[intents.index(b"NIFTI_INTENT_POINTSET")]), 1, 1, 1)
+    else:
+        info.surface_kind = "series" if b"NIFTI_INTENT_TIME_SERIES" in intents else "maps"
     labels = [v for k, v in pairs[len(head) :] if k == "Name"]
     if labels and len(labels) == n_arr:
         info.labels = (

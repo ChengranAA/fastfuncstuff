@@ -180,3 +180,39 @@ def test_header_read_does_not_import_torch():
     code = "import sys, fastfuncstuff.cli.info; print('torch' in sys.modules)"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert out.stdout.strip() == "False", out.stderr
+
+
+def test_a_gifti_reports_as_a_surface_and_keeps_its_history(tmp_path, capsys):
+    """ffs_info on a .func.gii fell into the voxel report and died on its '???'
+    orientation; and gii outputs carried no provenance at all."""
+    from fastfuncstuff.io.gifti import (
+        gifti_as_nifti,
+        save_gifti_data,
+        save_gifti_surface,
+        save_nifti_data_as_gifti,
+    )
+
+    rng = np.random.default_rng(0)
+    series = tmp_path / "run.lh.func.gii"
+    save_gifti_data(series, rng.normal(size=(50, 7)), meta={"TR_seconds": "2", "mesh": "ico"})
+    info = read_info(series)
+    assert info.surface_kind == "series" and info.shape == (50, 1, 1, 7) and info.tr == 2.0
+    assert info.history.count("\n") == 0 and "[" in info.history  # one entry: this save
+
+    # A tool reading it and writing a map continues the trail.
+    img = gifti_as_nifti(series)
+    out = tmp_path / "mean.lh.shape.gii"
+    save_nifti_data_as_gifti(out, np.asarray(img.dataobj)[..., :1], header=img.header)
+    assert read_info(out).history.count("\n") == 1
+
+    mesh = tmp_path / "lh.white.surf.gii"
+    faces = np.array([[0, 1, 2], [0, 2, 3]])
+    save_gifti_surface(mesh, rng.normal(size=(4, 3)), faces)
+    m = read_info(mesh)
+    assert m.surface_kind == "mesh" and m.shape[0] == 4 and m.n_faces == 2
+
+    assert main([str(series), str(out), str(mesh)]) == 0
+    text = capsys.readouterr().out
+    assert "50 vertices × 7 time points" in text and "TR 2 s" in text
+    assert "50 vertices × 1 map" in text and "4 vertices · 2 triangles" in text
+    assert "history" in text and "orient" not in text

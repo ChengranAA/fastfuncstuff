@@ -153,8 +153,49 @@ def _human_time(sec: float) -> str:
     return f"{sec / 60:.1f} min"
 
 
+def _surface_rows(info: DatasetInfo, st: _Style) -> list[tuple[str, str]]:
+    """A GIfTI's report: vertices and arrays, not a voxel grid it does not have."""
+    meta = info.surface_meta
+    rows = [("storage", f"GIFTI · {_human_bytes(info.file_bytes)} on disk")]
+    nv, n_arr = info.shape[0], info.shape[3]
+    if info.surface_kind == "mesh":
+        rows.append(("mesh", f"{nv:,} vertices · {info.n_faces:,} triangles"))
+    else:
+        what = "time point" if info.surface_kind == "series" else "map"
+        rows.append(("data", f"{nv:,} vertices × {n_arr} {what}{'s' * (n_arr != 1)}"))
+        if info.selector is not None:
+            rows[-1] = (rows[-1][0], rows[-1][1] + st.dim("   [selector applied]"))
+    if info.tr > 0 and info.surface_kind == "series":
+        rows.append(("time", f"TR {info.tr:.4g} s · {_human_time(info.tr * n_arr)}"))
+    on = [f"{k} {meta[k]}" for k in ("subject", "mesh", "hemi") if meta.get(k)]
+    if on:
+        rows.append(("on", " · ".join(on)))
+    if meta.get("mesh_fingerprint"):
+        rows.append(("fingerprint", st.dim(meta["mesh_fingerprint"])))
+    if info.labels and (len(info.labels) > 1 or info.labels[0] != "?"):
+        shown = ", ".join(info.labels[:8])
+        if len(info.labels) > 8:
+            shown += st.dim(f" … (+{len(info.labels) - 8})")
+        rows.append(("labels", shown))
+    told = {"subject", "mesh", "hemi", "mesh_fingerprint", "TR_seconds", "history", "brick_labels"}
+    # Short values in full (sampling, depths...); long ones (sha1s, json) by name.
+    long = []
+    for k, v in meta.items():
+        if k in told:
+            continue
+        if len(v) <= 48 and "\n" not in v:
+            rows.append((k, st.dim(v)))
+        else:
+            long.append(k)
+    if long:
+        rows.append(("also", st.dim(", ".join(long))))
+    return rows
+
+
 def format_report(info: DatasetInfo, st: _Style, show_history: bool = True) -> str:
     """The no-flags human view: one aligned block per dataset."""
+    if info.storage == "GIFTI":
+        return _finish_report(info, st, _surface_rows(info, st), show_history)
     rows: list[tuple[str, str]] = []
 
     stored = [info.storage]
@@ -246,7 +287,12 @@ def format_report(info: DatasetInfo, st: _Style, show_history: bool = True) -> s
 
     if info.descrip:
         rows.append(("descrip", info.descrip))
+    return _finish_report(info, st, rows, show_history)
 
+
+def _finish_report(
+    info: DatasetInfo, st: _Style, rows: list[tuple[str, str]], show_history: bool
+) -> str:
     width = max(len(k) for k, _ in rows)
     body = "\n".join(f"  {st.key(k.ljust(width))}  {v}" for k, v in rows)
 

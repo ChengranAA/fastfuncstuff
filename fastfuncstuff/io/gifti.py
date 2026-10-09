@@ -15,12 +15,35 @@ import os
 import numpy as np
 
 __all__ = [
+    "HISTORY_KEY",
+    "with_history",
     "load_gifti_data",
     "load_gifti_surface",
     "mesh_fingerprint",
     "save_gifti_data",
     "save_gifti_surface",
 ]
+
+
+#: File-level metadata key holding the provenance trail, one entry per line.
+HISTORY_KEY = "history"
+
+
+def with_history(meta: dict[str, str] | None) -> dict[str, str]:
+    """``meta`` with this command appended to its history.
+
+    The same ``[user@host: ctime] commandline`` entry AFNI's HISTORY_NOTE gets
+    on every NIfTI ffs writes, as a plain newline-separated metadata value: a
+    file written from another (``save_nifti_data_as_gifti`` carries its input's
+    metadata) continues that file's trail.
+    """
+    from fastfuncstuff.io.afni import _history_commandline, _history_prefix
+
+    out = {k: str(v) for k, v in (meta or {}).items()}
+    entry = f"[{_history_prefix()}] {_history_commandline()}"
+    prior = out.get(HISTORY_KEY, "").rstrip("\n")
+    out[HISTORY_KEY] = f"{prior}\n{entry}" if prior else entry
+    return out
 
 
 def mesh_fingerprint(faces: np.ndarray, n_vertices: int | None = None) -> str:
@@ -60,9 +83,7 @@ def save_gifti_data(
         )
         for t in range(cols.shape[1])
     ]
-    img = nib.gifti.GiftiImage(
-        darrays=arrays, meta=nib.gifti.GiftiMetaData({k: str(v) for k, v in (meta or {}).items()})
-    )
+    img = nib.gifti.GiftiImage(darrays=arrays, meta=nib.gifti.GiftiMetaData(with_history(meta)))
     nib.save(img, os.fspath(path))
 
 
@@ -97,9 +118,7 @@ def save_gifti_surface(
         np.asarray(faces, np.int32), intent="NIFTI_INTENT_TRIANGLE", datatype="NIFTI_TYPE_INT32"
     )
     m = {"mesh_fingerprint": mesh_fingerprint(faces, len(vertices)), **(meta or {})}
-    img = nib.gifti.GiftiImage(
-        darrays=[pts, tri], meta=nib.gifti.GiftiMetaData({k: str(v) for k, v in m.items()})
-    )
+    img = nib.gifti.GiftiImage(darrays=[pts, tri], meta=nib.gifti.GiftiMetaData(with_history(m)))
     nib.save(img, os.fspath(path))
 
 
@@ -260,7 +279,5 @@ def save_nifti_data_as_gifti(
                 meta=nib.gifti.GiftiMetaData(am),
             )
         )
-    img = nib.gifti.GiftiImage(
-        darrays=arrays, meta=nib.gifti.GiftiMetaData({k: str(v) for k, v in meta.items()})
-    )
+    img = nib.gifti.GiftiImage(darrays=arrays, meta=nib.gifti.GiftiMetaData(with_history(meta)))
     nib.save(img, os.fspath(path))

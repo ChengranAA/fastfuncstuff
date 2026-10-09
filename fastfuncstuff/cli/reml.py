@@ -862,8 +862,16 @@ Examples:
         default=None,
         help="Surface (.gii) input: blur TO this smoothness instead of BY it (SurfSmooth "
         "-target_fwhm / 3dBlurToFWHM): the heat kernel is chosen so the first run, "
-        "detrended, measures FWHM mm (1-difference estimate), then every run is smoothed "
         "with it. Data already that smooth are left alone. Exclusive with -do_blur.",
+    )
+    proc_opts.add_argument(
+        "-blur_to_columns",
+        type=int,
+        metavar="N",
+        default=40,
+        help="-blur_to_fwhm: how many uncensored time points, spread over the runs, "
+        "carry the kernel search. The FWHM estimate averages over every edge, so a few "
+        "dozen pin it (3dBlurToFWHM uses at most 32).",
     )
     proc_opts.add_argument(
         "-surf_geom",
@@ -1294,27 +1302,55 @@ def _surface_smoother(args, input_file, header, n_vertices: int):
     return HeatSmoother(vertices, faces, args.do_blur, mask=_surface_mask(args))
 
 
-def _surface_blur_to(args, input_file, header, n_vertices: int, device):
-    """-blur_to_fwhm: the kernel that brings the first run (detrended) to the target."""
-    from fastfuncstuff.io.afni import load_nifti
-    from fastfuncstuff.surface.acf import blur_to_fwhm, detrend
+def _blur_to_good_list(args, design_info, run_starts, total_tps, trim):
+    """The uncensored TRs, as analyze_from_design_matrix will resolve them: -censor
+    overrides an xmat GoodList. None when nothing is censored."""
+    if args.censor is not None:
+        from fastfuncstuff.io.afni import read_censor_1d
+
+        bounds = list(run_starts) + [total_tps]
+        return read_censor_1d(
+            args.censor,
+            n_expected=total_tps,
+            run_lengths_tr=[bounds[i + 1] - bounds[i] for i in range(len(run_starts))],
+            trim=trim,
+        )
+    return design_info.get("good_list")
+
+
+def _blur_to_master(args, data, design_info, run_starts, trim):
+    """-blur_to_fwhm's master: OLS residuals of the unblurred data against the model's
+    own design, at ~40 uncensored time points spread over every run (stats.blur_to)."""
+    from fastfuncstuff.stats.blur_to import residual_master, sample_columns
+
+    total = data.shape[1]
+    good = _blur_to_good_list(args, design_info, run_starts, total, trim)
+    bounds = [int(r) for r in run_starts] + [total]
+    lengths = [bounds[i + 1] - bounds[i] for i in range(len(run_starts))]
+    cols = sample_columns(lengths, args.blur_to_columns, good=good)
+    return residual_master(data, design_info["matrix"], cols, good=good)
+
+
+def _surface_blur_to(args, input_file, header, n_vertices: int, master, keep=None):
+    """-blur_to_fwhm on the surface: the heat kernel that brings ``master`` to the target."""
+    from fastfuncstuff.surface.acf import blur_to_fwhm
 
     vertices, faces = _surface_geometry(args, input_file, header, n_vertices)
     mask = _surface_mask(args)
-    first = np.asarray(load_nifti(input_file).dataobj, np.float64).reshape(n_vertices, -1)
-    master = detrend(first, degree=max(int(args.polort or 3), 1) if args.polort else 3)
+    if keep is not None:
+        mask = np.asarray(keep, bool) if mask is None else mask & np.asarray(keep, bool)
     hs, kernel, achieved = blur_to_fwhm(
-        master, vertices, faces, args.blur_to_fwhm, mask, device=None
+        master, vertices, faces, args.blur_to_fwhm, mask, n_columns=master.shape[1]
     )
     if hs is None:
         print(
-            f"  Surface data already {achieved:.2f} mm smooth (>= {args.blur_to_fwhm}): "
+            f"  Surface residuals already {achieved:.2f} mm smooth (>= {args.blur_to_fwhm}): "
             "no blur applied"
         )
         return None
     print(
         f"  Blurring TO {args.blur_to_fwhm} mm: heat kernel {kernel:.2f} mm "
-        f"(first run reaches {achieved:.2f} mm)"
+        f"(OLS residuals at {master.shape[1]} time points reach {achieved:.2f} mm)"
     )
     return hs
 
@@ -3221,10 +3257,6 @@ def main():
                 f"  Applying surface heat smoothing (FWHM = {args.do_blur} mm along the "
                 f"cortex, {int(surface_smoother.mask.sum()):,} vertices)..."
             )
-        elif args.blur_to_fwhm is not None:
-            surface_smoother = _surface_blur_to(
-                args, input_files[0], nifti_header, n_voxels, device
-            )
         elif args.do_blur is not None:
             print(f"  Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
 
@@ -3257,6 +3289,8 @@ def main():
             # signature that a mid-run dropout is detected by.
             if guard_acc is not None:
                 guard_acc.observe_run(run_data, run_idx)
+            # -blur_to_fwhm blurs after the load instead: its kernel is chosen on
+            # the residuals of the whole, still unblurred, dataset.
             if args.do_blur is not None or surface_smoother is not None:
                 return _blur_run(run_data, run_idx)
             return run_data
@@ -3339,6 +3373,24 @@ def main():
             args.mask = guard_mask_path
             guard_keep = keep
             guard_affine = affine
+
+        if args.blur_to_fwhm is not None:
+            print(f"  Blur TO {args.blur_to_fwhm} mm: master = OLS residuals of the unblurred data")
+            master = _blur_to_master(args, fmri_data_preprocessed, design_info, run_starts, trim)
+            surface_smoother = _surface_blur_to(
+                args,
+                input_files[0],
+                nifti_header,
+                n_voxels,
+                master,
+                keep=None if guard_keep is None else guard_keep.numpy(),
+            )
+            del master
+            if surface_smoother is not None:
+                bounds = [int(r) for r in run_starts] + [fmri_data_preprocessed.shape[1]]
+                for r0, r1 in zip(bounds[:-1], bounds[1:], strict=True):
+                    seg = fmri_data_preprocessed[:, r0:r1]
+                    fmri_data_preprocessed[:, r0:r1] = surface_smoother(seg)
 
         # Diagnostics hook 1: grand mean, computed on the un-scaled data.
         if want_diag:

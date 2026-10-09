@@ -16,9 +16,8 @@ which a GPU does at once -- and distance is Dijkstra along mesh edges, as SUMA's
 
 **Blurring to a smoothness** (SurfSmooth ``-target_fwhm``, 3dBlurToFWHM): find the heat
 kernel that brings a master (detrended data, or better the residuals of a fit) to the
-target FWHM, then smooth the data with exactly that kernel. The smoother is linear, so
-a bisection on the master is the whole search; SUMA instead re-estimates after every
-explicit pass.
+target FWHM, then smooth the data with exactly that kernel. The search itself, and the
+residual master, are geometry-free and live in :mod:`fastfuncstuff.stats.blur_to`.
 """
 
 from __future__ import annotations
@@ -191,39 +190,21 @@ def blur_to_fwhm(
     """The heat smoother that brings ``master`` to ``target`` FWHM (1-difference estimate).
 
     Returns ``(smoother, kernel_fwhm, achieved)``; ``smoother`` is None when the master
-    is already at least that smooth (nothing to add, as 3dBlurToFWHM reports). A random
-    subset of ``n_columns`` time points carries the search: the estimate averages over
-    every edge, so a few dozen columns already pin it to a percent.
+    is already at least that smooth. A master wider than ``n_columns`` is cut to a
+    random ``n_columns`` of its time points (``stats.blur_to.sample_columns`` makes a
+    better, run-stratified sample when the run structure is known).
     """
+    from fastfuncstuff.stats.blur_to import bisect_kernel
+
     x = np.asarray(master)
-    cols = np.random.default_rng(seed).choice(
-        x.shape[1], size=min(n_columns, x.shape[1]), replace=False
-    )
-    sub = x[:, np.sort(cols)]
+    if x.shape[1] > n_columns:
+        cols = np.random.default_rng(seed).choice(x.shape[1], size=n_columns, replace=False)
+        x = x[:, np.sort(cols)]
 
     def measure(kernel: float) -> tuple[float, HeatSmoother | None]:
         if kernel <= 0:
-            return surface_fwhm(sub, vertices, faces, mask)[0], None
+            return surface_fwhm(x, vertices, faces, mask)[0], None
         hs = HeatSmoother(vertices, faces, kernel, mask=mask, device=device)
-        return surface_fwhm(hs(sub), vertices, faces, mask)[0], hs
+        return surface_fwhm(hs(x), vertices, faces, mask)[0], hs
 
-    start, _ = measure(0.0)
-    if not np.isfinite(start) or start >= target:
-        return None, 0.0, float(start)
-    lo, hi = 0.0, float(target)
-    fhi, hs_hi = measure(hi)
-    while fhi < target and hi < 8 * target:
-        lo, hi = hi, hi * 1.5
-        fhi, hs_hi = measure(hi)
-    best = (hi, fhi, hs_hi)
-    for _ in range(20):
-        mid = 0.5 * (lo + hi)
-        fmid, hs_mid = measure(mid)
-        if fmid >= target:
-            hi, best = mid, (mid, fmid, hs_mid)
-        else:
-            lo = mid
-        if abs(best[1] - target) <= tol * target:
-            break
-    kernel, achieved, hs = best
-    return hs, float(kernel), float(achieved)
+    return bisect_kernel(measure, target, tol)

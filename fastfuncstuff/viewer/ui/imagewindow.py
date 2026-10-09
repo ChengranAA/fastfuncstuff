@@ -544,13 +544,20 @@ class ImageWindow(QtWidgets.QWidget):
         self.slice_label.setVisible(not compact)
         labels = {b: (full, bare) for b, full, bare in self._labels}
         room = width - 12  # the header's margins
+
+        def fits(row) -> bool:
+            row.invalidate()
+            return row.sizeHint().width() <= room
+
         # Row by row: full labels where they fit, the keys alone where not.
+        # The slice readout goes before the labels do.
         for row in (self._view_row, self._tools_row):
             buttons = [w for i in range(row.count()) if (w := row.itemAt(i).widget()) in labels]
             for b in buttons:
                 b.setText(labels[b][0])
-            row.invalidate()
-            if compact or row.sizeHint().width() > room:
+            if row is self._view_row and not compact and not fits(row):
+                self.slice_label.setVisible(False)
+            if compact or not fits(row):
                 for b in buttons:
                     b.setText(labels[b][1])
         super().resizeEvent(event)

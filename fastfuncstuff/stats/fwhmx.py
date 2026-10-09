@@ -247,6 +247,7 @@ def estimate_fwhmx_run(
     demed: bool = False,
     unif: bool = False,
     corder: int | None = None,
+    unif_scale: str = "mad",
     device: torch.device | None = None,
     progress: bool = True,
     progress_desc: str = "FWHMx",
@@ -277,6 +278,13 @@ def estimate_fwhmx_run(
             Detrending implies ``unif`` (AFNI: "-detrend disables -demed, and
             includes -unif"). Pass this for *raw* timeseries: low-frequency drift
             is spatially structured, so leaving it in biases the spatial ACF.
+        unif_scale: what ``unif`` divides each voxel by. ``"mad"`` (AFNI's, after
+            de-medianing) or ``"sd"`` (after de-meaning). A MAD from n points has
+            ~1.17/sqrt(n) relative error, spatially white, which reads as roughness:
+            on noise of known width the classic FWHM comes out -9% at 40 time points
+            and -3% at 120, and the ACF grows a white nugget (a 0.994 -> 0.973 at 40).
+            The SD is within ~1% at any length, and is what ``stats.blur_to``'s
+            neighbour-correlation estimate equals. Keep ``"mad"`` for 3dFWHMx parity.
         progress: show a tqdm bar over timepoint chunks and the offset loop.
 
     Returns:
@@ -303,7 +311,11 @@ def estimate_fwhmx_run(
     # irrelevant to the ACF, but dividing each voxel by its temporal MAD makes
     # the per-voxel variance uniform, which is what actually changes the spatial
     # correlation on non-stationary data. Done once here so both passes see it.
-    if demed or unif:
+    if unif and unif_scale == "sd":
+        resid_2d = resid_2d - resid_2d.mean(dim=1, keepdim=True)
+        sd = resid_2d.std(dim=1, keepdim=True)
+        resid_2d = resid_2d / torch.where(sd > 0, sd, torch.ones_like(sd))
+    elif demed or unif:
         med = resid_2d.median(dim=1, keepdim=True).values
         resid_2d = resid_2d - med
         if unif:

@@ -152,3 +152,23 @@ def test_parity_with_3dfwhmx_acf(sigma, vox):
     assert res.fwhm == pytest.approx(f_af, rel=0.03)
     assert res.a == pytest.approx(a_af, abs=0.03)
     assert res.b == pytest.approx(b_af, rel=0.08)
+
+
+def test_sd_unif_is_unbiased_on_a_short_run_where_mad_reads_rough():
+    # A MAD from 40 points is noisy enough to look like spatially white roughness.
+    rng = np.random.default_rng(5)
+    shape, nt = (40, 40, 30), 40
+    vols = np.stack([gaussian_filter(rng.normal(size=shape), 2.5, mode="wrap") for _ in range(nt)])
+    gain = np.exp(0.5 * rng.normal(size=shape))  # non-uniform variance, as real data
+    data = (vols * gain).reshape(nt, -1).T.astype(np.float32)
+    mask = torch.ones(shape, dtype=torch.bool)
+    r = torch.as_tensor(data)
+    truth = estimate_fwhmx_run(
+        torch.as_tensor((vols.reshape(nt, -1).T).astype(np.float32)), mask, shape,
+        (2.0, 2.0, 2.0), progress=False,
+    ).classic_combined  # fmt: skip
+    kw = dict(unif=True, progress=False)
+    mad = estimate_fwhmx_run(r, mask, shape, (2.0, 2.0, 2.0), **kw).classic_combined
+    sd = estimate_fwhmx_run(r, mask, shape, (2.0, 2.0, 2.0), unif_scale="sd", **kw)
+    assert sd.classic_combined == pytest.approx(truth, rel=0.02)
+    assert mad < 0.95 * truth

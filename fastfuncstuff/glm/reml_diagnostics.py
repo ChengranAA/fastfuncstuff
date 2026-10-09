@@ -115,6 +115,7 @@ def per_run_fwhmx(
     device: torch.device | None = None,
     *,
     unif: bool = True,
+    unif_scale: str = "sd",
     verbose: bool = True,
 ):
     """3dFWHMx classic + ACF estimate of the residual smoothness, once per run.
@@ -126,9 +127,13 @@ def per_run_fwhmx(
 
     ``unif`` (default True) uniformizes per-voxel variance by temporal MAD before
     estimating, matching afni_proc.py's blur estimate (``3dFWHMx -detrend`` sets
-    ``-unif``). The residuals are already model-detrended, so only the MAD step is
-    applied; it markedly affects the ACF on data with spatially non-uniform
-    variance (high-res / anisotropic).
+    ``-unif``). The residuals are already model-detrended, so only the scaling step
+    is applied; it markedly affects the ACF on data with spatially non-uniform
+    variance (high-res / anisotropic). The scale is each voxel's SD, not AFNI's
+    MAD (``unif_scale``): a MAD from a short run is noisy enough to read as
+    roughness (-3% FWHM at 120 TRs, -9% at 40, plus a white nugget in the ACF
+    that makes ClustSim liberal), and the SD-scaled estimate is the one
+    ``-blur_to_fwhm`` steers by, so the reported smoothness matches the target.
 
     Returns a list of ``(run_number_1based, FWHMxResult)``.
     """
@@ -151,6 +156,7 @@ def per_run_fwhmx(
             volume_shape,
             voxdims,
             unif=unif,
+            unif_scale=unif_scale,
             device=device,
             progress=verbose,
             progress_desc=f"    run {r + 1} FWHMx",

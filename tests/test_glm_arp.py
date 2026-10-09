@@ -115,3 +115,47 @@ def test_run_subsets_drop_columns_they_have_no_data_for(problem):
         [_dense_reml(torch.eye(b - a, dtype=F64), Xr, Y[v, a:b])[0] for v in range(5)]
     )
     torch.testing.assert_close(reml_criterion(theta, one), ref, rtol=0, atol=1e-9)
+
+
+def test_analytic_gradient_matches_finite_differences(problem):
+    """The core's backward is hand-written; a sign or factor slip there would
+    still converge somewhere — just not at the REML optimum."""
+    from fastfuncstuff.glm.arp import _grad
+
+    *_, st = problem
+    theta = torch.randn(5, 3, dtype=F64) * 0.4
+    g = _grad(theta, st)
+    h = 1e-6
+    fd = torch.stack(
+        [
+            (reml_criterion(theta + h * e, st) - reml_criterion(theta - h * e, st)) / (2 * h)
+            for e in torch.eye(3, dtype=F64)
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(g, fd, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("layout", ["all_shared", "all_private"])
+def test_structured_solve_handles_degenerate_column_layouts(problem, layout):
+    """Every column shared (no per-run block) and every column private (no
+    shared block) are both legal designs; the Schur path must reduce to the
+    dense answer in each."""
+    X, Y, bounds, _, _ = problem
+    n = X.shape[0]
+    if layout == "all_shared":
+        Xl = torch.cat(
+            [torch.ones(n, 1, dtype=F64), torch.linspace(-1, 1, n, dtype=F64)[:, None], X[:, :3]], 1
+        )
+    else:
+        Xl = X[:, 3:]  # per-run constants + drifts only
+    beta = torch.linalg.lstsq(Xl, Y.T).solution.T
+    st = lag_stats(Y - beta @ Xl.T, Xl, bounds, P)
+    theta = torch.randn(Y.shape[0], 2, dtype=F64) * 0.4
+    ref = torch.stack(
+        [
+            _dense_reml(_dense_whitener(theta[v], 2, bounds, n), Xl, Y[v])[0]
+            for v in range(Y.shape[0])
+        ]
+    )
+    torch.testing.assert_close(reml_criterion(theta, st), ref, rtol=0, atol=1e-9)

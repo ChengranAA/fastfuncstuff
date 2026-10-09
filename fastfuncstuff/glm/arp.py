@@ -58,29 +58,32 @@ class LagStats:
     r_head: Tensor  # (V, R, P)
     X_head: Tensor  # (R, P, K)
     support: Tensor  # (R, K) bool
-    # Run-summed stats on the supported columns, built once per instance: every
-    # criterion evaluation needs them, and S_Xr is the largest tensor here.
-    _summed: tuple[Tensor, Tensor, Tensor, Tensor] | None = field(
-        default=None, repr=False, compare=False
-    )
+    # The criterion's data, built once per instance (see `compact`).
+    _crit: _Crit | None = field(default=None, repr=False, compare=False)
 
-    def summed(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """``(Crr (V, P1²), SXr (V, P1², Kc), SXX (P1², Kc²), X_head (R, P, Kc))``
-        summed over runs and restricted to the columns these runs support."""
-        if self._summed is None:
-            cols = self.support.any(dim=0)
-            V, P1 = self.Crr.shape[0], self.P + 1
-            Kc = int(cols.sum())
-            self._summed = (
-                self.Crr.sum(1).reshape(V, P1 * P1),
-                self.SXr[..., cols].sum(1).reshape(V, P1 * P1, Kc),
-                self.SXX[..., cols][..., cols, :].sum(0).reshape(P1 * P1, Kc * Kc),
-                self.X_head[..., cols],
-            )
-        return self._summed
+    def compact(self) -> _Crit:
+        """The criterion's data for these runs, run-summed and structured.
+
+        r'V⁻¹r, X'V⁻¹r and X'V⁻¹X are each linear in one feature vector per
+        voxel: the steady taps' outer product c⊗c and G = H'H of the head
+        filter. Their coefficients are summed over runs here, so an evaluation
+        is a few GEMMs with no per-run or per-row work. Both feature blocks are
+        symmetric and are folded to one triangle.
+
+        M = X'V⁻¹X is split by column support: columns that live in one run only
+        (per-run polynomials, per-run motion — block-diagonal nuisance) give one
+        block per run, and V⁻¹ is block-diagonal by run, so M is *exactly* zero
+        between different runs' blocks. Only the shared columns (the task)
+        couple them. Factoring through that structure (Schur complement on the
+        shared block) replaces one K³ per voxel with R·k³ + k_s³."""
+        if self._crit is None:
+            self._crit = _build_crit(self)
+        return self._crit
 
     def runs(self, idx: Sequence[int] | Tensor) -> LagStats:
         """These runs only (stats keep their run axis)."""
+        if self.Crr.shape[1] != len(self.n):
+            raise ValueError("these stats were summed over runs (per_run=False)")
         i = torch.as_tensor(idx, dtype=torch.long, device=self.n.device)
         return LagStats(
             self.P,
@@ -94,10 +97,7 @@ class LagStats:
         )
 
     def voxels(self, sl: slice | Tensor) -> LagStats:
-        cached = None
-        if self._summed is not None:
-            c, sx, sxx, xh = self._summed
-            cached = (c[sl], sx[sl], sxx, xh)
+        cached = self._crit.voxels(sl) if self._crit is not None else None
         return LagStats(
             self.P,
             self.n,
@@ -111,6 +111,153 @@ class LagStats:
         )
 
 
+@dataclass
+class _Crit:
+    """Run-summed, column-structured criterion data for a voxel batch.
+
+    ``F`` folded features. Private columns are padded to ``k`` per run (``pad``
+    marks the padding, given an identity diagonal so the blocks stay PD);
+    ``order`` lists the original (supported-column) index of each structured
+    column: the R·k private slots (−1 for padding), then the shared ones."""
+
+    P: int
+    n: Tensor  # (R,)
+    a_r: Tensor  # (V, F)
+    g_priv: Tensor  # (V, F, R, k)
+    g_shared: Tensor  # (V, F, ks)
+    D: Tensor  # (F, R, k, k)
+    B: Tensor  # (F, R, k, ks)
+    S: Tensor  # (F, ks, ks)
+    pad: Tensor  # (R, k) bool
+    order: Tensor  # (R·k + ks,) long
+    n_cols: int  # number of supported columns K
+
+    def voxels(self, sl: slice | Tensor) -> _Crit:
+        return _Crit(
+            self.P, self.n, self.a_r[sl], self.g_priv[sl], self.g_shared[sl],
+            self.D, self.B, self.S, self.pad, self.order, self.n_cols,
+        )  # fmt: skip
+
+    def compact(self) -> _Crit:
+        return self
+
+
+def _build_crit(st: LagStats) -> _Crit:
+    cols = st.support.any(dim=0)
+    V, P, P1 = st.Crr.shape[0], st.P, st.P + 1
+    dev, dt = st.Crr.device, st.Crr.dtype
+    Kc = int(cols.sum())
+    rh, xh = st.r_head, st.X_head[..., cols]
+    Fm = _feature_fold(P, dt, dev)  # (F_full, F)
+    a_r = (
+        torch.cat(
+            [
+                st.Crr.sum(1).reshape(V, P1 * P1),
+                torch.einsum("vrs,vrt->vst", rh, rh).reshape(V, P * P),
+            ],
+            dim=1,
+        )
+        @ Fm
+    )
+    A_g = torch.einsum(
+        "vfk,fs->vsk",
+        torch.cat(
+            [
+                st.SXr[..., cols].sum(1).reshape(V, P1 * P1, Kc),
+                torch.einsum("rsK,vrt->vstK", xh, rh).reshape(V, P * P, Kc),
+            ],
+            dim=1,
+        ),
+        Fm,
+    )  # (V, F, Kc)
+    A_M = (
+        Fm.T
+        @ torch.cat(
+            [
+                st.SXX[..., cols][..., cols, :].sum(0).reshape(P1 * P1, Kc * Kc),
+                torch.einsum("rsK,rtJ->stKJ", xh, xh).reshape(P * P, Kc * Kc),
+            ],
+            dim=0,
+        )
+    ).reshape(-1, Kc, Kc)  # (F, Kc, Kc)
+
+    # column structure: private to one run, or shared
+    sup = st.support[:, cols]  # (R, Kc)
+    private = sup.sum(0) == 1
+    R = sup.shape[0]
+    priv = [torch.nonzero(sup[r] & private).squeeze(1) for r in range(R)]
+    shared = torch.nonzero(~private).squeeze(1)
+    k = max((int(x.numel()) for x in priv), default=0)
+    slots = torch.full((R, k), -1, dtype=torch.long, device=dev)
+    for r, x in enumerate(priv):
+        slots[r, : x.numel()] = x
+    pad = slots < 0
+    si = slots.clamp(min=0)  # padding reads column 0, then is zeroed
+    keep = (~pad).to(dt)
+    D = A_M[:, si[:, :, None], si[:, None, :]] * (keep[:, :, None] * keep[:, None, :])
+    B = A_M[:, si[:, :, None], shared[None, None, :]] * keep[:, :, None]
+    S = A_M[:, shared[:, None], shared[None, :]]
+    gD = A_g[:, :, si] * keep
+    gS = A_g[:, :, shared]
+    order = torch.cat([slots.reshape(-1), shared])
+    return _Crit(P, st.n, a_r, gD, gS, D, B, S, pad, order, Kc)
+
+
+def _solve_structured(u: Tensor, c: _Crit):
+    """Assemble M's blocks for features ``u`` (V, F), factor, and solve M a = g.
+
+    Returns a dict with the factors and ``a`` (aD (V,R,k), aS (V,ks)),
+    ``ga`` = g'a, ``logdetM``, ``rw2`` and ``bad`` (non-PD)."""
+    V, F = u.shape
+    R, k = c.pad.shape
+    ks = c.S.shape[-1]
+    eye_pad = torch.diag_embed(c.pad.to(u.dtype))  # (R, k, k): 1 on padded diagonal
+    Dm = (u @ c.D.reshape(F, -1)).reshape(V, R, k, k) + eye_pad
+    Bm = (u @ c.B.reshape(F, -1)).reshape(V, R, k, ks)
+    Sm = (u @ c.S.reshape(F, -1)).reshape(V, ks, ks)
+    gD = torch.einsum("vf,vfrk->vrk", u, c.g_priv)
+    gS = torch.einsum("vf,vfk->vk", u, c.g_shared)
+    rw2 = (u * c.a_r).sum(-1)
+
+    LD, infoD = torch.linalg.cholesky_ex(Dm)
+    bad = (infoD != 0).any(-1)
+    eye_k = torch.eye(k, dtype=u.dtype, device=u.device)
+    LD = torch.where((infoD != 0)[..., None, None], eye_k, LD)
+    Y = torch.cholesky_solve(Bm, LD)  # D⁻¹B  (V, R, k, ks)
+    zD = torch.cholesky_solve(gD.unsqueeze(-1), LD).squeeze(-1)  # D⁻¹gD
+    BtY = torch.einsum("vrki,vrkj->vij", Bm, Y)
+    Sig = Sm - BtY
+    LS, infoS = torch.linalg.cholesky_ex(Sig)
+    bad = bad | (infoS != 0)
+    eye_s = torch.eye(ks, dtype=u.dtype, device=u.device)
+    LS = torch.where((infoS != 0)[:, None, None], eye_s, LS)
+    rhs = gS - torch.einsum("vrki,vrk->vi", Bm, zD)
+    aS = torch.cholesky_solve(rhs.unsqueeze(-1), LS).squeeze(-1)
+    aD = zD - torch.einsum("vrki,vi->vrk", Y, aS)
+    ga = (gD * aD).sum((-1, -2)) + (gS * aS).sum(-1)
+    logdetM = 2 * torch.log(torch.diagonal(LD, dim1=-2, dim2=-1)).sum((-1, -2)) + 2 * torch.log(
+        torch.diagonal(LS, dim1=-2, dim2=-1)
+    ).sum(-1)
+    return {"LD": LD, "LS": LS, "Y": Y, "aD": aD, "aS": aS, "ga": ga, "rw2": rw2,
+            "logdetM": logdetM, "bad": bad}  # fmt: skip
+
+
+def _minv_blocks(f: dict, c: _Crit) -> tuple[Tensor, Tensor, Tensor]:
+    """M⁻¹ on the structured blocks (the only entries any coefficient touches):
+    S-block Σ⁻¹, B-block −D⁻¹BΣ⁻¹, D-blocks D⁻¹ + D⁻¹BΣ⁻¹B'D⁻¹. Padding zeroed."""
+    Si = torch.cholesky_inverse(f["LS"])
+    Y = f["Y"]
+    YS = torch.einsum("vrki,vij->vrkj", Y, Si)
+    Mb = -YS
+    Md = torch.cholesky_inverse(f["LD"]) + torch.einsum("vrki,vrli->vrkl", YS, Y)
+    keep = (~c.pad).to(Md.dtype)
+    Md = Md * (keep[:, :, None] * keep[:, None, :])
+    return Md, Mb, Si
+
+
+Stats = LagStats | _Crit
+
+
 def lag_stats(
     resid: Tensor,
     X: Tensor,
@@ -118,20 +265,26 @@ def lag_stats(
     P: int,
     *,
     dtype: torch.dtype = torch.float64,
+    per_run: bool = True,
 ) -> LagStats:
     """One pass: lagged cross-products of residuals ``resid`` (V, T) and design
     ``X`` (T, K) out to lag ``P``, per run. The GEMMs run in the inputs' dtype;
     results are stored in ``dtype`` (float64 by default — every later step works
     on small matrices, where float64 is cheap and the likelihood surface is flat).
+
+    ``per_run=False`` sums the lag statistics over runs as it goes (an R-fold
+    memory saving) for fits that never take a subset of runs; the per-run heads
+    are kept either way, because the head filter restarts in every run.
     """
     V, _ = resid.shape
     K = X.shape[1]
     R = len(bounds)
+    Rs = R if per_run else 1
     dev = resid.device
     P1 = P + 1
-    Crr = torch.empty(V, R, P1, P1, dtype=dtype, device=dev)
-    SXr = torch.empty(V, R, P1, P1, K, dtype=dtype, device=dev)
-    SXX = torch.empty(R, P1, P1, K, K, dtype=dtype, device=dev)
+    Crr = torch.zeros(V, Rs, P1, P1, dtype=dtype, device=dev)
+    SXr = torch.zeros(V, Rs, P1, P1, K, dtype=dtype, device=dev)
+    SXX = torch.zeros(Rs, P1, P1, K, K, dtype=dtype, device=dev)
     r_head = torch.empty(V, R, P, dtype=dtype, device=dev)
     X_head = torch.empty(R, P, K, dtype=dtype, device=dev)
     support = torch.empty(R, K, dtype=torch.bool, device=dev)
@@ -146,12 +299,13 @@ def lag_stats(
         # lag l view: samples t-l for t = P..m-1
         rlag = torch.stack([r[:, P - lag : m - lag] for lag in range(P1)], dim=1)  # (V, P1, m-P)
         xlag = torch.stack([x[P - lag : m - lag] for lag in range(P1)], dim=0)  # (P1, m-P, K)
-        Crr[:, ri] = (rlag @ rlag.transpose(1, 2)).to(dtype)
+        k = ri if per_run else 0
+        Crr[:, k] += (rlag @ rlag.transpose(1, 2)).to(dtype)
         # S_Xr[v,k,l,:] = xlag[k]' rlag[v,l] — one GEMM: ((P1·K), m-P) @ (m-P, V·P1)
         xs = xlag.permute(0, 2, 1).reshape(P1 * K, m - P)
         rs = rlag.permute(2, 0, 1).reshape(m - P, V * P1)
-        SXr[:, ri] = (xs @ rs).reshape(P1, K, V, P1).permute(2, 0, 3, 1).to(dtype)
-        SXX[ri] = (xs @ xs.T).reshape(P1, K, P1, K).permute(0, 2, 1, 3).to(dtype)
+        SXr[:, k] += (xs @ rs).reshape(P1, K, V, P1).permute(2, 0, 3, 1).to(dtype)
+        SXX[k] += (xs @ xs.T).reshape(P1, K, P1, K).permute(0, 2, 1, 3).to(dtype)
         r_head[:, ri] = r[:, :P].to(dtype)
         X_head[ri] = x[:P].to(dtype)
         support[ri] = x.abs().amax(dim=0) > 0
@@ -190,60 +344,110 @@ def _head_filter(taps: Tensor, p: int, P: int) -> Tensor:
     return torch.stack(rows, dim=-2)
 
 
-def _quadratic_parts(theta: Tensor, st: LagStats) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """(rw2, g, M, logdetV) per voxel for κ = tanh(θ), θ (V, p), summed over runs,
-    on the columns these runs support."""
+def _feature_index(P: int, device) -> Tensor:
+    """Upper-triangle positions of the two symmetric feature blocks in the full
+    (P+1)² + P² feature vector."""
+    P1 = P + 1
+    a, b = torch.triu_indices(P1, P1, device=device)
+    c, d = torch.triu_indices(P, P, device=device)
+    return torch.cat([a * P1 + b, P1 * P1 + c * P + d])
+
+
+def _feature_fold(P: int, dtype, device) -> Tensor:
+    """(F_full, F) matrix adding each coefficient to its mirror: Σ_kl u_kl A_kl
+    = Σ_{k≤l} u_kl (A_kl + A_lk) for symmetric u."""
+    P1 = P + 1
+    idx = _feature_index(P, device)
+    F = torch.zeros(P1 * P1 + P * P, idx.numel(), dtype=dtype, device=device)
+    cols = torch.arange(idx.numel(), device=device)
+    F[idx, cols] = 1
+    # mirror of each kept entry within its block
+    a, b = torch.triu_indices(P1, P1, device=device)
+    c, d = torch.triu_indices(P, P, device=device)
+    mirror = torch.cat([b * P1 + a, P1 * P1 + d * P + c])
+    F[mirror, cols] = 1
+    return F
+
+
+def _features(theta: Tensor, st: Stats) -> tuple[Tensor, Tensor]:
+    """(u (V, F), log|V| (V,)) for κ = tanh(θ): the per-voxel feature vector the
+    quadratic forms are linear in (see :meth:`LagStats.summed`), and log|V|."""
     p, P = theta.shape[-1], st.P
-    kappa = torch.tanh(theta)
-    taps, v = levinson(kappa, P)  # (V, p+1, P+1), (V, p+1)
-    c = taps[:, p]  # steady taps (V, P1)
+    taps, v = levinson(torch.tanh(theta), P)  # (V, p+1, P+1), (V, p+1)
+    c = taps[:, p]  # steady taps
     H = _head_filter(taps, p, P)  # (V, P, P)
+    V = theta.shape[0]
+    u = torch.cat(
+        [(c.unsqueeze(2) * c.unsqueeze(1)).reshape(V, -1), (H.transpose(1, 2) @ H).reshape(V, -1)],
+        dim=1,
+    )[:, _feature_index(P, theta.device)]
+    # per run: Σ_{j<p} log v_j + (n_r − p)·log v_p   (every run is longer than P ≥ p)
+    logv = torch.log(v)
+    R, N = len(st.n), st.n.sum().to(theta.dtype)
+    logdetV = R * logv[:, :p].sum(-1) + (N - R * p) * logv[:, p]
+    return u, logdetV
 
-    V, P1 = c.shape
-    Crr, SXr, SXX, X_head = st.summed()
-    K = SXr.shape[-1]
-    cc = (c.unsqueeze(2) * c.unsqueeze(1)).reshape(V, P1 * P1)  # tap outer product
-    rw2 = (cc * Crr).sum(-1)
-    g = torch.bmm(cc.unsqueeze(1), SXr).squeeze(1)
-    M = (cc @ SXX).reshape(V, K, K)
-    hr = torch.einsum("vts,vrs->vrt", H, st.r_head)  # (V, R, P) whitened heads
-    hx = torch.einsum("vts,rsK->vrtK", H, X_head)  # (V, R, P, K)
-    rw2 = rw2 + hr.pow(2).sum((1, 2))
-    g = g + torch.einsum("vrtK,vrt->vK", hx, hr)
-    M = M + torch.einsum("vrtK,vrtJ->vKJ", hx, hx)
 
-    logv = torch.log(v)  # (V, p+1)
-    n = st.n.to(theta.dtype)
-    head = torch.cumsum(logv[:, :p], dim=1)  # Σ_{j<min(n,p)} log v_j; runs are longer than P ≥ p
-    logdetV = (head[:, -1:] if p else theta.new_zeros(theta.shape[0], 1)).squeeze(1) * len(
-        st.n
-    ) + logv[:, p] * (n - p).sum()
-    return rw2, g, M, logdetV
+class _Core(torch.autograd.Function):
+    """``log|M| + m·log RSS`` from the features u, with an analytic gradient.
+
+    RSS = rw2 − g'M⁻¹g. With a = M⁻¹g: ∂/∂M = M⁻¹ + (m/RSS)·aa',
+    ∂/∂g = −2(m/RSS)·a, ∂/∂rw2 = m/RSS, contracted with the (structured)
+    coefficients. Non-PD M or RSS ≤ 0 → +inf (a line search backs off it);
+    those voxels get zero gradient."""
+
+    @staticmethod
+    def forward(ctx, u, c: _Crit, m: int):
+        f = _solve_structured(u, c)
+        rss = f["rw2"] - f["ga"]
+        bad = f["bad"] | ~(rss > 0)
+        out = f["logdetM"] + m * torch.log(rss)
+        out = torch.where(bad, torch.full_like(out, float("inf")), out)
+        ctx.f, ctx.c, ctx.m = f, c, m
+        ctx.save_for_backward(rss, bad)
+        return out
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Tensor):
+        (grad_out,) = grad_outputs
+        rss, bad = ctx.saved_tensors
+        f, c, m = ctx.f, ctx.c, ctx.m
+        g0 = torch.where(bad, torch.zeros_like(grad_out), grad_out)
+        w = g0 * m / torch.where(bad, torch.ones_like(rss), rss)
+        Md, Mb, Ms = _minv_blocks(f, c)
+        aD, aS = f["aD"], f["aS"]
+        dD = g0[:, None, None, None] * Md + w[:, None, None, None] * aD.unsqueeze(
+            -1
+        ) * aD.unsqueeze(-2)
+        dB = (
+            g0[:, None, None, None] * Mb
+            + w[:, None, None, None] * aD.unsqueeze(-1) * aS[:, None, None, :]
+        )
+        dS = g0[:, None, None] * Ms + w[:, None, None] * aS.unsqueeze(-1) * aS.unsqueeze(-2)
+        V, F = c.a_r.shape
+        du = dD.reshape(V, -1) @ c.D.reshape(F, -1).T
+        du = du + 2 * (dB.reshape(V, -1) @ c.B.reshape(F, -1).T)  # B and B' both in M
+        du = du + dS.reshape(V, -1) @ c.S.reshape(F, -1).T
+        du = du - 2 * w[:, None] * (
+            torch.einsum("vfrk,vrk->vf", c.g_priv, aD) + torch.einsum("vfk,vk->vf", c.g_shared, aS)
+        )
+        du = du + w[:, None] * c.a_r
+        return du, None, None
+
+
+def reml_criterion(theta: Tensor, st: Stats) -> Tensor:
+    """``log|V| + log|X'V⁻¹X| + (N−K)·log RSS`` per voxel (smaller is better) —
+    ``glm.arma``'s criterion, for AR(p) with κ = tanh(θ). Non-stationary-looking
+    or numerically singular points (|κ| → 1) are +inf."""
+    c = st.compact()
+    u, logdetV = _features(theta, st)
+    m = int(st.n.sum()) - c.n_cols
+    return logdetV + _Core.apply(u, c, m)
 
 
 def _columns(st: LagStats) -> Tensor:
     """Design columns with data in any of these runs."""
     return st.support.any(dim=0)
-
-
-def reml_criterion(theta: Tensor, st: LagStats) -> Tensor:
-    """``log|V| + log|X'V⁻¹X| + (N−K)·log RSS`` per voxel (smaller is better) —
-    ``glm.arma``'s criterion, for AR(p) with κ = tanh(θ)."""
-    rw2, g, M, logdetV = _quadratic_parts(theta, st)
-    # Near |κ| → 1 the taps blow up and M stops being numerically PD; such a θ is
-    # +inf, so a line search backs off it rather than the whole batch failing.
-    L, info = torch.linalg.cholesky_ex(M)
-    bad = info != 0
-    if bool(bad.any()):
-        L = torch.where(
-            bad[:, None, None], torch.eye(M.shape[-1], dtype=M.dtype, device=M.device), L
-        )
-    a = torch.cholesky_solve(g.unsqueeze(-1), L).squeeze(-1)
-    rss = rw2 - (g * a).sum(-1)
-    N, K = int(st.n.sum()), M.shape[-1]
-    logdetM = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
-    crit = logdetV + logdetM + (N - K) * torch.log(rss)
-    return torch.where(bad | ~(rss > 0), torch.full_like(crit, float("inf")), crit)
 
 
 def yule_walker_init(st: LagStats, p: int, clamp: float = 0.95) -> Tensor:
@@ -263,7 +467,7 @@ def yule_walker_init(st: LagStats, p: int, clamp: float = 0.95) -> Tensor:
     return torch.atanh(torch.stack(kappa, dim=-1)) if p else gamma.new_zeros(gamma.shape[0], 0)
 
 
-def _grad(theta: Tensor, st: LagStats) -> Tensor:
+def _grad(theta: Tensor, st: Stats) -> Tensor:
     """Per-voxel gradient of the criterion. The criterion is a sum of independent
     voxel terms, so one backward pass of the sum gives every voxel's own."""
     with torch.enable_grad():
@@ -272,7 +476,7 @@ def _grad(theta: Tensor, st: LagStats) -> Tensor:
     return gr
 
 
-def _hessian(theta: Tensor, st: LagStats, h: float = 1e-4) -> Tensor:
+def _hessian(theta: Tensor, st: Stats, h: float = 1e-4) -> Tensor:
     """Per-voxel p×p Hessian by central differences of :func:`_grad`.
 
     2p backward passes, each the size of one evaluation — forward-over-reverse
@@ -287,7 +491,7 @@ def _hessian(theta: Tensor, st: LagStats, h: float = 1e-4) -> Tensor:
     return 0.5 * (H + H.transpose(1, 2))
 
 
-def theta_covariance(theta: Tensor, st: LagStats) -> Tensor:
+def theta_covariance(theta: Tensor, st: Stats) -> Tensor:
     """Asymptotic covariance of θ̂ per voxel: the criterion is −2·log-likelihood
     (up to a constant), so the information is half its Hessian."""
     return torch.linalg.inv(0.5 * _hessian(theta, st))
@@ -314,7 +518,7 @@ def fit_ar_reml(
         z = torch.zeros(st.Crr.shape[0], 0, dtype=st.Crr.dtype, device=st.Crr.device)
         return z, reml_criterion(z, st)
     theta = (yule_walker_init(st, p) if theta0 is None else theta0).clone()
-    st.summed()
+    st = st.compact()
     crit = reml_criterion(theta, st)
     gr = _grad(theta, st)
     B = _hessian(theta, st)
@@ -382,15 +586,25 @@ def gls_from_stats(theta: Tensor, st: LagStats, beta_ols: Tensor) -> dict[str, T
     """GLS at the fitted AR(p): betas, their variances and σ² from the same stats.
 
     ``β = β_OLS + M⁻¹g`` (because X'V⁻¹y = Mβ_OLS + g), ``Var β = σ²M⁻¹``,
-    ``σ² = RSS/(N−K)``. ``beta_ols`` (V, K) must be the fit ``resid`` came from."""
-    cols = _columns(st)
-    rw2, g, M, _ = _quadratic_parts(theta, st)
-    L = torch.linalg.cholesky(M)
-    a = torch.cholesky_solve(g.unsqueeze(-1), L).squeeze(-1)
-    rss = rw2 - (g * a).sum(-1)
-    N, K = int(st.n.sum()), int(cols.sum())
-    sigma2 = rss / (N - K)
-    Minv_diag = torch.diagonal(torch.cholesky_inverse(L), dim1=-2, dim2=-1)
-    beta = beta_ols[:, cols].to(a.dtype) + a
-    var = sigma2[:, None] * Minv_diag
+    ``σ² = RSS/(N−K)``. ``beta_ols`` (V, K) must be the fit ``resid`` came from;
+    the outputs cover the columns these runs support, in their original order."""
+    c = st.compact()
+    u, _ = _features(theta, st)
+    f = _solve_structured(u, c)
+    rss = f["rw2"] - f["ga"]
+    sigma2 = rss / (int(st.n.sum()) - c.n_cols)
+    Md, _, Ms = _minv_blocks(f, c)
+    V = u.shape[0]
+    a_struct = torch.cat([f["aD"].reshape(V, -1), f["aS"]], dim=1)
+    dg_struct = torch.cat(
+        [torch.diagonal(Md, dim1=-2, dim2=-1).reshape(V, -1), torch.diagonal(Ms, dim1=-2, dim2=-1)],
+        dim=1,
+    )
+    real = c.order >= 0
+    a = u.new_zeros(V, c.n_cols)
+    dg = u.new_zeros(V, c.n_cols)
+    a[:, c.order[real]] = a_struct[:, real]
+    dg[:, c.order[real]] = dg_struct[:, real]
+    beta = beta_ols[:, _columns(st)].to(a.dtype) + a
+    var = sigma2[:, None] * dg
     return {"beta": beta, "var": var, "sigma2": sigma2, "t": beta / var.sqrt(), "rss": rss}

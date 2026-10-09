@@ -315,3 +315,29 @@ def test_local_blur_to_evens_out_a_volume_that_is_rough_on_one_side():
     # outside the mask nothing moves
     out = ~mask.reshape(-1)
     np.testing.assert_allclose(ad(held)[out], held[out], rtol=1e-6)
+
+
+def test_surface_local_blur_to_evens_out_a_sheet_that_is_rough_on_one_side(sheet):
+    from fastfuncstuff.surface.acf import blur_to_fwhm, blur_to_fwhm_local, local_surface_fwhm
+
+    v, f, inner = sheet
+    rough = _noise(v, f, 240, 1.5, 11)
+    smooth = _noise(v, f, 240, 4.0, 12)
+    rough /= rough[inner].std()
+    smooth /= smooth[inner].std()
+    y = np.where((v[:, 0] < 40)[:, None], rough, smooth)
+    left = inner & (v[:, 0] > 14) & (v[:, 0] < 32)
+    right = inner & (v[:, 0] > 48) & (v[:, 0] < 66)
+
+    def halves(x):
+        loc = local_surface_fwhm(x, v, f, inner, 8.0)
+        return float(np.nanmedian(loc[left])), float(np.nanmedian(loc[right]))
+
+    master, held = y[:, :120], y[:, 120:]
+    sad, _, achieved, _ = blur_to_fwhm_local(master, v, f, 7.0, inner)
+    assert sad is not None and achieved == pytest.approx(7.0, rel=0.03)
+    hs, _, _ = blur_to_fwhm(master, v, f, 7.0, inner, n_columns=120)
+    l_ad, r_ad = halves(sad(held))
+    l_hs, r_hs = halves(hs(held))
+    assert abs(l_ad - r_ad) < 0.5 * abs(l_hs - r_hs)
+    assert surface_fwhm(sad(held), v, f, inner)[0] == pytest.approx(7.0, rel=0.04)

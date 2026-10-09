@@ -42,7 +42,15 @@ from scipy.sparse import linalg as spla
 
 from .mesh import vertex_areas
 
-__all__ = ["HeatSmoother", "cotan_laplacian", "mesh_edges", "surface_fwhm", "torch_csr"]
+__all__ = [
+    "HeatSmoother",
+    "cotan_laplacian",
+    "jacobi_cg",
+    "mesh_edges",
+    "surface_edge_sums",
+    "surface_fwhm",
+    "torch_csr",
+]
 
 _LN2 = float(np.log(2.0))
 
@@ -218,27 +226,31 @@ class HeatSmoother:
         return out.cpu().numpy() if was_numpy else out
 
     def _cg(self, b, x0):
-        """Solve ``A X = B`` column-wise by Jacobi-preconditioned CG, from ``x0``."""
-        import torch
+        return jacobi_cg(self._a, self._dinv, b, x0, self.tol)
 
-        x = x0.clone()
-        r = b - self._a @ x
-        z = self._dinv[:, None] * r
-        p = z.clone()
-        rz = (r * z).sum(0)
-        bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(1e-30)
-        for _ in range(500):
-            ap = self._a @ p
-            alpha = rz / (p * ap).sum(0).clamp_min(1e-30)
-            x += alpha * p
-            r -= alpha * ap
-            if bool((torch.linalg.vector_norm(r, dim=0) / bnorm).max() < self.tol):
-                break
-            z = self._dinv[:, None] * r
-            rz_new = (r * z).sum(0)
-            p = z + (rz_new / rz.clamp_min(1e-30)) * p
-            rz = rz_new
-        return x
+
+def jacobi_cg(a, dinv, b, x0, tol: float = 1e-6, max_iter: int = 500):
+    """Solve ``A X = B`` column-wise by Jacobi-preconditioned CG, from ``x0`` (torch)."""
+    import torch
+
+    x = x0.clone()
+    r = b - a @ x
+    z = dinv[:, None] * r
+    p = z.clone()
+    rz = (r * z).sum(0)
+    bnorm = torch.linalg.vector_norm(b, dim=0).clamp_min(1e-30)
+    for _ in range(max_iter):
+        ap = a @ p
+        alpha = rz / (p * ap).sum(0).clamp_min(1e-30)
+        x += alpha * p
+        r -= alpha * ap
+        if bool((torch.linalg.vector_norm(r, dim=0) / bnorm).max() < tol):
+            break
+        z = dinv[:, None] * r
+        rz_new = (r * z).sum(0)
+        p = z + (rz_new / rz.clamp_min(1e-30)) * p
+        rz = rz_new
+    return x
 
 
 def surface_fwhm(
@@ -255,6 +267,22 @@ def surface_fwhm(
     over the edges at that vertex (NaN where there is none). Edges whose correlation is
     not in (0, 1) carry no information about a Gaussian width and are skipped.
     """
+    fwhm, num, den = surface_edge_sums(residuals, vertices, faces, mask)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        per = 1.0 / np.sqrt(num / (2 * _LN2 * den))
+    per[(den == 0) | ~(num > 0)] = np.nan
+    return fwhm, per
+
+
+def surface_edge_sums(
+    residuals: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """:func:`surface_fwhm`'s pieces: the global FWHM, and per vertex the sums
+    ``sum(-ln corr * d^2)`` and ``sum(d^4)`` over its edges, whose ratio is
+    ``2 ln2 / FWHM^2`` -- poolable over a neighbourhood before taking it."""
     r = np.asarray(residuals, np.float64)
     v = np.asarray(vertices, np.float64)
     n = v.shape[0]
@@ -275,7 +303,4 @@ def surface_fwhm(
     fwhm = float(1.0 / np.sqrt(inv)) if inv > 0 else float("nan")
     num = np.bincount(e.ravel(), np.repeat(y * d2, 2), minlength=n)
     den = np.bincount(e.ravel(), np.repeat(d2 * d2, 2), minlength=n)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        per = 1.0 / np.sqrt(num / (2 * _LN2 * den))
-    per[(den == 0) | ~(num > 0)] = np.nan
-    return fwhm, per
+    return fwhm, num, den

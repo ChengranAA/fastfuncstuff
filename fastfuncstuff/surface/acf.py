@@ -29,7 +29,16 @@ from scipy import sparse
 
 from .smooth import HeatSmoother, mesh_edges, surface_fwhm
 
-__all__ = ["SurfaceACF", "blur_to_fwhm", "detrend", "fit_surface_acf", "surface_acf"]
+__all__ = [
+    "SurfaceACF",
+    "SurfaceAdaptiveDiffusion",
+    "blur_to_fwhm",
+    "blur_to_fwhm_local",
+    "detrend",
+    "fit_surface_acf",
+    "local_surface_fwhm",
+    "surface_acf",
+]
 
 
 @dataclass
@@ -208,3 +217,169 @@ def blur_to_fwhm(
         return surface_fwhm(hs(x), vertices, faces, mask)[0], hs
 
     return bisect_kernel(measure, target, tol)
+
+
+def local_surface_fwhm(
+    x: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    mask: np.ndarray | None,
+    radius_mm: float,
+    device=None,
+) -> np.ndarray:
+    """Per-vertex FWHM (mm, NaN outside ``mask``): :func:`surface_fwhm`'s edge fit,
+    pooled over a heat-kernel neighbourhood of ``radius_mm`` (FWHM) along the cortex."""
+    from .smooth import _LN2, surface_edge_sums
+
+    _, num, den = surface_edge_sums(x, vertices, faces, mask)
+    pooled = HeatSmoother(vertices, faces, radius_mm, mask=mask, device=device)(
+        np.c_[num, den].astype(np.float64)
+    )
+    pooled = np.asarray(pooled, np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        per = 1.0 / np.sqrt(pooled[:, 0] / (2 * _LN2 * pooled[:, 1]))
+    per[~(pooled[:, 1] > 0) | ~(pooled[:, 0] > 0)] = np.nan
+    if mask is not None:
+        per[~np.asarray(mask, bool)] = np.nan
+    return per
+
+
+class SurfaceAdaptiveDiffusion:
+    """Recorded implicit heat steps with a per-vertex diffusivity on a mesh: each step
+    is ``(M + dt L_d) u' = M u`` with every cotan edge weight scaled by whether both
+    its ends still diffuse. Replaying applies exactly what the search measured; each
+    step's factorisation (CPU) or operator (GPU, Jacobi CG) is kept for every run."""
+
+    def __init__(self, vertices, faces, mask=None, device=None, tol: float = 1e-6):
+        from .mesh import vertex_areas
+        from .smooth import cotan_laplacian
+
+        n = np.asarray(vertices).shape[0]
+        self.mask = np.ones(n, bool) if mask is None else np.asarray(mask, bool)
+        self._idx = np.flatnonzero(self.mask)
+        lap = cotan_laplacian(vertices, faces, self.mask)[self._idx][:, self._idx].tocoo()
+        off = lap.row != lap.col
+        self._r, self._c, self._w = lap.row[off], lap.col[off], -lap.data[off]
+        mass = vertex_areas(np.asarray(vertices, np.float64), np.asarray(faces, np.int64))
+        self._mass = np.maximum(mass[self._idx], 1e-12)
+        self.device = device
+        self.tol = tol
+        self.steps: list[tuple[float, np.ndarray]] = []
+        self._ops: list = []
+
+    def operator(self, dt: float, d: np.ndarray):
+        """The solve for one step; ``d`` is a bool per masked vertex (who diffuses)."""
+        n = len(self._idx)
+        w = self._w * (d[self._r] & d[self._c])
+        weights = sparse.csr_matrix((w, (self._r, self._c)), shape=(n, n))
+        lap = sparse.diags(np.asarray(weights.sum(axis=1)).ravel()) - weights
+        a = (sparse.diags(self._mass) + dt * lap).tocsr()
+        if self.device is None:
+            from scipy.sparse import linalg as spla
+
+            return spla.factorized(a.tocsc())
+        import torch
+
+        from .smooth import jacobi_cg, torch_csr
+
+        a_t = torch_csr(a, self.device)
+        dinv = 1.0 / torch.as_tensor(a.diagonal(), dtype=torch.float32, device=self.device)
+        return lambda b: jacobi_cg(a_t, dinv, b, b.clone(), self.tol)
+
+    def apply(self, op, u):
+        """One step on masked rows ``u`` (numpy on CPU, torch on a device)."""
+        if self.device is None:
+            return op(self._mass[:, None] * u)
+        import torch
+
+        m = torch.as_tensor(self._mass, dtype=torch.float32, device=self.device)
+        return op(m[:, None] * u)
+
+    def record(self, dt: float, d: np.ndarray, op=None) -> None:
+        self.steps.append((float(dt), d))
+        self._ops.append(op if op is not None else self.operator(dt, d))
+
+    def _rows(self, x):
+        u = np.asarray(x)[self._idx]
+        if self.device is None:
+            return u.astype(np.float64)
+        import torch
+
+        return torch.as_tensor(u, dtype=torch.float32, device=self.device)
+
+    def __call__(self, data: np.ndarray) -> np.ndarray:
+        x = np.asarray(data)
+        vec = x.ndim == 1
+        x2 = x[:, None] if vec else x
+        out = np.array(x2, dtype=np.float32, copy=True)
+        u = self._rows(x2)
+        for op in self._ops:
+            u = self.apply(op, u)
+        out[self._idx] = u if self.device is None else u.cpu().numpy()
+        return out[:, 0] if vec else out
+
+
+def blur_to_fwhm_local(
+    master: np.ndarray,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target: float,
+    mask: np.ndarray | None = None,
+    radius_mm: float = 8.0,
+    device=None,
+    max_steps: int = 200,
+    tol: float = 0.02,
+) -> tuple[SurfaceAdaptiveDiffusion | None, float, float, np.ndarray]:
+    """Spatially varying blur-to on a mesh (the surface twin of
+    ``stats.blur_to.volume_blur_to_fwhm_local``): heat steps that stop wherever the
+    local FWHM (:func:`local_surface_fwhm`) has reached ``target``, until the global
+    FWHM does; the last step trimmed to land on it. Returns ``(diffusion, start,
+    achieved, local_fwhm_map)``; ``diffusion`` is None when already that smooth."""
+    sad = SurfaceAdaptiveDiffusion(vertices, faces, mask, device=device)
+    idx = sad._idx
+
+    def full(u):
+        out = np.zeros((len(sad.mask), u.shape[1]))
+        out[idx] = u if device is None else u.cpu().numpy()
+        return out
+
+    def glob(u):
+        return surface_fwhm(full(u), vertices, faces, sad.mask)[0]
+
+    u = sad._rows(master)
+    start = glob(u)
+    if not np.isfinite(start) or start >= target:
+        return (
+            None,
+            float(start),
+            float(start),
+            local_surface_fwhm(master, vertices, faces, sad.mask, radius_mm, device),
+        )
+    dt = max((target**2 - start**2) / (16 * np.log(2)) / 10.0, 1e-4)
+    achieved = start
+    for _ in range(max_steps):
+        local = local_surface_fwhm(full(u), vertices, faces, sad.mask, radius_mm, device)[idx]
+        d = np.isfinite(local) & (local < target)
+        if not d.any():
+            break
+        op = sad.operator(dt, d)
+        nxt = sad.apply(op, u)
+        f = glob(nxt)
+        if f >= target * (1 + tol):
+            lo, hi = 0.0, dt
+            for _ in range(12):
+                mid = 0.5 * (lo + hi)
+                if glob(sad.apply(sad.operator(mid, d), u)) >= target:
+                    hi = mid
+                else:
+                    lo = mid
+            sad.record(hi, d)
+            u = sad.apply(sad._ops[-1], u)
+            achieved = glob(u)
+            break
+        sad.record(dt, d, op)
+        u, achieved = nxt, f
+        if achieved >= target:
+            break
+    local = local_surface_fwhm(full(u), vertices, faces, sad.mask, radius_mm, device)
+    return sad, float(start), float(achieved), local

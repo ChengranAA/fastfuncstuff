@@ -38,6 +38,10 @@ kernel. The master, best first:
 Only -blur_to_columns time points, spread over the runs and never censored, carry
 the search.
 
+-blur_to_local makes it spatially varying (3dBlurToFWHM's method): small heat steps,
+each stopping wherever the local smoothness (pooled over -blur_to_nbhd mm) has reached
+the target, until the global one has. Rough cortex gets more blur than smooth.
+
 Inputs are runs of one hemisphere on one mesh. Outputs: one PREFIX.func.gii for a
 single input, else PREFIX.rNN.func.gii per run; the metadata records the kernel
 (blur_kernel_fwhm) and, for -blur_to_fwhm, the target and the master's measured
@@ -71,14 +75,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-polort", type=int, default=None,
                    help="Detrended master (no -matrix/-blurmaster): Legendre order per run. "
                    "Default: 1 + floor(run seconds / 150) when the TR is known, else 3.")  # fmt: skip
-    p.add_argument("-blur_to_columns", type=int, default=40, metavar="N",
-                   help="Time points that carry the -blur_to_fwhm search.")  # fmt: skip
+    p.add_argument("-blur_to_columns", type=int, default=None, metavar="N",
+                   help="Time points that carry the -blur_to_fwhm search. Default 40, or "
+                   "160 with -blur_to_local (a local estimate needs more).")  # fmt: skip
+    p.add_argument("-blur_to_local", action="store_true",
+                   help="-blur_to_fwhm, spatially varying: diffuse in steps and stop wherever "
+                   "the local smoothness has reached the target (3dBlurToFWHM's method).")  # fmt: skip
+    p.add_argument("-blur_to_nbhd", type=float, default=8.0, metavar="MM",
+                   help="-blur_to_local: neighbourhood (Gaussian FWHM, mm) of each local "
+                   "estimate.")  # fmt: skip
+    p.add_argument("-save_blur_fwhm", metavar="MAP.shape.gii", default=None,
+                   help="-blur_to_fwhm: write the local FWHM of the blurred master.")  # fmt: skip
     add_device_arg(p)
     args = p.parse_args(argv)
     if args.blur_to_fwhm is None and (args.blurmaster or args.matrix):
         p.error("-blurmaster / -matrix choose a master for -blur_to_fwhm")
     if args.censor and not args.matrix:
         p.error("-censor applies to the -matrix fit")
+    if args.blur_to_fwhm is None and (args.blur_to_local or args.save_blur_fwhm):
+        p.error("-blur_to_local / -save_blur_fwhm go with -blur_to_fwhm")
+    if args.blur_to_columns is None:
+        args.blur_to_columns = 160 if args.blur_to_local else 40
     return args
 
 
@@ -136,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.io.afni import load_afni_mask
     from fastfuncstuff.io.gifti import data_geometry, load_gifti_data, save_gifti_data
-    from fastfuncstuff.surface.acf import blur_to_fwhm
+    from fastfuncstuff.surface.acf import blur_to_fwhm, blur_to_fwhm_local, local_surface_fwhm
     from fastfuncstuff.surface.smooth import HeatSmoother, surface_fwhm
 
     args = parse_args(argv)
@@ -169,23 +186,43 @@ def main(argv: list[str] | None = None) -> int:
         data = np.concatenate(runs, axis=1)
         master = _master(args, data, lengths, tr)
         del data
-        hs, kernel, achieved = blur_to_fwhm(
-            master, vertices, faces, args.blur_to_fwhm, mask,
-            n_columns=master.shape[1], device=solve_on,
-        )  # fmt: skip
         start = surface_fwhm(master, vertices, faces, mask)[0]
+        local = None
+        if args.blur_to_local:
+            hs, _, achieved, local = blur_to_fwhm_local(
+                master, vertices, faces, args.blur_to_fwhm, mask, args.blur_to_nbhd,
+                device=solve_on,
+            )  # fmt: skip
+            how = "spatially varying diffusion"
+            if hs is not None:
+                record["blur_steps"] = str(len(hs.steps))
+                record["blur_nbhd"] = f"{args.blur_to_nbhd:g}"
+        else:
+            hs, kernel, achieved = blur_to_fwhm(
+                master, vertices, faces, args.blur_to_fwhm, mask,
+                n_columns=master.shape[1], device=solve_on,
+            )  # fmt: skip
+            record["blur_kernel_fwhm"] = f"{kernel:.4g}"
+            how = f"heat kernel {kernel:.2f} mm"
         record.update(
             blur_to_fwhm=f"{args.blur_to_fwhm:g}",
-            blur_kernel_fwhm=f"{kernel:.4g}",
             master_fwhm_before=f"{start:.4g}",
             master_fwhm_after=f"{achieved:.4g}",
         )
         if hs is None:
             print(f"  master already {start:.2f} mm smooth (>= {args.blur_to_fwhm}): no blur")
         else:
-            print(
-                f"  heat kernel {kernel:.2f} mm takes the master {start:.2f} -> {achieved:.2f} mm"
-            )
+            print(f"  {how} takes the master {start:.2f} -> {achieved:.2f} mm")
+        if args.save_blur_fwhm:
+            if local is None:
+                after = master if hs is None else hs(master)
+                local = local_surface_fwhm(after, vertices, faces, mask, args.blur_to_nbhd)
+            keep = {k: v for k, v in meta0.items() if k in ("mesh_fingerprint",)}
+            save_gifti_data(
+                args.save_blur_fwhm, np.nan_to_num(local).astype(np.float32), keep,
+                time_series=False,
+            )  # fmt: skip
+            print(f"  -> {Path(args.save_blur_fwhm).name} (local FWHM after blurring)")
 
     for run, (_, meta), src, out in zip(
         runs, loaded, args.input, _outputs(args.prefix, len(runs)), strict=True

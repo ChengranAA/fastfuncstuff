@@ -23,9 +23,12 @@ proportion to each run's uncensored length, because smoothness differs between r
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 __all__ = [
     "MaskedGaussian",
@@ -367,7 +370,7 @@ def volume_blur_to_fwhm_local(
     device=None,
     max_steps: int = 400,
     tol: float = 0.02,
-) -> tuple[AdaptiveDiffusion | None, float, float, object]:
+) -> tuple[AdaptiveDiffusion | None, float, float, Tensor]:
     """Spatially varying blur-to (3dBlurToFWHM's method): diffuse the master in small
     steps, re-measure each voxel's local FWHM (:func:`local_volume_fwhm`, pooled over
     ``radius_mm``) after each, and stop diffusing wherever it has reached ``target``.

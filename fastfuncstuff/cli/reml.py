@@ -874,10 +874,35 @@ Examples:
         "-blur_to_columns",
         type=int,
         metavar="N",
-        default=40,
+        default=None,
         help="-blur_to_fwhm: how many uncensored time points, spread over the runs, "
-        "carry the kernel search. The FWHM estimate averages over every edge, so a few "
-        "dozen pin it (3dBlurToFWHM uses at most 32).",
+        "carry the search. Default 40: the global FWHM averages over every edge, so a "
+        "few dozen pin the kernel to ~2%%. With -blur_to_local 160: a local estimate "
+        "averages over a neighbourhood only, and on real cortex 40 points leave a "
+        "90th-percentile error of ~7%% against a true spread of ~17%%; 160 halve it.",
+    )
+    proc_opts.add_argument(
+        "-blur_to_local",
+        action="store_true",
+        help="-blur_to_fwhm, spatially varying (3dBlurToFWHM's method): diffuse in small "
+        "steps and stop wherever the LOCAL smoothness has reached the target, until the "
+        "global one has. Rough places get more blur than smooth ones, so the residuals "
+        "come out closer to the stationary field a cluster table assumes.",
+    )
+    proc_opts.add_argument(
+        "-blur_to_nbhd",
+        type=float,
+        metavar="MM",
+        default=8.0,
+        help="-blur_to_local: the neighbourhood (FWHM of a Gaussian, mm) each local "
+        "smoothness estimate is pooled over.",
+    )
+    proc_opts.add_argument(
+        "-save_blur_fwhm",
+        metavar="FILE",
+        default=None,
+        help="-blur_to_fwhm: write the local FWHM of the blurred master (one map; "
+        ".shape.gii on surface input) -- where the target was and was not reached.",
     )
     proc_opts.add_argument(
         "-surf_geom",
@@ -1316,64 +1341,106 @@ def _blur_to_good_list(args, design_info, run_starts, total_tps, trim):
 
 def _blur_to_master(args, data, design_info, run_starts, trim):
     """-blur_to_fwhm's master: OLS residuals of the unblurred data against the model's
-    own design, at ~40 uncensored time points spread over every run (stats.blur_to)."""
+    own design, at -blur_to_columns uncensored time points spread over every run."""
     from fastfuncstuff.stats.blur_to import residual_master, sample_columns
 
     total = data.shape[1]
     good = _blur_to_good_list(args, design_info, run_starts, total, trim)
     bounds = [int(r) for r in run_starts] + [total]
     lengths = [bounds[i + 1] - bounds[i] for i in range(len(run_starts))]
-    cols = sample_columns(lengths, args.blur_to_columns, good=good)
+    n_cols = args.blur_to_columns or (160 if args.blur_to_local else 40)
+    cols = sample_columns(lengths, n_cols, good=good)
     return residual_master(data, design_info["matrix"], cols, good=good)
 
 
-def _surface_blur_to(args, input_file, header, n_vertices: int, master, keep=None):
-    """-blur_to_fwhm on the surface: the heat kernel that brings ``master`` to the target."""
-    from fastfuncstuff.surface.acf import blur_to_fwhm
+def _report_blur_to(args, op, start, achieved, n_cols, what):
+    if op is None:
+        print(
+            f"  Residuals already {start:.2f} mm smooth (>= {args.blur_to_fwhm}): no blur applied"
+        )
+        return
+    how = "spatially varying diffusion" if args.blur_to_local else what
+    print(
+        f"  Blurring TO {args.blur_to_fwhm} mm by {how}: OLS residuals at {n_cols} time "
+        f"points go {start:.2f} -> {achieved:.2f} mm"
+    )
+
+
+def _surface_blur_to(args, input_file, header, n_vertices: int, master, keep=None, device=None):
+    """-blur_to_fwhm on the surface: heat smoothing that brings ``master`` to the
+    target -- one kernel, or (-blur_to_local) diffusion that stops where it is reached."""
+    from fastfuncstuff.io.gifti import save_gifti_data, surface_meta
+    from fastfuncstuff.surface.acf import blur_to_fwhm, blur_to_fwhm_local, local_surface_fwhm
+    from fastfuncstuff.surface.smooth import surface_fwhm
 
     vertices, faces = _surface_geometry(args, input_file, header, n_vertices)
     mask = _surface_mask(args)
     if keep is not None:
         mask = np.asarray(keep, bool) if mask is None else mask & np.asarray(keep, bool)
-    hs, kernel, achieved = blur_to_fwhm(
-        master, vertices, faces, args.blur_to_fwhm, mask, n_columns=master.shape[1]
-    )
-    if hs is None:
-        print(
-            f"  Surface residuals already {achieved:.2f} mm smooth (>= {args.blur_to_fwhm}): "
-            "no blur applied"
+    on = _surface_device(device)
+    local = None
+    if args.blur_to_local:
+        op, start, achieved, local = blur_to_fwhm_local(
+            master, vertices, faces, args.blur_to_fwhm, mask, args.blur_to_nbhd, device=on
         )
-        return None
-    print(
-        f"  Blurring TO {args.blur_to_fwhm} mm: heat kernel {kernel:.2f} mm "
-        f"(OLS residuals at {master.shape[1]} time points reach {achieved:.2f} mm)"
-    )
-    return hs
+        what = ""
+    else:
+        start = surface_fwhm(master, vertices, faces, mask)[0]
+        op, kernel, achieved = blur_to_fwhm(
+            master, vertices, faces, args.blur_to_fwhm, mask, n_columns=master.shape[1]
+        )
+        what = f"a {kernel:.2f} mm heat kernel"
+    _report_blur_to(args, op, start, achieved, master.shape[1], what)
+    if args.save_blur_fwhm:
+        if local is None:
+            after = master if op is None else op(master)
+            local = local_surface_fwhm(after, vertices, faces, mask, args.blur_to_nbhd, on)
+        meta = {k: v for k, v in (surface_meta(header) or {}).items() if k == "mesh_fingerprint"}
+        save_gifti_data(
+            args.save_blur_fwhm, np.nan_to_num(local).astype(np.float32), meta, time_series=False
+        )
+        print(f"  • local FWHM after blurring: {args.save_blur_fwhm}")
+    return op
 
 
-def _volume_blur_to(args, master, volume_shape, voxel_sizes, keep, device):
-    """-blur_to_fwhm on a voxel grid: the in-mask Gaussian that brings ``master`` to
-    the target, by 3dFWHMx's classic estimate inside -mask (and the guard's keep)."""
+def _volume_blur_to(args, master, volume_shape, voxel_sizes, keep, device, affine):
+    """-blur_to_fwhm on a voxel grid, inside -mask (and the guard's keep): one in-mask
+    Gaussian, or (-blur_to_local) diffusion that stops where the target is reached."""
     from fastfuncstuff.io.afni import load_afni_mask
-    from fastfuncstuff.stats.blur_to import volume_blur_to_fwhm
+    from fastfuncstuff.stats.blur_to import (
+        local_volume_fwhm,
+        volume_blur_to_fwhm,
+        volume_blur_to_fwhm_local,
+        volume_fwhm,
+    )
 
     mask = load_afni_mask(args.mask).reshape(-1).astype(bool)
     if keep is not None:
         mask &= np.asarray(keep, bool)
-    g, kernel, achieved = volume_blur_to_fwhm(
-        master, mask.reshape(volume_shape), voxel_sizes, args.blur_to_fwhm, device=device
-    )
-    if g is None:
-        print(
-            f"  Residuals already {achieved:.2f} mm smooth (>= {args.blur_to_fwhm}): "
-            "no blur applied"
+    mask = mask.reshape(volume_shape)
+    local = None
+    if args.blur_to_local:
+        op, start, achieved, local = volume_blur_to_fwhm_local(
+            master, mask, voxel_sizes, args.blur_to_fwhm, args.blur_to_nbhd, device=device
         )
-        return None
-    print(
-        f"  Blurring TO {args.blur_to_fwhm} mm: Gaussian {kernel:.2f} mm inside the mask "
-        f"(OLS residuals at {master.shape[1]} time points reach {achieved:.2f} mm)"
-    )
-    return g
+        what = ""
+    else:
+        start = volume_fwhm(master, mask, voxel_sizes, device)
+        op, kernel, achieved = volume_blur_to_fwhm(
+            master, mask, voxel_sizes, args.blur_to_fwhm, device=device
+        )
+        what = f"a {kernel:.2f} mm Gaussian inside the mask"
+    _report_blur_to(args, op, start, achieved, master.shape[1], what)
+    if args.save_blur_fwhm:
+        if local is None:
+            after = master if op is None else op(master)
+            local = local_volume_fwhm(after, mask, voxel_sizes, args.blur_to_nbhd, device)
+        from fastfuncstuff.io.afni import save_nifti
+
+        vol = np.nan_to_num(local.cpu().numpy()).astype(np.float32)
+        save_nifti(vol, args.save_blur_fwhm, affine=affine)
+        print(f"  • local FWHM after blurring: {args.save_blur_fwhm}")
+    return op
 
 
 def _observe_surface_acf(args, input_file, residuals, mask, label, device):
@@ -3403,10 +3470,12 @@ def main():
             keep_np = None if guard_keep is None else guard_keep.numpy()
             if surface_input:
                 blur_to = _surface_blur_to(
-                    args, input_files[0], nifti_header, n_voxels, master, keep=keep_np
+                    args, input_files[0], nifti_header, n_voxels, master, keep_np, device
                 )
             else:
-                blur_to = _volume_blur_to(args, master, volume_shape, voxel_sizes, keep_np, device)
+                blur_to = _volume_blur_to(
+                    args, master, volume_shape, voxel_sizes, keep_np, device, affine
+                )
             del master
             if blur_to is not None:
                 bounds = [int(r) for r in run_starts] + [fmri_data_preprocessed.shape[1]]

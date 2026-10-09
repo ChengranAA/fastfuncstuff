@@ -174,8 +174,18 @@ def test_blursurf_cli_by_and_to_with_a_residual_master(tmp_path):
     assert float(m5["master_fwhm_after"]) == pytest.approx(5.0, rel=0.03)
     assert float(m5["master_fwhm_before"]) < 3.0 < float(m5["blur_kernel_fwhm"]) < 5.0
 
+    loc = ["-blur_to_local", "-save_blur_fwhm", str(out / "loc.shape.gii")]
+    assert run([*argv, *loc, "-prefix", str(out / "bl5")]) == 0
+    _, ml = load_gifti_data(out / "bl5.r02.func.gii")
+    assert float(ml["master_fwhm_after"]) == pytest.approx(5.0, rel=0.04)
+    assert int(ml["blur_steps"]) >= 1 and "blur_kernel_fwhm" not in ml
+    fmap, _ = load_gifti_data(out / "loc.shape.gii")
+    assert fmap.shape == (len(v),) and np.nanmedian(fmap[fmap > 0]) > 3.5
+
     with pytest.raises(SystemExit):
         run(["-input", *inputs, "-do_blur", "3", "-blur_to_fwhm", "5", "-prefix", "z"])
+    with pytest.raises(SystemExit):
+        run(["-input", *inputs, "-do_blur", "3", "-blur_to_local", "-prefix", "z"])
     with pytest.raises(SystemExit):
         run(["-input", *inputs, "-do_blur", "3", "-matrix", "X", "-prefix", "z"])
 
@@ -270,9 +280,18 @@ def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, m
         run(*common, "-Rbuck", str(tmp_path / "x.nii"))  # a volume needs -mask
     run(*common, "-mask", str(tmp_path / "mask.nii"), "-Rbuck", str(tmp_path / "s.nii"),
         "-save_acf", str(tmp_path / "acf"))  # fmt: skip
-    avg = (tmp_path / "acf.fwhmx_reml.txt").read_text().splitlines()[-1].split()
-    classic = float(np.exp(np.mean(np.log([float(v) for v in avg[1:4]]))))
-    assert classic == pytest.approx(6.0, rel=0.05)
+
+    def classic(stem):
+        avg = (tmp_path / f"{stem}.fwhmx_reml.txt").read_text().splitlines()[-1].split()
+        return float(np.exp(np.mean(np.log([float(v) for v in avg[1:4]]))))
+
+    assert classic("acf") == pytest.approx(6.0, rel=0.05)
+    run(*common, "-mask", str(tmp_path / "mask.nii"), "-Rbuck", str(tmp_path / "l.nii"),
+        "-blur_to_local", "-save_blur_fwhm", str(tmp_path / "loc.nii"),
+        "-save_acf", str(tmp_path / "acfl"))  # fmt: skip
+    assert classic("acfl") == pytest.approx(6.0, rel=0.05)
+    fmap = np.asarray(nib.load(str(tmp_path / "loc.nii")).dataobj)
+    assert fmap.shape == shape and np.median(fmap[mask]) == pytest.approx(6.0, rel=0.1)
 
 
 def test_local_blur_to_evens_out_a_volume_that_is_rough_on_one_side():

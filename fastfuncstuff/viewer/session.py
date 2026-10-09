@@ -252,7 +252,9 @@ class ViewerSession:
         #: are coming back to.
         self._modes: dict[str, Mode] = {self.mode.name: self.mode}
         self.mode.attach(self)
-        self._volume_cache: dict[tuple[str, int], torch.Tensor] = {}
+        self._volume_cache: dict[tuple, torch.Tensor] = {}
+        #: Display transforms of time series, per (layer, hemi, view, generation).
+        self._time_views: dict[tuple, object] = {}
         #: Built on demand from a layer's voxels and kept until the flag or the
         #: layer changes. Describing an atlas is one pass over the volume, and
         #: the crosshair readout asks which region it is on every move.
@@ -429,7 +431,7 @@ class ViewerSession:
         data = sld.parts[hemi]
         idx = self.state.time_index if chosen.time_linked else chosen.volume_index
         idx = max(0, min(int(idx), data.values.shape[1] - 1))
-        values = data.values[:, idx]
+        values = self.vertex_frame(chosen, hemi, idx)
         stat = (
             data.values[:, chosen.threshold_brick] if chosen.threshold_index is not None else values
         )
@@ -586,9 +588,10 @@ class ViewerSession:
         (its painted ribbon counts each vertex once per voxel it owns), else the
         volume."""
         sld = self.surface_layers.get(key)
-        if sld is not None:
-            return np.concatenate([d.values[:, index] for d in sld.parts.values()])
-        return self.volume(key, index)
+        layer = self.state.layers.find(key)
+        if sld is not None and layer is not None:
+            return np.concatenate([self.vertex_frame(layer, h, index) for h in sld.parts])
+        return self.shown_volume(key, index)
 
     def overlay_look(self, key: str, index: int, *, colormap: str) -> dict[str, object]:
         """Colour scale for one sub-brick of an overlay: range, and hot or red-blue.
@@ -1616,6 +1619,67 @@ class ViewerSession:
             return res.array[..., idx]
         return self.store.preview(key, idx)
 
+    def time_view(self, layer: Layer, hemi: str | None = None):
+        """The layer's display transform (viewer.timeview), or None when it is shown raw.
+
+        Built once per (layer, view, data generation) -- the drift fit is the
+        expensive part, every frame after it is cheap. Per hemisphere for a
+        surface result, whose series are vertices rather than voxels. None
+        while a volume is not yet resident: it shows raw until it is.
+        """
+        from fastfuncstuff.viewer.timeview import build_time_view
+
+        if (layer.time_detrend < 0 and not layer.time_psc) or not layer.time_linked:
+            return None
+        res = self.store.get(layer.key)
+        key = (layer.key, hemi, layer.time_detrend, layer.time_psc, res.generation)
+        cache = self._time_views
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        sld = self.surface_layers.get(layer.key)
+        if sld is not None:
+            if hemi is None or hemi not in sld.parts:
+                return None
+            series = sld.parts[hemi].values
+        else:
+            if res.array is None:
+                return None
+            series = res.array
+        for stale in [k for k in cache if k[0] == layer.key and k[1] == hemi]:
+            del cache[stale]
+        cache[key] = view = build_time_view(series, layer.time_detrend, layer.time_psc)
+        return view
+
+    def vertex_frame(self, layer: Layer, hemi: str, index: int) -> np.ndarray:
+        """A surface result's values at ``index`` on ``hemi``, as viewed."""
+        data = self.surface_layers[layer.key].parts[hemi]
+        idx = max(0, min(int(index), data.values.shape[1] - 1))
+        values = data.values[:, idx]
+        view = self.time_view(layer, hemi)
+        return values if view is None else view.frame(values, idx)
+
+    def shown_volume(self, key: str, index: int | None = None) -> np.ndarray:
+        """:meth:`volume` through the layer's time view: what is drawn, not what is stored.
+
+        The display paths (slices, the 3-D window, the readout, AUTO's range)
+        read this; analysis (DERIVE, edit snapping) keeps reading :meth:`volume`.
+        """
+        layer = self.state.layers.find(key)
+        raw = self.volume(key, index)
+        if layer is None or (layer.time_detrend < 0 and not layer.time_psc):
+            return raw
+        idx = self.state.time_index if index is None else index
+        idx = max(0, min(int(idx), layer.n_volumes - 1))
+        sld = self.surface_layers.get(key)
+        if sld is not None:
+            vol = np.zeros(raw.shape, np.float32)
+            for hemi in sld.parts:
+                sld.maps[hemi].paint(self.vertex_frame(layer, hemi, idx), out=vol)
+            return vol
+        view = self.time_view(layer)
+        return raw if view is None else view.frame(raw, idx)
+
     def surface_sampler(self, key: str | None = None, mode: str = "linear"):
         """The image a surface edit snaps to: ``key``'s current volume, or the bottom layer's.
 
@@ -1665,13 +1729,13 @@ class ViewerSession:
             idx = layer.volume_index
         idx = max(0, min(int(idx), res.info.n_volumes - 1))
 
-        cache_key = (key, idx)
+        cache_key = (key, idx, layer.time_detrend, layer.time_psc)
         hit = self._volume_cache.get(cache_key)
         if hit is not None:
             return hit
 
         try:
-            arr = self.volume(key, idx)
+            arr = self.shown_volume(key, idx)
         except (KeyError, FileNotFoundError, ValueError):
             return None
         tensor = torch.as_tensor(np.ascontiguousarray(arr), dtype=torch.float32).to(

@@ -1388,6 +1388,23 @@ class SetThreshold(Command):
 
 @command
 @dataclass(frozen=True)
+class SetLayerTimeView(Command):
+    """View a time series detrended (order >= 0) and/or as percent signal change.
+
+    Display only: the slices, the 3-D surface and the readout show the
+    transformed frame; nothing is written, and graphs keep their own detrend.
+    """
+
+    name = "SET_LAYER_TIME_VIEW"
+    # LAYERS: the cached on-device frames hold the old view.
+    aspects = Aspect.LAYERS | Aspect.SLICES
+    key: str
+    detrend: int
+    psc: bool
+
+
+@command
+@dataclass(frozen=True)
 class SetRangeMirror(Command):
     """Hold a layer's min at the negation of its max."""
 
@@ -2614,6 +2631,16 @@ def install(
         _hold_p(layer, changes)
         st.layers.update(cmd.key, **changes)
         return SetThresholdIndex.aspects
+
+    @bus.handle(SetLayerTimeView.name)
+    def _set_time_view(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetLayerTimeView)
+        order, psc = max(-1, int(cmd.detrend)), bool(cmd.psc)
+        layer = st.layers.get(cmd.key)
+        if (layer.time_detrend, layer.time_psc) == (order, psc):
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, time_detrend=order, time_psc=psc)
+        return SetLayerTimeView.aspects
 
     @bus.handle(SetRangeMirror.name)
     def _set_range_mirror(cmd: Command, st: ViewerState) -> Aspect:

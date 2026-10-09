@@ -2048,11 +2048,13 @@ class SurfaceWindow(QtWidgets.QWidget):
                 idx,
                 thr if thr != idx else None,
                 np.asarray(layer.affine).tobytes(),
+                layer.time_detrend,
+                layer.time_psc,
             )
             data = self._slot_cache.get(key)
             if data is None:
                 try:
-                    value = s3.texture_data(self.session.volume(layer.key, idx))
+                    value = s3.texture_data(self.session.shown_volume(layer.key, idx))
                     stat = (
                         None
                         if thr is None or thr == idx

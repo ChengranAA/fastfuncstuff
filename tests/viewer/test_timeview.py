@@ -55,3 +55,42 @@ def test_no_detrend_and_no_psc_is_the_raw_frame(series):
     view = build_time_view(series, -1, psc=False)
     assert view.identity
     np.testing.assert_array_equal(view.frame(series[..., 3], 3), series[..., 3])
+
+
+def test_a_layers_time_view_is_what_the_slices_draw_and_it_replays(tmp_path, series):
+    import nibabel as nib
+    import torch
+
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.vocab import SetIndex, SetLayerTimeView
+
+    img = nib.Nifti1Image(series, np.eye(4))
+    img.header.set_xyzt_units("mm", "sec")
+    img.header["pixdim"][4] = 2.0
+    nib.save(img, tmp_path / "run.nii.gz")
+    session = ViewerSession(device=torch.device("cpu"))
+    try:
+        session.load(str(tmp_path / "run.nii.gz"))
+        key = session.graph_layers()[0].key
+        session.store.ensure_ram(key)
+        session.do(SetIndex(12))
+        raw = session.display_volume(key).numpy().copy()
+        session.do(SetLayerTimeView(key, 1, True))
+        shown = session.display_volume(key).numpy()
+        want = build_time_view(series, 1, True).frame(series[..., 12], 12)
+        np.testing.assert_allclose(shown, want, atol=1e-3)
+        assert not np.allclose(shown, raw)
+        # Analysis keeps the stored values.
+        np.testing.assert_allclose(session.volume(key, 12), series[..., 12])
+
+        script = session.to_script()
+        assert "SET_LAYER_TIME_VIEW" in script
+        again = ViewerSession(device=torch.device("cpu"))
+        try:
+            again.run_script(script)
+            layer = again.state.layers.get(key)
+            assert (layer.time_detrend, layer.time_psc) == (1, True)
+        finally:
+            again.close()
+    finally:
+        session.close()

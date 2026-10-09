@@ -102,6 +102,12 @@ class Layer:
     #: it outlives the mode that was active when it was made.
     source: str = "file"
 
+    #: A time series viewed rather than shown raw (viewer.timeview): Legendre
+    #: drift up to this order removed (-1: none), and/or as percent signal
+    #: change from each voxel's mean. Display only; DERIVE keeps a copy.
+    time_detrend: int = -1
+    time_psc: bool = False
+
     #: Display range. ``None`` means "derive from the data" -- resolved once the
     #: volume is resident, then cached here.
     range_lo: float | None = None

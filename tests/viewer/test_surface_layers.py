@@ -309,3 +309,29 @@ def test_launch_command_reopens_what_is_loaded(world):
         for k in ("white", "pial")
     )
     assert args.surfaces is None
+
+
+def test_a_surface_series_is_shown_through_its_time_view(world):
+    from fastfuncstuff.io.gifti import save_gifti_data
+    from fastfuncstuff.viewer.timeview import build_time_view
+    from fastfuncstuff.viewer.vocab import Load, SetIndex, SetLayerTimeView
+
+    s, tmp_path, d, f, _ = world
+    rng = np.random.default_rng(1)
+    series = (1000 + 5 * np.arange(8.0) + rng.normal(size=(len(d), 8))).astype(np.float32)
+    fp = mesh_fingerprint(f, len(d))
+    save_gifti_data(
+        tmp_path / "r.lh.func.gii", series, meta={"mesh_fingerprint": fp, "TR_seconds": "2"}
+    )
+    s.do(Load(str(tmp_path / "r.lh.func.gii")))
+    layer = list(s.state.layers)[-1]
+    assert layer.time_linked and layer.n_volumes == 8
+    s.do(SetIndex(5))
+    s.do(SetLayerTimeView(layer.key, 1, False))
+    layer = s.state.layers.get(layer.key)
+    want = build_time_view(series, 1, False).frame(series[:, 5], 5)
+    np.testing.assert_allclose(s.vertex_frame(layer, "lh", 5), want, atol=1e-3)
+    # The ribbon painted from the viewed values, not the stored ones.
+    rm = s.surfaces.ribbon_map("lh", layer.shape, layer.affine)
+    vol = s.shown_volume(layer.key, 5)
+    np.testing.assert_allclose(vol.reshape(-1)[rm.flat], want[rm.vertex], atol=1e-3)

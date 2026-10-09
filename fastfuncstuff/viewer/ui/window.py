@@ -1427,6 +1427,37 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.resample_head = self._head(key_label("DRAW", "e"))
         form.addRow(self.resample_head, self.resample_box)
 
+        # How a time series is SHOWN as time is stepped: detrended and/or as
+        # percent signal change, so a frame shows activity instead of each
+        # voxel's mean. Display only, like DRAW; DERIVE keeps a copy.
+        from fastfuncstuff.viewer.ui.gridgraph import DETREND_LABELS
+
+        self.time_row = QtWidgets.QWidget()
+        time_row = QtWidgets.QHBoxLayout(self.time_row)
+        time_row.setContentsMargins(0, 0, 0, 0)
+        time_row.setSpacing(6)
+        self.time_detrend_box = QtWidgets.QComboBox()
+        self.time_detrend_box.setToolTip(
+            "Show each frame with this much Legendre drift taken out of every\n"
+            "voxel's series -- mean, linear, ... -- so stepping through time\n"
+            "shows the activity, not the anatomy and the scanner's drift.\n"
+            "Display only: nothing is written, and graphs keep their own detrend."
+        )
+        for order, name in DETREND_LABELS:
+            self.time_detrend_box.addItem(name, userData=order)
+        self.time_detrend_box.activated.connect(lambda _: self._set_time_view())
+        self._shrinkable(self.time_detrend_box)
+        time_row.addWidget(self.time_detrend_box, 1)
+        self.time_psc_check = QtWidgets.QCheckBox("PSC")
+        self.time_psc_check.setToolTip(
+            "Percent signal change from each voxel's mean (after any detrend).\n"
+            "Zero outside the head, where the mean is ~0."
+        )
+        self.time_psc_check.toggled.connect(lambda _: self._set_time_view())
+        time_row.addWidget(self.time_psc_check)
+        self.time_head = self._head("TIME")
+        form.addRow(self.time_head, self.time_row)
+
         # Min, threshold and max are edited on the bar itself. Splitting the
         # number from the picture of the number is what let the bar go stale.
         self.rangebar = RangeBar()
@@ -1791,6 +1822,19 @@ class ViewerWindow(QtWidgets.QMainWindow):
         layer = self.session.state.selected_layer()
         return None if layer is None else layer.key
 
+    def _set_time_view(self) -> None:
+        """Dispatch the TIME row, then re-range: a detrended frame sits around
+        zero and a PSC one in percent, so the raw run's range shows nothing."""
+        from fastfuncstuff.viewer.vocab import SetLayerTimeView
+
+        key = self.current_key()
+        if key is None:
+            return
+        order = int(self.time_detrend_box.currentData())
+        psc = self.time_psc_check.isChecked()
+        self._dispatch(SetLayerTimeView(key, order, psc))
+        self._autorange()
+
     def _apply(self, cls, **kwargs) -> None:
         key = self.current_key()
         if key is None:
@@ -1968,7 +2012,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         layer = self.session.state.layers.get(key)
         if layer.time_linked or layer.n_volumes <= 1 or layer.is_computed:
-            lo, hi = derive_range(self.session.volume(key))
+            lo, hi = derive_range(self.session.shown_volume(key))
             self._dispatch(SetRange(key, float(lo), float(hi)))
             return
         # The sub-brick on screen, not the time index -- which on a bucket is
@@ -2332,6 +2376,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
         index = self.resample_box.findData(layer.resample)
         self.resample_box.setCurrentIndex(max(index, 0))
         self.resample_box.blockSignals(False)
+        timed = layer.time_linked and layer.n_volumes > 1
+        self.time_head.setVisible(timed)
+        self.time_row.setVisible(timed)
+        for widget in (self.time_detrend_box, self.time_psc_check):
+            widget.blockSignals(True)
+        self.time_detrend_box.setCurrentIndex(
+            max(self.time_detrend_box.findData(layer.time_detrend), 0)
+        )
+        self.time_psc_check.setChecked(layer.time_psc)
+        for widget in (self.time_detrend_box, self.time_psc_check):
+            widget.blockSignals(False)
         self._sync_brick_pickers(layer)
         self.opacity_slider.blockSignals(True)
         self.opacity_slider.setValue(int(round(layer.opacity * 100)))

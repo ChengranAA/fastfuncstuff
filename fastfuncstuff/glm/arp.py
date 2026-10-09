@@ -44,22 +44,34 @@ from torch import Tensor
 
 @dataclass
 class LagStats:
-    """Lagged cross-products of OLS residuals and design, per run.
+    """Lagged cross-products of OLS residuals and design, per run, on each run's
+    own columns.
 
-    ``r`` is indexed (V, R, ...) — voxels, runs. Design terms are shared across
-    voxels. ``support`` marks the design columns that are nonzero in each run,
-    so a subset of runs can drop the columns it has no data for."""
+    A run only touches the design columns that are nonzero in it (its own
+    polynomials and motion, plus the shared task columns), so the design side is
+    stored on those *local* columns: ``cols`` (R, kl) maps each run's local slot
+    to a design column (−1 = padding). 100 runs × 401 columns with 5 per run
+    stays 5 wide instead of 401. ``r`` terms are indexed (V, R, ...)."""
 
     P: int
     n: Tensor  # (R,) run lengths
     Crr: Tensor  # (V, R, P+1, P+1)
-    SXr: Tensor  # (V, R, P+1, P+1, K)
-    SXX: Tensor  # (R, P+1, P+1, K, K)
+    SXr: Tensor  # (V, R, P+1, P+1, kl)
+    SXX: Tensor  # (R, P+1, P+1, kl, kl)
     r_head: Tensor  # (V, R, P)
-    X_head: Tensor  # (R, P, K)
-    support: Tensor  # (R, K) bool
+    X_head: Tensor  # (R, P, kl)
+    cols: Tensor  # (R, kl) long, −1 = padding
+    K: int  # columns in the full design
     # The criterion's data, built once per instance (see `compact`).
     _crit: _Crit | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def support(self) -> Tensor:
+        """(R, K) bool: design columns with data in each run."""
+        sup = torch.zeros(len(self.n), self.K, dtype=torch.bool, device=self.cols.device)
+        r, j = torch.nonzero(self.cols >= 0, as_tuple=True)
+        sup[r, self.cols[r, j]] = True
+        return sup
 
     def compact(self) -> _Crit:
         """The criterion's data for these runs, run-summed and structured.
@@ -82,33 +94,18 @@ class LagStats:
 
     def runs(self, idx: Sequence[int] | Tensor) -> LagStats:
         """These runs only (stats keep their run axis)."""
-        if self.Crr.shape[1] != len(self.n):
-            raise ValueError("these stats were summed over runs (per_run=False)")
         i = torch.as_tensor(idx, dtype=torch.long, device=self.n.device)
         return LagStats(
-            self.P,
-            self.n[i],
-            self.Crr[:, i],
-            self.SXr[:, i],
-            self.SXX[i],
-            self.r_head[:, i],
-            self.X_head[i],
-            self.support[i],
-        )
+            self.P, self.n[i], self.Crr[:, i], self.SXr[:, i], self.SXX[i],
+            self.r_head[:, i], self.X_head[i], self.cols[i], self.K,
+        )  # fmt: skip
 
     def voxels(self, sl: slice | Tensor) -> LagStats:
         cached = self._crit.voxels(sl) if self._crit is not None else None
         return LagStats(
-            self.P,
-            self.n,
-            self.Crr[sl],
-            self.SXr[sl],
-            self.SXX,
-            self.r_head[sl],
-            self.X_head,
-            self.support,
-            cached,
-        )
+            self.P, self.n, self.Crr[sl], self.SXr[sl], self.SXX, self.r_head[sl],
+            self.X_head, self.cols, self.K, cached,
+        )  # fmt: skip
 
 
 @dataclass
@@ -117,8 +114,8 @@ class _Crit:
 
     ``F`` folded features. Private columns are padded to ``k`` per run (``pad``
     marks the padding, given an identity diagonal so the blocks stay PD);
-    ``order`` lists the original (supported-column) index of each structured
-    column: the R·k private slots (−1 for padding), then the shared ones."""
+    ``order`` gives each structured column's position in ``ucols``: the R·k
+    private slots (−1 for padding), then the shared ones."""
 
     P: int
     n: Tensor  # (R,)
@@ -129,13 +126,17 @@ class _Crit:
     B: Tensor  # (F, R, k, ks)
     S: Tensor  # (F, ks, ks)
     pad: Tensor  # (R, k) bool
-    order: Tensor  # (R·k + ks,) long
-    n_cols: int  # number of supported columns K
+    order: Tensor  # (R·k + ks,) long, positions in ``ucols``
+    ucols: Tensor  # (n_cols,) the design columns these runs support, sorted
+
+    @property
+    def n_cols(self) -> int:
+        return int(self.ucols.numel())
 
     def voxels(self, sl: slice | Tensor) -> _Crit:
         return _Crit(
             self.P, self.n, self.a_r[sl], self.g_priv[sl], self.g_shared[sl],
-            self.D, self.B, self.S, self.pad, self.order, self.n_cols,
+            self.D, self.B, self.S, self.pad, self.order, self.ucols,
         )  # fmt: skip
 
     def compact(self) -> _Crit:
@@ -143,12 +144,12 @@ class _Crit:
 
 
 def _build_crit(st: LagStats) -> _Crit:
-    cols = st.support.any(dim=0)
-    V, P, P1 = st.Crr.shape[0], st.P, st.P + 1
+    V, R = st.Crr.shape[:2]
+    P, P1, kl = st.P, st.P + 1, st.cols.shape[1]
     dev, dt = st.Crr.device, st.Crr.dtype
-    Kc = int(cols.sum())
-    rh, xh = st.r_head, st.X_head[..., cols]
+    rh, xh = st.r_head, st.X_head
     Fm = _feature_fold(P, dt, dev)  # (F_full, F)
+    F = Fm.shape[1]
     a_r = (
         torch.cat(
             [
@@ -159,48 +160,64 @@ def _build_crit(st: LagStats) -> _Crit:
         )
         @ Fm
     )
-    A_g = torch.einsum(
-        "vfk,fs->vsk",
+    # per-run coefficients on local columns, features folded
+    Ag = torch.einsum(
+        "vrfk,fs->vrsk",
         torch.cat(
             [
-                st.SXr[..., cols].sum(1).reshape(V, P1 * P1, Kc),
-                torch.einsum("rsK,vrt->vstK", xh, rh).reshape(V, P * P, Kc),
+                st.SXr.reshape(V, R, P1 * P1, kl),
+                torch.einsum("rsK,vrt->vrstK", xh, rh).reshape(V, R, P * P, kl),
+            ],
+            dim=2,
+        ),
+        Fm,
+    )  # (V, R, F, kl)
+    Am = torch.einsum(
+        "rfx,fs->rsx",
+        torch.cat(
+            [
+                st.SXX.reshape(R, P1 * P1, kl * kl),
+                torch.einsum("rsK,rtJ->rstKJ", xh, xh).reshape(R, P * P, kl * kl),
             ],
             dim=1,
         ),
         Fm,
-    )  # (V, F, Kc)
-    A_M = (
-        Fm.T
-        @ torch.cat(
-            [
-                st.SXX[..., cols][..., cols, :].sum(0).reshape(P1 * P1, Kc * Kc),
-                torch.einsum("rsK,rtJ->stKJ", xh, xh).reshape(P * P, Kc * Kc),
-            ],
-            dim=0,
-        )
-    ).reshape(-1, Kc, Kc)  # (F, Kc, Kc)
+    ).reshape(R, F, kl, kl)
 
-    # column structure: private to one run, or shared
-    sup = st.support[:, cols]  # (R, Kc)
-    private = sup.sum(0) == 1
-    R = sup.shape[0]
-    priv = [torch.nonzero(sup[r] & private).squeeze(1) for r in range(R)]
-    shared = torch.nonzero(~private).squeeze(1)
-    k = max((int(x.numel()) for x in priv), default=0)
+    # global column structure: private to one run, or shared by several
+    valid = st.cols >= 0
+    ucols = torch.unique(st.cols[valid])
+    gpos = torch.searchsorted(ucols, st.cols.clamp(min=0))  # position in ucols
+    count = torch.bincount(gpos[valid], minlength=ucols.numel())
+    is_shared = count > 1
+    shared_pos = torch.nonzero(is_shared).squeeze(1)  # positions in ucols
+    spos_of = torch.full((ucols.numel(),), -1, dtype=torch.long, device=dev)
+    spos_of[shared_pos] = torch.arange(shared_pos.numel(), device=dev)
+    ks = shared_pos.numel()
+    priv_loc = [torch.nonzero(valid[r] & ~is_shared[gpos[r]]).squeeze(1) for r in range(R)]
+    k = max((int(x.numel()) for x in priv_loc), default=0)
+
+    D = torch.zeros(F, R, k, k, dtype=dt, device=dev)
+    B = torch.zeros(F, R, k, ks, dtype=dt, device=dev)
+    S = torch.zeros(F, ks, ks, dtype=dt, device=dev)
+    g_priv = torch.zeros(V, F, R, k, dtype=dt, device=dev)
+    g_shared = torch.zeros(V, F, ks, dtype=dt, device=dev)
     slots = torch.full((R, k), -1, dtype=torch.long, device=dev)
-    for r, x in enumerate(priv):
-        slots[r, : x.numel()] = x
+    for r in range(R):
+        pl = priv_loc[r]
+        sl = torch.nonzero(valid[r] & is_shared[gpos[r]]).squeeze(1)
+        sp = spos_of[gpos[r, sl]]
+        npv = pl.numel()
+        ip = torch.arange(npv, device=dev)
+        D[:, r, ip[:, None], ip[None, :]] = Am[r][:, pl[:, None], pl[None, :]]
+        B[:, r, ip[:, None], sp[None, :]] = Am[r][:, pl[:, None], sl[None, :]]
+        S[:, sp[:, None], sp[None, :]] += Am[r][:, sl[:, None], sl[None, :]]
+        g_priv[:, :, r, :npv] = Ag[:, r][:, :, pl]
+        g_shared[:, :, sp] += Ag[:, r][:, :, sl]
+        slots[r, :npv] = gpos[r, pl]
     pad = slots < 0
-    si = slots.clamp(min=0)  # padding reads column 0, then is zeroed
-    keep = (~pad).to(dt)
-    D = A_M[:, si[:, :, None], si[:, None, :]] * (keep[:, :, None] * keep[:, None, :])
-    B = A_M[:, si[:, :, None], shared[None, None, :]] * keep[:, :, None]
-    S = A_M[:, shared[:, None], shared[None, :]]
-    gD = A_g[:, :, si] * keep
-    gS = A_g[:, :, shared]
-    order = torch.cat([slots.reshape(-1), shared])
-    return _Crit(P, st.n, a_r, gD, gS, D, B, S, pad, order, Kc)
+    order = torch.cat([slots.reshape(-1), shared_pos])
+    return _Crit(P, st.n, a_r, g_priv, g_shared, D, B, S, pad, order, ucols)
 
 
 def _solve_structured(u: Tensor, c: _Crit):
@@ -265,51 +282,48 @@ def lag_stats(
     P: int,
     *,
     dtype: torch.dtype = torch.float64,
-    per_run: bool = True,
 ) -> LagStats:
     """One pass: lagged cross-products of residuals ``resid`` (V, T) and design
-    ``X`` (T, K) out to lag ``P``, per run. The GEMMs run in the inputs' dtype;
-    results are stored in ``dtype`` (float64 by default — every later step works
-    on small matrices, where float64 is cheap and the likelihood surface is flat).
-
-    ``per_run=False`` sums the lag statistics over runs as it goes (an R-fold
-    memory saving) for fits that never take a subset of runs; the per-run heads
-    are kept either way, because the head filter restarts in every run.
-    """
+    ``X`` (T, K) out to lag ``P``, per run, on each run's own columns. The GEMMs
+    run in the inputs' dtype; results are stored in ``dtype`` (float64 by
+    default — every later step works on small matrices, where float64 is cheap
+    and the likelihood surface is flat)."""
     V, _ = resid.shape
     K = X.shape[1]
     R = len(bounds)
-    Rs = R if per_run else 1
     dev = resid.device
     P1 = P + 1
-    Crr = torch.zeros(V, Rs, P1, P1, dtype=dtype, device=dev)
-    SXr = torch.zeros(V, Rs, P1, P1, K, dtype=dtype, device=dev)
-    SXX = torch.zeros(Rs, P1, P1, K, K, dtype=dtype, device=dev)
-    r_head = torch.empty(V, R, P, dtype=dtype, device=dev)
-    X_head = torch.empty(R, P, K, dtype=dtype, device=dev)
-    support = torch.empty(R, K, dtype=torch.bool, device=dev)
-    n = torch.tensor([e - s for s, e in bounds], device=dev)
     Xc = X.to(device=dev, dtype=resid.dtype)
+    local = [torch.nonzero(Xc[s:e].abs().amax(dim=0) > 0).squeeze(1) for s, e in bounds]
+    kl = max(int(c.numel()) for c in local)
+    cols = torch.full((R, kl), -1, dtype=torch.long, device=dev)
+    Crr = torch.empty(V, R, P1, P1, dtype=dtype, device=dev)
+    SXr = torch.zeros(V, R, P1, P1, kl, dtype=dtype, device=dev)
+    SXX = torch.zeros(R, P1, P1, kl, kl, dtype=dtype, device=dev)
+    r_head = torch.empty(V, R, P, dtype=dtype, device=dev)
+    X_head = torch.zeros(R, P, kl, dtype=dtype, device=dev)
+    n = torch.tensor([e - s for s, e in bounds], device=dev)
     for ri, (s, e) in enumerate(bounds):
         m = e - s
         if m <= P:
             raise ValueError(f"run {ri} has {m} timepoints; AR order needs more than P={P}")
+        c = local[ri]
+        kc = c.numel()
+        cols[ri, :kc] = c
         r = resid[:, s:e]
-        x = Xc[s:e]
+        x = Xc[s:e][:, c]
         # lag l view: samples t-l for t = P..m-1
         rlag = torch.stack([r[:, P - lag : m - lag] for lag in range(P1)], dim=1)  # (V, P1, m-P)
-        xlag = torch.stack([x[P - lag : m - lag] for lag in range(P1)], dim=0)  # (P1, m-P, K)
-        k = ri if per_run else 0
-        Crr[:, k] += (rlag @ rlag.transpose(1, 2)).to(dtype)
-        # S_Xr[v,k,l,:] = xlag[k]' rlag[v,l] — one GEMM: ((P1·K), m-P) @ (m-P, V·P1)
-        xs = xlag.permute(0, 2, 1).reshape(P1 * K, m - P)
+        xlag = torch.stack([x[P - lag : m - lag] for lag in range(P1)], dim=0)  # (P1, m-P, kc)
+        Crr[:, ri] = (rlag @ rlag.transpose(1, 2)).to(dtype)
+        # S_Xr[v,k,l,:] = xlag[k]' rlag[v,l] — one GEMM: ((P1·kc), m-P) @ (m-P, V·P1)
+        xs = xlag.permute(0, 2, 1).reshape(P1 * kc, m - P)
         rs = rlag.permute(2, 0, 1).reshape(m - P, V * P1)
-        SXr[:, k] += (xs @ rs).reshape(P1, K, V, P1).permute(2, 0, 3, 1).to(dtype)
-        SXX[k] += (xs @ xs.T).reshape(P1, K, P1, K).permute(0, 2, 1, 3).to(dtype)
+        SXr[:, ri, :, :, :kc] = (xs @ rs).reshape(P1, kc, V, P1).permute(2, 0, 3, 1).to(dtype)
+        SXX[ri, :, :, :kc, :kc] = (xs @ xs.T).reshape(P1, kc, P1, kc).permute(0, 2, 1, 3).to(dtype)
         r_head[:, ri] = r[:, :P].to(dtype)
-        X_head[ri] = x[:P].to(dtype)
-        support[ri] = x.abs().amax(dim=0) > 0
-    return LagStats(P, n, Crr, SXr, SXX, r_head, X_head, support)
+        X_head[ri, :, :kc] = x[:P].to(dtype)
+    return LagStats(P, n, Crr, SXr, SXX, r_head, X_head, cols, K)
 
 
 def levinson(kappa: Tensor, P: int) -> tuple[Tensor, Tensor]:
@@ -446,8 +460,8 @@ def reml_criterion(theta: Tensor, st: Stats) -> Tensor:
 
 
 def _columns(st: LagStats) -> Tensor:
-    """Design columns with data in any of these runs."""
-    return st.support.any(dim=0)
+    """Design columns with data in any of these runs (sorted indices)."""
+    return st.compact().ucols
 
 
 def yule_walker_init(st: LagStats, p: int, clamp: float = 0.95) -> Tensor:

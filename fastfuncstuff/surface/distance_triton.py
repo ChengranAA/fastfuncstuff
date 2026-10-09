@@ -203,30 +203,38 @@ class BrickIndex:
     def __init__(
         self, vertices: np.ndarray, faces: np.ndarray, device: torch.device, cell_mm: float = 1.0
     ) -> None:
-        v = np.asarray(vertices, np.float64)
-        f = np.asarray(faces, np.int64)
+        # Built on the device: in numpy the repeat, sort and count of a cortical
+        # mesh took ~0.5 s each, more than the search it serves.
+        v = torch.as_tensor(np.asarray(vertices, np.float64), device=device)
+        f = torch.as_tensor(np.asarray(faces, np.int64), device=device)
         tri = v[f]  # (F, 3, 3)
-        lo = tri.reshape(-1, 3).min(0) - cell_mm
-        dims = np.ceil((tri.reshape(-1, 3).max(0) + cell_mm - lo) / cell_mm).astype(np.int64) + 1
-        c0 = np.floor((tri.min(1) - lo) / cell_mm).astype(np.int64)
-        c1 = np.floor((tri.max(1) - lo) / cell_mm).astype(np.int64)
+        flat_v = tri.reshape(-1, 3)
+        lo_t = flat_v.amin(0) - cell_mm
+        dims_t = torch.ceil((flat_v.amax(0) + cell_mm - lo_t) / cell_mm).long() + 1
+        c0 = torch.floor((tri.amin(1) - lo_t) / cell_mm).long()
+        c1 = torch.floor((tri.amax(1) - lo_t) / cell_mm).long()
         span = c1 - c0 + 1
         n = span.prod(1)
-        face = np.repeat(np.arange(len(f)), n)
-        local = np.arange(face.size) - np.repeat(np.cumsum(n) - n, n)
+        face = torch.repeat_interleave(torch.arange(len(f), device=device), n)
+        local = torch.arange(face.numel(), device=device) - torch.repeat_interleave(
+            torch.cumsum(n, 0) - n, n
+        )
         sx, sy = span[face, 0], span[face, 1]
         ix = c0[face, 0] + local % sx
         iy = c0[face, 1] + (local // sx) % sy
         iz = c0[face, 2] + local // (sx * sy)
-        flat = (iz * dims[1] + iy) * dims[0] + ix
-        order = np.argsort(flat, kind="stable")
+        del local, sx, sy
+        lo, dims = lo_t.cpu().numpy(), dims_t.cpu().numpy()
+        flat = (iz * int(dims[1]) + iy) * int(dims[0]) + ix
+        del ix, iy, iz
+        order = torch.argsort(flat, stable=True)
         n_cells = int(np.prod(dims))
-        ptr = np.zeros(n_cells + 1, np.int64)
-        np.cumsum(np.bincount(flat, minlength=n_cells), out=ptr[1:])
+        ptr = torch.zeros(n_cells + 1, dtype=torch.int64, device=device)
+        torch.cumsum(torch.bincount(flat, minlength=n_cells), 0, out=ptr[1:])
         face = face[order]
-        self.tri = torch.as_tensor(tri[face].reshape(-1, 9), dtype=torch.float32, device=device)
-        self.face_id = torch.as_tensor(face, dtype=torch.int32, device=device)
-        self.cell_ptr = torch.as_tensor(ptr, dtype=torch.int32, device=device)
+        self.tri = tri[face].reshape(-1, 9).to(torch.float32)
+        self.face_id = face.to(torch.int32)
+        self.cell_ptr = ptr.to(torch.int32)
         self.origin = lo
         self.cell_mm = float(cell_mm)
         self.dims = dims

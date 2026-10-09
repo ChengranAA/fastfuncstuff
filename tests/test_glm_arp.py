@@ -159,3 +159,27 @@ def test_structured_solve_handles_degenerate_column_layouts(problem, layout):
         ]
     )
     torch.testing.assert_close(reml_criterion(theta, st), ref, rtol=0, atol=1e-9)
+
+
+def test_batched_run_subsets_equal_fitting_each_subset_alone(problem):
+    """batch() stacks run subsets with different column counts (padding) into
+    one problem; criteria and fitted θ must be what each subset gives alone."""
+    *_, st = problem
+    subsets = [[0, 1], [1, 2], [0, 2]]
+    bat = st.batch(subsets)
+    V = st.Crr.shape[0]
+    theta = torch.randn(V, 2, dtype=F64) * 0.4
+    crit_b = reml_criterion(theta.repeat(len(subsets), 1), bat).reshape(len(subsets), V)
+    th_b, cr_b = fit_ar_reml(bat, 2, tol=1e-10)
+    th_b, cr_b = th_b.reshape(len(subsets), V, 2), cr_b.reshape(len(subsets), V)
+    for g, sub in enumerate(subsets):
+        alone = st.runs(sub)
+        torch.testing.assert_close(crit_b[g], reml_criterion(theta, alone), rtol=0, atol=1e-9)
+        th_a, cr_a = fit_ar_reml(alone, 2, tol=1e-10)
+        torch.testing.assert_close(cr_b[g], cr_a, rtol=0, atol=1e-6)
+        torch.testing.assert_close(th_b[g], th_a, rtol=0, atol=1e-4)
+    # single runs: one column fewer per subset than pairs, all private
+    one = st.batch([[0], [1], [2]])
+    c1 = reml_criterion(theta.repeat(3, 1), one).reshape(3, V)
+    for r in range(3):
+        torch.testing.assert_close(c1[r], reml_criterion(theta, st.runs([r])), rtol=0, atol=1e-9)

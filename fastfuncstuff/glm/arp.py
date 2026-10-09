@@ -92,6 +92,13 @@ class LagStats:
             self._crit = _build_crit(self)
         return self._crit
 
+    def batch(self, subsets: Sequence[Sequence[int]]) -> _Crit:
+        """Many run subsets (each the same size) as one batch of problems —
+        every run alone, every leave-k-out training set, … — fitted, scored and
+        differentiated together on the GPU. Items are group-major: the result's
+        item ``g·V + v`` is voxel v under ``subsets[g]``."""
+        return _stack_crits([self.runs(list(s)).compact() for s in subsets])
+
     def runs(self, idx: Sequence[int] | Tensor) -> LagStats:
         """These runs only (stats keep their run axis)."""
         i = torch.as_tensor(idx, dtype=torch.long, device=self.n.device)
@@ -110,33 +117,57 @@ class LagStats:
 
 @dataclass
 class _Crit:
-    """Run-summed, column-structured criterion data for a voxel batch.
+    """Run-summed, column-structured criterion data for a batch of problems.
 
-    ``F`` folded features. Private columns are padded to ``k`` per run (``pad``
-    marks the padding, given an identity diagonal so the blocks stay PD);
-    ``order`` gives each structured column's position in ``ucols``: the R·k
-    private slots (−1 for padding), then the shared ones."""
+    A *group* is one set of runs with its own design blocks; every group has the
+    same V voxels, and the per-voxel data is stored item-major (item = group·V +
+    voxel). A single ``LagStats`` gives G = 1; :meth:`LagStats.batch` stacks many
+    run subsets (each run alone, every training set, …) so they are fitted as
+    one GPU job instead of one Python-driven fit each.
+
+    ``F`` folded features. Private columns are padded to ``k`` per run and shared
+    ones to ``ks`` (``pad``/``pad_s`` mark padding, given an identity diagonal so
+    the blocks stay PD); ``order`` gives each structured column's position in
+    that group's ``ucols``: R·k private slots (−1 = padding), then shared."""
 
     P: int
-    n: Tensor  # (R,)
-    a_r: Tensor  # (V, F)
-    g_priv: Tensor  # (V, F, R, k)
-    g_shared: Tensor  # (V, F, ks)
-    D: Tensor  # (F, R, k, k)
-    B: Tensor  # (F, R, k, ks)
-    S: Tensor  # (F, ks, ks)
-    pad: Tensor  # (R, k) bool
-    order: Tensor  # (R·k + ks,) long, positions in ``ucols``
-    ucols: Tensor  # (n_cols,) the design columns these runs support, sorted
+    n: Tensor  # (G, R)
+    a_r: Tensor  # (G·V, F)
+    g_priv: Tensor  # (G·V, F, R, k)
+    g_shared: Tensor  # (G·V, F, ks)
+    D: Tensor  # (G, F, R, k, k)
+    B: Tensor  # (G, F, R, k, ks)
+    S: Tensor  # (G, F, ks, ks)
+    pad: Tensor  # (G, R, k) bool
+    pad_s: Tensor  # (G, ks) bool
+    order: Tensor  # (G, R·k + ks) long
+    ucols: list[Tensor]  # per group: the design columns its runs support, sorted
+    acf: Tensor  # (G·V, P+1) residual autocorrelation (Yule–Walker start)
 
     @property
-    def n_cols(self) -> int:
-        return int(self.ucols.numel())
+    def G(self) -> int:
+        return self.D.shape[0]
+
+    @property
+    def V(self) -> int:
+        return self.a_r.shape[0] // self.G
+
+    @property
+    def n_cols(self) -> Tensor:
+        """(G,) supported columns per group."""
+        return torch.tensor([u.numel() for u in self.ucols], device=self.n.device)
+
+    def per_item(self, x: Tensor) -> Tensor:
+        """Broadcast a per-group (G, ...) tensor to items (G·V, ...)."""
+        return x.repeat_interleave(self.V, dim=0)
 
     def voxels(self, sl: slice | Tensor) -> _Crit:
+        """These voxels (indices within a group), in every group."""
+        idx = torch.arange(self.V, device=self.a_r.device)[sl]
+        items = (torch.arange(self.G, device=idx.device)[:, None] * self.V + idx[None]).reshape(-1)
         return _Crit(
-            self.P, self.n, self.a_r[sl], self.g_priv[sl], self.g_shared[sl],
-            self.D, self.B, self.S, self.pad, self.order, self.ucols,
+            self.P, self.n, self.a_r[items], self.g_priv[items], self.g_shared[items],
+            self.D, self.B, self.S, self.pad, self.pad_s, self.order, self.ucols, self.acf[items],
         )  # fmt: skip
 
     def compact(self) -> _Crit:
@@ -209,39 +240,83 @@ def _build_crit(st: LagStats) -> _Crit:
         g_priv[:, :, r, :npv] = Ag[:, r][:, :, pl]
         g_shared[:, :, sp] += Ag[:, r][:, :, sl]
         slots[r, :npv] = gpos[r, pl]
-    pad = slots < 0
-    order = torch.cat([slots.reshape(-1), shared_pos])
-    return _Crit(P, st.n, a_r, g_priv, g_shared, D, B, S, pad, order, ucols)
+    C0 = st.Crr.sum(1)[:, 0, :]  # lag-k residual autocovariance, k = 0..P
+    return _Crit(
+        P, st.n[None], a_r, g_priv, g_shared, D[None], B[None], S[None],
+        (slots < 0)[None], torch.zeros(1, ks, dtype=torch.bool, device=dev),
+        torch.cat([slots.reshape(-1), shared_pos])[None], [ucols], C0 / C0[:, :1],
+    )  # fmt: skip
+
+
+def _stack_crits(crits: Sequence[_Crit]) -> _Crit:
+    """Stack G=1 criteria for different run subsets (same voxels, same number of
+    runs) into one batch, padding the block sizes to the largest."""
+    R = crits[0].n.shape[1]
+    if any(c.n.shape[1] != R for c in crits):
+        raise ValueError("batched run subsets must all have the same number of runs")
+    k = max(c.pad.shape[-1] for c in crits)
+    ks = max(c.S.shape[-1] for c in crits)
+
+    def padto(x: Tensor, dims: dict[int, int], value=0.0) -> Tensor:
+        pads = [0] * (2 * x.ndim)
+        for d, size in dims.items():
+            pads[2 * (x.ndim - 1 - d) + 1] = size - x.shape[d]
+        return torch.nn.functional.pad(x, pads, value=value)
+
+    def order_pad(c: _Crit) -> Tensor:
+        kk = c.pad.shape[-1]
+        o = c.order[0]
+        priv = padto(o[: R * kk].reshape(R, kk), {1: k}, -1).reshape(-1)
+        return torch.cat([priv, padto(o[R * kk :], {0: ks}, -1)])
+
+    return _Crit(
+        crits[0].P,
+        torch.cat([c.n for c in crits]),
+        torch.cat([c.a_r for c in crits]),
+        torch.cat([padto(c.g_priv, {3: k}) for c in crits]),
+        torch.cat([padto(c.g_shared, {2: ks}) for c in crits]),
+        torch.cat([padto(c.D, {3: k, 4: k}) for c in crits]),
+        torch.cat([padto(c.B, {3: k, 4: ks}) for c in crits]),
+        torch.cat([padto(c.S, {2: ks, 3: ks}) for c in crits]),
+        torch.cat([padto(c.pad.float(), {2: k}, 1.0).bool() for c in crits]),
+        torch.cat([padto(c.pad_s.float(), {1: ks}, 1.0).bool() for c in crits]),
+        torch.stack([order_pad(c) for c in crits]),
+        [u for c in crits for u in c.ucols],
+        torch.cat([c.acf for c in crits]),
+    )
+
+
+def _gemm_groups(u: Tensor, W: Tensor, c: _Crit) -> Tensor:
+    """Per-item ``u @ W[group]``: (G·V, F) × (G, F, ...) → (G·V, ...) as one bmm."""
+    G, V = c.G, c.V
+    out = torch.bmm(u.reshape(G, V, -1), W.reshape(G, W.shape[1], -1))
+    return out.reshape(G * V, *W.shape[2:])
 
 
 def _solve_structured(u: Tensor, c: _Crit):
-    """Assemble M's blocks for features ``u`` (V, F), factor, and solve M a = g.
+    """Assemble M's blocks for features ``u`` (G·V, F), factor, solve M a = g.
 
-    Returns a dict with the factors and ``a`` (aD (V,R,k), aS (V,ks)),
+    Returns a dict with the factors and ``a`` (aD (N,R,k), aS (N,ks)),
     ``ga`` = g'a, ``logdetM``, ``rw2`` and ``bad`` (non-PD)."""
-    V, F = u.shape
-    R, k = c.pad.shape
+    R, k = c.pad.shape[1:]
     ks = c.S.shape[-1]
-    eye_pad = torch.diag_embed(c.pad.to(u.dtype))  # (R, k, k): 1 on padded diagonal
-    Dm = (u @ c.D.reshape(F, -1)).reshape(V, R, k, k) + eye_pad
-    Bm = (u @ c.B.reshape(F, -1)).reshape(V, R, k, ks)
-    Sm = (u @ c.S.reshape(F, -1)).reshape(V, ks, ks)
+    dt = u.dtype
+    Dm = _gemm_groups(u, c.D, c) + c.per_item(torch.diag_embed(c.pad.to(dt)))
+    Bm = _gemm_groups(u, c.B, c)
+    Sm = _gemm_groups(u, c.S, c) + c.per_item(torch.diag_embed(c.pad_s.to(dt)))
     gD = torch.einsum("vf,vfrk->vrk", u, c.g_priv)
     gS = torch.einsum("vf,vfk->vk", u, c.g_shared)
     rw2 = (u * c.a_r).sum(-1)
 
     LD, infoD = torch.linalg.cholesky_ex(Dm)
     bad = (infoD != 0).any(-1)
-    eye_k = torch.eye(k, dtype=u.dtype, device=u.device)
-    LD = torch.where((infoD != 0)[..., None, None], eye_k, LD)
-    Y = torch.cholesky_solve(Bm, LD)  # D⁻¹B  (V, R, k, ks)
+    LD = torch.where((infoD != 0)[..., None, None], torch.eye(k, dtype=dt, device=u.device), LD)
+    Y = torch.cholesky_solve(Bm, LD)  # D⁻¹B  (N, R, k, ks)
     zD = torch.cholesky_solve(gD.unsqueeze(-1), LD).squeeze(-1)  # D⁻¹gD
-    BtY = torch.einsum("vrki,vrkj->vij", Bm, Y)
-    Sig = Sm - BtY
+    Sig = Sm - torch.einsum("vrki,vrkj->vij", Bm, Y)
     LS, infoS = torch.linalg.cholesky_ex(Sig)
     bad = bad | (infoS != 0)
-    eye_s = torch.eye(ks, dtype=u.dtype, device=u.device)
-    LS = torch.where((infoS != 0)[:, None, None], eye_s, LS)
+    LS = torch.where((infoS != 0)[:, None, None], torch.eye(ks, dtype=dt, device=u.device), LS)
     rhs = gS - torch.einsum("vrki,vrk->vi", Bm, zD)
     aS = torch.cholesky_solve(rhs.unsqueeze(-1), LS).squeeze(-1)
     aD = zD - torch.einsum("vrki,vi->vrk", Y, aS)
@@ -259,10 +334,12 @@ def _minv_blocks(f: dict, c: _Crit) -> tuple[Tensor, Tensor, Tensor]:
     Si = torch.cholesky_inverse(f["LS"])
     Y = f["Y"]
     YS = torch.einsum("vrki,vij->vrkj", Y, Si)
-    Mb = -YS
     Md = torch.cholesky_inverse(f["LD"]) + torch.einsum("vrki,vrli->vrkl", YS, Y)
-    keep = (~c.pad).to(Md.dtype)
-    Md = Md * (keep[:, :, None] * keep[:, None, :])
+    keep = c.per_item((~c.pad).to(Md.dtype))  # (N, R, k)
+    keep_s = c.per_item((~c.pad_s).to(Md.dtype))  # (N, ks)
+    Md = Md * (keep[..., :, None] * keep[..., None, :])
+    Mb = -YS * (keep[..., :, None] * keep_s[:, None, None, :])
+    Si = Si * (keep_s[:, :, None] * keep_s[:, None, :])
     return Md, Mb, Si
 
 
@@ -377,22 +454,26 @@ def _feature_fold(P: int, dtype, device) -> Tensor:
     return F
 
 
-def _features(theta: Tensor, st: Stats) -> tuple[Tensor, Tensor]:
-    """(u (V, F), log|V| (V,)) for κ = tanh(θ): the per-voxel feature vector the
-    quadratic forms are linear in (see :meth:`LagStats.summed`), and log|V|."""
-    p, P = theta.shape[-1], st.P
-    taps, v = levinson(torch.tanh(theta), P)  # (V, p+1, P+1), (V, p+1)
-    c = taps[:, p]  # steady taps
-    H = _head_filter(taps, p, P)  # (V, P, P)
-    V = theta.shape[0]
+def _features(theta: Tensor, c: _Crit) -> tuple[Tensor, Tensor]:
+    """(u (N, F), log|V| (N,)) for κ = tanh(θ), θ (N, p): the per-item feature
+    vector the quadratic forms are linear in (see :meth:`LagStats.compact`)."""
+    p, P = theta.shape[-1], c.P
+    taps, v = levinson(torch.tanh(theta), P)  # (N, p+1, P+1), (N, p+1)
+    tc = taps[:, p]  # steady taps
+    H = _head_filter(taps, p, P)  # (N, P, P)
+    N = theta.shape[0]
     u = torch.cat(
-        [(c.unsqueeze(2) * c.unsqueeze(1)).reshape(V, -1), (H.transpose(1, 2) @ H).reshape(V, -1)],
+        [
+            (tc.unsqueeze(2) * tc.unsqueeze(1)).reshape(N, -1),
+            (H.transpose(1, 2) @ H).reshape(N, -1),
+        ],
         dim=1,
     )[:, _feature_index(P, theta.device)]
     # per run: Σ_{j<p} log v_j + (n_r − p)·log v_p   (every run is longer than P ≥ p)
     logv = torch.log(v)
-    R, N = len(st.n), st.n.sum().to(theta.dtype)
-    logdetV = R * logv[:, :p].sum(-1) + (N - R * p) * logv[:, p]
+    R = c.n.shape[1]
+    T = c.per_item(c.n.sum(1).to(theta.dtype))
+    logdetV = R * logv[:, :p].sum(-1) + (T - R * p) * logv[:, p]
     return u, logdetV
 
 
@@ -402,24 +483,24 @@ class _Core(torch.autograd.Function):
     RSS = rw2 − g'M⁻¹g. With a = M⁻¹g: ∂/∂M = M⁻¹ + (m/RSS)·aa',
     ∂/∂g = −2(m/RSS)·a, ∂/∂rw2 = m/RSS, contracted with the (structured)
     coefficients. Non-PD M or RSS ≤ 0 → +inf (a line search backs off it);
-    those voxels get zero gradient."""
+    those items get zero gradient."""
 
     @staticmethod
-    def forward(ctx, u, c: _Crit, m: int):
+    def forward(ctx, u, c: _Crit, m: Tensor):
         f = _solve_structured(u, c)
         rss = f["rw2"] - f["ga"]
         bad = f["bad"] | ~(rss > 0)
         out = f["logdetM"] + m * torch.log(rss)
         out = torch.where(bad, torch.full_like(out, float("inf")), out)
-        ctx.f, ctx.c, ctx.m = f, c, m
-        ctx.save_for_backward(rss, bad)
+        ctx.f, ctx.c = f, c
+        ctx.save_for_backward(rss, bad, m)
         return out
 
     @staticmethod
     def backward(ctx, *grad_outputs: Tensor):
         (grad_out,) = grad_outputs
-        rss, bad = ctx.saved_tensors
-        f, c, m = ctx.f, ctx.c, ctx.m
+        rss, bad, m = ctx.saved_tensors
+        f, c = ctx.f, ctx.c
         g0 = torch.where(bad, torch.zeros_like(grad_out), grad_out)
         w = g0 * m / torch.where(bad, torch.ones_like(rss), rss)
         Md, Mb, Ms = _minv_blocks(f, c)
@@ -432,10 +513,14 @@ class _Core(torch.autograd.Function):
             + w[:, None, None, None] * aD.unsqueeze(-1) * aS[:, None, None, :]
         )
         dS = g0[:, None, None] * Ms + w[:, None, None] * aS.unsqueeze(-1) * aS.unsqueeze(-2)
-        V, F = c.a_r.shape
-        du = dD.reshape(V, -1) @ c.D.reshape(F, -1).T
-        du = du + 2 * (dB.reshape(V, -1) @ c.B.reshape(F, -1).T)  # B and B' both in M
-        du = du + dS.reshape(V, -1) @ c.S.reshape(F, -1).T
+
+        def back(d: Tensor, W: Tensor) -> Tensor:  # Σ d·W[group] over the block entries
+            G, V = c.G, c.V
+            return torch.bmm(
+                d.reshape(G, V, -1), W.reshape(G, W.shape[1], -1).transpose(1, 2)
+            ).reshape(G * V, -1)
+
+        du = back(dD, c.D) + 2 * back(dB, c.B) + back(dS, c.S)  # B and B' both in M
         du = du - 2 * w[:, None] * (
             torch.einsum("vfrk,vrk->vf", c.g_priv, aD) + torch.einsum("vfk,vk->vf", c.g_shared, aS)
         )
@@ -444,25 +529,20 @@ class _Core(torch.autograd.Function):
 
 
 def reml_criterion(theta: Tensor, st: Stats) -> Tensor:
-    """``log|V| + log|X'V⁻¹X| + (N−K)·log RSS`` per voxel (smaller is better) —
-    ``glm.arma``'s criterion, for AR(p) with κ = tanh(θ). Non-stationary-looking
-    or numerically singular points (|κ| → 1) are +inf."""
+    """``log|V| + log|X'V⁻¹X| + (N−K)·log RSS`` per item (smaller is better) —
+    ``glm.arma``'s criterion, for AR(p) with κ = tanh(θ). Items are voxels for a
+    single ``LagStats``, group-major voxels for a :meth:`LagStats.batch`.
+    Non-stationary-looking or numerically singular points (|κ| → 1) are +inf."""
     c = st.compact()
-    u, logdetV = _features(theta, st)
-    m = int(st.n.sum()) - c.n_cols
+    u, logdetV = _features(theta, c)
+    m = c.per_item((c.n.sum(1) - c.n_cols).to(theta.dtype))
     return logdetV + _Core.apply(u, c, m)
 
 
-def _columns(st: LagStats) -> Tensor:
-    """Design columns with data in any of these runs (sorted indices)."""
-    return st.compact().ucols
-
-
-def yule_walker_init(st: LagStats, p: int, clamp: float = 0.95) -> Tensor:
-    """θ from the residual autocorrelations — Newton's starting point. Biased by
-    the design projection (that is what REML then removes), close enough to start."""
-    C = st.Crr.sum(1)
-    gamma = C[:, 0, : p + 1] / C[:, 0, :1]  # lag-k autocorrelation, k = 0..p
+def yule_walker_init(st: Stats, p: int, clamp: float = 0.95) -> Tensor:
+    """θ from the residual autocorrelations — the optimiser's starting point.
+    Biased by the design projection (REML then removes that), close enough to start."""
+    gamma = st.compact().acf[:, : p + 1]
     kappa = []
     phi = gamma.new_zeros(gamma.shape[0], 0)
     v = gamma.new_ones(gamma.shape[0])
@@ -509,87 +589,91 @@ def theta_covariance(theta: Tensor, st: Stats) -> Tensor:
 
 
 def fit_ar_reml(
-    st: LagStats,
+    st: Stats,
     p: int,
     *,
     n_iter: int = 60,
     tol: float = 1e-4,
     theta0: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Per-voxel REML AR(p): quasi-Newton on θ (κ = tanh θ) from Yule–Walker.
+    """Per-item REML AR(p): quasi-Newton on θ (κ = tanh θ) from Yule–Walker.
 
-    Returns ``(theta (V, p), criterion (V,))``; ``tol`` is the predicted remaining
-    decrease, in criterion units, at which a voxel stops. The p×p Hessian is taken once by
-    central differences at the start, then kept current by BFGS updates — one
-    gradient per iteration instead of 2p+1, which is what the cost is made of.
-    Steps are Levenberg-damped where the model is not positive definite, capped
-    at 1 in θ (tanh saturates), and backtracked until the criterion drops.
+    Returns ``(theta (N, p), criterion (N,))`` with N = voxels for a single
+    ``LagStats`` or group-major voxels for a :meth:`LagStats.batch`; ``tol`` is
+    the predicted remaining decrease, in criterion units, at which an item
+    stops. The p×p Hessian is taken once by central differences, then kept
+    current by BFGS — one gradient per iteration. Steps are Levenberg-damped
+    where the model is not positive definite, capped at 1 in θ (tanh
+    saturates), and backtracked until the criterion drops.
+
+    Every item is evaluated every iteration and a mask decides who moves:
+    selecting the active subset each time is what kept the GPU idle (many small
+    gathers and launches) once the batch spans hundreds of run subsets.
     """
+    c = st.compact()
     if p == 0:
-        z = torch.zeros(st.Crr.shape[0], 0, dtype=st.Crr.dtype, device=st.Crr.device)
-        return z, reml_criterion(z, st)
-    theta = (yule_walker_init(st, p) if theta0 is None else theta0).clone()
-    st = st.compact()
-    crit = reml_criterion(theta, st)
-    gr = _grad(theta, st)
-    B = _hessian(theta, st)
+        z = torch.zeros(c.a_r.shape[0], 0, dtype=c.a_r.dtype, device=c.a_r.device)
+        return z, reml_criterion(z, c)
+    theta = (yule_walker_init(c, p) if theta0 is None else theta0).clone()
+    crit = reml_criterion(theta, c)
+    gr = _grad(theta, c)
+    B = _hessian(theta, c)
     eye = torch.eye(p, dtype=theta.dtype, device=theta.device)
-    active = torch.ones(theta.shape[0], dtype=torch.bool, device=theta.device)
+    active = torch.isfinite(crit)
     fresh = torch.ones_like(active)  # B is an exact Hessian, not a BFGS model
     for _ in range(n_iter):
-        idx = active.nonzero().squeeze(1)
-        if idx.numel() == 0:
+        if not bool(active.any()):
             break
-        th, sub, g0, Bi, c0 = theta[idx], st.voxels(idx), gr[idx], B[idx], crit[idx]
-        lam_min = torch.linalg.eigvalsh(Bi)[:, 0]
+        lam_min = torch.linalg.eigvalsh(B)[:, 0]
         damp = (1e-6 - lam_min).clamp(min=0) + 1e-9
-        step = torch.linalg.solve(Bi + damp[:, None, None] * eye, g0.unsqueeze(-1)).squeeze(-1)
-        # tanh saturates: a θ step past ~1 is a jump to |κ| ≈ 1, never progress
+        Bd = B + damp[:, None, None] * eye
+        step = torch.linalg.solve(Bd, gr.unsqueeze(-1)).squeeze(-1)
         step = step / step.norm(dim=-1, keepdim=True).clamp(min=1.0)
-        scale = torch.ones_like(c0)
-        accepted = torch.zeros_like(c0, dtype=torch.bool)
-        new_th, new_c = th.clone(), c0.clone()
+        step = torch.where(active[:, None], step, torch.zeros_like(step))
+        scale = torch.ones_like(crit)
+        accepted = ~active
+        new_th, new_c = theta.clone(), crit.clone()
         for _ in range(12):
-            todo = ~accepted
-            if not bool(todo.any()):
+            if bool(accepted.all()):
                 break
-            w = todo.nonzero().squeeze(1)
-            cand = th[w] - scale[w, None] * step[w]
-            cc = reml_criterion(cand, sub.voxels(w))
-            ok = torch.isfinite(cc) & (cc <= c0[w])
-            new_th[w[ok]] = cand[ok]
-            new_c[w[ok]] = cc[ok]
-            accepted[w[ok]] = True
-            scale[w[~ok]] *= 0.5
-        g1 = _grad(new_th, sub)
+            cand = theta - scale[:, None] * step
+            cc = reml_criterion(cand, c)
+            ok = ~accepted & torch.isfinite(cc) & (cc <= crit)
+            new_th = torch.where(ok[:, None], cand, new_th)
+            new_c = torch.where(ok, cc, new_c)
+            accepted = accepted | ok
+            scale = torch.where(accepted, scale, scale * 0.5)
+        moved_ok = accepted & active
+        g1 = _grad(new_th, c)
         # BFGS update of the Hessian model; skipped where curvature is not positive
-        sv, yv = new_th - th, g1 - g0
+        sv, yv = new_th - theta, g1 - gr
         sy = (sv * yv).sum(-1)
-        Bs = (Bi @ sv.unsqueeze(-1)).squeeze(-1)
+        Bs = (B @ sv.unsqueeze(-1)).squeeze(-1)
         sBs = (sv * Bs).sum(-1)
-        upd = (sy > 1e-12) & (sBs > 1e-12)
-        Bn = Bi + torch.where(
+        upd = moved_ok & (sy > 1e-12) & (sBs > 1e-12)
+        Bn = B + torch.where(
             upd[:, None, None],
             yv.unsqueeze(-1) * yv.unsqueeze(-2) / sy.clamp(min=1e-12)[:, None, None]
             - Bs.unsqueeze(-1) * Bs.unsqueeze(-2) / sBs.clamp(min=1e-12)[:, None, None],
-            torch.zeros_like(Bi),
+            torch.zeros_like(B),
         )
-        theta[idx], crit[idx], gr[idx], B[idx] = new_th, new_c, g1, Bn
+        theta, crit = new_th, new_c
+        gr = torch.where(moved_ok[:, None], g1, gr)
+        B = Bn
         # Converged when the model predicts less than `tol` left to gain (criterion
-        # units, i.e. −2·log-likelihood). A relative-change test stops BFGS while
-        # it is still creeping along a shallow valley.
+        # units, −2·log-likelihood); a relative-change test stops BFGS while it is
+        # still creeping along a shallow valley.
         pred = 0.5 * (
-            g1 * torch.linalg.solve(Bn + damp[:, None, None] * eye, g1.unsqueeze(-1)).squeeze(-1)
+            gr * torch.linalg.solve(B + damp[:, None, None] * eye, gr.unsqueeze(-1)).squeeze(-1)
         ).sum(-1)
-        moved = pred.abs() > tol
-        # A stale BFGS model can point nowhere useful: give those voxels an exact
+        failed = active & ~accepted
+        # A stale BFGS model can point nowhere useful: give those items an exact
         # Hessian and another go. Stop only when an exact-Hessian step fails too.
-        retry = ~accepted & ~fresh[idx]
+        retry = failed & ~fresh
         if bool(retry.any()):
-            r = idx[retry]
-            B[r] = _hessian(theta[r], st.voxels(r))
-        fresh[idx] = retry
-        active[idx] = (moved & accepted) | retry
+            B = torch.where(retry[:, None, None], _hessian(theta, c), B)
+        fresh = retry
+        active = (moved_ok & (pred.abs() > tol)) | retry
     return theta, crit
 
 
@@ -600,10 +684,13 @@ def gls_from_stats(theta: Tensor, st: LagStats, beta_ols: Tensor) -> dict[str, T
     ``σ² = RSS/(N−K)``. ``beta_ols`` (V, K) must be the fit ``resid`` came from;
     the outputs cover the columns these runs support, in their original order."""
     c = st.compact()
-    u, _ = _features(theta, st)
+    if c.G != 1:
+        raise ValueError("gls_from_stats takes one run set; fit batches group by group")
+    u, _ = _features(theta, c)
     f = _solve_structured(u, c)
     rss = f["rw2"] - f["ga"]
-    sigma2 = rss / (int(st.n.sum()) - c.n_cols)
+    K = c.ucols[0].numel()
+    sigma2 = rss / (int(c.n.sum()) - K)
     Md, _, Ms = _minv_blocks(f, c)
     V = u.shape[0]
     a_struct = torch.cat([f["aD"].reshape(V, -1), f["aS"]], dim=1)
@@ -611,11 +698,12 @@ def gls_from_stats(theta: Tensor, st: LagStats, beta_ols: Tensor) -> dict[str, T
         [torch.diagonal(Md, dim1=-2, dim2=-1).reshape(V, -1), torch.diagonal(Ms, dim1=-2, dim2=-1)],
         dim=1,
     )
-    real = c.order >= 0
-    a = u.new_zeros(V, c.n_cols)
-    dg = u.new_zeros(V, c.n_cols)
-    a[:, c.order[real]] = a_struct[:, real]
-    dg[:, c.order[real]] = dg_struct[:, real]
-    beta = beta_ols[:, _columns(st)].to(a.dtype) + a
+    order = c.order[0]
+    real = order >= 0
+    a = u.new_zeros(V, K)
+    dg = u.new_zeros(V, K)
+    a[:, order[real]] = a_struct[:, real]
+    dg[:, order[real]] = dg_struct[:, real]
+    beta = beta_ols[:, c.ucols[0]].to(a.dtype) + a
     var = sigma2[:, None] * dg
     return {"beta": beta, "var": var, "sigma2": sigma2, "t": beta / var.sqrt(), "rss": rss}

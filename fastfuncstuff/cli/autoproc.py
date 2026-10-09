@@ -12,6 +12,7 @@ written (the point is: no broken scripts).
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shlex
 import shutil
@@ -135,6 +136,32 @@ def build_parser() -> argparse.ArgumentParser:
         "written: stage09.anat_head (as given) and stage09.anat_brain (stripped, "
         "what everything aligns to). This gives no tissue priors, so -anat_nonlin "
         "still needs -tpm.",
+    )
+    g.add_argument(
+        "-presurf",
+        choices=["auto", "no"],
+        default="auto",
+        help="auto (default): when the anat comes from the BIDS tree and is an MP2RAGE "
+        "acq-uni T1w with its acq-inv2 (and acq-inv1) beside it, run ffs_util_presurf "
+        "(MPRAGEise UNI by the bias-corrected INV2) and skull-strip THAT with "
+        "mri_synthstrip, instead of aligning to the noisy-background UNI. Needs a "
+        "tissue template (-presurf_tpm, -tpm or $FFS_TPM). no = UNI as found.",
+    )
+    g.add_argument(
+        "-presurf_denoise",
+        "-presurf-denoise",
+        choices=["off", "reg", "mprage"],
+        default="off",
+        help="ffs_util_presurf -denoise (needs acq-inv1): jointly denoise INV1/INV2 "
+        "first. reg = the O'Brien-regularised UNI, mprage = the rebuilt UNI "
+        "MPRAGEised. off (default) = presurfer as published.",
+    )
+    g.add_argument(
+        "-presurf_tpm",
+        "-presurf-tpm",
+        metavar="FILE",
+        help="6-class tissue template for the presurf segmentations (SPM's tpm/TPM.nii); "
+        "default -tpm, else $FFS_TPM",
     )
     g.add_argument("-no_anat", "-no-anat", action="store_true", help="stay in EPI space (no anat)")
     g.add_argument(
@@ -1324,6 +1351,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     for label, val in (
         ("-anat", anat_path if args.anat else None),
         ("-tpm", args.tpm),
+        ("-presurf_tpm (or $FFS_TPM)", opt.presurf_tpm),
         ("-tpm_source", opt.tpm_source),
         ("-ref_file", opt.ref_file),
         ("-ref_anat", opt.ref_anat),
@@ -1331,6 +1359,12 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     ):
         if val and not Path(val).exists():
             errors.append(f"{label} not found: {val}")
+    no_inv1 = [Path(uni).name for uni, _, inv1 in opt.presurf if inv1 is None]
+    if opt.presurf_denoise != "off" and no_inv1:
+        errors.append(
+            f"-presurf_denoise {opt.presurf_denoise} denoises INV1 and INV2 jointly, but "
+            f"there is no acq-inv1 beside {', '.join(no_inv1)}. Drop -presurf_denoise."
+        )
     for ev in opt.events or []:
         if not Path(ev).exists():
             errors.append(f"-events not found: {ev}")
@@ -1839,6 +1873,49 @@ def _report_fmap_assignment(subject) -> None:
             )
 
 
+def _resolve_presurf(
+    args, anat_paths: list[str], from_bids: bool
+) -> tuple[list[tuple[str, str, str | None]], str | None, str]:
+    """(one (uni, inv2, inv1) per anat input, the TPM, a line for the report).
+
+    Only for anats the BIDS scan chose: -anat FILE means that file, as it is.
+    All inputs or none — a mean of MPRAGEised and raw UNI mixes two contrasts."""
+    from fastfuncstuff.autoproc.bids import mp2rage_partners
+
+    if args.presurf == "no" or not from_bids or not anat_paths:
+        return [], None, ""
+    pairs = [(p, *mp2rage_partners(Path(p))) for p in anat_paths]
+    if not any(inv2 for _, inv2, _ in pairs):
+        return [], None, ""
+    missing = [Path(p).name for p, inv2, _ in pairs if inv2 is None]
+    if missing:
+        return (
+            [],
+            None,
+            (f"  presurfer skipped: no acq-inv2 beside {', '.join(missing)}; UNI used as found."),
+        )
+    tpm = args.presurf_tpm or args.tpm or os.environ.get("FFS_TPM")
+    if not tpm:
+        return (
+            [],
+            None,
+            (
+                "  presurfer skipped: MP2RAGE inv2/uni found, but no tissue template. Pass "
+                "-presurf_tpm (SPM's tpm/TPM.nii) or set $FFS_TPM; UNI used as found."
+            ),
+        )
+    triples = [(p, str(inv2), str(inv1) if inv1 else None) for p, inv2, inv1 in pairs]
+    dn = f", -denoise {args.presurf_denoise}" if args.presurf_denoise != "off" else ""
+    return (
+        triples,
+        tpm,
+        (
+            f"  presurfer{dn}: MPRAGEise each UNI by its INV2, then mri_synthstrip "
+            "(stage09.anat_head / stage09.anat_brain)"
+        ),
+    )
+
+
 def _report_anat(anat_paths: list[str], from_bids: bool, skipped: list[Path] | None = None) -> None:
     """Print the T1w the anat step will use — all of them when several are being
     averaged, and the ones the scan saw but rejected.
@@ -2033,8 +2110,14 @@ def main(argv: list[str] | None = None) -> int:
         anat_paths = [str(p) for p in group]
         unused = [p for p in anat_candidates(subject, args.bids_dir)[1] if p not in group]
     anat_path = anat_paths[0] if anat_paths else None
+    from_bids = not (args.anat or args.suma)
+    presurf, presurf_tpm, presurf_note = _resolve_presurf(args, anat_paths, from_bids)
+    used = {Path(p) for t in presurf for p in t[1:] if p}
+    unused = [p for p in unused if p not in used]
 
-    _report_anat(anat_paths, from_bids=not (args.anat or args.suma), skipped=unused)
+    _report_anat(anat_paths, from_bids=from_bids, skipped=unused)
+    if presurf_note:
+        print(presurf_note, file=sys.stderr)
 
     go_to_anat = False if args.no_anat else rget("go_to_anat", True)
     fs_subject = _baked_subject(
@@ -2128,7 +2211,11 @@ def main(argv: list[str] | None = None) -> int:
         # -ref_image is the answer for every level; -anat_source overrides it for
         # the anat step alone.
         anat_source=args.anat_source or args.ref_image or "auto",
-        anat_skull=args.anat_skull == "yes",
+        # presurf's head still has a skull; synthstrip is what makes the brain.
+        anat_skull=args.anat_skull == "yes" or bool(presurf and go_to_anat),
+        presurf=presurf if go_to_anat else [],
+        presurf_denoise=args.presurf_denoise,
+        presurf_tpm=presurf_tpm,
         do_mni=args.do_mni,
         mni_backend=mni_backend,
         mni_template=mni_template,

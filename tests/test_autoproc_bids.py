@@ -551,3 +551,49 @@ def test_free_text_acq_label_does_not_hide_the_fieldmap(tmp_path: Path):
     assert "dir-PA" in fg.forward_path.name
     assert "dir-AP" in fg.reverse_path.name
     assert fg.intended_runs == [("bar1", "")]
+
+
+def _mp2rage_session(root: Path, runs=("01", "02"), inv1=True) -> Path:
+    d = root / "sub-ME1" / "ses-WB"
+    _touch(d / "func" / "sub-ME1_ses-WB_task-x_run-01_bold.nii.gz", {"RepetitionTime": 1.5})
+    for r in runs:
+        for acq in ("uni", "inv2", *(("inv1",) if inv1 else ())):
+            _touch(d / "anat" / f"sub-ME1_ses-WB_acq-{acq}_run-{r}_T1w.nii.gz", {})
+    return d / "anat"
+
+
+def test_mp2rage_partners_pair_each_uni_with_its_own_run(tmp_path: Path):
+    """Two MP2RAGE runs: run-02's UNI must be MPRAGEised by run-02's INV2, never
+    run-01's — they are different head positions."""
+    from fastfuncstuff.autoproc.bids import mp2rage_partners
+
+    anat = _mp2rage_session(tmp_path)
+    inv2, inv1 = mp2rage_partners(anat / "sub-ME1_ses-WB_acq-uni_run-02_T1w.nii.gz")
+    assert inv2 is not None and inv2.name == "sub-ME1_ses-WB_acq-inv2_run-02_T1w.nii.gz"
+    assert inv1 is not None and inv1.name == "sub-ME1_ses-WB_acq-inv1_run-02_T1w.nii.gz"
+    # not a UNI → no partners, even with inversions beside it
+    assert mp2rage_partners(anat / "sub-ME1_ses-WB_acq-inv2_run-01_T1w.nii.gz") == (None, None)
+
+
+def _presurf_args(**kw):
+    from argparse import Namespace
+
+    base = dict(presurf="auto", presurf_tpm="/t/TPM.nii", tpm=None, presurf_denoise="off")
+    return Namespace(**{**base, **kw})
+
+
+def test_presurf_resolves_only_for_scanned_mp2rage(tmp_path: Path, monkeypatch):
+    from fastfuncstuff.cli.autoproc import _resolve_presurf
+
+    monkeypatch.delenv("FFS_TPM", raising=False)
+    anat = _mp2rage_session(tmp_path, runs=("01",), inv1=False)
+    uni = [str(anat / "sub-ME1_ses-WB_acq-uni_run-01_T1w.nii.gz")]
+    triples, tpm, _ = _resolve_presurf(_presurf_args(), uni, from_bids=True)
+    assert triples == [(uni[0], uni[0].replace("acq-uni", "acq-inv2"), None)]
+    assert tpm == "/t/TPM.nii"
+    # -anat FILE means that file as it is; -presurf no opts out
+    assert _resolve_presurf(_presurf_args(), uni, from_bids=False)[0] == []
+    assert _resolve_presurf(_presurf_args(presurf="no"), uni, from_bids=True)[0] == []
+    # no template anywhere → falls back to UNI, and says so
+    triples, _, note = _resolve_presurf(_presurf_args(presurf_tpm=None), uni, from_bids=True)
+    assert triples == [] and "FFS_TPM" in note

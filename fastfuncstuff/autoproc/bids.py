@@ -904,3 +904,20 @@ def _anat_rank(p: Path) -> tuple[int, int, int, str]:
 
 def _pick_anat(t1s: list[Path]) -> Path | None:
     return min(t1s, key=_anat_rank) if t1s else None
+
+
+_ACQ_UNI = re.compile(r"(?<=_)acq-uni(?=_)")
+
+
+def mp2rage_partners(uni: Path) -> tuple[Path | None, Path | None]:
+    """(inv2, inv1) filed beside an ``acq-uni`` T1w, or None for each one missing.
+
+    Same name with only the ``acq`` label swapped, so a run/rec/ses entity pairs
+    each UNI with its own inversions and never with another repeat's."""
+    if parse_entities(uni.name).get("acq") != "uni":
+        return None, None
+    found = []
+    for inv in ("inv2", "inv1"):
+        p = uni.with_name(_ACQ_UNI.sub(f"acq-{inv}", uni.name, count=1))
+        found.append(p if p.exists() else None)
+    return found[0], found[1]

@@ -76,6 +76,11 @@ DEFAULT_OPTS: dict[str, str] = {
     # anat is an alignment target for cross-modal lpc, and a bright CSF collar is
     # the part of the head an EPI has no counterpart for.
     "synthstrip": "--no-csf",
+    # MP2RAGE inv1/inv2/uni → MPRAGEised head (ffs_util_presurf), which the strip
+    # then reads instead of UNI. Its own masks are written but not used: synthstrip
+    # is the one brain mask, whatever the contrast. -no_classes because nothing
+    # here reads the 12 posterior maps.
+    "presurf": "-no_classes",
     # final compose+resample (ffs_nwarp).
     "nwarp": "-interp wsinc5 -no_neg",
     # ROMEO temporal phase unwrapping (-phase_proc). "-t epi" is the single-echo

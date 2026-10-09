@@ -2078,6 +2078,43 @@ def test_multiple_anats_without_a_skull_still_average():
     assert 'ANAT="stage09.anat_avg.nii.gz"' in s
 
 
+def test_presurf_mprageises_each_input_then_averages_then_strips():
+    """MP2RAGE: UNI's amplified-noise background must never reach synthstrip or
+    the average. Each repeat is MPRAGEised by its own INV2 first, the mean is of
+    those, and the strip reads the mean."""
+    presurf = [
+        ("/b/acq-uni_run-01_T1w.nii.gz", "/b/acq-inv2_run-01_T1w.nii.gz", None),
+        ("/b/acq-uni_run-02_T1w.nii.gz", "/b/acq-inv2_run-02_T1w.nii.gz", None),
+    ]
+    s = _skull_script(
+        anat_extra=[presurf[1][0]], anat_skull=True, presurf=presurf, presurf_tpm="/t/TPM.nii"
+    )
+    assert (
+        '-inv2 /b/acq-inv2_run-02_T1w.nii.gz \\\n    -tpm /t/TPM.nii \\\n    -prefix "presurf_work/anat2.nii.gz"'
+        in s
+    )
+    assert "-inv1" not in s and "-denoise" not in s
+    # the average is built from the MPRAGEised heads, based on the first
+    assert '-base "presurf_work/anat1_MPRAGEised.nii.gz"' in s
+    assert "-source presurf_work/anat2_MPRAGEised.nii.gz" in s
+    order = [
+        s.index('-prefix "presurf_work/anat2.nii.gz"'),
+        s.index('-prefix "stage09.anat_avg.nii.gz"'),
+        s.index('mri_synthstrip -i "stage09.anat_avg.nii.gz"'),
+    ]
+    assert order == sorted(order)
+    assert "ffs_util_presurf" in s.split("stage: preflight")[1].split("stage")[0]
+
+
+def test_presurf_denoise_reg_names_the_head_it_makes():
+    presurf = [("/b/uni.nii.gz", "/b/inv2.nii.gz", "/b/inv1.nii.gz")]
+    s = _skull_script(
+        anat_skull=True, presurf=presurf, presurf_denoise="reg", presurf_tpm="/t/T.nii"
+    )
+    assert "-inv1 /b/inv1.nii.gz" in s and "-denoise reg" in s
+    assert 'cp -f "presurf_work/anat1_UNIreg.nii.gz" "stage09.anat_head.nii.gz"' in s
+
+
 def test_do_mni_puts_both_links_at_the_head_of_every_chain():
     """MNI is the LAST thing that happens to the data, which in this chain order
     (leftmost acts first on coordinates) means the two leftmost tokens — and it

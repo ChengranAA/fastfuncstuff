@@ -225,6 +225,12 @@ class Options:
     # -anat_skull yes: the anat still has a skull, so strip it in-script with
     # mri_synthstrip before anything aligns to it.
     anat_skull: bool = False
+    # MP2RAGE through ffs_util_presurf before the average and the strip: one
+    # (uni, inv2, inv1-or-None) per anat input, in [anat_path, *anat_extra] order.
+    # Empty = the anat inputs are used as they are.
+    presurf: list[tuple[str, str, str | None]] = field(default_factory=list)
+    presurf_denoise: str = "off"  # off | reg | mprage (ffs_util_presurf -denoise)
+    presurf_tpm: str | None = None
     moco_ref: str = "sbref"  # moco base: sbref|first|last|<int>  (sbref → sbref if present)
     # Which EPI-contrast image the anat linear step aligns to. All choices live on
     # the SAME grid (the reference fmap's undistorted space) — see

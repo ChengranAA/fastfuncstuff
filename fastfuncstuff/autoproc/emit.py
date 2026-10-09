@@ -982,20 +982,19 @@ def _qc_anat(plan: Plan) -> str:
         # the strip ate cortex. It cannot join the group above — that one lives on
         # the autoboxed grid, and qc_tcat stacks, it does not resample.
         pre = _anat_prestrip(opt)
-        calls.insert(
-            0,
-            _qc_call(
-                _qc_stem("anat_strip"),
-                [
-                    (pre, "anat_avg" if opt.anat_extra else "anat_head"),
-                    (_anat_brain(), "anat_brain"),
-                ],
-            ),
-        )
+        strip_items: QCItems = [
+            (pre, "anat_avg" if opt.anat_extra else "anat_head"),
+            (_anat_brain(), "anat_brain"),
+        ]
+        if opt.presurf:
+            # UNI beside what MPRAGEise made of it. The presurf outputs and the
+            # mean (based on the first) all sit on the first UNI's grid.
+            strip_items.insert(0, (opt.presurf[0][0], "uni"))
+        calls.insert(0, _qc_call(_qc_stem("anat_strip"), strip_items))
     if opt.anat_extra:
         # Every T1w that went into the mean, plus the mean: a rigid alignment that
         # missed shows up here as the one sub-brick that does not overlay.
-        ins: QCItems = [(opt.anat_path or "$ANAT", "anat_in1")]
+        ins: QCItems = [(_anat_inputs(opt, opt.anat_path or "$ANAT")[0], "anat_in1")]
         ins += [(_anat_in_al(k), f"anat_in{k}") for k in range(2, len(opt.anat_extra) + 2)]
         ins.append((_anat_avg(), "anat_avg"))
         calls.insert(0, _qc_call(_qc_stem("anat_avg"), ins))
@@ -1402,6 +1401,8 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
     tools = [*_TOOLS, *dict.fromkeys(nl_tools)]
     if _phase_on(plan):
         tools = [*tools, "romeo"]
+    if opt.presurf and _own_anat(opt):
+        tools = [*tools, "ffs_util_presurf"]
     if opt.anat_skull and _own_anat(opt):
         tools = [*tools, "mri_synthstrip"]
     if opt.do_mni and _own_anat(opt):
@@ -2452,8 +2453,12 @@ def _stage_anat(plan: Plan) -> str:
         anat_ph = (
             opt.anat_path or "${FFS_ANAT:?set FFS_ANAT to the T1w to align to (SUMA brain.nii.gz)}"
         )
+        if opt.presurf:
+            out.append(_presurf_block(opt))
+        inputs = _anat_inputs(opt, anat_ph)
+        anat_ph = inputs[0]
         if opt.anat_extra:
-            out.append(_anat_average_block(opt, anat_ph))
+            out.append(_anat_average_block(anat_ph, inputs[1:]))
             anat_ph = _anat_avg()
         if opt.anat_skull:
             out.append(_skullstrip_block(opt, anat_ph))
@@ -2695,7 +2700,7 @@ def _anat_in_al(k: int) -> str:
     return f"stage09.anat_in{k}_al.nii.gz"
 
 
-def _anat_average_block(opt, base: str) -> str:
+def _anat_average_block(base: str, extras: list[str]) -> str:
     """Align every extra T1w to the first and average them.
 
     Plain .gz throughout: these are images to look at when the mean comes out
@@ -2703,7 +2708,7 @@ def _anat_average_block(opt, base: str) -> str:
     al_opts = _split_flags(config.DEFAULT_OPTS["anat_avg"])
     avg = _anat_avg()
     steps = []
-    for k, extra in enumerate(opt.anat_extra, start=2):
+    for k, extra in enumerate(extras, start=2):
         steps.append(
             _ffs(
                 "ffs_allineate",
@@ -2716,7 +2721,7 @@ def _anat_average_block(opt, base: str) -> str:
                 ],
             )
         )
-    aligned = [_anat_in_al(k) for k in range(2, len(opt.anat_extra) + 2)]
+    aligned = [_anat_in_al(k) for k in range(2, len(extras) + 2)]
     inputs = " ".join(f'"{p}"' for p in [base, *aligned])
     steps.append(
         _ffs(
@@ -2725,11 +2730,55 @@ def _anat_average_block(opt, base: str) -> str:
         )
     )
     body = "\n".join(steps)
-    n = len(opt.anat_extra) + 1
+    n = len(extras) + 1
     return f"""# --- average {n} T1w of one acquisition (aligned to the first) ---
 if [ ! -f "{avg}" ]; then
 {body}
 fi"""
+
+
+def _presurf_image(opt, k: int) -> str:
+    """The k-th (1-based) anat input's head image from ffs_util_presurf.
+
+    Named by what -denoise made it: UNIreg is the regularised UNI, not an
+    MPRAGEised one, and a filename that says otherwise misleads at the QC."""
+    kind = "UNIreg" if opt.presurf_denoise == "reg" else "MPRAGEised"
+    return f"presurf_work/anat{k}_{kind}.nii.gz"
+
+
+def _anat_inputs(opt, first: str) -> list[str]:
+    """What the average (or, with one input, the strip) starts from: the presurf
+    heads when the inputs are MP2RAGE, else the T1w as given."""
+    if opt.presurf:
+        return [_presurf_image(opt, k) for k in range(1, len(opt.presurf) + 1)]
+    return [first, *opt.anat_extra]
+
+
+def _presurf_block(opt) -> str:
+    """MP2RAGE inv1/inv2/uni → an MPRAGE-like head, once per anat input.
+
+    UNI is a ratio image: its background is noise amplified to full brightness,
+    which synthstrip and every cross-modal cost then have to work around.
+    MPRAGEising multiplies it by the bias-corrected INV2, which is dark there."""
+    tpm = shlex.quote(opt.presurf_tpm) if opt.presurf_tpm else '"${FFS_TPM:?set FFS_TPM}"'
+    flags = _split_flags(config.DEFAULT_OPTS["presurf"])
+    steps = []
+    for k, (uni, inv2, inv1) in enumerate(opt.presurf, start=1):
+        call = _ffs(
+            "ffs_util_presurf",
+            [
+                f"-uni {shlex.quote(uni)}",
+                f"-inv2 {shlex.quote(inv2)}",
+                f"-inv1 {shlex.quote(inv1)}" if inv1 else "",
+                f"-tpm {tpm}",
+                f'-prefix "presurf_work/anat{k}.nii.gz"',
+                f"-denoise {opt.presurf_denoise}" if opt.presurf_denoise != "off" else "",
+                *flags,
+                '-device "$DEVICE"',
+            ],
+        )
+        steps.append(f'if [ ! -f "{_presurf_image(opt, k)}" ]; then\n{call}\nfi')
+    return "# --- MP2RAGE → MPRAGEised head (presurfer) ---\n" + "\n".join(steps)
 
 
 def _anat_head() -> str:

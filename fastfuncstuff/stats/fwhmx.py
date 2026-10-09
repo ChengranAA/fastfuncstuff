@@ -138,6 +138,31 @@ def _forman_fwhm(var: Tensor, dvar: Tensor, vox_mm: float) -> Tensor:
     return fwhm
 
 
+def _classic_accumulate(
+    vol: Tensor, mask: Tensor, widths: tuple[float, float, float], log_s: list, n_s: list
+) -> int:
+    """Add a (T, ...) chunk's per-axis log Forman FWHMs into ``log_s`` / ``n_s`` (for
+    the geometric mean over sub-bricks); returns how many sub-bricks had variance."""
+    _, _, fvar, _count = _spatial_mean_demean(vol, mask)
+    for ax, width in enumerate(widths, start=1):
+        arr = _forman_fwhm(fvar, _axis_diff_var(vol, mask, ax), width)
+        good = arr[torch.isfinite(arr) & (arr > 0)]
+        if good.numel():
+            log_s[ax - 1] += float(torch.log(good).sum().item())
+            n_s[ax - 1] += good.numel()
+    return int((fvar > 0).sum().item())
+
+
+def classic_fwhm(vol: Tensor, mask: Tensor, voxdims: tuple[float, float, float]) -> float:
+    """3dFWHMx's combined classic (Forman 1-difference) FWHM of a ``(T, s0, s1, s2)``
+    stack inside ``mask`` -- the number 3dBlurToFWHM steers by, without the ACF pass."""
+    log_s, n_s = [0.0, 0.0, 0.0], [0, 0, 0]
+    w0, w1, w2 = (abs(float(v)) for v in voxdims)
+    widths = (w0, w1, w2)
+    _classic_accumulate(vol, mask.to(torch.bool), widths, log_s, n_s)
+    return _geom_combine(*(float(np.exp(log_s[i] / n_s[i])) if n_s[i] else 0.0 for i in range(3)))
+
+
 # ---------------------------------------------------------------------------
 # ACF cluster (get_ACF_cluster) + radius binning (ACF_cluster_to_modelE)
 # ---------------------------------------------------------------------------
@@ -315,14 +340,7 @@ def estimate_fwhmx_run(
     for t0 in bar1:
         t1 = min(n_time, t0 + tchunk)
         vol = _scatter(resid_2d[:, t0:t1], mask, (t1 - t0, s0, s1, s2), device)
-        _, _, fvar, _count = _spatial_mean_demean(vol, mask)
-        for ax, width in ((1, v0), (2, v1), (3, v2)):
-            arr = _forman_fwhm(fvar, _axis_diff_var(vol, mask, ax), width)
-            good = arr[torch.isfinite(arr) & (arr > 0)]
-            if good.numel():
-                log_s[ax - 1] += float(torch.log(good).sum().item())
-                n_s[ax - 1] += good.numel()
-        n_bricks += int((fvar > 0).sum().item())
+        n_bricks += _classic_accumulate(vol, mask, (v0, v1, v2), log_s, n_s)
         del vol
 
     classic = tuple(float(np.exp(log_s[i] / n_s[i])) if n_s[i] else 0.0 for i in range(3))

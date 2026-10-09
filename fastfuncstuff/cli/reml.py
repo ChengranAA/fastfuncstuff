@@ -860,9 +860,15 @@ Examples:
         type=float,
         metavar="FWHM",
         default=None,
-        help="Surface (.gii) input: blur TO this smoothness instead of BY it (SurfSmooth "
-        "-target_fwhm / 3dBlurToFWHM): the heat kernel is chosen so the first run, "
-        "with it. Data already that smooth are left alone. Exclusive with -do_blur.",
+        help="Blur TO this smoothness instead of BY it (3dBlurToFWHM / SurfSmooth "
+        "-target_fwhm -blurmaster). Surface input: a heat kernel along the cortex; "
+        "volume input: a Gaussian inside -mask (required; nothing outside it bleeds "
+        "in, and voxels outside it are left alone). The kernel is chosen so the "
+        "residuals of an OLS fit of this model to the unblurred data measure FWHM mm "
+        "(1-difference estimate) -- the task is not mistaken for smoothness, and "
+        "blurring commutes with that fit, so no refit is needed -- then every run is "
+        "smoothed with it. Data already that smooth are left alone. Exclusive with "
+        "-do_blur.",
     )
     proc_opts.add_argument(
         "-blur_to_columns",
@@ -1343,6 +1349,31 @@ def _surface_blur_to(args, input_file, header, n_vertices: int, master, keep=Non
         f"(OLS residuals at {master.shape[1]} time points reach {achieved:.2f} mm)"
     )
     return hs
+
+
+def _volume_blur_to(args, master, volume_shape, voxel_sizes, keep, device):
+    """-blur_to_fwhm on a voxel grid: the in-mask Gaussian that brings ``master`` to
+    the target, by 3dFWHMx's classic estimate inside -mask (and the guard's keep)."""
+    from fastfuncstuff.io.afni import load_afni_mask
+    from fastfuncstuff.stats.blur_to import volume_blur_to_fwhm
+
+    mask = load_afni_mask(args.mask).reshape(-1).astype(bool)
+    if keep is not None:
+        mask &= np.asarray(keep, bool)
+    g, kernel, achieved = volume_blur_to_fwhm(
+        master, mask.reshape(volume_shape), voxel_sizes, args.blur_to_fwhm, device=device
+    )
+    if g is None:
+        print(
+            f"  Residuals already {achieved:.2f} mm smooth (>= {args.blur_to_fwhm}): "
+            "no blur applied"
+        )
+        return None
+    print(
+        f"  Blurring TO {args.blur_to_fwhm} mm: Gaussian {kernel:.2f} mm inside the mask "
+        f"(OLS residuals at {master.shape[1]} time points reach {achieved:.2f} mm)"
+    )
+    return g
 
 
 def _observe_surface_acf(args, input_file, residuals, mask, label, device):
@@ -1998,11 +2029,13 @@ def main():
     from fastfuncstuff.io.gifti import is_gifti
 
     surface_input = is_gifti(str(input_files[0]).split("[")[0])
-    if args.blur_to_fwhm is not None and (not surface_input or args.do_blur is not None):
-        print(
-            "❌ ERROR: -blur_to_fwhm is for surface (.gii) input, and replaces -do_blur.",
-            file=sys.stderr,
-        )
+    if args.blur_to_fwhm is not None and args.do_blur is not None:
+        print("❌ ERROR: -blur_to_fwhm replaces -do_blur: pick one.", file=sys.stderr)
+        sys.exit(1)
+    if args.blur_to_fwhm is not None and not surface_input and not args.mask:
+        # The guard's own mask keeps every voxel with a signal, air included, and
+        # white noise there would drag the measured smoothness down.
+        print("❌ ERROR: -blur_to_fwhm on volume data needs -mask (the brain).", file=sys.stderr)
         sys.exit(1)
     if surface_input:
         # Surface data run as AFNI's 1-D volume (V, 1, 1, T); the GLM itself does
@@ -3367,20 +3400,19 @@ def main():
         if args.blur_to_fwhm is not None:
             print(f"  Blur TO {args.blur_to_fwhm} mm: master = OLS residuals of the unblurred data")
             master = _blur_to_master(args, fmri_data_preprocessed, design_info, run_starts, trim)
-            surface_smoother = _surface_blur_to(
-                args,
-                input_files[0],
-                nifti_header,
-                n_voxels,
-                master,
-                keep=None if guard_keep is None else guard_keep.numpy(),
-            )
+            keep_np = None if guard_keep is None else guard_keep.numpy()
+            if surface_input:
+                blur_to = _surface_blur_to(
+                    args, input_files[0], nifti_header, n_voxels, master, keep=keep_np
+                )
+            else:
+                blur_to = _volume_blur_to(args, master, volume_shape, voxel_sizes, keep_np, device)
             del master
-            if surface_smoother is not None:
+            if blur_to is not None:
                 bounds = [int(r) for r in run_starts] + [fmri_data_preprocessed.shape[1]]
                 for r0, r1 in zip(bounds[:-1], bounds[1:], strict=True):
                     seg = fmri_data_preprocessed[:, r0:r1]
-                    fmri_data_preprocessed[:, r0:r1] = surface_smoother(seg)
+                    fmri_data_preprocessed[:, r0:r1] = blur_to(seg)
 
         # Diagnostics hook 1: grand mean, computed on the un-scaled data.
         if want_diag:

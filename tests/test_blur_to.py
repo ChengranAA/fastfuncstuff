@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -176,3 +178,98 @@ def test_blursurf_cli_by_and_to_with_a_residual_master(tmp_path):
         run(["-input", *inputs, "-do_blur", "3", "-blur_to_fwhm", "5", "-prefix", "z"])
     with pytest.raises(SystemExit):
         run(["-input", *inputs, "-do_blur", "3", "-matrix", "X", "-prefix", "z"])
+
+
+# ---------------------------------------------------------------------------
+# Volume: the in-mask Gaussian and the 3dFWHMx-steered search
+# ---------------------------------------------------------------------------
+
+
+def _ball(shape=(36, 36, 30), r=13.0):
+    g = np.indices(shape).astype(float)
+    c = (np.array(shape)[:, None, None, None] - 1) / 2
+    return ((g - c) ** 2).sum(0) < r**2
+
+
+def _smooth_noise_vol(shape, t, fwhm_vox, seed):
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(seed)
+    s = fwhm_vox / 2.3548
+    vols = [gaussian_filter(rng.normal(size=shape), s, mode="wrap") for _ in range(t)]
+    return np.stack(vols, -1).reshape(-1, t)
+
+
+def test_masked_gaussian_keeps_a_constant_and_leaves_the_outside_alone():
+    import torch
+
+    from fastfuncstuff.stats.blur_to import MaskedGaussian
+
+    mask = _ball()
+    x = np.zeros((mask.size, 3), np.float32)
+    x[mask.reshape(-1)] = 7.0
+    x[~mask.reshape(-1)] = -50.0  # air must not bleed in
+    out = MaskedGaussian(mask, (2.0, 2.0, 2.0), 6.0, device=torch.device("cpu"))(x)
+    np.testing.assert_allclose(out[mask.reshape(-1)], 7.0, rtol=1e-5)
+    np.testing.assert_array_equal(out[~mask.reshape(-1)], -50.0)
+
+
+def test_volume_blur_to_lands_on_the_target_on_the_whole_data():
+    import torch
+
+    from fastfuncstuff.stats.blur_to import volume_blur_to_fwhm
+
+    cpu = torch.device("cpu")
+    mask = _ball()
+    shape, vox = mask.shape, (2.0, 2.0, 2.5)
+    y = _smooth_noise_vol(shape, 80, 1.5, 3)
+    g, kernel, achieved = volume_blur_to_fwhm(y[:, :40], mask, vox, 7.0, device=cpu)
+    assert g is not None and 0 < kernel < 7.0
+    assert achieved == pytest.approx(7.0, rel=0.03)
+    # on the other 40 time points, by plain 3dFWHMx (the noise is stationary, so no
+    # -unif, whose MAD from 40 points would itself read ~9% low)
+    from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
+
+    rows = torch.as_tensor(g(y[:, 40:])[mask.reshape(-1)])
+    res = estimate_fwhmx_run(rows, torch.as_tensor(mask), shape, vox, progress=False)
+    assert res.classic_combined == pytest.approx(7.0, rel=0.04)
+    none, _, start = volume_blur_to_fwhm(y[:, :40], mask, vox, 2.0, device=cpu)
+    assert none is None and start > 2.0
+
+
+def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, monkeypatch):
+    import nibabel as nib
+
+    from fastfuncstuff.cli import reml
+
+    # Pure noise under the model, so the residuals are what the search measured: a
+    # task the model misfits leaves a smooth blob in them that the post-fit 3dFWHMx
+    # (spatially demeaned, MAD -unif) and the search weigh differently. 300 TRs keep
+    # the post-fit -unif's own MAD bias to ~2%.
+    mask = _ball((30, 30, 24), 11.0)
+    shape, t_n, tr = mask.shape, 300, 2.0
+    y = 1000 + 5 * _smooth_noise_vol(shape, t_n, 1.5, 9)
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    img = nib.Nifti1Image(y.reshape(*shape, t_n).astype(np.float32), aff)
+    img.header.set_xyzt_units("mm", "sec")
+    img.header["pixdim"][4] = tr
+    img.to_filename(str(tmp_path / "bold.nii"))
+    nib.Nifti1Image(mask.astype(np.float32), aff).to_filename(str(tmp_path / "mask.nii"))
+    with open(tmp_path / "ev.tsv", "w") as f:
+        f.write("onset\tduration\ttrial_type\n")
+        for o in np.arange(0, t_n * tr, 40):
+            f.write(f"{o}\t20\ttask\n")
+
+    def run(*argv):
+        monkeypatch.setattr(sys, "argv", ["ffs_reml", *argv, "-device", "cpu", "-verb", "0"])
+        reml.main()
+
+    common = ["-input", str(tmp_path / "bold.nii"), "-events", str(tmp_path / "ev.tsv"),
+              "-polort", "2", "-blur_to_fwhm", "6"]  # fmt: skip
+    with pytest.raises(SystemExit):
+        run(*common, "-Rbuck", str(tmp_path / "x.nii"))  # a volume needs -mask
+    run(*common, "-mask", str(tmp_path / "mask.nii"), "-Rbuck", str(tmp_path / "s.nii"),
+        "-save_acf", str(tmp_path / "acf"))  # fmt: skip
+    avg = (tmp_path / "acf.fwhmx_reml.txt").read_text().splitlines()[-1].split()
+    classic = float(np.exp(np.mean(np.log([float(v) for v in avg[1:4]]))))
+    assert classic == pytest.approx(6.0, rel=0.05)

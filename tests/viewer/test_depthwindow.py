@@ -52,3 +52,25 @@ def test_profile_of_a_disc_reads_wm_gm_csf_and_exports(tmp_path):
     finally:
         session.close()
         app.processEvents()
+
+
+def test_a_closing_depth_window_does_not_dispatch_for_its_gone_viewport(tmp_path):
+    """Closing moves focus off the radius box, whose editingFinished then fired
+    SET_DEPTH_VIEW for a viewport the close had already removed: KeyError 'D1'."""
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.depthwindow import DepthWindow
+    from fastfuncstuff.viewer.vocab import CloseView, OpenView
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), np.float32), np.eye(4)), tmp_path / "a.nii")
+    session = ViewerSession(device=torch.device("cpu"))
+    try:
+        session.load(str(tmp_path / "a.nii"))
+        session.do(OpenView("D1", "depth", "axial"))
+        win = DepthWindow("D1", session, session.do)
+        session.do(CloseView("D1"))
+        win.radius_spin.editingFinished.emit()  # what losing focus does
+        win._changed()
+        app.processEvents()
+    finally:
+        session.close()

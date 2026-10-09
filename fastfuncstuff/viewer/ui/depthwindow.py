@@ -352,6 +352,10 @@ class DepthWindow(QtWidgets.QWidget):
         super().closeEvent(event)
 
     def _changed(self, *_args) -> None:
+        # The radius box's editingFinished fires on losing focus -- which closing
+        # the window does, after its viewport has gone.
+        if self._viewport() is None:
+            return
         source = SOURCES[self.source_box.currentIndex()]
         layer = self.layer_box.currentData() or ""
         roi = self.roi_box.currentData() or ""

@@ -1523,6 +1523,12 @@ def precompute_reml_grid(
     n_t, n_k = X.shape
     bpe = torch.empty(0, dtype=dtype).element_size()
     per_pair = n_t * n_k * bpe * 4  # X_w, Q, the triangular-solve workspace, margin
+    if storage.type == "cuda":
+        # X_w and Q only stay on the card when they fit comfortably; the search
+        # streams them per pair from the CPU otherwise.
+        free, _ = torch.cuda.mem_get_info(storage)
+        if 2 * n_valid * n_t * n_k * bpe > 0.4 * free:
+            storage = torch.device("cpu")
     if work.type == "cuda":
         free, _ = torch.cuda.mem_get_info(work)
         chunk = max(1, min(n_valid, int(free * 0.5 // per_pair)))

@@ -841,7 +841,7 @@ def test_mark_in_a_slice_paint_in_3d_move_and_make_an_roi(tmp_path):
         from fastfuncstuff.viewer.commands import Aspect
 
         surf.refresh(Aspect.ALL)
-        assert surf.canvas._cpu["lh"]["vcolor"][top, 3] == 255
+        assert surf.canvas._cpu["lh"]["mark"][top, 3] == 255
         surf._paint_highlight("lh", top, True)
         assert not surfaces.highlight["lh"][top]
 

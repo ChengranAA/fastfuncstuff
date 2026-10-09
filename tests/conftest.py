@@ -76,6 +76,23 @@ def cpu_backend_by_default(monkeypatch, request):
             monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
 
 
+@pytest.fixture(scope="session")
+def _surface_cache_root(tmp_path_factory):
+    return tmp_path_factory.mktemp("surface_cache")
+
+
+@pytest.fixture(autouse=True)
+def surface_cache_in_tmp(monkeypatch, _surface_cache_root):
+    """Keep surface/diskcache entries out of the real ~/.cache.
+
+    Patched rather than via XDG_CACHE_HOME, which also roots the Triton and
+    compile-cost caches that GPU tests want warm.
+    """
+    from fastfuncstuff.surface import diskcache
+
+    monkeypatch.setattr(diskcache, "_dir", lambda kind: _surface_cache_root / kind)
+
+
 @pytest.fixture(autouse=True)
 def reset_random_seed(request):
     """Reset only the RNGs that the selected test is allowed to use."""

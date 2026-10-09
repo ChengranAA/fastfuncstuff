@@ -212,7 +212,8 @@ class SurfaceStore:
         from fastfuncstuff.io.freesurfer import read_surface
         from fastfuncstuff.io.gifti import mesh_fingerprint
         from fastfuncstuff.processing.surface_projection import resolve_mesh
-        from fastfuncstuff.surface.remesh import sphere_lookup
+        from fastfuncstuff.surface import diskcache
+        from fastfuncstuff.surface.remesh import SphereLookup, sphere_lookup
 
         meta = getattr(data, "meta", {}) or {}
         mesh, subject = meta.get("mesh"), meta.get("subject")
@@ -232,7 +233,14 @@ class SurfaceStore:
             if len(tgt.vertices) != data.n_vertices:
                 return None
             reg = read_surface(Path(self.subject) / "surf" / f"{hint}.sphere.reg")
-            look = sphere_lookup(tgt.vertices, tgt.faces, reg.vertices)
+            faces = np.asarray(tgt.faces, np.int64)
+            disk = diskcache.content_key("lookup-1", tgt.vertices, faces, reg.vertices)
+            got = diskcache.load("sphere_lookups", disk)
+            if got is not None:
+                look = SphereLookup(faces, got["face"], got["weights"])
+            else:
+                look = sphere_lookup(tgt.vertices, faces, reg.vertices)
+                diskcache.save("sphere_lookups", disk, face=look.face, weights=look.weights)
             self._template_lookups[key] = look
         v = data.values
         integral = bool(np.all(np.isfinite(v)) and np.all(v == np.round(v)))
@@ -304,7 +312,8 @@ class SurfaceStore:
         """
         from concurrent.futures import ThreadPoolExecutor
 
-        from fastfuncstuff.surface.ribbon import build_ribbon_map
+        from fastfuncstuff.surface import diskcache
+        from fastfuncstuff.surface.ribbon import RibbonMap, build_ribbon_map
 
         aff = np.asarray(affine, np.float64)
         grid = (tuple(int(x) for x in shape), aff.round(6).tobytes())
@@ -313,9 +322,15 @@ class SurfaceStore:
 
         def build(hemi):
             h = self.hemis[hemi]
-            white = h.states["white"]
-            pial = h.states.get("pial", white)
-            return build_ribbon_map(white, pial, h.faces, aff, shape, self.device)
+            white = np.asarray(h.states["white"])
+            pial = np.asarray(h.states.get("pial", white))
+            disk = diskcache.content_key("ribbon-1", white, pial, np.asarray(h.faces), *grid)
+            got = diskcache.load("ribbon_maps", disk)
+            if got is not None:
+                return RibbonMap(grid[0], aff, got["flat"], got["vertex"], got["depth"], len(white))
+            rm = build_ribbon_map(white, pial, h.faces, aff, shape, self.device)
+            diskcache.save("ribbon_maps", disk, flat=rm.flat, vertex=rm.vertex, depth=rm.depth)
+            return rm
 
         if len(missing) > 1:
             with ThreadPoolExecutor(len(missing)) as pool:

@@ -253,3 +253,28 @@ def test_an_alpha_sizes_each_hemisphere_by_its_own_table(world):
     assert len(table) == 1 and table.clusters[0].peak_xyz[0] < 0  # lh's cap
     assert "lh ≥ 150 mm²" in table.size_rule and "rh ≥ 900 mm²" in table.size_rule
     assert table.is_surface and table.dropped is not None and table.dropped.any()
+
+
+def test_ribbon_map_comes_back_from_disk_until_the_mesh_changes(world, monkeypatch):
+    import fastfuncstuff.surface.ribbon as ribbon
+
+    s, _, _, _, _ = world
+    base = s.state.layers.base
+    fresh = s.surfaces.ribbon_maps(["lh", "rh"], base.shape, base.affine)
+    s.surfaces._ribbons.clear()  # a new session: nothing in memory
+
+    def no_build(*a, **k):
+        raise AssertionError("rebuilt a ribbon map that was on disk")
+
+    monkeypatch.setattr(ribbon, "build_ribbon_map", no_build)
+    again = s.surfaces.ribbon_maps(["lh", "rh"], base.shape, base.affine)
+    for h in ("lh", "rh"):
+        for field in ("flat", "vertex", "depth"):
+            np.testing.assert_array_equal(getattr(again[h], field), getattr(fresh[h], field))
+        assert again[h].n_vertices == fresh[h].n_vertices
+
+    # An edited pial is a different mesh: the disk entry must not answer for it.
+    s.surfaces.hemis["lh"].states["pial"] = s.surfaces.hemis["lh"].states["pial"] * 1.01
+    s.surfaces.version["lh"] = s.surfaces.version.get("lh", 0) + 1
+    with pytest.raises(AssertionError, match="rebuilt"):
+        s.surfaces.ribbon_map("lh", base.shape, base.affine)

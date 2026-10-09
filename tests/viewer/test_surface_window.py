@@ -512,3 +512,20 @@ def test_paint_mode_outlines_the_brush_at_the_cursor_at_its_size(window):
     assert radius() == pytest.approx(2 * r0, abs=2.0)
     win._toggle_paint()  # off: no outline
     assert not _overlay_pixels(c, (255, 255, 255)).any()
+
+
+def test_header_buttons_do_what_their_keys_do_and_say_where_they_are(window):
+    session, win = window
+    c = win.canvas
+    win.cross_button.click()
+    assert c.cross_style == "off" and win.cross_button.text().endswith("off")
+    win.voxel_button.click()
+    assert c.sampling == "linear" and win.voxel_button.text().endswith("linear")
+    assert win.paint_row.isHidden()
+    win.paint_button.click()
+    assert c.paint_mode and win.paint_button.isChecked() and not win.paint_row.isHidden()
+    folding = session.state.viewports.get("S1").folding
+    win.fold_button.click()
+    win.refresh(Aspect.ALL)
+    now = session.state.viewports.get("S1").folding
+    assert now != folding and win.fold_button.text().endswith(now)

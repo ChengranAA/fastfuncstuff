@@ -312,6 +312,30 @@ class Camera:
 MARKER_FLOATS = 7
 
 
+def edge_quads(
+    a: np.ndarray,
+    b: np.ndarray,
+    toward: np.ndarray,
+    half_mm: float,
+    rgba: tuple[float, float, float, float],
+    lift_mm: float = 0.0,
+) -> np.ndarray:
+    """Segments ``a[i] -> b[i]`` as camera-facing quads, ``(6 * E, MARKER_FLOATS)``.
+
+    ``lift_mm`` moves them toward the camera, for lines lying on the surface
+    that would otherwise fight it for depth. Segments seen end-on are dropped.
+    """
+    a = np.atleast_2d(np.asarray(a, np.float64)) + lift_mm * toward
+    b = np.atleast_2d(np.asarray(b, np.float64)) + lift_mm * toward
+    side = np.cross(b - a, toward)
+    n = np.linalg.norm(side, axis=1, keepdims=True)
+    keep = n[:, 0] > 1e-9
+    s = side[keep] / n[keep] * half_mm
+    a, b = a[keep], b[keep]
+    tris = np.stack([a - s, a + s, b + s, a - s, b + s, b - s], 1).reshape(-1, 3)
+    return np.c_[tris, np.tile(rgba, (len(tris), 1))].astype(np.float32)
+
+
 def crosshair_geometry(
     centre: np.ndarray,
     axes: np.ndarray,

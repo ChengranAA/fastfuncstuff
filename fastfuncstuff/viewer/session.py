@@ -2118,5 +2118,58 @@ class ViewerSession:
             return np.empty(0, dtype=np.float32)
         return np.asarray(res.array[i, j, k, :], dtype=np.float32)
 
+    def vertex_voxels(self, hemi: str, vertices: np.ndarray, depth: float) -> list:
+        """Display-grid voxels under vertices, at a cortical depth (0 white .. 1 pial)."""
+        grid = self.state.grid
+        h = self.surfaces.hemis.get(hemi)
+        if grid is None or h is None:
+            return []
+        white = np.asarray(h.states["white"], np.float64)[vertices]
+        pial = np.asarray(h.states.get("pial", h.states["white"]), np.float64)[vertices]
+        mm = white + float(depth) * (pial - white)
+        inv = np.linalg.inv(np.asarray(grid.affine, np.float64))
+        ijk = np.rint(mm @ inv[:3, :3].T + inv[:3, 3]).astype(int)
+        return [grid.clamp(tuple(v)) for v in ijk]
+
+    def vertex_timeseries(
+        self, layer: Layer, hemi: str, vertices: np.ndarray, depth: float
+    ) -> np.ndarray:
+        """A time-linked layer's courses at vertices, ``(len(vertices), T)``.
+
+        A surface result is read off its own vertices. A volume is read where
+        the 3-D window samples it: at ``depth`` between white and pial, at the
+        display voxel there -- so a vertex's line and its colour agree. Rows
+        are empty-width (T = 0) while the volume is not resident.
+        """
+        sld = self.surface_layers.get(layer.key)
+        if sld is not None:
+            data = sld.parts.get(hemi)
+            if data is None:
+                return np.empty((len(vertices), 0), np.float32)
+            return np.asarray(data.values[vertices], np.float32)
+        rows = [
+            self.timeseries(layer.key, ijk) for ijk in self.vertex_voxels(hemi, vertices, depth)
+        ]
+        if not rows or any(r.size == 0 for r in rows):
+            return np.empty((len(vertices), 0), np.float32)
+        return np.stack(rows)
+
+    def vertex_tints(
+        self, hemi: str, vertices: np.ndarray, depth: float
+    ) -> list[tuple[float, float, float] | None] | None:
+        """The overlay's colour at each vertex, ``None`` where cut; None without one.
+
+        The surface result the 3-D window shows when there is one, else the
+        volume overlay at the vertex's voxel, as the graph window tints.
+        """
+        shown = self.surface_vertex_rgba(hemi)
+        if shown is not None:
+            rgba = np.asarray(shown[0])[vertices]
+            return [
+                (px[0] / 255.0, px[1] / 255.0, px[2] / 255.0) if px[3] > 0 else None
+                for px in rgba.astype(float)
+            ]
+        return self.overlay_colors(self.vertex_voxels(hemi, vertices, depth))
+
     def close(self) -> None:
         self.store.shutdown()

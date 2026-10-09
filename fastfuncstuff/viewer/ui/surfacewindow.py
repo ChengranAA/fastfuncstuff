@@ -205,6 +205,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self.cross_at: tuple[str, int, np.ndarray | None] | None = None
         #: "lines" (axes through it), "dot", or "off"; see SurfaceWindow.CROSS_STYLES.
         self.cross_style = "lines"
+        #: A vertex graph's patch, outlined on the surface: (hemi, vertex id pairs).
+        self.outline: tuple[str, np.ndarray] | None = None
         #: Paint brush radius to outline at the cursor, mm; 0 shows none.
         self.brush_mm = 0.0
         self._hover: QtCore.QPointF | None = None
@@ -523,29 +525,55 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._pipeline = ps
 
     #: Marker vertices the dynamic buffer holds; crosshair_geometry makes ~200.
-    MARKER_VERTICES = 512
+    #: A multiple of three: the buffer is cut whole triangles at a time.
+    MARKER_VERTICES = 8190
 
     def _marker_geometry(self, height: int) -> np.ndarray | None:
-        """The crosshair's triangles this frame, or None when it is not drawn."""
+        """The crosshair's and the graph patch's triangles this frame, or None."""
+        parts = []
+        if self.outline is not None and self.outline[0] in self._visible:
+            hemi, pairs = self.outline
+            drawn = self.drawn_positions(hemi)
+            if drawn is not None and len(pairs):
+                # Magenta: apart from the crosshair's teal, the highlight's amber
+                # and the grey of the cortex.
+                r, g, b = theme.palette().series[3]
+                mm = 1.0 / self.camera.px_per_mm(height)
+                parts.append(
+                    s3.edge_quads(
+                        drawn[pairs[:, 0]],
+                        drawn[pairs[:, 1]],
+                        self.camera.rotation[2],
+                        1.0 * mm,
+                        (r, g, b, 1.0),
+                        # On the surface itself: lifted a little, or it flickers.
+                        lift_mm=0.4,
+                    )
+                )
         marker = None if self.cross_style == "off" else self.cross_marker()
-        if marker is None:
+        if marker is not None:
+            centre, axes = marker
+            # On the anatomy, where folds hide the crosshair. A laid-out shape has
+            # no folds to see into, and lines from a point on its convex surface
+            # would run in front of it; the point alone, lifted off the surface.
+            assert self.cross_at is not None
+            anatomical = self.cross_at[2] is not None and self.morph >= 1.0
+            parts.append(
+                s3.crosshair_geometry(
+                    centre,
+                    axes,
+                    self.camera,
+                    height,
+                    tuple(theme.palette().crosshair[:3]),
+                    lines=self.cross_style == "lines" and anatomical,
+                    lift_mm=0.0 if anatomical else 2.0,
+                )
+            )
+        if not parts:
             return None
-        centre, axes = marker
-        # On the anatomy, where folds hide the crosshair. A laid-out shape has
-        # no folds to see into, and lines from a point on its convex surface
-        # would run in front of it; the point alone, lifted off the surface.
-        assert self.cross_at is not None
-        anatomical = self.cross_at[2] is not None and self.morph >= 1.0
-        tris = s3.crosshair_geometry(
-            centre,
-            axes,
-            self.camera,
-            height,
-            tuple(theme.palette().crosshair[:3]),
-            lines=self.cross_style == "lines" and anatomical,
-            lift_mm=0.0 if anatomical else 2.0,
-        )
-        return tris[: self.MARKER_VERTICES]
+        # The crosshair last, so a full buffer drops outline rather than it.
+        tris = np.concatenate(parts)
+        return tris[-self.MARKER_VERTICES :]
 
     def _ensure_marker(self) -> None:
         if self._marker is not None:
@@ -1192,6 +1220,14 @@ class SurfaceWindow(QtWidgets.QWidget):
             self._cycle_depth_stat,
         )
         bar.addSpacing(8)
+        self.graph_button = self._tool(
+            bar,
+            "GRAPH",
+            "g",
+            "Time courses of the vertices around the crosshair, each drawn where it sits "
+            "on the flattened patch; the patch is outlined on the surface",
+            self._open_graph,
+        )
         self.paint_button = self._tool(
             bar,
             "PAINT",
@@ -1259,6 +1295,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         )
         v.addWidget(self.region_label)
 
+        #: The vertex graph window, while open (g).
+        self.vertex_graph = None
         self.canvas = SurfaceCanvas(self)
         self.canvas.located.connect(self.located)
         self.canvas.seeded.connect(self.seeded)
@@ -1301,6 +1339,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("m", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
                 Key("c", "centre the view on the crosshair (c c: every window)", double_tap(self._centre_view, self.centre_all_requested.emit), group="view"),
                 Key("x", "crosshair: axis lines / off / dot", self._cycle_cross, group="view"),
+                Key("g", "vertex graph: time courses on the patch around the crosshair", self._open_graph, group="view"),
                 Key("k", "folding shade: curv / sulc / binary / off", self._cycle_folding, group="view"),
                 Key("n", "voxels: nearest / linear / cubic", self._cycle_sampling, group="view"),
                 Key("v", "next view (top, lateral, medial, front...)", lambda: self._cycle_view(1), group="view"),
@@ -1598,6 +1637,19 @@ class SurfaceWindow(QtWidgets.QWidget):
             self.canvas.camera.target = drawn[k].astype(np.float64)
             self.canvas.update()
 
+    def _open_graph(self) -> None:
+        from fastfuncstuff.viewer.ui.vertexgraph import VertexGraphWindow
+
+        if self.vertex_graph is None:
+            self.vertex_graph = VertexGraphWindow(self)
+            self.vertex_graph.closed.connect(self._graph_closed)
+        self.vertex_graph.refresh()
+        self.vertex_graph.show()
+        self.vertex_graph.raise_()
+
+    def _graph_closed(self) -> None:
+        self.vertex_graph = None
+
     def _cycle_cross(self) -> None:
         styles = self.CROSS_STYLES
         self.canvas.cross_style = styles[(styles.index(self.canvas.cross_style) + 1) % len(styles)]
@@ -1612,6 +1664,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.update()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
+        if self.vertex_graph is not None:
+            self.vertex_graph.close()
         self.closed.emit(self.vid)
         super().closeEvent(event)
 
@@ -1742,6 +1796,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         # The 2-D windows' ( ) change the same brush.
         c.brush_mm = self.session.state.surface_brush[0]
         self._sync_header(vp)
+        if self.vertex_graph is not None:
+            self.vertex_graph.refresh()
         c.update()
 
     def _camera_for(

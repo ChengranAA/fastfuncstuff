@@ -1262,24 +1262,14 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
 def _surface_geometry(args, input_file, header, n_vertices: int):
     """(vertices, faces) of the mesh surface data live on: -surf_geom, or the input's
     'geometry' metadata, checked against the data's mesh fingerprint."""
-    from fastfuncstuff.io.gifti import load_gifti_surface, mesh_fingerprint, surface_meta
+    from fastfuncstuff.io.gifti import data_geometry, surface_meta
 
-    meta = surface_meta(header) or {}
-    geom = args.surf_geom
-    if geom is None and meta.get("geometry"):
-        geom = str(Path(str(input_file).split("[")[0]).parent / meta["geometry"])
-    if geom is None or not Path(geom).exists():
-        raise SystemExit(
-            "ffs_reml: this needs the mesh the surface data live on: pass -surf_geom "
-            f"(the ?h.midthickness.surf.gii); looked for {geom!r}"
+    try:
+        return data_geometry(
+            str(input_file).split("[")[0], surface_meta(header), n_vertices, args.surf_geom
         )
-    vertices, faces, _ = load_gifti_surface(geom)
-    if len(vertices) != n_vertices:
-        raise SystemExit(f"ffs_reml: {geom} has {len(vertices)} vertices, the data {n_vertices}")
-    want = meta.get("mesh_fingerprint")
-    if want and want != mesh_fingerprint(faces, len(vertices)):
-        raise SystemExit(f"ffs_reml: {geom} is not the mesh the data were sampled on")
-    return vertices, faces
+    except ValueError as e:
+        raise SystemExit(f"ffs_reml: {e}") from None
 
 
 def _surface_mask(args) -> np.ndarray | None:

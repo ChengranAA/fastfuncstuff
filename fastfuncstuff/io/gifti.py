@@ -154,6 +154,34 @@ _STAT_INTENT = {
 }
 
 
+def data_geometry(
+    data_path: str | os.PathLike,
+    meta: dict[str, str] | None,
+    n_vertices: int,
+    surf_geom: str | os.PathLike | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(vertices, faces)`` of the mesh surface data live on: ``surf_geom``, else the
+    data's ``geometry`` metadata (relative to the data file), checked against the
+    data's vertex count and mesh fingerprint. ValueError when it cannot be found or
+    does not match."""
+    meta = meta or {}
+    geom = None if surf_geom is None else os.fspath(surf_geom)
+    if geom is None and meta.get("geometry"):
+        geom = os.path.join(os.path.dirname(os.fspath(data_path)), meta["geometry"])
+    if geom is None or not os.path.exists(geom):
+        raise ValueError(
+            "this needs the mesh the surface data live on: pass -surf_geom "
+            f"(the ?h.midthickness.surf.gii); looked for {geom!r}"
+        )
+    vertices, faces, _ = load_gifti_surface(geom)
+    if len(vertices) != n_vertices:
+        raise ValueError(f"{geom} has {len(vertices)} vertices, the data {n_vertices}")
+    want = meta.get("mesh_fingerprint")
+    if want and want != mesh_fingerprint(faces, len(vertices)):
+        raise ValueError(f"{geom} is not the mesh the data were sampled on")
+    return vertices, faces
+
+
 def is_gifti(path: str | os.PathLike) -> bool:
     return os.fspath(path).lower().endswith(".gii")
 

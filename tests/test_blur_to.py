@@ -124,3 +124,55 @@ def test_forty_time_points_pin_the_kernel(sheet):
         for s in range(5)
     ]
     assert np.max(np.abs(np.array(ks) / k_all - 1)) < 0.04
+
+
+def test_blursurf_cli_by_and_to_with_a_residual_master(tmp_path):
+    from fastfuncstuff.cli.util_blursurf import main
+    from fastfuncstuff.io.gifti import (
+        load_gifti_data,
+        mesh_fingerprint,
+        save_gifti_data,
+        save_gifti_surface,
+    )
+
+    def run(argv):
+        return main([*argv, "-device", "cpu"])
+
+    v, f = _sheet(41, 1.0)
+    fp = mesh_fingerprint(f, len(v))
+    save_gifti_surface(tmp_path / "mid.surf.gii", v, f)
+    lengths = [60, 60]
+    task = (np.arange(120) % 20 < 10).astype(float)
+    x = _design(lengths, task)
+    blob = np.exp(-((v[:, 0] - 20) ** 2 + (v[:, 1] - 20) ** 2) / 50)
+    y = 100 + _noise(v, f, 120, 2.0, 7) + 3 * np.outer(blob, task)
+    meta = {"TR_seconds": "1", "mesh_fingerprint": fp, "geometry": "mid.surf.gii"}
+    for r, s in enumerate((0, 60)):
+        save_gifti_data(tmp_path / f"run{r}.func.gii", y[:, s : s + 60].astype(np.float32), meta)
+    inputs = [str(tmp_path / "run0.func.gii"), str(tmp_path / "run1.func.gii")]
+    good = np.delete(np.arange(120), [5, 6, 70])
+    header = [
+        '# RunStart = "0,60"',
+        f'# GoodList = "{",".join(map(str, good))}"',
+        '# NRowFull = "120"',
+    ]
+    rows = [" ".join(f"{c:.8g}" for c in row) for row in x]
+    (tmp_path / "X.xmat.1D").write_text("\n".join(header + rows) + "\n")
+
+    out = tmp_path / "out"
+    out.mkdir()
+    assert run(["-input", *inputs, "-do_blur", "3", "-prefix", str(out / "b3")]) == 0
+    b3, m3 = load_gifti_data(out / "b3.r02.func.gii")
+    np.testing.assert_allclose(b3, HeatSmoother(v, f, 3.0)(y[:, 60:]), rtol=1e-5, atol=1e-3)
+    assert m3["blur_kernel_fwhm"] == "3" and m3["geometry"] == "../mid.surf.gii"
+
+    argv = ["-input", *inputs, "-blur_to_fwhm", "5", "-matrix", str(tmp_path / "X.xmat.1D")]
+    assert run([*argv, "-prefix", str(out / "bto5")]) == 0
+    _, m5 = load_gifti_data(out / "bto5.r01.func.gii")
+    assert float(m5["master_fwhm_after"]) == pytest.approx(5.0, rel=0.03)
+    assert float(m5["master_fwhm_before"]) < 3.0 < float(m5["blur_kernel_fwhm"]) < 5.0
+
+    with pytest.raises(SystemExit):
+        run(["-input", *inputs, "-do_blur", "3", "-blur_to_fwhm", "5", "-prefix", "z"])
+    with pytest.raises(SystemExit):
+        run(["-input", *inputs, "-do_blur", "3", "-matrix", "X", "-prefix", "z"])

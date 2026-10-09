@@ -227,6 +227,9 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._outline: tuple[str | None, list[int], bool] | None = None
         #: CPU copies for picking: drawn positions A/B, white, pial, faces.
         self._cpu: dict[str, dict[str, np.ndarray]] = {}
+        #: Bumped when positions upload, so lookups cached against them expire.
+        self._cpu_version = 0
+        self._nearest_hit: tuple | None = None
         #: Per drawn slot: the key its textures hold, and those textures.
         self._uploaded: list[tuple | None] = [None] * s3.MAX_LAYERS
         self._slot_tex: list[tuple[QRhiTexture, QRhiTexture] | None] = [None] * s3.MAX_LAYERS
@@ -315,6 +318,8 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         }
         pend = self._pending.setdefault(hemi, {})
         cpu = self._cpu.setdefault(hemi, {})
+        if white is not None or pial is not None or pos_a is not None or pos_b is not None:
+            self._cpu_version += 1
         for k, v in given.items():
             if v is not None:
                 kind = np.uint8 if k in ("vcolor", "mark") else np.float32
@@ -332,6 +337,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     def drop_hemispheres(self) -> None:
         self._pending.clear()
         self._cpu.clear()
+        self._cpu_version += 1
         self._faces.clear()
         for gpu in self._gpu.values():
             for b in gpu.buffers.values():
@@ -410,9 +416,18 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         return p @ m[:3, :3].T.astype(np.float32) + m[:3, 3].astype(np.float32)
 
     def nearest_vertex(self, mm) -> tuple[str, int] | None:
-        """The shown vertex whose mid-depth point is closest to scanner ``mm``."""
-        best: tuple[float, str, int] | None = None
+        """The shown vertex whose mid-depth point is closest to scanner ``mm``.
+
+        Remembered for the last point asked: every time step of a series
+        refreshes the crosshair, which has not moved, and the search is a pass
+        over every vertex.
+        """
         p = np.asarray(mm, np.float32)
+        key = (p.tobytes(), tuple(sorted(self._visible)), self._cpu_version)
+        hit = self._nearest_hit
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        best: tuple[float, str, int] | None = None
         for hemi in self._visible:
             cpu = self._cpu.get(hemi)
             if not cpu or "white" not in cpu or "pial" not in cpu:
@@ -421,7 +436,9 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             k = int(np.argmin(d2))
             if best is None or d2[k] < best[0]:
                 best = (float(d2[k]), hemi, k)
-        return None if best is None else (best[1], best[2])
+        found = None if best is None else (best[1], best[2])
+        self._nearest_hit = (key, found)
+        return found
 
     # -- RHI -----------------------------------------------------------------
     def initialize(self, cb: QRhiCommandBuffer) -> None:  # noqa: ARG002 (Qt)

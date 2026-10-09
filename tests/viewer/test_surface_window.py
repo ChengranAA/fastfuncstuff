@@ -562,3 +562,19 @@ def test_the_highlight_has_its_own_attribute_so_it_draws_over_overlays(window):
     mark = c._cpu["lh"]["mark"]
     assert (mark[lit, 3] == 255).all() and (mark[~lit, 3] == 0).all()
     np.testing.assert_array_equal(c._cpu["lh"]["vcolor"], before)
+
+
+def test_nearest_vertex_is_remembered_until_positions_move(window):
+    session, win = window
+    c = win.canvas
+    first = c.nearest_vertex((5.0, -7.0, 1.5))
+    assert c.nearest_vertex((5.0, -7.0, 1.5)) == first  # served from memory
+    # A map re-upload is not a move: still remembered.
+    c.set_hemisphere(
+        "lh", pos_a=None, pos_b=None, nrm_a=None, nrm_b=None, vcolor=c._cpu["lh"]["vcolor"]
+    )
+    assert c._nearest_hit is not None and c.nearest_vertex((5.0, -7.0, 1.5)) == first
+    # Shift the surface 10 mm in x: the nearest vertex to the same point changes.
+    w, p = c._cpu["lh"]["white"] + [10.0, 0, 0], c._cpu["lh"]["pial"] + [10.0, 0, 0]
+    c.set_hemisphere("lh", pos_a=None, pos_b=None, nrm_a=None, nrm_b=None, white=w, pial=p)
+    assert c.nearest_vertex((5.0, -7.0, 1.5)) != first

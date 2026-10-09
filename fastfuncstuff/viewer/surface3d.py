@@ -564,15 +564,20 @@ VERTEX_MAPS = ("", "thickness", "sulc", "curv", "annot", "flags")
 
 
 def over(top: np.ndarray, under: np.ndarray) -> np.ndarray:
-    """``top`` RGBA (uint8) alpha-blended over ``under``: a surface layer over a map."""
-    a = top[:, 3:4].astype(np.float32) / 255.0
-    b = under[:, 3:4].astype(np.float32) / 255.0
-    out_a = a + b * (1.0 - a)
-    rgb = top[:, :3] * a + under[:, :3] * b * (1.0 - a)
-    rgb = np.divide(rgb, out_a, out=np.zeros_like(rgb), where=out_a > 0)
+    """``top`` RGBA (uint8) alpha-blended over ``under``: a surface layer over a map.
+
+    float32 throughout and one division per vertex rather than per channel: it
+    runs for every hemisphere on every time step of a surface series.
+    """
+    a = top[:, 3].astype(np.float32) * np.float32(1 / 255)
+    wb = under[:, 3].astype(np.float32) * np.float32(1 / 255) * (1 - a)
+    out_a = a + wb
+    inv = np.zeros_like(out_a)
+    np.divide(1, out_a, out=inv, where=out_a > 0)
+    rgb = top[:, :3] * (a * inv)[:, None] + under[:, :3] * (wb * inv)[:, None]
     out = np.empty_like(top)
-    out[:, :3] = np.clip(np.round(rgb), 0, 255).astype(np.uint8)
-    out[:, 3] = np.clip(np.round(out_a[:, 0] * 255), 0, 255).astype(np.uint8)
+    out[:, :3] = np.clip(np.rint(rgb, out=rgb), 0, 255)
+    out[:, 3] = np.clip(np.rint(out_a * 255), 0, 255)
     return out
 
 

@@ -890,9 +890,29 @@ Examples:
         default=None,
         help="-blur_to_fwhm: how many uncensored time points, spread over the runs, "
         "carry the search. Default 40: the global FWHM averages over every edge, so a "
-        "few dozen pin the kernel to ~2%%. With -blur_to_local 160: a local estimate "
+        "few dozen pin the kernel to ~2%%. With -blur_to_local / -blur_to_tsnr 160: a local estimate "
         "averages over a neighbourhood only, and on real cortex 40 points leave a "
         "90th-percentile error of ~7%% against a true spread of ~17%%; 160 halve it.",
+    )
+    proc_opts.add_argument(
+        "-blur_to_tsnr",
+        type=float,
+        metavar="TSNR",
+        default=None,
+        help="Blur each place only as much as it needs to reach this RESIDUAL tSNR "
+        "(temporal mean over the SD of the OLS residuals): noisy places get more, clean "
+        "ones none. A place also stops at -blur_tsnr_max_fwhm, or once a step that grew "
+        "its smoothness ~12%% bought under 3%% of tSNR -- spatially structured noise "
+        "(physiological, vascular) does not average down. Diffusion, as -blur_to_local; "
+        "-clustsim then defaults to the residual null, since smoothness varies by design. "
+        "Volume input needs -mask. Exclusive with -do_blur / -blur_to_fwhm.",
+    )
+    proc_opts.add_argument(
+        "-blur_tsnr_max_fwhm",
+        type=float,
+        metavar="MM",
+        default=8.0,
+        help="-blur_to_tsnr: no place is smoothed past this local FWHM.",
     )
     proc_opts.add_argument(
         "-blur_to_local",
@@ -907,14 +927,14 @@ Examples:
         type=float,
         metavar="MM",
         default=8.0,
-        help="-blur_to_local: the neighbourhood (FWHM of a Gaussian, mm) each local "
-        "smoothness estimate is pooled over.",
+        help="-blur_to_local / -blur_to_tsnr: the neighbourhood (FWHM of a Gaussian, mm) "
+        "each local smoothness or tSNR estimate is pooled over.",
     )
     proc_opts.add_argument(
         "-save_blur_fwhm",
         metavar="FILE",
         default=None,
-        help="-blur_to_fwhm: write the local FWHM of the blurred master (one map; "
+        help="-blur_to_fwhm / -blur_to_tsnr: write the local FWHM of the blurred master (one map; "
         ".shape.gii on surface input) -- where the target was and was not reached.",
     )
     proc_opts.add_argument(
@@ -1361,9 +1381,28 @@ def _blur_to_master(args, data, design_info, run_starts, trim):
     good = _blur_to_good_list(args, design_info, run_starts, total, trim)
     bounds = [int(r) for r in run_starts] + [total]
     lengths = [bounds[i + 1] - bounds[i] for i in range(len(run_starts))]
-    n_cols = args.blur_to_columns or (160 if args.blur_to_local else 40)
+    n_cols = args.blur_to_columns or (160 if _blur_varies(args) else 40)
     cols = sample_columns(lengths, n_cols, good=good)
     return residual_master(data, design_info["matrix"], cols, good=good)
+
+
+def _blur_varies(args) -> bool:
+    """Whether the blur is spatially varying on purpose (-blur_to_local, -blur_to_tsnr)."""
+    return bool(args.blur_to_local) or args.blur_to_tsnr is not None
+
+
+def _report_blur_tsnr(args, op, t0, t1, local, n_cols):
+    t0, t1, local = (np.asarray(a.cpu() if hasattr(a, "cpu") else a) for a in (t0, t1, local))
+    ok = np.isfinite(t1)
+    if op is None:
+        print(f"  Residual tSNR already >= {args.blur_to_tsnr:g} everywhere: no blur applied")
+        return
+    print(
+        f"  Blurring TO residual tSNR {args.blur_to_tsnr:g} (cap {args.blur_tsnr_max_fwhm:g} mm, "
+        f"{n_cols} time points): median tSNR {np.nanmedian(t0):.1f} -> {np.nanmedian(t1):.1f}, "
+        f"{100 * np.mean(t1[ok] >= args.blur_to_tsnr):.0f}% reach it; local FWHM median "
+        f"{np.nanmedian(local):.2f} mm (90th pct {np.nanpercentile(local, 90):.2f})"
+    )
 
 
 def _report_blur_to(args, op, start, achieved, n_cols, what):
@@ -1379,11 +1418,18 @@ def _report_blur_to(args, op, start, achieved, n_cols, what):
     )
 
 
-def _surface_blur_to(args, input_file, header, n_vertices: int, master, keep=None, device=None):
-    """-blur_to_fwhm on the surface: heat smoothing that brings ``master`` to the
-    target -- one kernel, or (-blur_to_local) diffusion that stops where it is reached."""
+def _surface_blur_to(
+    args, input_file, header, n_vertices: int, master, keep=None, device=None, mean=None
+):
+    """-blur_to_fwhm / -blur_to_tsnr on the surface: heat smoothing that brings
+    ``master`` to the target -- one kernel, or diffusion that stops where it is reached."""
     from fastfuncstuff.io.gifti import save_gifti_data, surface_meta
-    from fastfuncstuff.surface.acf import blur_to_fwhm, blur_to_fwhm_local, local_surface_fwhm
+    from fastfuncstuff.surface.acf import (
+        blur_to_fwhm,
+        blur_to_fwhm_local,
+        blur_to_tsnr,
+        local_surface_fwhm,
+    )
     from fastfuncstuff.surface.smooth import surface_fwhm
 
     vertices, faces = _surface_geometry(args, input_file, header, n_vertices)
@@ -1392,18 +1438,25 @@ def _surface_blur_to(args, input_file, header, n_vertices: int, master, keep=Non
         mask = np.asarray(keep, bool) if mask is None else mask & np.asarray(keep, bool)
     on = _surface_device(device)
     local = None
-    if args.blur_to_local:
+    if args.blur_to_tsnr is not None:
+        op, t0, t1, local = blur_to_tsnr(
+            master, mean, vertices, faces, args.blur_to_tsnr, args.blur_tsnr_max_fwhm, mask,
+            args.blur_to_nbhd, device=on,
+        )  # fmt: skip
+        _report_blur_tsnr(args, op, t0, t1, local, master.shape[1])
+    elif args.blur_to_local:
         op, start, achieved, local = blur_to_fwhm_local(
             master, vertices, faces, args.blur_to_fwhm, mask, args.blur_to_nbhd, device=on
         )
-        what = ""
+        _report_blur_to(args, op, start, achieved, master.shape[1], "")
     else:
         start = surface_fwhm(master, vertices, faces, mask)[0]
         op, kernel, achieved = blur_to_fwhm(
             master, vertices, faces, args.blur_to_fwhm, mask, n_columns=master.shape[1]
         )
-        what = f"a {kernel:.2f} mm heat kernel"
-    _report_blur_to(args, op, start, achieved, master.shape[1], what)
+        _report_blur_to(
+            args, op, start, achieved, master.shape[1], f"a {kernel:.2f} mm heat kernel"
+        )
     if args.save_blur_fwhm:
         if local is None:
             after = master if op is None else op(master)
@@ -1416,14 +1469,15 @@ def _surface_blur_to(args, input_file, header, n_vertices: int, master, keep=Non
     return op
 
 
-def _volume_blur_to(args, master, volume_shape, voxel_sizes, keep, device, affine):
-    """-blur_to_fwhm on a voxel grid, inside -mask (and the guard's keep): one in-mask
-    Gaussian, or (-blur_to_local) diffusion that stops where the target is reached."""
+def _volume_blur_to(args, master, volume_shape, voxel_sizes, keep, device, affine, mean=None):
+    """-blur_to_fwhm / -blur_to_tsnr on a voxel grid, inside -mask (and the guard's
+    keep): one in-mask Gaussian, or diffusion that stops where the target is reached."""
     from fastfuncstuff.io.afni import load_afni_mask
     from fastfuncstuff.stats.blur_to import (
         local_volume_fwhm,
         volume_blur_to_fwhm,
         volume_blur_to_fwhm_local,
+        volume_blur_to_tsnr,
         volume_fwhm,
     )
 
@@ -1432,18 +1486,30 @@ def _volume_blur_to(args, master, volume_shape, voxel_sizes, keep, device, affin
         mask &= np.asarray(keep, bool)
     mask = mask.reshape(volume_shape)
     local = None
-    if args.blur_to_local:
+    if args.blur_to_tsnr is not None:
+        op, t0, t1, local = volume_blur_to_tsnr(
+            master, mean, mask, voxel_sizes, args.blur_to_tsnr, args.blur_tsnr_max_fwhm,
+            args.blur_to_nbhd, device=device,
+        )  # fmt: skip
+        _report_blur_tsnr(args, op, t0[mask], t1[mask], local[mask], master.shape[1])
+    elif args.blur_to_local:
         op, start, achieved, local = volume_blur_to_fwhm_local(
             master, mask, voxel_sizes, args.blur_to_fwhm, args.blur_to_nbhd, device=device
         )
-        what = ""
+        _report_blur_to(args, op, start, achieved, master.shape[1], "")
     else:
         start = volume_fwhm(master, mask, voxel_sizes, device)
         op, kernel, achieved = volume_blur_to_fwhm(
             master, mask, voxel_sizes, args.blur_to_fwhm, device=device
         )
-        what = f"a {kernel:.2f} mm Gaussian inside the mask"
-    _report_blur_to(args, op, start, achieved, master.shape[1], what)
+        _report_blur_to(
+            args,
+            op,
+            start,
+            achieved,
+            master.shape[1],
+            f"a {kernel:.2f} mm Gaussian inside the mask",
+        )
     if args.save_blur_fwhm:
         if local is None:
             after = master if op is None else op(master)
@@ -2117,13 +2183,19 @@ def main():
     from fastfuncstuff.io.gifti import is_gifti
 
     surface_input = is_gifti(str(input_files[0]).split("[")[0])
-    if args.blur_to_fwhm is not None and args.do_blur is not None:
-        print("❌ ERROR: -blur_to_fwhm replaces -do_blur: pick one.", file=sys.stderr)
+    blurs = [f for f, on in (("-do_blur", args.do_blur is not None),
+                             ("-blur_to_fwhm", args.blur_to_fwhm is not None),
+                             ("-blur_to_tsnr", args.blur_to_tsnr is not None)) if on]  # fmt: skip
+    if len(blurs) > 1:
+        print(f"❌ ERROR: {' and '.join(blurs)} are alternatives: pick one.", file=sys.stderr)
         sys.exit(1)
-    if args.blur_to_fwhm is not None and not surface_input and not args.mask:
+    if args.blur_to_local and args.blur_to_fwhm is None:
+        print("❌ ERROR: -blur_to_local goes with -blur_to_fwhm.", file=sys.stderr)
+        sys.exit(1)
+    if blurs and blurs[0] != "-do_blur" and not surface_input and not args.mask:
         # The guard's own mask keeps every voxel with a signal, air included, and
         # white noise there would drag the measured smoothness down.
-        print("❌ ERROR: -blur_to_fwhm on volume data needs -mask (the brain).", file=sys.stderr)
+        print(f"❌ ERROR: {blurs[0]} on volume data needs -mask (the brain).", file=sys.stderr)
         sys.exit(1)
     if surface_input:
         # Surface data run as AFNI's 1-D volume (V, 1, 1, T); the GLM itself does
@@ -3293,6 +3365,7 @@ def main():
     preprocessing_applied = (
         args.do_blur is not None
         or args.blur_to_fwhm is not None
+        or args.blur_to_tsnr is not None
         or args.do_scale
         or want_diag
         or guard_enabled
@@ -3485,17 +3558,22 @@ def main():
             guard_keep = keep
             guard_affine = affine
 
-        if args.blur_to_fwhm is not None:
-            print(f"  Blur TO {args.blur_to_fwhm} mm: master = OLS residuals of the unblurred data")
+        if args.blur_to_fwhm is not None or args.blur_to_tsnr is not None:
+            print("  Blur TO a target: master = OLS residuals of the unblurred data")
             master = _blur_to_master(args, fmri_data_preprocessed, design_info, run_starts, trim)
+            mean = (
+                fmri_data_preprocessed.mean(axis=1, dtype=np.float64)
+                if args.blur_to_tsnr is not None
+                else None
+            )
             keep_np = None if guard_keep is None else guard_keep.numpy()
             if surface_input:
                 blur_to = _surface_blur_to(
-                    args, input_files[0], nifti_header, n_voxels, master, keep_np, device
+                    args, input_files[0], nifti_header, n_voxels, master, keep_np, device, mean
                 )
             else:
                 blur_to = _volume_blur_to(
-                    args, master, volume_shape, voxel_sizes, keep_np, device, affine
+                    args, master, volume_shape, voxel_sizes, keep_np, device, affine, mean
                 )
             del master
             if blur_to is not None:
@@ -4820,8 +4898,7 @@ def _clustsim_null(args) -> str:
     """-clustsim_null as given, else resid when the blur made smoothness vary on purpose."""
     if args.clustsim_null:
         return args.clustsim_null
-    local = args.blur_to_local or getattr(args, "blur_to_tsnr", None) is not None
-    return "resid" if local else "acf"
+    return "resid" if _blur_varies(args) else "acf"
 
 
 def _residual_null(diag, mask, device):

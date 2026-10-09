@@ -42,6 +42,12 @@ the search.
 each stopping wherever the local smoothness (pooled over -blur_to_nbhd mm) has reached
 the target, until the global one has. Rough cortex gets more blur than smooth.
 
+-blur_to_tsnr T blurs each place until its residual tSNR (temporal mean over the
+master's SD, pooled over -blur_to_nbhd) reaches T: noisy cortex gets more, clean none,
+nothing past -blur_tsnr_max_fwhm, and a place stops once more blur stops buying tSNR.
+Cluster inference on such data wants a null that knows the smoothness varies
+(ffs_reml -clustsim_null resid).
+
 Inputs are runs of one hemisphere on one mesh. Outputs: one PREFIX.func.gii for a
 single input, else PREFIX.rNN.func.gii per run; the metadata records the kernel
 (blur_kernel_fwhm) and, for -blur_to_fwhm, the target and the master's measured
@@ -59,6 +65,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      help="Smooth BY a heat kernel of FWHM mm.")  # fmt: skip
     how.add_argument("-blur_to_fwhm", type=float, metavar="FWHM", default=None,
                      help="Smooth TO this FWHM (mm), measured on the master.")  # fmt: skip
+    how.add_argument("-blur_to_tsnr", type=float, metavar="TSNR", default=None,
+                     help="Smooth each place only until its RESIDUAL tSNR (mean over the "
+                     "master's SD) reaches this, up to -blur_tsnr_max_fwhm, and not where "
+                     "it stops paying (structured noise does not average down).")  # fmt: skip
+    p.add_argument("-blur_tsnr_max_fwhm", type=float, default=8.0, metavar="MM",
+                   help="-blur_to_tsnr: no place is smoothed past this local FWHM.")  # fmt: skip
     p.add_argument("-surf_geom", metavar="SURF.gii", default=None,
                    help="The mesh the data live on (this subject's midthickness). Default: "
                    "the 'geometry' named in the input's metadata.")  # fmt: skip
@@ -88,14 +100,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="-blur_to_fwhm: write the local FWHM of the blurred master.")  # fmt: skip
     add_device_arg(p)
     args = p.parse_args(argv)
-    if args.blur_to_fwhm is None and (args.blurmaster or args.matrix):
-        p.error("-blurmaster / -matrix choose a master for -blur_to_fwhm")
+    to_target = args.blur_to_fwhm is not None or args.blur_to_tsnr is not None
+    if not to_target and (args.blurmaster or args.matrix):
+        p.error("-blurmaster / -matrix choose a master for -blur_to_fwhm / -blur_to_tsnr")
     if args.censor and not args.matrix:
         p.error("-censor applies to the -matrix fit")
-    if args.blur_to_fwhm is None and (args.blur_to_local or args.save_blur_fwhm):
-        p.error("-blur_to_local / -save_blur_fwhm go with -blur_to_fwhm")
+    if args.blur_to_fwhm is None and args.blur_to_local:
+        p.error("-blur_to_local goes with -blur_to_fwhm")
+    if not to_target and args.save_blur_fwhm:
+        p.error("-save_blur_fwhm goes with -blur_to_fwhm / -blur_to_tsnr")
     if args.blur_to_columns is None:
-        args.blur_to_columns = 160 if args.blur_to_local else 40
+        varies = args.blur_to_local or args.blur_to_tsnr is not None
+        args.blur_to_columns = 160 if varies else 40
     return args
 
 
@@ -153,7 +169,12 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.cli_utils import setup_device
     from fastfuncstuff.io.afni import load_afni_mask
     from fastfuncstuff.io.gifti import data_geometry, load_gifti_data, save_gifti_data
-    from fastfuncstuff.surface.acf import blur_to_fwhm, blur_to_fwhm_local, local_surface_fwhm
+    from fastfuncstuff.surface.acf import (
+        blur_to_fwhm,
+        blur_to_fwhm_local,
+        blur_to_tsnr,
+        local_surface_fwhm,
+    )
     from fastfuncstuff.surface.smooth import HeatSmoother, surface_fwhm
 
     args = parse_args(argv)
@@ -185,10 +206,30 @@ def main(argv: list[str] | None = None) -> int:
     else:
         data = np.concatenate(runs, axis=1)
         master = _master(args, data, lengths, tr)
+        mean = data.mean(axis=1, dtype=np.float64)
         del data
         start = surface_fwhm(master, vertices, faces, mask)[0]
         local = None
-        if args.blur_to_local:
+        if args.blur_to_tsnr is not None:
+            hs, t0, t1, local = blur_to_tsnr(
+                master, mean, vertices, faces, args.blur_to_tsnr, args.blur_tsnr_max_fwhm,
+                mask, args.blur_to_nbhd, device=solve_on,
+            )  # fmt: skip
+            achieved = surface_fwhm(master if hs is None else hs(master), vertices, faces, mask)[0]
+            ok = np.isfinite(t1)
+            reach = 100 * np.mean(t1[ok] >= args.blur_to_tsnr)
+            how = (
+                f"tSNR-driven diffusion (median tSNR {np.nanmedian(t0):.1f} -> "
+                f"{np.nanmedian(t1):.1f}, {reach:.0f}% reach {args.blur_to_tsnr:g})"
+            )
+            record.update(
+                blur_to_tsnr=f"{args.blur_to_tsnr:g}",
+                blur_tsnr_max_fwhm=f"{args.blur_tsnr_max_fwhm:g}",
+                tsnr_median_before=f"{np.nanmedian(t0):.4g}",
+                tsnr_median_after=f"{np.nanmedian(t1):.4g}",
+                blur_steps=str(0 if hs is None else len(hs.steps)),
+            )
+        elif args.blur_to_local:
             hs, _, achieved, local = blur_to_fwhm_local(
                 master, vertices, faces, args.blur_to_fwhm, mask, args.blur_to_nbhd,
                 device=solve_on,
@@ -204,13 +245,11 @@ def main(argv: list[str] | None = None) -> int:
             )  # fmt: skip
             record["blur_kernel_fwhm"] = f"{kernel:.4g}"
             how = f"heat kernel {kernel:.2f} mm"
-        record.update(
-            blur_to_fwhm=f"{args.blur_to_fwhm:g}",
-            master_fwhm_before=f"{start:.4g}",
-            master_fwhm_after=f"{achieved:.4g}",
-        )
+        record.update(master_fwhm_before=f"{start:.4g}", master_fwhm_after=f"{achieved:.4g}")
+        if args.blur_to_fwhm is not None:
+            record["blur_to_fwhm"] = f"{args.blur_to_fwhm:g}"
         if hs is None:
-            print(f"  master already {start:.2f} mm smooth (>= {args.blur_to_fwhm}): no blur")
+            print(f"  master already at the target ({start:.2f} mm smooth): no blur")
         else:
             print(f"  {how} takes the master {start:.2f} -> {achieved:.2f} mm")
         if args.save_blur_fwhm:

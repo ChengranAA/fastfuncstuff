@@ -182,6 +182,14 @@ def test_blursurf_cli_by_and_to_with_a_residual_master(tmp_path):
     fmap, _ = load_gifti_data(out / "loc.shape.gii")
     assert fmap.shape == (len(v),) and np.nanmedian(fmap[fmap > 0]) > 3.5
 
+    target = 2.0 * float(np.median(y.mean(1) / y.std(1)))
+    tsnr_argv = ["-input", *inputs, "-blur_to_tsnr", f"{target:.1f}", "-blur_tsnr_max_fwhm", "8",
+                 "-matrix", str(tmp_path / "X.xmat.1D"), "-prefix", str(out / "bt")]  # fmt: skip
+    assert run(tsnr_argv) == 0
+    _, mt = load_gifti_data(out / "bt.r01.func.gii")
+    assert float(mt["tsnr_median_after"]) > 1.5 * float(mt["tsnr_median_before"])
+    assert int(mt["blur_steps"]) >= 1
+
     with pytest.raises(SystemExit):
         run(["-input", *inputs, "-do_blur", "3", "-blur_to_fwhm", "5", "-prefix", "z"])
     with pytest.raises(SystemExit):
@@ -428,3 +436,40 @@ def test_surface_blur_to_tsnr_blurs_noisy_white_noise_not_clean_or_structured(sh
     assert np.nanmedian(t1[smooth]) < 40
     held = sad(y[:, 160:])
     assert 57 < np.median((held.mean(1) / held.std(1))[white]) < 72
+
+
+def test_reml_volume_blur_to_tsnr_end_to_end(tmp_path, monkeypatch, capsys):
+    import nibabel as nib
+
+    from fastfuncstuff.cli import reml
+
+    shape, t_n, tr = (32, 24, 16), 240, 2.0
+    mask = np.ones(shape, bool)
+    mask[[0, -1]] = mask[:, [0, -1]] = mask[:, :, [0, -1]] = False
+    white = _smooth_noise_vol(shape, t_n, 0.8, 4).reshape(*shape, t_n)
+    amp = np.where(np.arange(32) < 16, 40.0, 8.0)[:, None, None, None]
+    y = 1000 + amp * white / white.std()
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    img = nib.Nifti1Image(y.astype(np.float32), aff)
+    img.header.set_xyzt_units("mm", "sec")
+    img.header["pixdim"][4] = tr
+    img.to_filename(str(tmp_path / "bold.nii"))
+    nib.Nifti1Image(mask.astype(np.float32), aff).to_filename(str(tmp_path / "mask.nii"))
+    with open(tmp_path / "ev.tsv", "w") as f:
+        f.write("onset\ttrial_type\tduration\n")
+        for o in np.arange(0, t_n * tr, 40):
+            f.write(f"{o}\ttask\t20\n")
+    monkeypatch.setattr(sys, "argv", [
+        "ffs_reml", "-input", str(tmp_path / "bold.nii"), "-events", str(tmp_path / "ev.tsv"),
+        "-polort", "2", "-mask", str(tmp_path / "mask.nii"), "-blur_to_tsnr", "60",
+        "-Rbuck", str(tmp_path / "s.nii"), "-save_tsnr", str(tmp_path / "tsnr.nii"),
+        "-save_blur_fwhm", str(tmp_path / "fw.nii"), "-clustsim", "-clustsim_niter", "100",
+        "-device", "cpu", "-verb", "0",
+    ])  # fmt: skip
+    reml.main()
+    out = capsys.readouterr().out
+    assert "Blurring TO residual tSNR 60" in out and "sign-flipped residuals" in out
+    fw = np.asarray(nib.load(str(tmp_path / "fw.nii")).dataobj)
+    noisy, clean = mask.copy(), mask.copy()
+    noisy[14:], clean[:18] = False, False
+    assert np.median(fw[noisy]) > 1.5 * np.median(fw[clean])  # the noisy half got the blur

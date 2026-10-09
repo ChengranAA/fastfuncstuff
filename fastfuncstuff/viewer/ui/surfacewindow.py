@@ -1117,6 +1117,8 @@ class SurfaceWindow(QtWidgets.QWidget):
     seeded = QtCore.Signal(float, float, float)
     #: `c c`: centre every window on the crosshair, not just this one.
     centre_all_requested = QtCore.Signal()
+    #: ANIMATE (a): play / pause time, paced by this window's frames.
+    play_requested = QtCore.Signal()
 
     #: Radius of the crosshair's mark on the surface, mm.
     CROSS_MM = 2.0
@@ -1190,6 +1192,15 @@ class SurfaceWindow(QtWidgets.QWidget):
             lambda: self._cycle_view(1),
         )
         self._tool(bar, "RESET", "0", "Reset the camera", self._reset_camera)
+        self.animate_button = self._tool(
+            bar,
+            "ANIMATE",
+            "a",
+            "Play / pause time: the loaded series stepped one frame after the last "
+            "has been drawn, so none is skipped",
+            self.play_requested.emit,
+            checkable=True,
+        )
         self.open_button = self._tool(
             bar,
             "OPEN",
@@ -1357,6 +1368,7 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("c", "centre the view on the crosshair (c c: every window)", double_tap(self._centre_view, self.centre_all_requested.emit), group="view"),
                 Key("x", "crosshair: axis lines / off / dot", self._cycle_cross, group="view"),
                 Key("g", "vertex graph: time courses on the patch around the crosshair", self._open_graph, group="view"),
+                Key("a", "animate: play / pause time, one frame after the last is drawn", self.play_requested.emit, group="view"),
                 Key("k", "folding shade: curv / sulc / binary / off", self._cycle_folding, group="view"),
                 Key("n", "voxels: nearest / linear / cubic", self._cycle_sampling, group="view"),
                 Key("v", "next view (top, lateral, medial, front...)", lambda: self._cycle_view(1), group="view"),
@@ -1653,6 +1665,9 @@ class SurfaceWindow(QtWidgets.QWidget):
         if drawn is not None:
             self.canvas.camera.target = drawn[k].astype(np.float64)
             self.canvas.update()
+
+    def set_playing(self, on: bool) -> None:
+        self.animate_button.setChecked(bool(on))
 
     def _open_graph(self) -> None:
         from fastfuncstuff.viewer.ui.vertexgraph import VertexGraphWindow

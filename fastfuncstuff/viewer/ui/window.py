@@ -224,9 +224,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # over before the next one takes the worker.
         self.runner.finished.connect(lambda *_: QtCore.QTimer.singleShot(0, self._drain_rebuilds))
 
-        self._play = QtCore.QTimer(self)
-        self._play.setInterval(60)
-        self._play.timeout.connect(lambda: self._step_time(1))
+        from fastfuncstuff.viewer.ui.player import Player
+
+        self._play = Player(
+            lambda: self._step_time(1), lambda: self.manager.surface_canvases(), self
+        )
+        self._play.toggled.connect(self._play_toggled)
+        self._play.rate.connect(
+            lambda fps: self.statusBar().showMessage(f"playing · {fps:.1f} frames/s", 1500)
+        )
 
         self._sync_tabs()
         self._apply_theme()
@@ -267,6 +273,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         manager.mode_action_requested.connect(
             lambda name, c=ctl: self._on(c, self._mode_action, name)
         )
+        manager.play_requested.connect(lambda c=ctl: self._on(c, self._toggle_play))
         manager.rows_selected.connect(
             lambda vid, a, b, c=ctl: self._on(c, self._carpet_rows_to_layer, vid, a, b)
         )
@@ -343,6 +350,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if ctl is self._active:
             return
         self._close_tool_dialogs()
+        # The player steps the active controller's time: it stops with it.
+        self._play.stop()
         self._active = ctl
         self._show_active()
 
@@ -1958,7 +1967,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._dispatch(SetIndex(int(value)))
 
     def _toggle_play(self) -> None:
-        self._play.stop() if self._play.isActive() else self._play.start()
+        if not self._play.isActive() and self.session.state.max_time_index() <= 0:
+            self.statusBar().showMessage("nothing to play: no 4-D series is loaded", 4000)
+            return
+        self._play.toggle()
+
+    def _play_toggled(self, on: bool) -> None:
+        self.manager.set_playing(on)
+        if not on:
+            self.statusBar().showMessage("paused", 1500)
 
     def _toggle_visible(self) -> None:
         key = self.current_key()

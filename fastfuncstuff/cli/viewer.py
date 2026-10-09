@@ -49,7 +49,7 @@ keys (main window)
   f  F                 tile / stagger every window      r  raise them all
   d                    dark / light palette
   arrows / PgUp PgDn   move the crosshair
-  , .                  step time            v  play / pause
+  , .                  step time            v  play / pause (a in a 3-D window)
   [ ]                  select layer       space  show / hide layer
   { }  u  Del          lower / raise layer, make underlay, remove
   t T                  threshold down / up

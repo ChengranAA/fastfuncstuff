@@ -82,6 +82,8 @@ class WindowManager(QtCore.QObject):
     rows_selected = QtCore.Signal(str, int, int)
     #: A window's key asked the active mode for an action, by name.
     mode_action_requested = QtCore.Signal(str)
+    #: A 3-D window's ANIMATE: play / pause time (the controller owns the player).
+    play_requested = QtCore.Signal()
 
     def __init__(
         self,
@@ -110,6 +112,8 @@ class WindowManager(QtCore.QObject):
         self._settle.setInterval(SETTLE_MS)
         self._settle.timeout.connect(self.flush_held)
         self._timing = bool(os.environ.get("FFS_VIEWER_TIMING"))
+        #: Whether the controller's player is running (the 3-D ANIMATE buttons show it).
+        self.playing = False
 
     # -- reconciliation -------------------------------------------------
     def sync(self) -> None:
@@ -155,6 +159,8 @@ class WindowManager(QtCore.QObject):
             win.located.connect(self._on_located)
             win.seeded.connect(self._on_seeded)
             win.centre_all_requested.connect(self.centre_on_crosshair)
+            win.play_requested.connect(self.play_requested)
+            win.set_playing(self.playing)
         elif viewport.is_carpet:
             win = CarpetWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.scrubbed.connect(self._on_scrubbed)
@@ -312,6 +318,16 @@ class WindowManager(QtCore.QObject):
             return
         dirty = dirty | self._held.pop(win.vid, Aspect.NOTHING)
         self._timed(win, lambda: win.refresh(dirty))
+
+    def set_playing(self, on: bool) -> None:
+        self.playing = bool(on)
+        for win in self.windows.values():
+            if isinstance(win, SurfaceWindow):
+                win.set_playing(self.playing)
+
+    def surface_canvases(self) -> list:
+        """The 3-D canvases a player waits on before its next frame."""
+        return [w.canvas for w in self.windows.values() if isinstance(w, SurfaceWindow)]
 
     def flush_held(self) -> None:
         """Draw every window a scroll held back (the scroll has stopped)."""

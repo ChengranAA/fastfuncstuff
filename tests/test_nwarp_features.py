@@ -750,6 +750,50 @@ def test_master_warp_uses_warp_grid(tmp_path):
     assert got.shape[:3] == (10, 10, 10)
 
 
+@pytest.mark.parametrize("dxyz", [None, 3.0], ids=["master_grid", "dxyz"])
+def test_oblique_master_output_keeps_the_masters_frame(tmp_path, dxyz):
+    # Bug of record: the resample runs in the master's cardinal frame and the
+    # output header used to carry that cardinal affine, so an oblique (anat-
+    # space) final series displayed rotated against the anat it was aligned to.
+    # f is linear in TRUE scanner mm, so reading the output through its own
+    # header must reproduce f wherever the grid landed.
+    n = 14
+    t = np.deg2rad(10.0)
+    aff = np.eye(4)
+    aff[:3, :3] = np.array([[1, 0, 0], [0, np.cos(t), -np.sin(t)], [0, np.sin(t), np.cos(t)]]) * 2.0
+    aff[:3, 3] = (-14.0, -12.0, -10.0)
+    ii, jj, kk = np.meshgrid(np.arange(n), np.arange(n), np.arange(n), indexing="ij")
+    ijk = np.stack([ii, jj, kk, np.ones_like(ii)], -1).reshape(-1, 4).T
+    coef = np.array([0.7, -0.4, 1.1])
+    vals = ((aff @ ijk)[:3].T @ coef + 50.0).reshape(n, n, n)
+    src_path = tmp_path / "f.nii"
+    nib.Nifti1Image(vals.astype(np.float32), aff).to_filename(str(src_path))
+    ident = tmp_path / "ident.aff12.1D"
+    ident.write_text("1 0 0 0 0 1 0 0 0 0 1 0\n")
+
+    out = tmp_path / "out.nii"
+    nwarpforge(
+        source_path=str(src_path),
+        nwarp_specs=[str(ident)],
+        prefix=str(out),
+        master_path=str(src_path),
+        dxyz=dxyz,
+        interp="linear",
+        device=DEV,
+        verb=0,
+    )
+    img = nib.load(str(out))
+    if dxyz is None:
+        np.testing.assert_allclose(img.affine, aff, atol=1e-5)
+    got = np.asarray(img.dataobj)
+    s = got.shape
+    oi, oj, ok = np.meshgrid(np.arange(s[0]), np.arange(s[1]), np.arange(s[2]), indexing="ij")
+    oijk = np.stack([oi, oj, ok, np.ones_like(oi)], -1).reshape(-1, 4).T
+    want = ((img.affine @ oijk)[:3].T @ coef + 50.0).reshape(s)
+    inner = (slice(2, -2),) * 3  # clear of the source's edge
+    np.testing.assert_allclose(got[inner], want[inner], atol=2e-3)
+
+
 # --------------------------------------------------------------------------
 # interleaved warp/affine chain (distortion + motion + cross-run + anat + MNI)
 # --------------------------------------------------------------------------

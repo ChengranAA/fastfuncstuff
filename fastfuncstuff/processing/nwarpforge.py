@@ -2058,10 +2058,21 @@ def nwarpforge(
         output_affine = compute_cardinal_affine(source_header["affine"])
         master_space_info = get_afni_space_info(source_header.get("header"))
 
+    # The resample runs in the master's cardinal frame (AFNI's ijk_to_dicom), but
+    # the voxels it fills are the master's own lattice; this maps that cardinal
+    # frame back to the master's real (oblique) one for the written header, the
+    # way AFNI's EDIT_empty_copy(dset_mast) keeps ijk_to_dicom_real. Applied as a
+    # left factor it carries any -dxyz regrid or auto-padding along with it.
+    obliquity = np.eye(4)
+    if output_affine is not None:
+        obliquity = output_real_affine @ np.linalg.inv(output_affine)
+
     # Resolve "-master WARP": peek the first nonlinear warp's header for the grid
     # (its affine is needed now to convert affine matrices into voxel space).
     if use_warp_master:
         output_shape, output_affine, warp_hdr = _first_nonlinear_warp_grid(nwarp_specs)
+        real = warp_hdr.get_best_affine()  # ty: ignore[unresolved-attribute]
+        obliquity = np.asarray(real, dtype=np.float64) @ np.linalg.inv(output_affine)
         master_hdr_obj = warp_hdr
         master_space_info = get_afni_space_info(warp_hdr)
         if verb >= 1:
@@ -2668,8 +2679,8 @@ def nwarpforge(
         n_pts = point_plan.shape[2]
         return output.reshape(-1, n_pts) if output.ndim == 4 else output.reshape(n_pts)
 
-    # Build output header: use output_affine (cardinal), don't inherit
-    # source's qform/sform which would conflict with the output grid.
+    # Build output header: the output grid's affine in the master's real frame
+    # (obliquity @ output_affine), not the source's qform/sform.
     # Preserve temporal metadata (TR, units) from source.
     # Propagate AFNI view/space from master (e.g. tlrc + MNI_2009c_asym).
     # header_info["header"] is a nibabel header object; the dict itself is
@@ -2723,7 +2734,7 @@ def nwarpforge(
         warnings.warn(f"nwarpforge: failed to build output header: {exc}", stacklevel=2)
         out_hdr = None
 
-    output_header = {"affine": output_affine, "header": out_hdr}
+    output_header = {"affine": obliquity @ output_affine, "header": out_hdr}
     with progress_context(f"Writing {prefix}"):
         save_image(output, prefix, header_info=output_header)
 

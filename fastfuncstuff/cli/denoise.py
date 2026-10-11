@@ -2395,6 +2395,7 @@ def main():
             microtime_dt=args.microtime_dt,
             n_hrfs=20,
             library_path=args.hrf_library,
+            device=device,
         )
         if args.hrf_library:
             print(f"  Loaded custom HRF library from {args.hrf_library}")

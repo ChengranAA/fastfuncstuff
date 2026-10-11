@@ -51,6 +51,19 @@ from fastfuncstuff.io.dsetinfo import DatasetInfo, read_info, read_volume
 from fastfuncstuff.memory import get_available_memory
 
 
+def _c_order(arr: np.ndarray) -> np.ndarray:
+    """``arr`` in C order, transposed by torch's threaded copy when it is not.
+
+    NumPy's copy is single-threaded: 1.1 s for a 340 MB F-ordered run on six
+    cores, against 0.27 s here -- most of the wait after the gzip itself.
+    """
+    if arr.flags.c_contiguous:
+        return arr
+    if not arr.flags.writeable:
+        return np.ascontiguousarray(arr)  # torch will not wrap read-only memory
+    return torch.from_numpy(arr).contiguous().numpy()
+
+
 class Tier(IntEnum):
     """How far along the disk-to-device path a dataset currently is.
 
@@ -407,7 +420,7 @@ class VolumeStore:
             # that copy was being paid again on every mode preparation --
             # measured at 1.9 GB of copying per InstaCorr parameter change on a
             # 1.4 GB dataset, for data that was already resident.
-            arr = np.ascontiguousarray(arr)
+            arr = _c_order(arr)
         except BaseException as exc:  # surfaced via Resident.error, not swallowed
             with self._lock:
                 res.error = exc

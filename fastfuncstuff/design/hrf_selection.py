@@ -2674,6 +2674,7 @@ def save_hrf_selection_results(
     nii_ext: str = ".nii.gz",
     selected_tr_dt: float | None = None,
     microtime_dt: float = 0.1,
+    nifti_header: object | None = None,
 ) -> dict[str, str | list[str]]:
     """
     Save HRF selection results to disk.
@@ -2736,17 +2737,18 @@ def save_hrf_selection_results(
         affine,
         voxel_mask,
         r2_label=r2_label,
+        nifti_header=nifti_header,
     )
     output_files["hrf_index"] = hrf_index_file
 
     # 2. Save CV R² for best HRF (standalone, for compatibility / plotting)
     xval_r2_file = f"{output_prefix}_xval_r2{nii_ext}"
-    _save_volume(results.xval_r2_best, xval_r2_file, volume_shape, affine, voxel_mask)
+    _save_volume(results.xval_r2_best, xval_r2_file, volume_shape, affine, voxel_mask, nifti_header)
     output_files["xval_r2"] = xval_r2_file
 
     # 3. Save CV R² std
     xval_std_file = f"{output_prefix}_xval_r2_std{nii_ext}"
-    _save_volume(results.xval_r2_std, xval_std_file, volume_shape, affine, voxel_mask)
+    _save_volume(results.xval_r2_std, xval_std_file, volume_shape, affine, voxel_mask, nifti_header)
     output_files["xval_r2_std"] = xval_std_file
 
     # 3b. Save canonical HRF baseline R² for comparison
@@ -2758,6 +2760,7 @@ def save_hrf_selection_results(
             volume_shape,
             affine,
             voxel_mask,
+            nifti_header,
         )
         output_files["xval_r2_canonical"] = canonical_r2_file
 
@@ -2770,6 +2773,7 @@ def save_hrf_selection_results(
             volume_shape,
             affine,
             voxel_mask,
+            nifti_header,
         )
         output_files["xval_r2_all_hrfs"] = xval_r2_all_file
 
@@ -2783,13 +2787,14 @@ def save_hrf_selection_results(
         val = getattr(results, field_name, None)
         if val is not None:
             fpath = f"{output_prefix}_{field_name}{nii_ext}"
-            _save_volume(val, fpath, volume_shape, affine, voxel_mask)
+            _save_volume(val, fpath, volume_shape, affine, voxel_mask, nifti_header)
             output_files[field_name] = fpath
 
     # 4. Save final betas
     if results.final_results is not None:
         results.final_results.original_shape = volume_shape
         results.final_results.affine = affine
+        results.final_results.nifti_header = nifti_header
         if voxel_mask is not None:
             results.final_results.voxel_mask = voxel_mask
 
@@ -2807,6 +2812,7 @@ def save_hrf_selection_results(
     if results.canonical_results is not None:
         results.canonical_results.original_shape = volume_shape
         results.canonical_results.affine = affine
+        results.canonical_results.nifti_header = nifti_header
         if voxel_mask is not None:
             results.canonical_results.voxel_mask = voxel_mask
 
@@ -2826,7 +2832,9 @@ def save_hrf_selection_results(
         hrf_lib = results.hrf_library.cpu()  # (n_hrfs, n_hrf_timepoints)
         idx = results.hrf_index.cpu().long()  # (n_voxels,) 0-based
         selected = hrf_lib[idx, :]  # (n_voxels, n_hrf_timepoints)
-        _save_volume_4d(selected, selected_hrfs_file, volume_shape, affine, voxel_mask)
+        _save_volume_4d(
+            selected, selected_hrfs_file, volume_shape, affine, voxel_mask, nifti_header
+        )
         output_files["selected_hrfs"] = selected_hrfs_file
 
         if selected_tr_dt:
@@ -2839,7 +2847,7 @@ def save_hrf_selection_results(
             step = max(1, int(round(selected_tr_dt / microtime_dt)))
             selected_tr = selected[:, ::step]
             tr_file = f"{output_prefix}_selected_hrfs_tr{nii_ext}"
-            _save_volume_4d(selected_tr, tr_file, volume_shape, affine, voxel_mask)
+            _save_volume_4d(selected_tr, tr_file, volume_shape, affine, voxel_mask, nifti_header)
             output_files["selected_hrfs_tr"] = tr_file
 
     # 5. Save HRF library for ARMA reuse
@@ -3174,6 +3182,7 @@ def _save_hrf_index_bucket(
     affine: np.ndarray | None,
     voxel_mask: torch.Tensor | None,
     r2_label: str = "R2_xval",
+    nifti_header: object | None = None,
 ) -> None:
     """Save HRF index and max R² as a 2-sub-brick AFNI-style bucket.
 
@@ -3206,6 +3215,7 @@ def _save_hrf_index_bucket(
         output_path=filepath,
         affine=affine,
         brick_labels=["HRF_index", r2_label],
+        header=nifti_header,
     )
 
 
@@ -3215,6 +3225,7 @@ def _save_volume(
     volume_shape: tuple[int, int, int] | None,
     affine: np.ndarray | None,
     voxel_mask: torch.Tensor | None,
+    nifti_header: object | None = None,
 ):
     """Helper to save a 1D tensor as a 3D NIfTI volume."""
     from fastfuncstuff.io.afni import save_nifti
@@ -3236,7 +3247,9 @@ def _save_volume(
     if affine is None:
         affine = np.eye(4)
 
-    save_nifti(volume_data.astype(np.float32), output_path=filepath, affine=affine)
+    save_nifti(
+        volume_data.astype(np.float32), output_path=filepath, affine=affine, header=nifti_header
+    )
 
 
 def _save_volume_4d(
@@ -3245,6 +3258,7 @@ def _save_volume_4d(
     volume_shape: tuple[int, int, int] | None,
     affine: np.ndarray | None,
     voxel_mask: torch.Tensor | None,
+    nifti_header: object | None = None,
 ):
     """Helper to save a 2D tensor (n_voxels, n_volumes) as a 4D NIfTI volume."""
     from fastfuncstuff.io.afni import save_nifti
@@ -3268,7 +3282,9 @@ def _save_volume_4d(
     if affine is None:
         affine = np.eye(4)
 
-    save_nifti(volume_data.astype(np.float32), output_path=filepath, affine=affine)
+    save_nifti(
+        volume_data.astype(np.float32), output_path=filepath, affine=affine, header=nifti_header
+    )
 
 
 def plot_design_matrix(

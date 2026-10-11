@@ -848,6 +848,15 @@ def main():
     if args.dry_run:
         args.prefix = f"dry_run_{args.prefix}"
 
+    from fastfuncstuff.io.gifti import surface_meta
+
+    if surface_meta(load_result.nifti_header) is not None:
+        if pfx.nifti_ext not in (".nii.gz", ".gii", ".shape.gii", ".func.gii"):
+            raise ValueError("Surface input needs a .gii output prefix")
+        _nii_ext = pfx.nifti_ext if pfx.nifti_ext.endswith(".gii") else ".shape.gii"
+    elif pfx.nifti_ext.endswith(".gii"):
+        raise ValueError("GIfTI output requires surface input")
+
     # Extract results (these are reference copies, not deep copies — no memory duplication)
     data = load_result.data
     run_starts = load_result.run_starts
@@ -865,6 +874,7 @@ def main():
     # Every field is unpacked; drop the loader's handle so the full-volume
     # (n_voxels, n_timepoints) tensor has exactly one reference and any later
     # shrink of *data* can actually free the pre-mask copy.
+    nifti_header = load_result.nifti_header
     del load_result
 
     # Update args.tr with extracted value (for consistency with rest of code)
@@ -1629,6 +1639,7 @@ def main():
         nii_ext=_nii_ext,
         selected_tr_dt=_selected_tr_dt(args),
         microtime_dt=args.microtime_dt,
+        nifti_header=nifti_header,
     )
 
     # ---- Onset/offset diagnostics ----
@@ -1647,6 +1658,7 @@ def main():
                 volume_shape,
                 affine,
                 voxel_mask.numpy() if voxel_mask is not None else None,
+                header=nifti_header,
             )
             print(f"  {output_files['waveshape']}")
 
@@ -1658,6 +1670,7 @@ def main():
             volume_shape,
             affine,
             voxel_mask.numpy() if voxel_mask is not None else None,
+            header=nifti_header,
         )
         print(f"  {output_files['oso_gain']}")
         print(
@@ -1681,6 +1694,7 @@ def main():
             volume_shape,
             affine,
             voxel_mask.numpy() if voxel_mask is not None else None,
+            header=nifti_header,
         )
         print(f"  {output_files['hrfopt_xval_r2']}")
     if beta_ceiling is not None and beta_ceiling.explainable_withheld_because:
@@ -1722,6 +1736,7 @@ def main():
             onsets=None,
             save_plots=False,
             nii_ext=_nii_ext,
+            nifti_header=nifti_header,
         )
 
         # ---- Delta maps (primary − nodenoise) ----
@@ -1736,6 +1751,7 @@ def main():
             volume_shape,
             affine,
             voxel_mask,
+            nifti_header,
         )
 
         # In-sample (HRFopt) R² delta — the headline "fit looks better" number.
@@ -1753,6 +1769,7 @@ def main():
                 volume_shape,
                 affine,
                 voxel_mask,
+                nifti_header,
             )
 
         # HRF index: whether selection changed (uint-style mask) and signed shift.
@@ -1766,6 +1783,7 @@ def main():
             volume_shape,
             affine,
             voxel_mask,
+            nifti_header,
         )
         _save_volume(
             shift,
@@ -1773,6 +1791,7 @@ def main():
             volume_shape,
             affine,
             voxel_mask,
+            nifti_header,
         )
 
         # Summary block — keep it the one piece the user actually reads.
@@ -1817,6 +1836,7 @@ def main():
         # Set required metadata for saving (same as canonical_results)
         final_results_for_save.original_shape = volume_shape
         final_results_for_save.affine = affine
+        final_results_for_save.nifti_header = nifti_header
         if voxel_mask is not None:
             final_results_for_save.voxel_mask = voxel_mask
 
@@ -1858,7 +1878,12 @@ def main():
         # Save as NIfTI
         violation_path = f"{args.prefix}_scale_violations{_nii_ext}"
         with spinner(f"Writing {Path(violation_path).name}"):
-            save_nifti(violation_vol, output_path=violation_path, affine=affine)
+            save_nifti(
+                violation_vol,
+                output_path=violation_path,
+                affine=affine,
+                header=nifti_header,
+            )
         output_files["scale_violations"] = violation_path
 
         if scale_info["n_violations"] > 0:

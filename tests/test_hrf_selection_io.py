@@ -224,3 +224,38 @@ class TestLoadHrfSelectionForArma:
         torch.testing.assert_close(loaded["hrf_index"], payload["hrf_index"])
         assert loaded["hrf_group_indices"] == payload["hrf_group_indices"]
         assert loaded["metadata"] == payload["metadata"]
+
+
+def test_surface_hrf_index_roundtrip_to_ridge(tmp_path):
+    import nibabel as nib
+
+    from fastfuncstuff.design.hrf_selection import _save_hrf_index_bucket
+    from fastfuncstuff.glm.ridge import load_hrf_indices
+    from fastfuncstuff.io.gifti import (
+        gifti_as_nifti,
+        load_gifti_data,
+        save_gifti_data,
+        surface_meta,
+    )
+
+    mask = np.array([True, False, True, True])
+    source = tmp_path / "input.func.gii"
+    save_gifti_data(source, np.ones((4, 3)), {"mesh_fingerprint": "V4_F2_test"})
+    header = gifti_as_nifti(source).header
+    path = tmp_path / "chosen_hrf_index.shape.gii"
+    _save_hrf_index_bucket(
+        torch.tensor([1.0, 2.0, 3.0]),
+        torch.tensor([0.8, 0.7, 0.6]),
+        str(path),
+        (4, 1, 1),
+        np.eye(4),
+        torch.from_numpy(mask),
+        nifti_header=header,
+    )
+    data, meta = load_gifti_data(path)
+    np.testing.assert_array_equal(data[:, 0], [1, 0, 2, 3])
+    assert meta["mesh_fingerprint"] == "V4_F2_test"
+    assert surface_meta(gifti_as_nifti(path).header)["mesh_fingerprint"] == meta["mesh_fingerprint"]
+    torch.testing.assert_close(load_hrf_indices(str(path), mask), torch.tensor([0, 1, 2]))
+    img = nib.load(str(path))
+    assert [dict(a.meta).get("Name") for a in img.darrays] == ["HRF_index", "R2_xval"]

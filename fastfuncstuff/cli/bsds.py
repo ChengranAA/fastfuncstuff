@@ -13,8 +13,9 @@ Inputs
 - ``-parcellation none`` (default): each ``-input`` is a 2-D ROI time series
   (``.1D``/``.txt``/``.tsv``/``.csv``/``.npy``); axis is auto-detected (fewer
   ROIs than timepoints) or forced with ``-time_axis``.
-- ``-parcellation atlas``: each ``-input`` is a 4-D NIfTI; ``-atlas`` labels are
-  averaged into ROI time series.
+- ``-parcellation atlas``: each ``-input`` is a 4-D NIfTI or a .func.gii
+  surface time series; ``-atlas`` labels (.nii or .gii on the same mesh) are
+  averaged into ROI time series. Every run uses the same labelled parcels.
 - ``-parcellation ward|voronoi``: data-driven contiguous parcels from the run
   itself (``-mask`` optional, ``-n_parcels`` sets the count). ``ward`` needs
   scikit-learn.
@@ -22,7 +23,8 @@ Inputs
 Outputs (under ``-prefix``)
 ---------------------------
 ``*_model.npz`` (all arrays), ``*_summary.json``, ``*_transition.txt``,
-``*_state_means.txt``, ``*_fc_state-KK.txt``, and per run ``*_run-RR_states.1D``
+``*_state_means.txt``, ``*_fc_state-KK.txt``, a labelled .shape.gii for
+surface atlases, and per run ``*_run-RR_states.1D``
 (MAP path) and ``*_run-RR_stateprob.1D`` (K x T posterior).
 """
 
@@ -96,44 +98,94 @@ def _variance_mask(bold4d: np.ndarray) -> np.ndarray:
     return bold4d.std(axis=-1) > 0
 
 
-def _load_sessions(args) -> tuple[list[np.ndarray], np.ndarray | None]:
-    """Load every input into a ``(D, N)`` ROI time series, applying parcellation."""
+def _load_sessions(args) -> tuple[list[np.ndarray], np.ndarray | None, dict[str, str] | None]:
+    """Load runs into a common ``(D, N)`` parcel space."""
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.gifti import surface_meta
+
     paths = parse_input_files(args.input)
     sessions: list[np.ndarray] = []
     labels: np.ndarray | None = None
     atlas3d = None
     mask3d = None
+    atlas_mesh = None
+    atlas_meta = None
     if args.parcellation == "atlas":
         if not args.atlas:
             raise SystemExit("-parcellation atlas requires -atlas LABEL_IMAGE")
         with spinner(f"Loading {Path(args.atlas).name}"):
-            atlas_vol = _load_volume(args.atlas)
+            atlas_img = load_nifti(args.atlas)
+            atlas_vol = np.asarray(atlas_img.get_fdata(), dtype=np.float32)
         atlas3d = (atlas_vol[..., 0] if atlas_vol.ndim == 4 else atlas_vol).astype(np.int64)
+        atlas_meta = surface_meta(atlas_img.header)
+        if atlas_meta is not None and not atlas_meta.get("mesh_fingerprint"):
+            raise SystemExit(f"{args.atlas}: surface atlas has no mesh_fingerprint")
+        atlas_mesh = (atlas_meta or {}).get("mesh_fingerprint")
     if args.mask:
         with spinner(f"Loading {Path(args.mask).name}"):
-            mask_vol = _load_volume(args.mask)
+            mask_img = load_nifti(args.mask)
+            mask_vol = np.asarray(mask_img.get_fdata(), dtype=np.float32)
         mask3d = (mask_vol[..., 0] if mask_vol.ndim == 4 else mask_vol) > 0
-
+        mask_meta = surface_meta(mask_img.header)
+        if mask_meta is not None and not mask_meta.get("mesh_fingerprint"):
+            raise SystemExit(f"{args.mask}: surface mask has no mesh_fingerprint")
+        mask_mesh = (mask_meta or {}).get("mesh_fingerprint")
+        if atlas_mesh != mask_mesh and args.parcellation == "atlas":
+            raise SystemExit("-mask and -atlas must have the same surface mesh")
+    reference_mesh = None
+    reference_mask = None
     for path in tqdm(paths, desc="load runs", leave=True, disable=len(paths) < 4):
         if args.parcellation == "none":
             sessions.append(_load_2d_timeseries(path, args.time_axis))
             continue
-        bold = _load_volume(path)
+        img = load_nifti(path)
+        bold = np.asarray(img.get_fdata(), dtype=np.float32)
+        run_meta = surface_meta(img.header)
+        if run_meta is not None and not run_meta.get("mesh_fingerprint"):
+            raise SystemExit(f"{path}: surface run has no mesh_fingerprint")
+        mesh = (run_meta or {}).get("mesh_fingerprint")
         if bold.ndim != 4:
-            raise SystemExit(f"{path}: expected 4-D volume for parcellation, got {bold.ndim}-D")
-        m = mask3d if mask3d is not None else _variance_mask(bold)
+            raise SystemExit(f"{path}: expected 4-D image for parcellation, got {bold.ndim}-D")
+        if reference_mesh != mesh and sessions:
+            raise SystemExit(
+                f"{path}: cannot combine runs on different meshes or mix volumes and surfaces"
+            )
+        if not sessions:
+            reference_mesh = mesh
+        if args.parcellation == "atlas" and mesh != atlas_mesh:
+            raise SystemExit(f"{path}: atlas and run must have the same surface mesh")
+        if args.mask and mesh != mask_mesh:
+            raise SystemExit(f"{path}: mask and run must have the same surface mesh")
+        if mesh is not None and bold.shape[1:3] != (1, 1):
+            raise SystemExit(f"{path}: surface data must have shape (vertices, 1, 1, time)")
+        if mesh is not None and args.parcellation in ("ward", "voronoi"):
+            raise SystemExit("surface data require -parcellation atlas with a labelled surface map")
+        if args.parcellation in ("ward", "voronoi") and len(paths) > 1:
+            raise SystemExit(
+                "data-driven parcels differ between runs; use a shared -atlas for multiple runs"
+            )
+        if reference_mask is None:
+            reference_mask = (
+                mask3d
+                if mask3d is not None
+                else (atlas3d > 0 if args.parcellation == "atlas" else _variance_mask(bold))
+            )
+        m = reference_mask
         if args.parcellation == "atlas":
-            labels, ts = parcellate_atlas(bold, atlas3d, mask3d=m, aggregate=args.aggregate)
+            run_labels, ts = parcellate_atlas(bold, atlas3d, mask3d=m, aggregate=args.aggregate)
         elif args.parcellation == "ward":
-            labels, ts = parcellate_ward(bold, m, args.n_parcels, aggregate=args.aggregate)
+            run_labels, ts = parcellate_ward(bold, m, args.n_parcels, aggregate=args.aggregate)
         elif args.parcellation == "voronoi":
-            labels, ts = parcellate_voronoi(
+            run_labels, ts = parcellate_voronoi(
                 bold, m, args.n_parcels, seed=args.seed, aggregate=args.aggregate
             )
         else:
             raise SystemExit(f"unknown parcellation: {args.parcellation}")
+        if labels is not None and not np.array_equal(labels, run_labels):
+            raise SystemExit(f"{path}: parcel IDs differ from the first run")
+        labels = run_labels
         sessions.append(ts)
-    return sessions, labels
+    return sessions, labels, atlas_meta
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -143,7 +195,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Bayesian Switching Dynamical Systems on ROI time series.",
     )
     p.add_argument(
-        "-input", nargs="+", required=True, help="Run files (ROI time series or 4-D NIfTI)."
+        "-input",
+        nargs="+",
+        required=True,
+        help="Run files (ROI time series, 4-D NIfTI, or .func.gii with an atlas).",
     )
     p.add_argument("-prefix", required=True, help="Output prefix.")
     p.add_argument(
@@ -269,7 +324,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="none",
         help="How to turn inputs into ROI time series.",
     )
-    p.add_argument("-atlas", default=None, help="Label image for -parcellation atlas.")
+    p.add_argument(
+        "-atlas", default=None, help="Label image (.nii or .gii) for -parcellation atlas."
+    )
     p.add_argument("-mask", default=None, help="Brain mask for data-driven parcellation.")
     p.add_argument(
         "-n_parcels", "-n-parcels", type=int, default=100, help="Parcel count (ward/voronoi)."
@@ -551,11 +608,32 @@ def _save_task_alignment(stem: str, align) -> None:
 
 
 def _save_outputs(
-    stem: str, model, stats, args, labels, elapsed: float, directed=None, graph=None, switch=None
+    stem: str,
+    model,
+    stats,
+    args,
+    labels,
+    elapsed: float,
+    directed=None,
+    graph=None,
+    switch=None,
+    atlas_meta=None,
 ) -> None:
     base = Path(stem)
     base.parent.mkdir(parents=True, exist_ok=True)
     k = model.n_states
+    parcel_map_path = None
+    if atlas_meta is not None:
+        from fastfuncstuff.io.gifti import save_gifti_data
+
+        atlas_map = _load_volume(args.atlas)
+        atlas_map = atlas_map[..., 0] if atlas_map.ndim == 4 else atlas_map
+        if args.mask:
+            mask_map = _load_volume(args.mask)
+            mask_map = mask_map[..., 0] if mask_map.ndim == 4 else mask_map
+            atlas_map = np.where(mask_map > 0, atlas_map, 0)
+        parcel_map_path = f"{stem}_parcel_labels.shape.gii"
+        save_gifti_data(parcel_map_path, atlas_map[:, 0, 0], meta=atlas_meta)
 
     with spinner(f"Writing {stem}_model.npz"):
         np.savez(
@@ -578,6 +656,8 @@ def _save_outputs(
             else np.array(switch.group_switch_rate),
             switch_rate_subject=np.array([]) if switch is None else switch.subject_switch_rate,
             parcel_labels=np.array([]) if labels is None else np.asarray(labels),
+            parcel_map=np.array("") if parcel_map_path is None else np.array(parcel_map_path),
+            parcel_mesh_fingerprint=np.array((atlas_meta or {}).get("mesh_fingerprint", "")),
         )
     if switch is not None:
         with open(f"{stem}_switch_paths.txt", "w") as fh:
@@ -611,6 +691,8 @@ def _save_outputs(
         "group_lifetime_sec": stats.group_lifetime.tolist(),
         "elapsed_sec": round(elapsed, 2),
         "parcellation": args.parcellation,
+        "parcel_map": parcel_map_path,
+        "parcel_mesh_fingerprint": (atlas_meta or {}).get("mesh_fingerprint"),
     }
     if graph is not None:
         summary["global_efficiency"] = graph.global_efficiency.tolist()
@@ -630,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     print_cli_header("ffs_bsds", "Bayesian Switching Dynamical Systems")
     device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
-    sessions_np, labels = _load_sessions(args)
+    sessions_np, labels, atlas_meta = _load_sessions(args)
     print(
         f"  loaded {len(sessions_np)} session(s), "
         f"D={sessions_np[0].shape[0]} ROIs, "
@@ -710,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
         directed=directed,
         graph=graph,
         switch=switch,
+        atlas_meta=atlas_meta,
     )
     if align is not None:
         _save_task_alignment(pfx.stem, align)

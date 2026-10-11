@@ -429,7 +429,12 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         # everything downstream of this function is unchanged.
         img_out = nib.Nifti1Image.from_image(nib.load(str(filepath)))
     else:
-        # Standard nibabel loading for .nii and .nii.gz
+        # Standard nibabel loading for .nii and .nii.gz; a .gz decodes on every
+        # core when rapidgzip is installed (io/fastgzip.py), lazily as before.
+        if str(filepath).lower().endswith(".gz"):
+            from fastfuncstuff.io.fastgzip import install
+
+            install(resolve_cpu_threads()[0])
         img_out = nib.load(str(filepath))
         # Stub gap (see above); this function's contract is to always return
         # Nifti1Image, matching the .nii.zst branch above.

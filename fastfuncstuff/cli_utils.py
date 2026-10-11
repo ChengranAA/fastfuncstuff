@@ -577,6 +577,32 @@ def load_and_preprocess_runs(
     nifti_header = first_img.header.copy() if hasattr(first_img, "header") else None
     volume_shape = tuple(first_img.shape[:3]) if hasattr(first_img, "shape") else (0, 0, 0)
 
+    # A one-dimensional surface can share a vertex count with an unrelated mesh.
+    # Never treat it as an ordinary grid without checking every input's identity.
+    from fastfuncstuff.io.gifti import is_gifti, surface_meta
+
+    surface_input = is_gifti(str(input_files[0]).split("[")[0])
+    if any(is_gifti(str(path).split("[")[0]) != surface_input for path in input_files):
+        raise ValueError("Runs must all be GIfTI surfaces or all be volumes; fit each domain separately")
+    if surface_input:
+        fingerprint = (surface_meta(first_img.header) or {}).get("mesh_fingerprint")
+        if not fingerprint:
+            raise ValueError("Surface input needs mesh_fingerprint metadata")
+        for path in input_files[1:]:
+            img = load_nifti(path)
+            other = (surface_meta(img.header) or {}).get("mesh_fingerprint")
+            if img.shape[:3] != volume_shape or other != fingerprint:
+                raise ValueError(f"Surface run {path} does not match the first run's mesh")
+        if mask_file:
+            if not is_gifti(str(mask_file).split("[")[0]):
+                raise ValueError("A surface input needs a GIfTI mask on the same mesh")
+            mask_img = load_nifti(mask_file)
+            if (mask_img.shape[:3] != volume_shape or
+                    (surface_meta(mask_img.header) or {}).get("mesh_fingerprint") != fingerprint):
+                raise ValueError("Surface mask does not match the input mesh")
+        if mask_array is not None:
+            raise ValueError("Surface mask arrays have no mesh identity; pass a GIfTI mask file")
+
     # Get voxel sizes and TR from header (using get_zooms() which reads pixdim correctly)
     zooms = first_img.header.get_zooms()
     voxel_sizes = tuple(float(z) for z in zooms[:3])  # First 3 are spatial dimensions in mm
@@ -726,23 +752,36 @@ def load_and_preprocess_runs(
     # buffer, and hands the callback each run while it is the only copy alive.
     per_run_fn = None
     if blur_fwhm is not None:
-        if verbose:
-            print(f"\n  Applying Gaussian blur (FWHM = {blur_fwhm} mm)...")
+        if surface_input:
+            if not mask_file:
+                raise ValueError("Surface -do_blur needs a GIfTI -mask (the cortex and coverage)")
+            from fastfuncstuff.io.gifti import data_geometry
+            from fastfuncstuff.surface.smooth import HeatSmoother
 
-        def per_run_fn(run_data, _run_idx):
-            # The loader hands us (n_voxels, n_tps) in C order and, because a
-            # blur needs whole volumes, before any mask -- so the view back to
-            # (x, y, z, t) is free and complete.
-            n_tps = run_data.shape[1]
-            blurred = gaussian_blur_3d(
-                run_data.cpu().numpy().reshape(*volume_shape, n_tps),
-                fwhm_mm=blur_fwhm,
-                voxel_sizes=voxel_sizes,
-                device=device,
-                verbose=False,
+            vertices, faces = data_geometry(
+                str(input_files[0]).split("[")[0], surface_meta(first_img.header), volume_shape[0]
             )
-            out = torch.from_numpy(blurred.reshape(-1, n_tps))
-            return out.to(run_data.device)
+            smoother = HeatSmoother(vertices, faces, blur_fwhm, mask=mask_flat)
+            if verbose:
+                print(f"\n  Applying surface heat blur (FWHM = {blur_fwhm} mm)...")
+
+            def per_run_fn(run_data, _run_idx):
+                return torch.from_numpy(smoother(run_data.cpu().numpy())).to(run_data.device)
+        else:
+            if verbose:
+                print(f"\n  Applying Gaussian blur (FWHM = {blur_fwhm} mm)...")
+
+            def per_run_fn(run_data, _run_idx):
+                # The loader hands us (n_voxels, n_tps) before any mask.
+                n_tps = run_data.shape[1]
+                blurred = gaussian_blur_3d(
+                    run_data.cpu().numpy().reshape(*volume_shape, n_tps),
+                    fwhm_mm=blur_fwhm,
+                    voxel_sizes=voxel_sizes,
+                    device=device,
+                    verbose=False,
+                )
+                return torch.from_numpy(blurred.reshape(-1, n_tps)).to(run_data.device)
 
     data, run_starts = load_and_concatenate_runs(
         [Path(f) for f in input_files],

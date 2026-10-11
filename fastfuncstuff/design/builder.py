@@ -20,7 +20,6 @@ from typing import Literal, cast
 import numpy as np
 import torch
 from scipy import special
-from scipy.stats import gamma as scipy_gamma
 
 from fastfuncstuff.design.matrices import (
     convolve_hrf,
@@ -83,7 +82,11 @@ def spm_canonical_hrf(tr: float = 1.0, duration: float = 32.0) -> np.ndarray:
     scale2 = 1.0
 
     # Compute gamma functions
-    # Using scipy.stats.gamma for consistency with SPM
+    # Using scipy.stats.gamma for consistency with SPM. Imported here because
+    # scipy.stats costs 0.7 s, and glm.core imports this module at the top --
+    # so a module-level import charged every GLM consumer for one HRF shape.
+    from scipy.stats import gamma as scipy_gamma
+
     pos_gamma = scipy_gamma.pdf(t, peak1, scale=scale1)
     neg_gamma = scipy_gamma.pdf(t, peak2, scale=scale2)
 

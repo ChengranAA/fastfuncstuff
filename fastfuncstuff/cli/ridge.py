@@ -481,6 +481,16 @@ def main():
     if args.dry_run:
         args.prefix = f"dry_run_{args.prefix}"
 
+    from fastfuncstuff.io.gifti import surface_meta
+
+    surface_input = surface_meta(load_result.nifti_header) is not None
+    if surface_input:
+        if pfx.nifti_ext not in (".nii.gz", ".gii", ".shape.gii", ".func.gii"):
+            raise ValueError("Surface input needs a .gii output prefix")
+        _nii_ext = pfx.nifti_ext if pfx.nifti_ext.endswith(".gii") else ".shape.gii"
+    elif pfx.nifti_ext.endswith(".gii"):
+        raise ValueError("GIfTI output requires surface input")
+
     # Extract loaded data
     data = load_result.data
     run_starts = load_result.run_starts
@@ -502,6 +512,7 @@ def main():
     # Every field is unpacked; drop the loader's handle so the full-volume
     # (n_voxels, n_timepoints) tensor has exactly one reference and any later
     # shrink of *data* can actually free the pre-mask copy.
+    nifti_header = load_result.nifti_header
     del load_result
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
     try:
@@ -598,7 +609,20 @@ def main():
     if args.hrf_opt:
         print()
         print(f"Loading HRF optimization results from {args.hrf_opt}...")
-        hrf_index_file = f"{args.hrf_opt}_hrf_index.nii.gz"
+        hrf_pfx = parse_prefix(args.hrf_opt)
+        hrf_ext = (
+            (hrf_pfx.nifti_ext if hrf_pfx.nifti_ext.endswith(".gii") else ".shape.gii")
+            if surface_input
+            else hrf_pfx.nifti_ext
+        )
+        hrf_index_file = f"{hrf_pfx.stem}_hrf_index{hrf_ext}"
+        if surface_input:
+            from fastfuncstuff.io.afni import load_nifti
+
+            expected = surface_meta(nifti_header) or {}
+            actual = surface_meta(load_nifti(hrf_index_file).header) or {}
+            if actual.get("mesh_fingerprint") != expected.get("mesh_fingerprint"):
+                raise ValueError("HRF index mesh fingerprint does not match input data")
         hrf_indices = load_hrf_indices(hrf_index_file, mask=mask)
         print(f"  Loaded HRF indices: {hrf_indices.shape}")
 
@@ -1240,6 +1264,8 @@ def main():
                 affine=affine,
                 voxel_mask=voxel_mask_tensor,
                 xval_metric_name=cv_metric_token,
+                nifti_header=nifti_header,
+                nii_ext=_nii_ext,
             )
 
         # Also save ridge-specific outputs
@@ -1253,6 +1279,7 @@ def main():
                 vol_shape,
                 affine,
                 voxel_mask_np,
+                header=nifti_header,
             )
             print(f"  {args.prefix}_stim_vec_betas{_nii_ext}  ({', '.join(stim_vec_labels)})")
         save_volume_nifti(
@@ -1261,10 +1288,16 @@ def main():
             vol_shape,
             affine,
             voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_single_trial_full_r2{_nii_ext}")
         save_volume_nifti(
-            optimal_fracs, f"{args.prefix}_optimal_frac{_nii_ext}", vol_shape, affine, voxel_mask_np
+            optimal_fracs,
+            f"{args.prefix}_optimal_frac{_nii_ext}",
+            vol_shape,
+            affine,
+            voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_optimal_frac{_nii_ext}")
         save_4d_nifti(
@@ -1273,6 +1306,7 @@ def main():
             vol_shape,
             affine,
             voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_{cv_metric_token}_by_frac{_nii_ext}")
 
@@ -1313,6 +1347,7 @@ def main():
                     vol_shape,
                     affine,
                     voxel_mask_np,
+                    header=nifti_header,
                 )
                 print(f"  {path}")
                 if ceiling.explainable_withheld_because:
@@ -1329,14 +1364,25 @@ def main():
             vol_shape,
             affine,
             voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_r2_initial{_nii_ext}")
         save_volume_nifti(
-            results.r2, f"{args.prefix}_r2{_nii_ext}", vol_shape, affine, voxel_mask_np
+            results.r2,
+            f"{args.prefix}_r2{_nii_ext}",
+            vol_shape,
+            affine,
+            voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_r2{_nii_ext}")
         save_volume_nifti(
-            results.xval_r2, f"{args.prefix}_xval_r2{_nii_ext}", vol_shape, affine, voxel_mask_np
+            results.xval_r2,
+            f"{args.prefix}_xval_r2{_nii_ext}",
+            vol_shape,
+            affine,
+            voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_xval_r2{_nii_ext}")
         save_volume_nifti(
@@ -1345,6 +1391,7 @@ def main():
             vol_shape,
             affine,
             voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_optimal_frac{_nii_ext}")
 
@@ -1355,6 +1402,7 @@ def main():
             vol_shape,
             affine,
             voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_betas_single_trial{_nii_ext}")
 
@@ -1381,6 +1429,7 @@ def main():
             vol_shape,
             affine,
             voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_betas_condition{_nii_ext}")
 
@@ -1398,6 +1447,7 @@ def main():
             vol_shape,
             affine,
             voxel_mask_np,
+            header=nifti_header,
         )
         print(f"  {args.prefix}_r2_by_frac{_nii_ext}")
 
@@ -1418,6 +1468,7 @@ def main():
                 vol_shape,
                 affine,
                 voxel_mask_np,
+                header=nifti_header,
             )
             print(f"  {args.prefix}_scale_violations{_nii_ext}")
 

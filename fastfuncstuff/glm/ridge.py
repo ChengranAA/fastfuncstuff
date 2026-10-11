@@ -1339,7 +1339,7 @@ def load_hrf_indices(hrf_index_file: str, mask: np.ndarray | None = None) -> tor
     hrf_data = hrf_data - 1.0
 
     if mask is not None:
-        hrf_data = hrf_data[mask]
+        hrf_data = hrf_data.reshape(-1)[np.asarray(mask).reshape(-1)]
     else:
         hrf_data = hrf_data.flatten()
 

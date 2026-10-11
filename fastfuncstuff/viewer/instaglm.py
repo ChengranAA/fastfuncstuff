@@ -488,7 +488,9 @@ def _blurred_rows(
             np.ascontiguousarray(data[..., t0:t1], dtype=np.float32), device=device
         ).permute(3, 0, 1, 2)
         smoothed = gaussian3d_batched(block * m, sigma_vox) / denom
-        out[:, t0:t1] = smoothed.reshape(t1 - t0, -1)[:, keep].T
+        # Still (X,Y,Z,T) in memory under the (T,X,Y,Z) view, so (V,T) is a
+        # view and the gather reads whole rows.
+        out[:, t0:t1] = smoothed.permute(1, 2, 3, 0).reshape(-1, t1 - t0)[keep]
         del block, smoothed
     return out
 

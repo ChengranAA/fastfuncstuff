@@ -894,10 +894,18 @@ def gaussian_blur_3d(
     The kernel is computed in voxel units using the voxel sizes.
     For anisotropic voxels, the sigma differs in each dimension.
 
-    Memory: For large datasets, processes one timepoint at a time to limit
-    GPU memory usage. A single 3D volume is typically manageable.
+    Memory: streams blocks of timepoints, sized by ``memory.get_available_memory``
+    for the input block plus two working copies, so the device never holds
+    more than a budgeted slice of the run.
+
+    Each block is blurred in the array's own layout (``stats.smooth3d.blur_axis``):
+    no per-volume transpose, so a C-ordered ``(x, y, z, t)`` array and a
+    nibabel F-ordered one cost the same.
     """
-    import torch.nn.functional as F
+    from tqdm import tqdm
+
+    from fastfuncstuff.memory import get_available_memory
+    from fastfuncstuff.stats.smooth3d import blur_axis
 
     if device is None:
         device = get_device()
@@ -921,90 +929,42 @@ def gaussian_blur_3d(
         )
         print(f"  Sigma (voxels): {sigma_vox[0]:.2f} × {sigma_vox[1]:.2f} × {sigma_vox[2]:.2f}")
 
-    # Create 1D Gaussian kernels for each dimension
-    # Kernel size should be large enough to capture the Gaussian (typically 3-4 sigma each side)
-    kernels = []
-    for _dim, sigma in enumerate(sigma_vox):
+    # 1D Gaussian kernels, 4 sigma each side; None skips an axis whose sigma
+    # is too small to matter.
+    kernels: list[torch.Tensor | None] = []
+    for sigma in sigma_vox:
         if sigma < 0.1:
-            # Very small sigma - skip this dimension (identity)
             kernels.append(None)
             continue
-
-        # Kernel radius: 4 sigma, but at least 1 voxel
         radius = max(1, int(np.ceil(4 * sigma)))
-        _kernel_size = 2 * radius + 1
-
-        # Create 1D Gaussian kernel
-        x = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
+        x = torch.arange(-radius, radius + 1, dtype=torch.float32)
         kernel = torch.exp(-0.5 * (x / sigma) ** 2)
-        kernel = kernel / kernel.sum()  # Normalize
-
-        kernels.append(kernel)
+        kernels.append(kernel / kernel.sum())
 
     if verbose:
         kernel_sizes = [len(k) if k is not None else 1 for k in kernels]
         print(f"  Kernel sizes: {kernel_sizes[0]} × {kernel_sizes[1]} × {kernel_sizes[2]} voxels")
 
-    # Estimate memory for one volume
-    vol_size_gb = (nx * ny * nz * 4) / (1024**3)  # float32
-
-    # Decide whether to use GPU based on volume size
-    # Most GPUs can handle a few GB per volume easily
-    use_gpu = device.type in ("cuda", "mps") and vol_size_gb < 2.0
-
-    if verbose and not use_gpu and device.type != "cpu":
-        print(f"  Note: Processing on CPU (volume size {vol_size_gb:.2f} GB)")
-
-    compute_device = device if use_gpu else torch.device("cpu")
-
-    # Allocate output
-    data_blurred = np.zeros_like(data)
-
-    # Process each timepoint
-    if verbose:
-        from tqdm import tqdm
-
-        iterator = tqdm(range(nt), desc="  Blurring", unit="vol")
-    else:
-        iterator = range(nt)
-
-    for t in iterator:
-        # Get single volume and convert to tensor
-        vol = torch.from_numpy(data[:, :, :, t]).float().to(compute_device)
-
-        # Apply separable 1D convolutions
-        # For F.conv1d, we need: (batch, channels, length)
-        # We'll process each dimension by reshaping appropriately
-
-        # X dimension: reshape to (ny*nz, 1, nx), convolve, reshape back
-        if kernels[0] is not None:
-            k = kernels[0].to(compute_device)
-            pad = len(k) // 2
-            # Reshape: (nx, ny, nz) -> (ny*nz, 1, nx)
-            vol_x = vol.permute(1, 2, 0).reshape(-1, 1, nx)
-            vol_x = F.conv1d(vol_x, k.view(1, 1, -1), padding=pad)
-            vol = vol_x.reshape(ny, nz, nx).permute(2, 0, 1)
-
-        # Y dimension: reshape to (nx*nz, 1, ny), convolve, reshape back
-        if kernels[1] is not None:
-            k = kernels[1].to(compute_device)
-            pad = len(k) // 2
-            # Reshape: (nx, ny, nz) -> (nx*nz, 1, ny)
-            vol_y = vol.permute(0, 2, 1).reshape(-1, 1, ny)
-            vol_y = F.conv1d(vol_y, k.view(1, 1, -1), padding=pad)
-            vol = vol_y.reshape(nx, nz, ny).permute(0, 2, 1)
-
-        # Z dimension: reshape to (nx*ny, 1, nz), convolve, reshape back
-        if kernels[2] is not None:
-            k = kernels[2].to(compute_device)
-            pad = len(k) // 2
-            # Reshape: (nx, ny, nz) -> (nx*ny, 1, nz)
-            vol_z = vol.reshape(nx * ny, 1, nz)
-            vol_z = F.conv1d(vol_z, k.view(1, 1, -1), padding=pad)
-            vol = vol_z.reshape(nx, ny, nz)
-
-        # Store result
-        data_blurred[:, :, :, t] = vol.cpu().numpy()
+    data_blurred = np.empty_like(data)
+    vol_bytes = nx * ny * nz * 4
+    # The block on the device plus the two arrays each axis pass ping-pongs.
+    chunk = max(1, min(nt, get_available_memory(device) // max(3 * vol_bytes, 1)))
+    starts = range(0, nt, chunk)
+    for t0 in tqdm(
+        starts, desc="  Blurring", unit="block", leave=True, disable=not verbose or len(starts) < 2
+    ):
+        t1 = min(t0 + chunk, nt)
+        block = data[..., t0:t1]
+        if not block.flags.writeable:
+            # torch refuses to wrap read-only memory (a memmap, a nibabel
+            # proxy); a copy in the same layout is cheaper than a warning.
+            block = block.copy(order="K")
+        vol = torch.from_numpy(block).to(device=device, dtype=torch.float32)
+        for axis, k in enumerate(kernels):
+            if k is not None:
+                vol = blur_axis(vol, k, axis)
+        data_blurred[..., t0:t1] = vol.cpu().numpy()
+        del vol
 
     if verbose:
         print(f"  ✓ Blurred {nt} volumes")

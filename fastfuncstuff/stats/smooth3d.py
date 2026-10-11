@@ -8,10 +8,8 @@ mask voxels.  ``smooth_var_per_perm`` is the public entry point: takes a
 volume, smooths each perm independently with a shared kernel, and
 gathers back to ``[P, V_in_mask]``.
 
-Performance: separable 1-D convolutions along each axis, ``torch.conv3d``
-treats P as the batch dim (channel = 1).  On GPU at 200 k mask voxels
-and 1000 perms, ~ 0.5–1 s including scatter/gather; CPU is ~ 10× slower
-but still adds only seconds to a full ffs_perm run.
+Performance: separable 1-D passes along each axis, each a shifted-slab
+accumulation (``blur_axis``) that works on any memory layout.
 """
 
 from __future__ import annotations
@@ -20,8 +18,6 @@ import math
 
 import numpy as np
 import torch
-from torch.nn.functional import conv3d
-from torch.nn.functional import pad as fpad
 
 # FWHM ↔ sigma constant: FWHM = sigma · 2√(2 ln 2)
 FWHM_TO_SIGMA = 1.0 / (2.0 * math.sqrt(2.0 * math.log(2.0)))
@@ -53,42 +49,55 @@ def _gaussian_kernel_1d(
     return k / k.sum()
 
 
-def _smooth_along_axis(
-    x: torch.Tensor,  # [P, 1, X, Y, Z]
-    sigma: float,
-    axis: int,
+def blur_axis(
+    x: torch.Tensor, kernel: torch.Tensor, axis: int, *, reflect: bool = False
 ) -> torch.Tensor:
-    """Convolve a 5-D tensor with a 1-D Gaussian along spatial axis 0/1/2.
+    """Correlate ``x`` with a symmetric 1-D ``kernel`` along ``axis``, any layout.
 
-    Padding is reflect so the mask-normalised denominator stays well
-    behaved at the brain boundary.
+    Shifted-slab accumulation -- one strided ``add_`` per tap -- rather than
+    ``conv1d``/``conv3d``. A convolution wants the filtered axis contiguous, so
+    on a ``(x, y, z, t)`` run it costs a transpose per axis per volume; and
+    oneDNN's single-channel ``conv3d`` measured 7x slower than this on CPU.
+    Every op here is elementwise over whatever strides ``x`` has, so a C- or
+    F-ordered array is blurred in place of its layout, on any device.
+
+    ``reflect`` mirrors without repeating the edge sample (torch's
+    ``reflect``), which needs ``radius < x.shape[axis]``; otherwise the
+    border is zero-padded, as ``conv1d(padding=r)`` would.
     """
-    if sigma <= 0:
-        return x
-    k = _gaussian_kernel_1d(sigma, x.dtype, x.device)
-    r = (k.numel() - 1) // 2
-    if axis == 0:
-        k3 = k.view(1, 1, -1, 1, 1)
-        # F.pad pads spatial dims in reverse order: (W_l, W_r, H_l, H_r, D_l, D_r)
-        x = fpad(x, (0, 0, 0, 0, r, r), mode="reflect")
-    elif axis == 1:
-        k3 = k.view(1, 1, 1, -1, 1)
-        x = fpad(x, (0, 0, r, r, 0, 0), mode="reflect")
-    else:
-        k3 = k.view(1, 1, 1, 1, -1)
-        x = fpad(x, (r, r, 0, 0, 0, 0), mode="reflect")
-    return conv3d(x, k3)
+    n = x.shape[axis]
+    taps = [float(w) for w in kernel.tolist()]
+    r = (len(taps) - 1) // 2
+    out = x * taps[r]
+    for j in range(1, r + 1):
+        w = taps[r + j]
+        if j < n:
+            out.narrow(axis, 0, n - j).add_(x.narrow(axis, j, n - j), alpha=w)
+            out.narrow(axis, j, n - j).add_(x.narrow(axis, 0, n - j), alpha=w)
+        if reflect:
+            if j >= n:
+                raise ValueError(f"reflect padding needs radius < {n}, got {r}")
+            # Past the high edge, i + j lands on 2(n-1) - (i + j); past the
+            # low edge, i - j lands on j - i. Both are j samples, mirrored.
+            out.narrow(axis, n - j, j).add_(x.narrow(axis, n - 1 - j, j).flip(axis), alpha=w)
+            out.narrow(axis, 0, j).add_(x.narrow(axis, 1, j).flip(axis), alpha=w)
+    return out
 
 
 def gaussian3d_batched(
     vol: torch.Tensor,  # [P, X, Y, Z]
     sigma_vox: tuple[float, float, float],
 ) -> torch.Tensor:
-    """Separable 3-D Gaussian, batched over the leading dim."""
-    x = vol.unsqueeze(1)  # [P, 1, X, Y, Z]
+    """Separable 3-D Gaussian, batched over the leading dim.
+
+    Padding is reflect so the mask-normalised denominator stays well
+    behaved at the brain boundary.
+    """
+    x = vol
     for ax, s in enumerate(sigma_vox):
-        x = _smooth_along_axis(x, s, ax)
-    return x.squeeze(1)
+        if s > 0:
+            x = blur_axis(x, _gaussian_kernel_1d(s, x.dtype, x.device), ax + 1, reflect=True)
+    return x
 
 
 def smooth_var_per_perm(

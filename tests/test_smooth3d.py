@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from scipy.ndimage import gaussian_filter
 
 from fastfuncstuff.stats.smooth3d import (
     FWHM_TO_SIGMA,
+    _gaussian_kernel_1d,
+    blur_axis,
     fwhm_mm_to_sigma_vox,
     gaussian3d_batched,
     smooth_var_per_perm,
@@ -66,3 +69,25 @@ def test_smooth_var_per_perm_preserves_shape():
     assert out.shape == var_pv.shape
     # Smoothed variance stays positive
     assert float(out.min()) > 0
+
+
+@pytest.mark.parametrize("reflect", [False, True])
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_blur_axis_matches_pad_and_conv_on_a_strided_array(axis, reflect):
+    """The mirror indices are the easy thing to get off by one, and a permuted
+    view is what the viewer actually passes -- so check both against torch's
+    own pad + conv1d on the same data made contiguous."""
+    g = torch.Generator().manual_seed(axis)
+    x = torch.randn(6, 7, 5, 4, generator=g).permute(3, 0, 1, 2)[1]  # (6, 7, 5), strided
+    k = _gaussian_kernel_1d(1.1, torch.float32, torch.device("cpu"))  # radius 5 >= 5 on axis 2
+    r = (k.numel() - 1) // 2
+    n = x.shape[axis]
+    lines = x.movedim(axis, -1).reshape(-1, 1, n)
+    if reflect and r >= n:
+        with pytest.raises(ValueError, match="reflect"):
+            blur_axis(x, k, axis, reflect=True)
+        return
+    padded = torch.nn.functional.pad(lines, (r, r), mode="reflect" if reflect else "constant")
+    want = torch.nn.functional.conv1d(padded, k.view(1, 1, -1))
+    want = want.reshape(*x.movedim(axis, -1).shape).movedim(-1, axis)
+    torch.testing.assert_close(blur_axis(x, k, axis, reflect=reflect), want)

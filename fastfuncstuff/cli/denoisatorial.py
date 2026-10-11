@@ -61,6 +61,7 @@ try:
         auto_polort,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
+        load_hrf_index_for_input,
         microtime_offset_bins,
         parse_input_files,
         parse_prefix,
@@ -85,7 +86,6 @@ try:
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
     from fastfuncstuff.glm.core import construct_polynomial_matrix
-    from fastfuncstuff.glm.ridge import load_hrf_indices
     from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.utils import (
         scale_to_percent_signal,
@@ -491,7 +491,7 @@ Notes:
         "-hrf_opt",
         type=str,
         default=None,
-        help="3dHRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz for "
+        help="3dHRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz (.shape.gii for surface input) for "
         "per-voxel HRF optimization. Each voxel uses its assigned HRF for "
         "design construction. Mutually exclusive with -canonical.",
     )
@@ -1293,14 +1293,10 @@ def main():
     if args.hrf_opt:
         # Per-voxel HRF mode: load HRF indices and library from 3dHRFoptfast output
         print(f"  Loading HRF optimization results from {args.hrf_opt}...")
-        hrf_index_file = f"{args.hrf_opt}_hrf_index.nii.gz"
-        if not Path(hrf_index_file).exists():
-            print(f"ERROR: HRF index file not found: {hrf_index_file}")
-            print("  Expected output from 3dHRFoptfast with prefix:", args.hrf_opt)
-            sys.exit(1)
-
-        mask_for_hrf = mask if mask is not None else None
-        hrf_indices = load_hrf_indices(hrf_index_file, mask=mask_for_hrf)
+        try:
+            hrf_indices = load_hrf_index_for_input(args.hrf_opt, nifti_header, mask)
+        except (FileNotFoundError, ValueError) as exc:
+            sys.exit(f"ERROR: {exc}")
         hrf_indices = hrf_indices.to(data.device)
         print(f"  Loaded HRF indices: {hrf_indices.shape}")
 

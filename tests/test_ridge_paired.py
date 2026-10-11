@@ -4,7 +4,6 @@ import sys
 
 import nibabel as nib
 import numpy as np
-import pytest
 
 from fastfuncstuff.cli.ridge import main
 from fastfuncstuff.io.gifti import load_gifti_data, save_gifti_data
@@ -113,10 +112,29 @@ def test_paired_single_trials_outputs(tmp_path, monkeypatch):
         assert (tmp_path / f"ridge_{stem}_surface.shape.gii").exists()
 
 
-def test_paired_hrf_opt_rejected_before_loading(tmp_path, monkeypatch, capsys):
+def test_paired_hrf_opt_reads_both_domain_maps(tmp_path, monkeypatch):
+    """One hrfopt prefix run per domain feeds a paired fit; masked maps line up."""
     vols, surfs = _inputs(tmp_path)
-    monkeypatch.setattr(sys, "argv", _args(tmp_path, vols, surfs) + ["-hrf_opt", "not_a_prefix"])
-    with pytest.raises(SystemExit) as error:
-        main()
-    assert error.value.code == 2
-    assert "paired -surface_input does not support -hrf_opt" in capsys.readouterr().err
+    nib.save(
+        nib.Nifti1Image(np.full((2, 2, 2), 3, np.float32), np.eye(4)),
+        tmp_path / "hrf_hrf_index.nii.gz",
+    )
+    save_gifti_data(
+        tmp_path / "hrf_hrf_index.shape.gii",
+        np.array([1, 2, 3, 4], np.float32),
+        {"mesh_fingerprint": "V4_F2_test"},
+        time_series=False,
+    )
+    sm = tmp_path / "surface_mask.shape.gii"
+    save_gifti_data(sm, np.array([1, 1, 0, 1], np.float32), {"mesh_fingerprint": "V4_F2_test"})
+    argv = _args(tmp_path, vols, surfs)
+    frac_arg = argv.index("-ridge_fracs")
+    argv[frac_arg + 1 : frac_arg + 4] = ["0.5", "1", "0.5"]
+    argv += ["-hrf_opt", str(tmp_path / "hrf"), "-surface_mask", str(sm)]
+    monkeypatch.setattr(sys, "argv", argv)
+    main()
+    # -hrf_opt switches ridge to beta-space CV, hence the single-trial names.
+    surf, _ = load_gifti_data(tmp_path / "ridge_single_trial_full_r2_surface.shape.gii")
+    assert surf.shape == (4,) and surf[2] == 0
+    vol = nib.load(str(tmp_path / "ridge_single_trial_full_r2_volume.nii.gz"))
+    assert vol.shape == (2, 2, 2)

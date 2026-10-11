@@ -1163,7 +1163,7 @@ Examples:
         type=str,
         default=None,
         help=(
-            "Per-voxel HRF mode. PREFIX from ffs_hrfopt — loads {PREFIX}_hrf_index.nii.gz "
+            "Per-voxel HRF mode. PREFIX from ffs_hrfopt — loads {PREFIX}_hrf_index.nii.gz (.shape.gii for surface input) "
             "and {PREFIX}_hrf_library.pt. Each voxel is fit with its assigned HRF. "
             "Requires -events or -onsets; mutually exclusive with -matrix."
         ),
@@ -2513,14 +2513,9 @@ def main():
         hrf_indices_obj = None
         model_durations = durations
         if args.hrfopt_prefix:
-            from fastfuncstuff.glm.ridge import load_hrf_indices
+            from fastfuncstuff.cli_utils import load_hrf_index_for_input
 
-            hrf_index_file = f"{args.hrfopt_prefix}_hrf_index.nii.gz"
-            hrf_lib_file = f"{args.hrfopt_prefix}_hrf_library.pt"
-            if not Path(hrf_index_file).exists():
-                print(f"ERROR: HRF index file not found: {hrf_index_file}")
-                print(f"  Expected ffs_hrfopt output with prefix: {args.hrfopt_prefix}")
-                sys.exit(1)
+            hrf_lib_file = f"{parse_prefix(args.hrfopt_prefix).stem}_hrf_library.pt"
             if not Path(hrf_lib_file).exists():
                 print(f"ERROR: HRF library file not found: {hrf_lib_file}")
                 sys.exit(1)
@@ -2528,7 +2523,12 @@ def main():
             print()
             print(f"Loading per-voxel HRF assignments from {args.hrfopt_prefix}...")
             # Volume-aligned (no mask) — analyze_from_design_matrix masks alongside data
-            hrf_indices_obj = load_hrf_indices(hrf_index_file, mask=None)
+            try:
+                hrf_indices_obj = load_hrf_index_for_input(
+                    args.hrfopt_prefix, load_nifti(str(input_files[0]).split("[")[0]).header
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                sys.exit(f"ERROR: {exc}")
             from fastfuncstuff.cli_utils import spinner
 
             with spinner(f"Loading {Path(hrf_lib_file).name}"):

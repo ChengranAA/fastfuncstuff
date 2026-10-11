@@ -583,7 +583,9 @@ def load_and_preprocess_runs(
 
     surface_input = is_gifti(str(input_files[0]).split("[")[0])
     if any(is_gifti(str(path).split("[")[0]) != surface_input for path in input_files):
-        raise ValueError("Runs must all be GIfTI surfaces or all be volumes; fit each domain separately")
+        raise ValueError(
+            "Runs must all be GIfTI surfaces or all be volumes; fit each domain separately"
+        )
     if surface_input:
         fingerprint = (surface_meta(first_img.header) or {}).get("mesh_fingerprint")
         if not fingerprint:
@@ -597,8 +599,10 @@ def load_and_preprocess_runs(
             if not is_gifti(str(mask_file).split("[")[0]):
                 raise ValueError("A surface input needs a GIfTI mask on the same mesh")
             mask_img = load_nifti(mask_file)
-            if (mask_img.shape[:3] != volume_shape or
-                    (surface_meta(mask_img.header) or {}).get("mesh_fingerprint") != fingerprint):
+            if (
+                mask_img.shape[:3] != volume_shape
+                or (surface_meta(mask_img.header) or {}).get("mesh_fingerprint") != fingerprint
+            ):
                 raise ValueError("Surface mask does not match the input mesh")
         if mask_array is not None:
             raise ValueError("Surface mask arrays have no mesh identity; pass a GIfTI mask file")
@@ -977,6 +981,56 @@ def apply_automask(
     keep_full = torch.from_numpy(auto_flat)
     keep = keep_full[torch.from_numpy(mask_flat)] if mask_flat is not None else keep_full
     return restrict_voxels(data, keep, volume_shape, mask_flat)
+
+
+def hrf_index_path(prefix: str, surface: bool) -> str:
+    """``ffs_hrfopt``'s index map for *prefix* in one domain: GIfTI or NIfTI."""
+    pfx = parse_prefix(prefix)
+    if surface:
+        ext = pfx.nifti_ext if pfx.nifti_ext.endswith(".gii") else ".shape.gii"
+    else:
+        ext = ".nii.gz" if pfx.nifti_ext.endswith(".gii") else pfx.nifti_ext
+    return f"{pfx.stem}_hrf_index{ext}"
+
+
+def load_hrf_index_for_input(prefix: str, header, mask: np.ndarray | None = None) -> torch.Tensor:
+    """Per-location HRF indices from an ``ffs_hrfopt`` prefix, in the input's domain.
+
+    *header* is the analysed data's header: a surface input reads
+    ``<stem>_hrf_index.shape.gii`` (and refuses another mesh's map), a volume
+    ``<stem>_hrf_index<ext>``, and paired input (a ``PairedHeader``) both,
+    concatenated in data order. Running ffs_hrfopt once per domain with the same
+    prefix leaves exactly that pair on disk.
+    """
+    from fastfuncstuff.glm.ridge import load_hrf_indices
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.gifti import surface_meta
+
+    paired = sys.modules.get("fastfuncstuff.io.paired")
+    if paired is not None and isinstance(header, paired.PairedHeader):
+        flat = None if mask is None else np.asarray(mask).reshape(-1)
+        parts = (
+            (header.volume_header, slice(0, header.n_volume)),
+            (header.surface_header, slice(header.n_volume, None)),
+        )
+        return torch.cat(
+            [
+                load_hrf_index_for_input(prefix, part, None if flat is None else flat[span])
+                for part, span in parts
+            ]
+        )
+
+    expected = surface_meta(header)
+    path = hrf_index_path(prefix, expected is not None)
+    if not Path(path).exists():
+        raise FileNotFoundError(
+            f"HRF index file not found: {path} (from ffs_hrfopt -prefix {prefix})"
+        )
+    if expected is not None:
+        found = surface_meta(load_nifti(path).header) or {}
+        if found.get("mesh_fingerprint") != expected.get("mesh_fingerprint"):
+            raise ValueError(f"{path} is on a different mesh than the input data")
+    return load_hrf_indices(path, mask=mask)
 
 
 def save_volume_nifti(
@@ -4139,7 +4193,8 @@ def preflight_check(
     ortvec_files : list of (path, label) tuples, optional
         Nuisance regressor files. Each must exist and have exactly total_timepoints rows.
     hrf_opt_prefix : str, optional
-        Prefix for HRFoptfast outputs. Checks `{prefix}_hrf_index.nii.gz` exists.
+        Prefix for HRFoptfast outputs. Checks the ``_hrf_index`` map in the inputs'
+        domain exists (see ``hrf_index_path``).
     denoise_prefix : str, optional
         Prefix for 3dDenoisefast outputs. Checks `{prefix}_noise_pcs.xmat.1D` exists.
     """
@@ -4170,9 +4225,12 @@ def preflight_check(
     # 2. HRFopt output file
     # ------------------------------------------------------------------
     if hrf_opt_prefix:
-        hrf_index_file = f"{hrf_opt_prefix}_hrf_index.nii.gz"
-        if not Path(hrf_index_file).exists():
-            errors.append(f"  -hrf_opt file not found: {hrf_index_file}")
+        from fastfuncstuff.io.gifti import is_gifti
+
+        for surface in sorted({is_gifti(str(f).split("[")[0]) for f in input_files}):
+            hrf_index_file = hrf_index_path(hrf_opt_prefix, surface)
+            if not Path(hrf_index_file).exists():
+                errors.append(f"  -hrf_opt file not found: {hrf_index_file}")
 
     # ------------------------------------------------------------------
     # 3. Denoise output file(s)

@@ -64,6 +64,7 @@ try:
         compute_run_lengths,
         get_average_run_duration,
         load_and_preprocess_runs,
+        load_hrf_index_for_input,
         microtime_offset_bins,
         parse_cv_strategy,
         parse_prefix,
@@ -91,7 +92,6 @@ try:
     from fastfuncstuff.glm.ridge import (
         create_single_trial_design,
         fit_ridge_single_trial,
-        load_hrf_indices,
         load_noise_pcs,
     )
     from fastfuncstuff.utils import scale_to_percent_signal
@@ -303,7 +303,7 @@ Notes:
         "-hrf_opt",
         type=str,
         default=None,
-        help="HRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz for per-voxel HRFs.",
+        help="HRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz (.shape.gii for surface input; both when paired).",
     )
     integ_opts.add_argument(
         "-denoise",
@@ -413,10 +413,6 @@ def main():
         parser.error("-surface_mask needs -surface_input")
     if args.surface_input and len(args.surface_input) != n_runs:
         parser.error("-surface_input needs one surface run for each -input volume run")
-    if args.surface_input and args.hrf_opt:
-        parser.error(
-            "paired -surface_input does not support -hrf_opt (HRF indices cannot span both domains)"
-        )
     if args.surface_input and args.dry_run:
         parser.error("paired -surface_input does not support -dry_run")
 
@@ -652,21 +648,7 @@ def main():
     if args.hrf_opt:
         print()
         print(f"Loading HRF optimization results from {args.hrf_opt}...")
-        hrf_pfx = parse_prefix(args.hrf_opt)
-        hrf_ext = (
-            (hrf_pfx.nifti_ext if hrf_pfx.nifti_ext.endswith(".gii") else ".shape.gii")
-            if surface_input
-            else hrf_pfx.nifti_ext
-        )
-        hrf_index_file = f"{hrf_pfx.stem}_hrf_index{hrf_ext}"
-        if surface_input:
-            from fastfuncstuff.io.afni import load_nifti
-
-            expected = surface_meta(nifti_header) or {}
-            actual = surface_meta(load_nifti(hrf_index_file).header) or {}
-            if actual.get("mesh_fingerprint") != expected.get("mesh_fingerprint"):
-                raise ValueError("HRF index mesh fingerprint does not match input data")
-        hrf_indices = load_hrf_indices(hrf_index_file, mask=mask)
+        hrf_indices = load_hrf_index_for_input(args.hrf_opt, nifti_header, mask)
         print(f"  Loaded HRF indices: {hrf_indices.shape}")
 
         # Load HRF library (reconstruct from metadata or use default)

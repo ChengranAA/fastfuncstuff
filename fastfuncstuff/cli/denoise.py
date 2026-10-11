@@ -62,6 +62,7 @@ try:
         collect_noise_comp_blocks,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
+        load_hrf_index_for_input,
         microtime_offset_bins,
         parse_cv_strategy,
         parse_input_files,
@@ -96,7 +97,6 @@ try:
         bucket_labels_from_groups,
     )
     from fastfuncstuff.glm.core import construct_polynomial_matrix
-    from fastfuncstuff.glm.ridge import load_hrf_indices
     from fastfuncstuff.io.afni import (
         load_afni_mask,  # noqa: F401 — availability check
         load_nifti,  # noqa: F401 — availability check
@@ -687,7 +687,7 @@ Notes:
         "-hrf_opt",
         type=str,
         default=None,
-        help="HRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz for per-voxel HRFs.",
+        help="HRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz (.shape.gii for surface input; both when paired).",
     )
     add_hrf_library_args(
         proc_opts,
@@ -1990,13 +1990,17 @@ def _denoise_output_extension(
 
     surface = [is_gifti(str(path).split("[")[0]) for path in input_files]
     if any(value != surface[0] for value in surface):
-        raise ValueError("Mixed surface/volume runs need explicit matched-domain inputs; fit each domain separately")
+        raise ValueError(
+            "Mixed surface/volume runs need explicit matched-domain inputs; fit each domain separately"
+        )
     ext = parse_prefix(prefix).nifti_ext
     if surface[0]:
         if automask:
             raise ValueError("-automask is volume-only; use a GIfTI -mask for surface data")
         if cv_blur is not None:
-            raise ValueError("-cv_blur is volume-only; use -do_blur with a GIfTI -mask for surface data")
+            raise ValueError(
+                "-cv_blur is volume-only; use -do_blur with a GIfTI -mask for surface data"
+            )
         if prefix.endswith((".nii", ".nii.gz", ".nii.zst")):
             raise ValueError("Surface outputs require a GIfTI -prefix, not a NIfTI extension")
         return ".func.gii" if ext == ".nii.gz" else ext
@@ -2380,10 +2384,7 @@ def main():
     if args.hrf_opt:
         print()
         print(f"Loading HRF optimization results from {args.hrf_opt}...")
-        hrf_index_file = f"{args.hrf_opt}_hrf_index.nii.gz"
-
-        # Load HRF indices (applies mask if data was masked)
-        hrf_indices = load_hrf_indices(hrf_index_file, mask=mask)
+        hrf_indices = load_hrf_index_for_input(args.hrf_opt, nifti_header, mask)
         print(f"  Loaded HRF indices: {hrf_indices.shape}")
 
         # Load HRF library (reconstruct from metadata or use default)

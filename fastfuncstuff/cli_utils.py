@@ -2778,6 +2778,32 @@ def add_outlier_censor_args(parser_or_group) -> None:
     )
 
 
+def add_paired_surface_args(group) -> None:
+    """``-surface_input`` / ``-surface_mask``: fit GIfTI runs jointly with ``-input`` volumes."""
+    group.add_argument(
+        "-surface_input",
+        nargs="+",
+        metavar="GII",
+        help="Surface (GIfTI) runs paired by position with the -input volume runs and fit"
+        " jointly with them. Every map is written twice: <name>_volume and <name>_surface.",
+    )
+    group.add_argument(
+        "-surface_mask",
+        metavar="GII",
+        help="Vertex mask on the -surface_input mesh (-mask covers the volume runs).",
+    )
+
+
+def validate_paired_surface_args(parser, args, n_runs: int) -> None:
+    """Checks shared by every tool registered with ``add_paired_surface_args``."""
+    if args.surface_mask and not args.surface_input:
+        parser.error("-surface_mask needs -surface_input")
+    if args.surface_input and len(args.surface_input) != n_runs:
+        parser.error("-surface_input needs one surface run for each -input volume run")
+    if args.surface_input and getattr(args, "dry_run", False):
+        parser.error("paired -surface_input does not support -dry_run")
+
+
 def add_device_arg(
     parser_or_group,
     *,

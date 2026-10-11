@@ -56,6 +56,7 @@ try:
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_noise_ceiling_args,
+        add_paired_surface_args,
         add_trim_args,
         add_verbose_arg,
         apply_trim_to_timing,
@@ -78,6 +79,7 @@ try:
         setup_device,
         spinner,
         trim_spec_from_args,
+        validate_paired_surface_args,
     )
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.stim_vec import (
@@ -164,17 +166,7 @@ Notes:
         required=True,
         help="Input fMRI dataset(s). Multiple files = multiple runs.",
     )
-    required.add_argument(
-        "-surface_input",
-        nargs="+",
-        metavar="GII",
-        help="Surface runs paired by index with -input volume runs; fit both domains together.",
-    )
-    required.add_argument(
-        "-surface_mask",
-        metavar="GII",
-        help="Surface vertex mask for paired -surface_input runs.",
-    )
+    add_paired_surface_args(required)
     required.add_argument(
         "-onsets",
         nargs="+",
@@ -409,12 +401,7 @@ def main():
     # ========================================================================
     input_files = args.input
     n_runs = len(input_files)
-    if args.surface_mask and not args.surface_input:
-        parser.error("-surface_mask needs -surface_input")
-    if args.surface_input and len(args.surface_input) != n_runs:
-        parser.error("-surface_input needs one surface run for each -input volume run")
-    if args.surface_input and args.dry_run:
-        parser.error("paired -surface_input does not support -dry_run")
+    validate_paired_surface_args(parser, args, n_runs)
 
     # Validate onset/events mutual exclusivity
     _has_onsets = bool(args.onsets)

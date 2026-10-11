@@ -21,7 +21,7 @@ def test_surface_extension_and_unsupported_volume_operations():
     files = ["left.func.gii", "right.func.gii"]
     assert _denoise_output_extension(files, "fit") == ".func.gii"
     assert _denoise_output_extension(files, "fit.shape.gii") == ".shape.gii"
-    with pytest.raises(ValueError, match="Mixed surface/volume"):
+    with pytest.raises(ValueError, match="mix surface and volume"):
         _denoise_output_extension([files[0], "run.nii.gz"], "fit")
     with pytest.raises(ValueError, match="automask"):
         _denoise_output_extension(files, "fit", automask=True)

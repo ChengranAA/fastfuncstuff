@@ -53,6 +53,7 @@ try:
         add_noise_ceiling_args,
         add_noise_comps_arguments,
         add_ortvec_arguments,
+        add_paired_surface_args,
         add_single_trial_args,
         add_trim_args,
         add_verbose_arg,
@@ -78,6 +79,7 @@ try:
         spinner,
         summarize_trial_repeats,
         trim_spec_from_args,
+        validate_paired_surface_args,
     )
     from fastfuncstuff.denoise.sequential import (
         DenoiseResults,
@@ -257,6 +259,9 @@ Notes:
         required=True,
         help="Input fMRI dataset(s). Multiple files = multiple runs.",
     )
+    # Paired domains share one noise pool: components come from quiet voxels and
+    # quiet vertices together, and every location is cleaned by them.
+    add_paired_surface_args(required)
     required.add_argument(
         "-onsets",
         nargs="+",
@@ -1148,6 +1153,7 @@ def save_denoising_results(
     voxel_mask: torch.Tensor | None = None,
     plots_mode: str = "no",
     slice_axis: str = "x",
+    slice_figures: bool = True,
     component_map_space: str = "full",
     noise_method: str = "pca",
     save_pcs_mode: str = "timecourse",
@@ -1557,8 +1563,8 @@ def save_denoising_results(
                         component_variance_ratio_per_run=results.metadata.get(
                             "ic_variance_ratio_per_run"
                         ),
-                        pc_weights_per_run=map_set.maps_per_run,
-                        volume_shape=volume_shape,
+                        pc_weights_per_run=map_set.maps_per_run if slice_figures else None,
+                        volume_shape=volume_shape if slice_figures else None,
                         voxel_mask=voxel_mask_np,
                         noise_pool_mask=(
                             results.noise_pool_mask.cpu().numpy() if map_set.pool_space else None
@@ -1984,23 +1990,38 @@ def save_model_fit_outputs(
 
 
 def _denoise_output_extension(
-    input_files: list[str], prefix: str, automask: bool = False, cv_blur: float | None = None
+    input_files: list[str],
+    prefix: str,
+    automask: bool = False,
+    cv_blur: float | None = None,
+    noise_pool_blur: float = 0.0,
+    paired: bool = False,
 ) -> str:
     from fastfuncstuff.io.gifti import is_gifti
 
     surface = [is_gifti(str(path).split("[")[0]) for path in input_files]
     if any(value != surface[0] for value in surface):
         raise ValueError(
-            "Mixed surface/volume runs need explicit matched-domain inputs; fit each domain separately"
+            "-input runs mix surface and volume; pass the GIfTI runs with -surface_input"
         )
     ext = parse_prefix(prefix).nifti_ext
-    if surface[0]:
+    if surface[0] or paired:
+        # These blur or erode on a voxel grid, which a mesh (or the paired
+        # volume-then-vertices layout) does not have.
+        what = "paired -surface_input data" if paired else "surface data"
         if automask:
-            raise ValueError("-automask is volume-only; use a GIfTI -mask for surface data")
+            raise ValueError(f"-automask is volume-only; use -mask/-surface_mask for {what}")
         if cv_blur is not None:
-            raise ValueError(
-                "-cv_blur is volume-only; use -do_blur with a GIfTI -mask for surface data"
-            )
+            raise ValueError(f"-cv_blur is volume-only; not available for {what}")
+        if noise_pool_blur:
+            raise ValueError(f"-noise_pool_blur is volume-only; not available for {what}")
+    if paired:
+        if surface[0]:
+            raise ValueError("With -surface_input, -input takes the volume runs")
+        if ext.endswith(".gii"):
+            raise ValueError("Paired outputs take a NIfTI -prefix; the surface half is GIfTI")
+        return ext
+    if surface[0]:
         if prefix.endswith((".nii", ".nii.gz", ".nii.zst")):
             raise ValueError("Surface outputs require a GIfTI -prefix, not a NIfTI extension")
         return ".func.gii" if ext == ".nii.gz" else ext
@@ -2030,13 +2051,19 @@ def main():
     from fastfuncstuff.io.gifti import is_gifti
 
     surface_input = is_gifti(str(input_files[0]).split("[")[0])
+    n_runs = len(input_files)
+    validate_paired_surface_args(parser, args, n_runs)
     try:
         _nii_ext = _denoise_output_extension(
-            input_files, requested_prefix, args.automask, args.cv_blur
+            input_files,
+            requested_prefix,
+            args.automask,
+            args.cv_blur,
+            args.noise_pool_blur,
+            paired=bool(args.surface_input),
         )
     except ValueError as exc:
         parser.error(str(exc))
-    n_runs = len(input_files)
 
     if n_runs < 2:
         print("ERROR: At least 2 runs required for cross-validation")
@@ -2150,38 +2177,68 @@ def main():
     print()
 
     # Load and preprocess data using unified utility
-    load_result: LoadResult = load_and_preprocess_runs(
-        input_files=input_files,
-        tr=args.tr,
-        mask_file=args.mask,
-        blur_fwhm=args.do_blur,
-        do_scale=False,  # Scaling will be applied later if requested
-        device=device,
-        force_cpu=args.keep_on_cpu,
-        dry_run=args.dry_run,
-        verbose=True,
-        load_threads=args.load_threads,
-        drop_first=args.drop_first,
-        drop_last=args.drop_last,
-    )
+    paired = None
+    if args.surface_input:
+        from fastfuncstuff.io.paired import load_paired_runs
+
+        paired = load_paired_runs(
+            input_files,
+            args.surface_input,
+            tr=args.tr,
+            volume_mask=args.mask,
+            surface_mask=args.surface_mask,
+            blur_fwhm=args.do_blur,
+            device=device,
+            force_cpu=args.keep_on_cpu,
+            load_threads=args.load_threads,
+            drop_first=args.drop_first,
+            drop_last=args.drop_last,
+            surface_ext=".func.gii",
+        )
+        load_result = paired.volume
+    else:
+        load_result: LoadResult = load_and_preprocess_runs(
+            input_files=input_files,
+            tr=args.tr,
+            mask_file=args.mask,
+            blur_fwhm=args.do_blur,
+            do_scale=False,  # Scaling will be applied later if requested
+            device=device,
+            force_cpu=args.keep_on_cpu,
+            dry_run=args.dry_run,
+            verbose=True,
+            load_threads=args.load_threads,
+            drop_first=args.drop_first,
+            drop_last=args.drop_last,
+        )
 
     # Modify prefix for dry run mode
     if args.dry_run:
         args.prefix = f"dry_run_{args.prefix}"
 
-    # Extract loaded data
-    data = load_result.data
+    # Extract loaded data. Paired runs present one pseudo-grid whose header
+    # splits every saved map back into its volume and surface files.
     run_starts = load_result.run_starts
     affine = load_result.affine
-    nifti_header = load_result.nifti_header
-    volume_shape = load_result.volume_shape
     voxel_sizes = load_result.voxel_sizes
-    mask = load_result.mask
-    mask_flat = load_result.mask_flat
-    n_voxels = load_result.n_voxels
     n_timepoints = load_result.n_timepoints
     n_runs = load_result.n_runs
-    keep_on_cpu = load_result.keep_on_cpu
+    if paired is not None:
+        data = paired.data
+        nifti_header = paired.header
+        volume_shape = paired.header.shape
+        mask, mask_flat = paired.mask, paired.mask_flat
+        n_voxels = data.shape[0]
+        keep_on_cpu = paired.keep_on_cpu
+    else:
+        data = load_result.data
+        nifti_header = load_result.nifti_header
+        volume_shape = load_result.volume_shape
+        mask, mask_flat = load_result.mask, load_result.mask_flat
+        n_voxels = load_result.n_voxels
+        keep_on_cpu = load_result.keep_on_cpu
+    # Neither a mesh nor the paired volume-then-vertices layout has slices to draw.
+    slice_figures = not surface_input and paired is None
 
     # Only checkable now that the runs are loaded. A silently out-of-range index
     # would index the wrong run rather than fail.
@@ -3764,7 +3821,7 @@ def main():
                     )
 
                     # A cortical sheet cannot be displayed as axial/sagittal slices.
-                    if mask_mismatch or surface_input:
+                    if mask_mismatch or not slice_figures:
                         # Skip spatial weight computation - just plot timecourses
                         loadings_cpu = None
                         noise_pool_mask_for_plot = None
@@ -3797,7 +3854,7 @@ def main():
                         run_starts=run_starts,
                         component_variance_ratio_per_run=ic_variance_ratio_per_run,
                         pc_weights_per_run=loadings_cpu,  # None = no spatial maps
-                        volume_shape=None if surface_input else volume_shape,
+                        volume_shape=volume_shape if slice_figures else None,
                         voxel_mask=voxel_mask_np,
                         noise_pool_mask=noise_pool_mask_for_plot,
                         n_pcs_to_show=n_pcs_to_show,
@@ -3981,6 +4038,7 @@ def main():
             voxel_mask=voxel_mask,
             plots_mode=args.plots,
             slice_axis=args.plot_ax,
+            slice_figures=slice_figures,
             component_map_space=args.component_map_space,
             noise_method=args.noise,
             save_pcs_mode=args.save_pcs,

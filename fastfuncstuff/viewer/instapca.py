@@ -145,6 +145,9 @@ def decompose(
     gram = torch.zeros(n_time, n_time, dtype=torch.float64, device=device)
     norms = np.empty(n_vox, dtype=np.float64)
     means = np.empty(n_vox, dtype=np.float64)
+    # One chunk -- the usual case on CPU -- is kept for the maps pass rather
+    # than prepared twice; that pass would hold the same array anyway.
+    kept: torch.Tensor | None = None
     with _no_tf32():
         for i in range(0, n_vox, step):
             if progress is not None:
@@ -153,6 +156,8 @@ def decompose(
             gram += (c.T @ c).double()
             norms[i : i + step] = norm.double().cpu().numpy()
             means[i : i + step] = mean.double().cpu().numpy()
+            if step >= n_vox:
+                kept = c
             del c
 
         if progress is not None:
@@ -168,9 +173,10 @@ def decompose(
         for i in range(0, n_vox, step):
             if progress is not None:
                 progress(0.55 + 0.4 * i / n_vox, "maps")
-            c, _norm, _mean = prepared(i)
+            c = kept if kept is not None else prepared(i)[0]
             corr[i : i + step] = (c @ u_dev).cpu().numpy()
             del c
+        kept = None
 
     # eigh's sign is arbitrary. Pointing each map's heavy tail positive is the
     # convention MELODIC uses, and it is what makes a re-run of the same data

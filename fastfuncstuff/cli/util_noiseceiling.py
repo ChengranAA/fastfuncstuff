@@ -56,6 +56,7 @@ from fastfuncstuff.cli_utils import (
     setup_device,
 )
 from fastfuncstuff.io.afni import load_nifti, save_nifti
+from fastfuncstuff.io.gifti import is_gifti, surface_meta
 from fastfuncstuff.stats.noise_ceiling import (
     beta_space_ceiling,
     mean_train_repeats,
@@ -102,8 +103,8 @@ Notes:
         "-input",
         nargs="+",
         default=None,
-        help="Run files, one per run, in the order -identical_sets labels them. "
-        "Detrend these first; see Notes.",
+        help="Run files (.nii* or .func.gii), one per run, in the order "
+        "-identical_sets labels them. Detrend these first; see Notes.",
     )
     ts.add_argument(
         "-identical_sets",
@@ -121,7 +122,8 @@ Notes:
     beta.add_argument(
         "-betas",
         default=None,
-        help="4D single-trial betas, one volume per trial, in the trial table's order.",
+        help="4D single-trial betas (.nii* or .func.gii), one map per trial, "
+        "in the trial table's order.",
     )
     beta.add_argument(
         "-trial_table",
@@ -155,7 +157,7 @@ Notes:
 
     common = parser.add_argument_group("Common")
     common.add_argument("-prefix", required=True, help="Output prefix.")
-    common.add_argument("-mask", default=None, help="Restrict to voxels inside this mask.")
+    common.add_argument("-mask", default=None, help="Restrict to voxels/vertices inside this mask.")
     common.add_argument(
         "-xval_r2",
         "-xval-r2",
@@ -277,13 +279,30 @@ def main() -> None:
     device = setup_device(args.device)
     if args.verb >= 1:
         print(f"  Device: {device}")
-    prefix_info = parse_prefix(args.prefix)
+    source = args.input[0] if timeseries_mode else args.betas
+    surface = is_gifti(source)
+    prefix_info = parse_prefix(args.prefix, default_ext=".shape.gii" if surface else ".nii.gz")
     out_prefix = prefix_info.stem
     extension = prefix_info.nifti_ext
+    if is_gifti(args.prefix) != surface and args.prefix != out_prefix:
+        raise SystemExit("ERROR: -prefix output domain must match the input domain.")
+
+    def check_domain(path: str, reference_header=None) -> None:
+        if is_gifti(path) != surface:
+            raise SystemExit(f"ERROR: {path} has a different volume/surface domain from {source}.")
+        if surface and reference_header is not None:
+            other = load_nifti(path)
+            ref = surface_meta(reference_header) or {}
+            meta = surface_meta(other.header) or {}
+            if ref.get("mesh_fingerprint") != meta.get("mesh_fingerprint"):
+                raise SystemExit(f"ERROR: {path} does not match the input mesh fingerprint.")
+            if other.shape[0] != reference_header.get_data_shape()[0]:
+                raise SystemExit(f"ERROR: {path} has a different vertex count from {source}.")
 
     mask_flat = None
     if args.mask:
-        mask_data, _, _, _ = _load_volume(args.mask)
+        check_domain(args.mask)
+        mask_data, _, _, mask_shape = _load_volume(args.mask)
         mask_flat = torch.from_numpy(mask_data[:, 0] > 0).to(device)
 
     if timeseries_mode:
@@ -298,8 +317,17 @@ def main() -> None:
         affine = header = None
         shape: tuple[int, ...] = ()
         for path in args.input:
-            flat, affine, header, shape = _load_volume(path)
+            check_domain(path, header)
+            flat, run_affine, run_header, run_shape = _load_volume(path)
+            if header is None:
+                affine, header, shape = run_affine, run_header, run_shape
+            elif run_shape != shape:
+                raise SystemExit(f"ERROR: {path} grid does not match the first run.")
             segments.append(torch.from_numpy(flat))
+        if args.mask:
+            check_domain(args.mask, header)
+            if mask_shape != shape:
+                raise SystemExit("ERROR: -mask grid does not match input runs.")
         run_lengths = [segment.shape[1] for segment in segments]
         run_starts = [int(sum(run_lengths[:i])) for i in range(len(run_lengths))]
         data = torch.cat(segments, dim=1).to(device)
@@ -330,6 +358,10 @@ def main() -> None:
         ncsnr_map = None
     else:
         betas_flat, affine, header, shape = _load_volume(args.betas)
+        if args.mask:
+            check_domain(args.mask, header)
+            if mask_shape != shape:
+                raise SystemExit("ERROR: -mask grid does not match betas.")
         condition_ids, run_ids = _read_trial_table(args.trial_table)
         if betas_flat.shape[1] != condition_ids.numel():
             print(
@@ -399,6 +431,7 @@ def main() -> None:
         _save(ncsnr_map, "ncsnr")
 
     if args.xval_r2:
+        check_domain(args.xval_r2, header)
         xval_flat, _, _, xval_shape = _load_volume(args.xval_r2)
         if tuple(xval_shape) != tuple(shape):
             print(

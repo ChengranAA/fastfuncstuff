@@ -30,6 +30,7 @@ try:
         sanitize_levels,
     )
     from fastfuncstuff.io.afni import load_nifti, save_nifti
+    from fastfuncstuff.io.gifti import is_gifti, surface_meta
     from fastfuncstuff.stats.variance_partition import (
         anova_partition,
         build_roi_weights,
@@ -892,6 +893,17 @@ def main() -> int:
 
     print(f"\n📥 Loading betas: {args.betas}")
     img = load_nifti(args.betas)
+    surface = is_gifti(args.betas)
+    source_mesh = (surface_meta(img.header) or {}).get("mesh_fingerprint")
+
+    def check_domain(path: str) -> None:
+        if is_gifti(path) != surface:
+            raise SystemExit(f"❌ {path} has a different volume/surface domain from -betas")
+        if surface:
+            other = load_nifti(path)
+            if (surface_meta(other.header) or {}).get("mesh_fingerprint") != source_mesh:
+                raise SystemExit(f"❌ {path} does not match the betas mesh fingerprint")
+
     data = np.asanyarray(img.dataobj)
     if data.ndim != 4:
         raise SystemExit(f"❌ -betas must be 4-D (one volume per trial), got {data.ndim}-D")
@@ -910,6 +922,7 @@ def main() -> int:
         print(f"   Kept {n_trials} of {n_rows_total} volumes after -drop_trials")
 
     if args.mask:
+        check_domain(args.mask)
         mask = np.asanyarray(load_nifti(args.mask).dataobj).astype(bool)
         if mask.shape != vol_shape:
             raise SystemExit(f"❌ mask {mask.shape} does not match betas grid {vol_shape}")
@@ -924,6 +937,7 @@ def main() -> int:
     roi_ids: list | None = None
     roi_spec: np.ndarray | None = None
     if args.atlas:
+        check_domain(args.atlas)
         atlas = np.asanyarray(load_nifti(args.atlas).dataobj)
         if atlas.shape[:3] != vol_shape:
             raise SystemExit(f"❌ atlas grid {atlas.shape[:3]} does not match betas {vol_shape}")
@@ -1109,7 +1123,9 @@ def main() -> int:
             maps[f"oneminusp_unc_{base}"] = 1.0 - perm_res.p_uncorrected[key]
             maps[f"oneminusp_fwe_{base}"] = 1.0 - perm_res.p_fwe[key]
 
-    info = parse_prefix(args.prefix)
+    info = parse_prefix(args.prefix, default_ext=".shape.gii" if surface else ".nii.gz")
+    if is_gifti(args.prefix) != surface and args.prefix != info.stem:
+        raise SystemExit("❌ -prefix output domain must match -betas")
     stem = info.stem
 
     assert res.heldout_sst is not None and res.noise_ceiling is not None
@@ -1321,7 +1337,9 @@ def main() -> int:
             stacked[..., i] = vol
 
     out_path = f"{stem}{info.nifti_ext}"
-    save_nifti(stacked, output_path=out_path, affine=img.affine, brick_labels=names)
+    save_nifti(
+        stacked, output_path=out_path, affine=img.affine, header=img.header, brick_labels=names
+    )
     kind = "parcel-painted" if roi_ids is not None else "voxelwise"
     print(f"💾 Wrote {out_path} ({len(maps)} sub-bricks, {kind})")
     for i, name in enumerate(names):

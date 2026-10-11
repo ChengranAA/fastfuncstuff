@@ -7,10 +7,14 @@ carries a per-trial suffix on the condition label that must come off.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.cli.util_noiseceiling import _index_labels, _read_trial_table
+nib = pytest.importorskip("nibabel")
+
+from fastfuncstuff.cli.util_noiseceiling import _index_labels, _read_trial_table, main
+from fastfuncstuff.io.gifti import save_gifti_data
 
 
 def _write(tmp_path, name, text):
@@ -96,6 +100,86 @@ class TestParserWiring:
             ["-input", "a.nii.gz", "-identical_sets", "movieA", "movieA", "-prefix", "o"]
         )
         assert args.identical_sets == ["movieA", "movieA"]
+
+
+def test_surface_repeats_preserve_mesh_and_reject_mixed_domains(tmp_path, monkeypatch):
+    rng = np.random.default_rng(7)
+    paths = []
+    for i in range(3):
+        path = tmp_path / f"run{i}.func.gii"
+        save_gifti_data(path, rng.normal(size=(6, 35)), meta={"mesh_fingerprint": "meshA"})
+        paths.append(path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "ffs_util_noiseceiling",
+            "-input",
+            *map(str, paths),
+            "-identical_sets",
+            "1",
+            "1",
+            "1",
+            "-prefix",
+            str(tmp_path / "ceiling"),
+            "-device",
+            "cpu",
+        ],
+    )
+    main()
+    output = nib.load(str(tmp_path / "ceiling_noise_ceiling.shape.gii"))
+    assert len(output.darrays) == 1
+    assert dict(output.meta)["mesh_fingerprint"] == "meshA"
+    wrong = tmp_path / "wrong.nii.gz"
+    nib.save(nib.Nifti1Image(np.ones((6, 1, 1)), np.eye(4)), wrong)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "ffs_util_noiseceiling",
+            "-input",
+            *map(str, paths),
+            "-identical_sets",
+            "1",
+            "1",
+            "1",
+            "-mask",
+            str(wrong),
+            "-prefix",
+            str(tmp_path / "bad"),
+            "-device",
+            "cpu",
+        ],
+    )
+    with pytest.raises(SystemExit, match="different volume/surface domain"):
+        main()
+
+
+def test_surface_beta_ceiling_and_xval_domain(tmp_path, monkeypatch):
+    rng = np.random.default_rng(13)
+    betas = tmp_path / "betas.func.gii"
+    save_gifti_data(betas, rng.normal(size=(8, 12)), meta={"mesh_fingerprint": "meshB"})
+    table = tmp_path / "trials.tsv"
+    table.write_text("condition\trun_index\n" + "".join(f"{i % 2}\t{i // 4}\n" for i in range(12)))
+    argv = [
+        "ffs_util_noiseceiling",
+        "-betas",
+        str(betas),
+        "-trial_table",
+        str(table),
+        "-prefix",
+        str(tmp_path / "beta_ceiling"),
+        "-device",
+        "cpu",
+    ]
+    monkeypatch.setattr("sys.argv", argv)
+    main()
+    out = nib.load(str(tmp_path / "beta_ceiling_ncsnr.shape.gii"))
+    assert len(out.darrays) == 1
+    assert dict(out.meta)["mesh_fingerprint"] == "meshB"
+    other = tmp_path / "r2.nii.gz"
+    nib.save(nib.Nifti1Image(np.ones((8, 1, 1)), np.eye(4)), other)
+    monkeypatch.setattr("sys.argv", [*argv, "-xval_r2", str(other)])
+    with pytest.raises(SystemExit, match="different volume/surface domain"):
+        main()
 
 
 class TestSplitHalfCeilingViaCli:

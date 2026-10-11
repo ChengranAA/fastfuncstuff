@@ -26,6 +26,7 @@ from test_variance_partition import (  # noqa: E402
 )
 
 from fastfuncstuff.cli.varpart import CEILING_FLOOR, _summarize_effects, main  # noqa: E402
+from fastfuncstuff.io.gifti import save_gifti_data  # noqa: E402
 
 
 def _fixture(tmp_path, shape=(4, 4, 3), noise=1.0, seed=0, drop_col=None):
@@ -61,6 +62,53 @@ def _run(args):
         return main()
     finally:
         sys.argv = argv
+
+
+def test_surface_map_preserves_mesh_and_rejects_volume_mask(tmp_path):
+    betas, tsv, shape, n_trials = _fixture(tmp_path, shape=(3, 2, 1))
+    data = np.asarray(nib.load(str(betas)).dataobj).reshape(6, n_trials)
+    surface = tmp_path / "betas.func.gii"
+    save_gifti_data(surface, data, meta={"mesh_fingerprint": "meshA"})
+    out = tmp_path / "surface_vp"
+    assert (
+        _run(
+            [
+                "-betas",
+                str(surface),
+                "-trials",
+                str(tsv),
+                "-factors",
+                "stim,task",
+                "-prefix",
+                str(out),
+                "-device",
+                "cpu",
+                "-quiet",
+            ]
+        )
+        == 0
+    )
+    img = nib.load(str(out) + ".shape.gii")
+    assert dict(img.meta)["mesh_fingerprint"] == "meshA"
+    assert len(img.darrays) == 23
+    with pytest.raises(SystemExit, match="different volume/surface domain"):
+        _run(
+            [
+                "-betas",
+                str(surface),
+                "-trials",
+                str(tsv),
+                "-factors",
+                "stim,task",
+                "-mask",
+                str(betas),
+                "-prefix",
+                str(tmp_path / "bad"),
+                "-device",
+                "cpu",
+                "-quiet",
+            ]
+        )
 
 
 def test_summary_pools_explained_sums_of_squares():

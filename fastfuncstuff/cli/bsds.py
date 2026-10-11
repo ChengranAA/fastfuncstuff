@@ -51,6 +51,7 @@ from fastfuncstuff.dynamics.bsds.model import fit_bsds, posterior_arrays
 from fastfuncstuff.dynamics.graph import state_graph_metrics
 from fastfuncstuff.dynamics.parcellate import (
     parcellate_atlas,
+    parcellate_surface_atlas,
     parcellate_voronoi,
     parcellate_ward,
 )
@@ -172,7 +173,15 @@ def _load_sessions(args) -> tuple[list[np.ndarray], np.ndarray | None, dict[str,
             )
         m = reference_mask
         if args.parcellation == "atlas":
-            run_labels, ts = parcellate_atlas(bold, atlas3d, mask3d=m, aggregate=args.aggregate)
+            if mesh is not None:
+                run_labels, ts = parcellate_surface_atlas(
+                    bold[:, 0, 0, :],
+                    atlas3d[:, 0, 0],
+                    mask_v=m[:, 0, 0],
+                    aggregate=args.aggregate,
+                )
+            else:
+                run_labels, ts = parcellate_atlas(bold, atlas3d, mask3d=m, aggregate=args.aggregate)
         elif args.parcellation == "ward":
             run_labels, ts = parcellate_ward(bold, m, args.n_parcels, aggregate=args.aggregate)
         elif args.parcellation == "voronoi":
@@ -624,16 +633,14 @@ def _save_outputs(
     k = model.n_states
     parcel_map_path = None
     if atlas_meta is not None:
-        from fastfuncstuff.io.gifti import save_gifti_data
+        from fastfuncstuff.io.gifti import load_gifti_data, save_gifti_data
 
-        atlas_map = _load_volume(args.atlas)
-        atlas_map = atlas_map[..., 0] if atlas_map.ndim == 4 else atlas_map
+        atlas_map, _ = load_gifti_data(args.atlas)
         if args.mask:
-            mask_map = _load_volume(args.mask)
-            mask_map = mask_map[..., 0] if mask_map.ndim == 4 else mask_map
+            mask_map, _ = load_gifti_data(args.mask)
             atlas_map = np.where(mask_map > 0, atlas_map, 0)
         parcel_map_path = f"{stem}_parcel_labels.shape.gii"
-        save_gifti_data(parcel_map_path, atlas_map[:, 0, 0], meta=atlas_meta)
+        save_gifti_data(parcel_map_path, atlas_map, meta=atlas_meta)
 
     with spinner(f"Writing {stem}_model.npz"):
         np.savez(

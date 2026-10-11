@@ -9,6 +9,7 @@ from fastfuncstuff.dynamics.parcellate import (
     _grid_adjacency,
     aggregate_by_labels,
     parcellate_atlas,
+    parcellate_surface_atlas,
     parcellate_voronoi,
 )
 
@@ -106,3 +107,13 @@ def test_parcellate_ward_recovers_blocks():
     # The two parcel timeseries should be well separated (low mutual correlation).
     c = np.corrcoef(ts)[0, 1]
     assert abs(c) < 0.5
+
+
+def test_surface_atlas_uses_vertex_labels_and_mask():
+    ts = np.arange(20, dtype=float).reshape(4, 5)
+    labels = np.array([1, 1, 2, 0])
+    ids, parcels = parcellate_surface_atlas(ts, labels, mask_v=np.array([1, 0, 1, 1]))
+    np.testing.assert_array_equal(ids, [1, 2])
+    np.testing.assert_array_equal(parcels, ts[[0, 2]])
+    with pytest.raises(ValueError, match="surface data need"):
+        parcellate_surface_atlas(ts, labels[:-1])

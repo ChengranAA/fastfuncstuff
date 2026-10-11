@@ -118,6 +118,34 @@ def parcellate_atlas(
     return aggregate_by_labels(ts, labels_v, aggregate)
 
 
+def parcellate_surface_atlas(
+    bold_vt: np.ndarray,
+    atlas_v: np.ndarray,
+    *,
+    mask_v: np.ndarray | None = None,
+    aggregate: str = "mean",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Aggregate vertex time series using labels on the same ordered mesh.
+
+    Mesh-fingerprint validation belongs to the image loader. This primitive works
+    on one-dimensional vertex indices, never a synthetic 3-D voxel grid.
+    """
+    bold_vt = np.asarray(bold_vt)
+    atlas_v = np.asarray(atlas_v)
+    if bold_vt.ndim != 2 or atlas_v.shape != (bold_vt.shape[0],):
+        raise ValueError(
+            f"surface data need (V, T) and (V,) atlas; got {bold_vt.shape}, {atlas_v.shape}"
+        )
+    if mask_v is not None and np.asarray(mask_v).shape != atlas_v.shape:
+        raise ValueError(
+            f"surface mask shape {np.shape(mask_v)} does not match atlas {atlas_v.shape}"
+        )
+    vertices = atlas_v > 0
+    if mask_v is not None:
+        vertices &= np.asarray(mask_v, dtype=bool)
+    return aggregate_by_labels(bold_vt[vertices], atlas_v[vertices], aggregate)
+
+
 def parcellate_voronoi(
     bold4d: np.ndarray,
     mask3d: np.ndarray,

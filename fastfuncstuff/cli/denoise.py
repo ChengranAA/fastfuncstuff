@@ -1983,6 +1983,28 @@ def save_model_fit_outputs(
     return output_files
 
 
+def _denoise_output_extension(
+    input_files: list[str], prefix: str, automask: bool = False, cv_blur: float | None = None
+) -> str:
+    from fastfuncstuff.io.gifti import is_gifti
+
+    surface = [is_gifti(str(path).split("[")[0]) for path in input_files]
+    if any(value != surface[0] for value in surface):
+        raise ValueError("Mixed surface/volume runs need explicit matched-domain inputs; fit each domain separately")
+    ext = parse_prefix(prefix).nifti_ext
+    if surface[0]:
+        if automask:
+            raise ValueError("-automask is volume-only; use a GIfTI -mask for surface data")
+        if cv_blur is not None:
+            raise ValueError("-cv_blur is volume-only; use -do_blur with a GIfTI -mask for surface data")
+        if prefix.endswith((".nii", ".nii.gz", ".nii.zst")):
+            raise ValueError("Surface outputs require a GIfTI -prefix, not a NIfTI extension")
+        return ".func.gii" if ext == ".nii.gz" else ext
+    if ext.endswith(".gii"):
+        raise ValueError("Volume outputs require a NIfTI -prefix, not a GIfTI extension")
+    return ext
+
+
 def main():
     parser = create_parser()
 
@@ -1993,14 +2015,23 @@ def main():
     args = parser.parse_args()
     _resolve_component_count(args)
 
+    requested_prefix = args.prefix
     pfx = parse_prefix(args.prefix)
     args.prefix = pfx.stem  # overwrite with clean stem
-    _nii_ext = pfx.nifti_ext
 
     print_header(args)
 
     # Parse and validate inputs
     input_files = parse_input_files(args.input)
+    from fastfuncstuff.io.gifti import is_gifti
+
+    surface_input = is_gifti(str(input_files[0]).split("[")[0])
+    try:
+        _nii_ext = _denoise_output_extension(
+            input_files, requested_prefix, args.automask, args.cv_blur
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     n_runs = len(input_files)
 
     if n_runs < 2:
@@ -3451,6 +3482,7 @@ def main():
             affine=affine,
             voxel_mask=voxel_mask,
             nifti_header=nifti_header,
+            nii_ext=_nii_ext,
         )
 
         if beta_ceiling is not None and beta_ceiling.result.n_usable:
@@ -3729,9 +3761,8 @@ def main():
                         f"  Component diagnostics: method={args.noise.upper()}, map_space={args.component_map_space}"
                     )
 
-                    # Only compute spatial loadings if mask matches data
-                    # Otherwise, just plot timecourses without spatial maps
-                    if mask_mismatch:
+                    # A cortical sheet cannot be displayed as axial/sagittal slices.
+                    if mask_mismatch or surface_input:
                         # Skip spatial weight computation - just plot timecourses
                         loadings_cpu = None
                         noise_pool_mask_for_plot = None
@@ -3764,7 +3795,7 @@ def main():
                         run_starts=run_starts,
                         component_variance_ratio_per_run=ic_variance_ratio_per_run,
                         pc_weights_per_run=loadings_cpu,  # None = no spatial maps
-                        volume_shape=volume_shape,
+                        volume_shape=None if surface_input else volume_shape,
                         voxel_mask=voxel_mask_np,
                         noise_pool_mask=noise_pool_mask_for_plot,
                         n_pcs_to_show=n_pcs_to_show,

@@ -1566,6 +1566,7 @@ def save_single_trial_results(
     voxel_mask: torch.Tensor | None = None,
     nifti_header: object | None = None,
     xval_metric_name: str = "r2",
+    nii_ext: str = ".nii.gz",
 ) -> dict[str, str]:
     """
     Save single-trial output files for GLMsingle-style analysis.
@@ -1638,7 +1639,7 @@ def save_single_trial_results(
         return full.reshape((*volume_shape, n_vols))
 
     # 1. Single-trial betas (4D)
-    betas_path = f"{output_prefix}_single_trial_betas.nii.gz"
+    betas_path = f"{output_prefix}_single_trial_betas{nii_ext}"
     save_nifti(to_volume_4d(betas), output_path=betas_path, affine=affine, header=nifti_header)
     output_files["single_trial_betas"] = betas_path
     print(f"  Saved: {betas_path} ({n_trials} trials)")
@@ -1647,7 +1648,7 @@ def save_single_trial_results(
     metric_token = (xval_metric_name or "r2").strip().lower().replace(" ", "_")
     if not metric_token:
         metric_token = "r2"
-    xval_path = f"{output_prefix}_single_trial_xval_{metric_token}.nii.gz"
+    xval_path = f"{output_prefix}_single_trial_xval_{metric_token}{nii_ext}"
     save_nifti(to_volume_3d(xval_r2), output_path=xval_path, affine=affine, header=nifti_header)
     output_files["single_trial_xval"] = xval_path
     # Backward-compatible alias for older consumers expecting the old key.
@@ -1661,7 +1662,7 @@ def save_single_trial_results(
         if mask.sum() > 0:
             condition_betas[:, c] = betas[:, mask].mean(dim=1)
 
-    cond_path = f"{output_prefix}_single_trial_condition_betas.nii.gz"
+    cond_path = f"{output_prefix}_single_trial_condition_betas{nii_ext}"
     save_nifti(
         to_volume_4d(condition_betas), output_path=cond_path, affine=affine, header=nifti_header
     )

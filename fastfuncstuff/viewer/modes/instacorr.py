@@ -194,9 +194,10 @@ class InstaCorrMode(Mode):
             sigma = fwhm_mm_to_sigma_vox(blur, self._zooms)
             vol = torch.as_tensor(self._source, dtype=torch.float32)
             vol = gaussian3d_batched(vol.permute(3, 0, 1, 2).to(device), sigma)
-            # (T,X,Y,Z) -> (V,T). The one transpose in the pipeline, and only
-            # on the opt-in path.
-            data = vol.reshape(nt, -1).T.contiguous()
+            # The blur keeps its input's strides, so this is still the store's
+            # (X,Y,Z,T) layout under a (T,X,Y,Z) view: permuting back to
+            # (V,T) is free, where reshaping as (T,V) would copy it twice.
+            data = vol.permute(1, 2, 3, 0).reshape(-1, nt)
         else:
             # The store keeps the array C-contiguous, so this is a free view of
             # data that is already resident -- no copy, no upload on CPU.
@@ -214,13 +215,15 @@ class InstaCorrMode(Mode):
         data = self._bandpass(data)
 
         step(0.85, "normalize")
+        # Out of place: until here ``data`` may still be a view of the store's
+        # array. Everything after works on this fresh copy, in place.
         data = data - data.mean(-1, keepdim=True)
         norm = data.norm(dim=-1, keepdim=True)
         # Constant voxels -- outside the brain, mostly -- would divide by zero
         # and then correlate perfectly with everything.
         self._valid = (norm > 1e-9).squeeze(-1)
-        data = data / norm.clamp(min=1e-9)
-        self._prepared = torch.where(self._valid.unsqueeze(-1), data, torch.zeros_like(data))
+        data.div_(norm.clamp_(min=1e-9))
+        self._prepared = data.masked_fill_(~self._valid.unsqueeze(-1), 0.0)
         self._shape = (nx, ny, nz)
         self._dirty = False
         step(1.0, "ready")

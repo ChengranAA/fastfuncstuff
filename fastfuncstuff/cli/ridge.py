@@ -419,8 +419,6 @@ def main():
         )
     if args.surface_input and args.dry_run:
         parser.error("paired -surface_input does not support -dry_run")
-    if args.surface_input and args.hrf_opt:
-        parser.error("paired -surface_input does not support -hrf_opt without paired HRF maps")
 
     # Validate onset/events mutual exclusivity
     _has_onsets = bool(args.onsets)
@@ -496,6 +494,7 @@ def main():
             volume_mask=args.mask,
             surface_mask=args.surface_mask,
             device=device,
+            load_threads=args.load_threads,
             drop_first=args.drop_first,
             drop_last=args.drop_last,
         )
@@ -530,13 +529,18 @@ def main():
     elif pfx.nifti_ext.endswith(".gii"):
         raise ValueError("GIfTI output requires surface input")
 
-    # Extract loaded data
-    data = paired.data if paired is not None else load_result.data
+    # Extract loaded data. Paired runs present one pseudo-grid whose header
+    # splits every saved map back into its volume and surface files.
     run_starts = load_result.run_starts
-    mask = load_result.mask
-    mask_flat = load_result.mask_flat
     affine = load_result.affine
-    volume_shape = load_result.volume_shape
+    if paired is not None:
+        data = paired.data
+        mask, mask_flat = paired.mask, paired.mask_flat
+        volume_shape = paired.header.shape
+    else:
+        data = load_result.data
+        mask, mask_flat = load_result.mask, load_result.mask_flat
+        volume_shape = load_result.volume_shape
     n_voxels = data.shape[0]
     n_timepoints = load_result.n_timepoints
     n_runs = load_result.n_runs
@@ -551,7 +555,7 @@ def main():
     # Every field is unpacked; drop the loader's handle so the full-volume
     # (n_voxels, n_timepoints) tensor has exactly one reference and any later
     # shrink of *data* can actually free the pre-mask copy.
-    nifti_header = load_result.nifti_header
+    nifti_header = paired.header if paired is not None else load_result.nifti_header
     del load_result
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
     try:
@@ -1262,6 +1266,8 @@ def main():
     # Save outputs
     print()
     print("Saving outputs...")
+    if paired is not None:
+        print(f"  Each map below is written as *_volume{_nii_ext} and *_surface.shape.gii")
     output_prefix = Path(args.prefix)
     output_dir = output_prefix.parent
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1269,56 +1275,6 @@ def main():
     # Get volume shape and affine for saving
     vol_shape = volume_shape
     # affine is already extracted from load_result
-
-    def save_paired_map(values, filename, _shape, _affine, _mask=None, **kwargs):
-        if paired is None:
-            return save_volume_nifti(values, filename, _shape, _affine, _mask, **kwargs)
-        volume_path = filename.replace(_nii_ext, f"_volume{pfx.nifti_ext}")
-        surface_path = filename.replace(_nii_ext, "_surface.shape.gii")
-        paired.save_map(values, volume_path, surface_path)
-
-    def save_paired_series(values, filename, _shape, _affine, _mask=None, **kwargs):
-        if paired is None:
-            return save_4d_nifti(values, filename, _shape, _affine, _mask, **kwargs)
-        volume_path = filename.replace(_nii_ext, f"_volume{pfx.nifti_ext}")
-        surface_path = filename.replace(_nii_ext, "_surface.shape.gii")
-        paired.save_map(values, volume_path, surface_path)
-
-    def save_paired_stack(layers, filename, _shape, _affine, _mask=None, **kwargs):
-        if paired is None:
-            return save_r2_ceiling_stack(layers, filename, _shape, _affine, _mask, **kwargs)
-        from fastfuncstuff.io.afni import save_nifti
-
-        present = [(values, label) for values, label in layers if values is not None]
-        if not present:
-            raise ValueError("R² stack needs at least one map")
-        split = [paired.split_map(values) for values, _ in present]
-        for domain_index, domain, suffix in (
-            (0, paired.volume, f"_volume{pfx.nifti_ext}"),
-            (1, paired.surface, "_surface.shape.gii"),
-        ):
-            maps = []
-            for parts in split:
-                part = parts[domain_index]
-                arr = (
-                    part.detach().cpu().numpy()
-                    if isinstance(part, torch.Tensor)
-                    else np.asarray(part)
-                )
-                if domain.mask_flat is not None:
-                    full = np.zeros(int(np.prod(domain.volume_shape)), np.float32)
-                    full[domain.mask_flat] = arr
-                    arr = full
-                maps.append(arr.reshape(domain.volume_shape))
-            stack = np.stack(maps, axis=-1) if len(maps) > 1 else maps[0]
-            save_nifti(
-                stack.astype(np.float32),
-                output_path=filename.replace(_nii_ext, suffix),
-                affine=domain.affine,
-                header=domain.nifti_header,
-                brick_labels=[label for _, label in present] if len(present) > 1 else None,
-            )
-        return filename.replace(_nii_ext, f"_volume{pfx.nifti_ext}")
 
     # Companion table describing every single-trial volume (both output paths below
     # write one volume per trial, in the design's chronological order).
@@ -1341,78 +1297,28 @@ def main():
         voxel_mask_tensor = torch.from_numpy(mask_flat) if mask is not None else None
 
         with spinner("Writing single-trial results"):
-            if paired is None:
-                outputs = [
-                    (
-                        final_betas,
-                        xval_r2,
-                        args.prefix,
-                        vol_shape,
-                        affine,
-                        voxel_mask_tensor,
-                        nifti_header,
-                        _nii_ext,
-                    )
-                ]
-            else:
-                outputs = []
-                betas_parts = paired.split_map(final_betas)
-                r2_parts = paired.split_map(xval_r2)
-                for domain, suffix, betas_part, r2_part, ext in zip(
-                    (paired.volume, paired.surface),
-                    ("volume", "surface"),
-                    betas_parts,
-                    r2_parts,
-                    (pfx.nifti_ext, ".shape.gii"),
-                    strict=True,
-                ):
-                    domain_mask = (
-                        torch.from_numpy(domain.mask_flat) if domain.mask_flat is not None else None
-                    )
-                    outputs.append(
-                        (
-                            betas_part,
-                            r2_part,
-                            f"{args.prefix}_{suffix}",
-                            domain.volume_shape,
-                            domain.affine,
-                            domain_mask,
-                            domain.nifti_header,
-                            ext,
-                        )
-                    )
-            for (
-                betas_part,
-                r2_part,
-                prefix_part,
-                shape,
-                domain_affine,
-                domain_mask,
-                domain_header,
-                ext,
-            ) in outputs:
-                save_single_trial_results(
-                    betas=betas_part,
-                    xval_r2=r2_part,
-                    trial_labels=trial_labels,
-                    trial_condition_ids=trial_condition_ids,
-                    trial_run_ids=trial_run_ids,
-                    condition_labels=condition_labels,
-                    output_prefix=str(prefix_part),
-                    volume_shape=shape,
-                    affine=domain_affine,
-                    voxel_mask=domain_mask,
-                    xval_metric_name=cv_metric_token,
-                    nifti_header=domain_header,
-                    nii_ext=ext,
-                )
+            save_single_trial_results(
+                betas=final_betas,
+                xval_r2=xval_r2,
+                trial_labels=trial_labels,
+                trial_condition_ids=trial_condition_ids,
+                trial_run_ids=trial_run_ids,
+                condition_labels=condition_labels,
+                output_prefix=str(args.prefix),
+                volume_shape=vol_shape,
+                affine=affine,
+                voxel_mask=voxel_mask_tensor,
+                xval_metric_name=cv_metric_token,
+                nifti_header=nifti_header,
+                nii_ext=_nii_ext,
+            )
 
         # Also save ridge-specific outputs
         voxel_mask_np = mask_flat if mask is not None else None
         if stim_vec_betas is not None:
             # The background is modelled, so report it: one sub-brick per stim
             # vector column, beside the trial betas rather than inside them.
-            save_paired_series(
+            save_4d_nifti(
                 stim_vec_betas,
                 f"{args.prefix}_stim_vec_betas{_nii_ext}",
                 vol_shape,
@@ -1421,7 +1327,7 @@ def main():
                 header=nifti_header,
             )
             print(f"  {args.prefix}_stim_vec_betas{_nii_ext}  ({', '.join(stim_vec_labels)})")
-        save_paired_map(
+        save_volume_nifti(
             full_r2,
             f"{args.prefix}_single_trial_full_r2{_nii_ext}",
             vol_shape,
@@ -1430,7 +1336,7 @@ def main():
             header=nifti_header,
         )
         print(f"  {args.prefix}_single_trial_full_r2{_nii_ext}")
-        save_paired_map(
+        save_volume_nifti(
             optimal_fracs,
             f"{args.prefix}_optimal_frac{_nii_ext}",
             vol_shape,
@@ -1439,7 +1345,7 @@ def main():
             header=nifti_header,
         )
         print(f"  {args.prefix}_optimal_frac{_nii_ext}")
-        save_paired_series(
+        save_4d_nifti(
             r2_by_frac,
             f"{args.prefix}_{cv_metric_token}_by_frac{_nii_ext}",
             vol_shape,
@@ -1475,7 +1381,7 @@ def main():
             if ceiling.result.n_usable:
                 # Stacked onto the very R2 the ceiling was built from, not onto
                 # whichever map has the closest filename.
-                path = save_paired_stack(
+                path = save_r2_ceiling_stack(
                     [
                         (xval_r2, "xval_R2"),
                         (ceiling.result.ceiling, "noise_ceiling"),
@@ -1497,7 +1403,7 @@ def main():
         voxel_mask_np = mask_flat if mask is not None else None
 
         # Save R² maps and optimal fractions
-        save_paired_map(
+        save_volume_nifti(
             results.r2_initial,
             f"{args.prefix}_r2_initial{_nii_ext}",
             vol_shape,
@@ -1506,7 +1412,7 @@ def main():
             header=nifti_header,
         )
         print(f"  {args.prefix}_r2_initial{_nii_ext}")
-        save_paired_map(
+        save_volume_nifti(
             results.r2,
             f"{args.prefix}_r2{_nii_ext}",
             vol_shape,
@@ -1515,7 +1421,7 @@ def main():
             header=nifti_header,
         )
         print(f"  {args.prefix}_r2{_nii_ext}")
-        save_paired_map(
+        save_volume_nifti(
             results.xval_r2,
             f"{args.prefix}_xval_r2{_nii_ext}",
             vol_shape,
@@ -1524,7 +1430,7 @@ def main():
             header=nifti_header,
         )
         print(f"  {args.prefix}_xval_r2{_nii_ext}")
-        save_paired_map(
+        save_volume_nifti(
             results.optimal_fracs,
             f"{args.prefix}_optimal_frac{_nii_ext}",
             vol_shape,
@@ -1535,7 +1441,7 @@ def main():
         print(f"  {args.prefix}_optimal_frac{_nii_ext}")
 
         # Save single-trial betas (4D file)
-        save_paired_series(
+        save_4d_nifti(
             results.betas_single_trial,
             f"{args.prefix}_betas_single_trial{_nii_ext}",
             vol_shape,
@@ -1562,7 +1468,7 @@ def main():
             if cond_mask.sum() > 0:
                 condition_betas[:, cond_idx] = results.betas_single_trial[:, cond_mask].mean(dim=1)
 
-        save_paired_series(
+        save_4d_nifti(
             condition_betas,
             f"{args.prefix}_betas_condition{_nii_ext}",
             vol_shape,
@@ -1580,7 +1486,7 @@ def main():
         print(f"  {condition_labels_file}")
 
         # Save R² per ridge fraction (4D file with one volume per fraction)
-        save_paired_series(
+        save_4d_nifti(
             results.r2_by_frac,
             f"{args.prefix}_r2_by_frac{_nii_ext}",
             vol_shape,
@@ -1601,7 +1507,7 @@ def main():
         if args.do_scale and violations_mask is not None and scale_info is not None:
             # Sum violations across time to get count per voxel
             violation_counts = violations_mask.cpu().sum(dim=1).numpy()  # (n_voxels,)
-            save_paired_map(
+            save_volume_nifti(
                 torch.from_numpy(violation_counts),
                 f"{args.prefix}_scale_violations{_nii_ext}",
                 vol_shape,

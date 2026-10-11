@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -12,14 +12,94 @@ from fastfuncstuff.cli_utils import LoadResult, load_and_preprocess_runs
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.io.gifti import is_gifti, surface_meta
 
+_VOLUME_EXTS = (".nii.gz", ".nii.zst", ".nii")
+
+
+@dataclass(frozen=True)
+class PairedHeader:
+    """Header for a location axis that is a volume grid followed by a surface mesh.
+
+    Paired data is laid out on a pseudo-grid of shape ``(n_grid + n_vertices, 1, 1)``
+    so mask, restrict and scatter code written for one domain works unchanged.
+    ``save_nifti`` recognises this header and writes ``<stem>_volume<ext>`` and
+    ``<stem>_surface<surface_ext>``, each with its own geometry.
+    """
+
+    volume_shape: tuple
+    volume_affine: np.ndarray
+    volume_header: object
+    surface_shape: tuple
+    surface_header: object
+    surface_ext: str = ".shape.gii"
+
+    @property
+    def n_volume(self) -> int:
+        return int(np.prod(self.volume_shape))
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.n_volume + int(np.prod(self.surface_shape)), 1, 1)
+
+    def copy(self) -> PairedHeader:
+        return self
+
+    def paths(self, output_path: str | Path) -> tuple[str, str]:
+        path = str(output_path)
+        ext = next((e for e in _VOLUME_EXTS if path.endswith(e)), None)
+        if ext is None:
+            raise ValueError(f"Paired outputs need a NIfTI path to split, got {path}")
+        stem = path[: -len(ext)]
+        return f"{stem}_volume{ext}", f"{stem}_surface{self.surface_ext}"
+
+    def save(self, data: np.ndarray, output_path: str | Path, **kwargs) -> None:
+        from fastfuncstuff.io.afni import save_nifti
+
+        data = np.asarray(data)
+        if data.shape[:3] != self.shape:
+            raise ValueError(f"Paired data must be shaped {self.shape}, got {data.shape}")
+        rest = data.shape[3:]
+        flat = data.reshape(self.shape[0], *rest)
+        volume_path, surface_path = self.paths(output_path)
+        save_nifti(
+            flat[: self.n_volume].reshape(*self.volume_shape, *rest),
+            volume_path,
+            affine=self.volume_affine,
+            header=self.volume_header,
+            **kwargs,
+        )
+        save_nifti(
+            flat[self.n_volume :].reshape(*self.surface_shape, *rest),
+            surface_path,
+            header=self.surface_header,
+            **kwargs,
+        )
+
 
 @dataclass
 class PairedRuns:
     data: torch.Tensor  # (volume locations + surface locations, total time)
     run_starts: list[int]
     tr: float
-    volume: LoadResult
+    volume: LoadResult  # geometry only; its data is released once concatenated
     surface: LoadResult
+    header: PairedHeader
+    keep_on_cpu: bool
+
+    @property
+    def mask_flat(self) -> np.ndarray:
+        """In-analysis locations on the pseudo-grid (see PairedHeader)."""
+        return np.concatenate(
+            [
+                d.mask_flat
+                if d.mask_flat is not None
+                else np.ones(int(np.prod(d.volume_shape)), bool)
+                for d in (self.volume, self.surface)
+            ]
+        )
+
+    @property
+    def mask(self) -> np.ndarray:
+        return self.mask_flat.reshape(self.header.shape)
 
     def split_map(
         self, values: torch.Tensor | np.ndarray
@@ -78,8 +158,11 @@ def load_paired_runs(
     surface_mask: str | None = None,
     blur_fwhm: float | None = None,
     device: torch.device = torch.device("cpu"),
+    force_cpu: bool = False,
+    load_threads: int | None = None,
     drop_first: int = 0,
     drop_last: int = 0,
+    surface_ext: str = ".shape.gii",
 ) -> PairedRuns:
     """Match two spatial domains by run index, then concatenate their locations.
 
@@ -107,6 +190,8 @@ def load_paired_runs(
         tr=effective_tr,
         blur_fwhm=blur_fwhm,
         device=device,
+        force_cpu=force_cpu,
+        load_threads=load_threads,
         drop_first=drop_first,
         drop_last=drop_last,
         verbose=False,
@@ -117,10 +202,21 @@ def load_paired_runs(
         raise ValueError("Paired runs must have equal time lengths after trimming")
     if not np.isclose(volume.tr, surface.tr):
         raise ValueError("Paired runs have inconsistent TR")
-    return PairedRuns(
-        torch.cat((volume.data, surface.data), dim=0),
-        volume.run_starts,
-        effective_tr,
-        volume,
-        surface,
+    # Each domain sized its own device strategy; if either had to stay on the
+    # host the combined matrix must too.
+    keep_on_cpu = volume.keep_on_cpu or surface.keep_on_cpu
+    target = torch.device("cpu") if keep_on_cpu else volume.data.device
+    data = torch.cat((volume.data.to(target), surface.data.to(target)), dim=0)
+    # The per-domain copies would otherwise sit beside the concatenation for the
+    # whole fit, doubling the resident data.
+    empty = torch.empty(0)
+    volume, surface = replace(volume, data=empty), replace(surface, data=empty)
+    header = PairedHeader(
+        tuple(volume.volume_shape),
+        volume.affine,
+        volume.nifti_header,
+        tuple(surface.volume_shape),
+        surface.nifti_header,
+        surface_ext,
     )
+    return PairedRuns(data, volume.run_starts, effective_tr, volume, surface, header, keep_on_cpu)

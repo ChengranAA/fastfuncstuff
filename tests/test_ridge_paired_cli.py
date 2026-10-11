@@ -59,16 +59,8 @@ def test_paired_ridge_cli(tmp_path, monkeypatch, single_trials):
     monkeypatch.setattr(sys, "argv", argv)
     main()
     tag = "single_trial_betas" if single_trials else "betas_single_trial"
-    vol_path = (
-        tmp_path / f"ridge_volume_{tag}.nii.gz"
-        if single_trials
-        else tmp_path / "ridge_betas_single_trial_volume.nii.gz"
-    )
-    surf_path = (
-        tmp_path / f"ridge_surface_{tag}.shape.gii"
-        if single_trials
-        else tmp_path / "ridge_betas_single_trial_surface.shape.gii"
-    )
+    vol_path = tmp_path / f"ridge_{tag}_volume.nii.gz"
+    surf_path = tmp_path / f"ridge_{tag}_surface.shape.gii"
     assert nib.load(vol_path).shape[:3] == (2, 2, 2)
     values, meta = load_gifti_data(surf_path)
     assert values.shape[0] == 4

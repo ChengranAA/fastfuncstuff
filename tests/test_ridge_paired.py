@@ -100,14 +100,14 @@ def test_paired_single_trials_outputs(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", args + ["-single_trials"])
     main()
     for domain, ext, spatial in (("volume", ".nii.gz", (2, 2, 2)), ("surface", ".shape.gii", (4,))):
-        path = tmp_path / f"ridge_{domain}_single_trial_betas{ext}"
+        path = tmp_path / f"ridge_single_trial_betas_{domain}{ext}"
         if domain == "volume":
             assert nib.load(str(path)).shape == (*spatial, 6)
         else:
             data, meta = load_gifti_data(path)
             assert data.shape == (*spatial, 6)
             assert meta["mesh_fingerprint"] == "V4_F2_test"
-        assert (tmp_path / f"ridge_{domain}_single_trial_xval_sse{ext}").exists()
+        assert (tmp_path / f"ridge_single_trial_xval_sse_{domain}{ext}").exists()
     for stem in ("optimal_frac", "single_trial_full_r2", "sse_by_frac"):
         assert (tmp_path / f"ridge_{stem}_volume.nii.gz").exists()
         assert (tmp_path / f"ridge_{stem}_surface.shape.gii").exists()

@@ -50,6 +50,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -3436,6 +3437,15 @@ def save_nifti(
         raise ImportError(
             "nibabel is required to save NIfTI files. Install with: pip install nibabel"
         ) from err
+
+    # A PairedHeader exists only once its module is loaded, so this never pulls
+    # torch into the torch-free save path.
+    paired = sys.modules.get("fastfuncstuff.io.paired")
+    if paired is not None and isinstance(header, paired.PairedHeader):
+        header.save(
+            data, output_path, tr=tr, brick_labels=brick_labels, brick_stataux=brick_stataux
+        )
+        return
 
     if str(output_path).lower().endswith(".gii"):
         # Surface output: GIfTI, carrying the input's mesh fingerprint and geometry

@@ -75,3 +75,21 @@ def test_surface_mask_kept_in_surface_output(tmp_path):
     assert np.array_equal(
         np.asanyarray(load_nifti(tmp_path / "s.shape.gii").dataobj).reshape(-1), [8, 0, 9]
     )
+
+
+def test_paired_header_splits_saved_maps(tmp_path):
+    """Anything saved on the pseudo-grid lands in one file per domain."""
+    from fastfuncstuff.io.afni import save_nifti
+
+    vols, surfs = _inputs(tmp_path, lengths=(5,))
+    paired = load_paired_runs(vols, surfs)
+    assert paired.volume.data.numel() == 0 and paired.surface.data.numel() == 0
+    assert paired.mask.shape == paired.header.shape == (11, 1, 1)
+    values = np.arange(22, dtype=np.float32).reshape(11, 1, 1, 2)
+    save_nifti(values, tmp_path / "map.nii.gz", header=paired.header, brick_labels=["a", "b"])
+    vol = np.asanyarray(load_nifti(tmp_path / "map_volume.nii.gz").dataobj)
+    surf = load_nifti(tmp_path / "map_surface.shape.gii")
+    assert vol.shape == (2, 2, 2, 2)
+    assert np.array_equal(vol.reshape(8, 2), values[:8, 0, 0])
+    assert np.array_equal(np.asanyarray(surf.dataobj).reshape(3, 2), values[8:, 0, 0])
+    assert surface_meta(surf.header)["mesh_fingerprint"] == "V3_F1_test"

@@ -230,6 +230,11 @@ def gifti_as_nifti(path: str | os.PathLike):
     data = cols[0][:, None, None] if len(cols) == 1 else np.stack(cols, axis=1)[:, None, None, :]
     out = nib.Nifti2Image(np.ascontiguousarray(data), np.eye(4))
     meta = dict(img.meta)
+    # The mesh path is relative to this file; outputs written elsewhere rebase it
+    # (save_nifti_data_as_gifti), which needs to know where it really is.
+    if meta.get("geometry") and not os.path.isabs(meta["geometry"]):
+        here = os.path.dirname(os.path.abspath(os.fspath(path)))
+        meta["geometry"] = os.path.normpath(os.path.join(here, meta["geometry"]))
     labels = [str(dict(a.meta).get("Name", "")) for a in img.darrays]
     if any(labels):
         meta["brick_labels"] = "\t".join(labels)
@@ -285,6 +290,13 @@ def save_nifti_data_as_gifti(
     cols = d.reshape(d.shape[0], -1).astype(np.float32)
     meta = dict(surface_meta(header) or {}) if header is not None else {}
     meta.pop("brick_labels", None)
+    if os.path.isabs(meta.get("geometry", "")):
+        try:
+            meta["geometry"] = os.path.relpath(
+                meta["geometry"], os.path.dirname(os.path.abspath(os.fspath(path)))
+            )
+        except ValueError:  # another Windows drive: only an absolute path reaches it
+            pass
     if tr is not None:
         meta["TR_seconds"] = f"{tr:g}"
     series = cols.shape[1] > 1 and not brick_labels and not brick_stataux

@@ -17,7 +17,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy import stats
 from scipy.interpolate import interp1d
 
 from fastfuncstuff.utils import get_device, to_tensor
@@ -349,7 +348,11 @@ def get_canonical_hrf(
     b2 = 1.0
     c = 1 / 6.0  # Undershoot ratio
 
-    # Double gamma HRF using gamma PDF directly
+    # Double gamma HRF using gamma PDF directly. scipy.stats is imported here,
+    # not at the top: it costs 0.7 s, and the viewer imports this module only
+    # to read the HRF library from disk.
+    from scipy import stats
+
     # First gamma (response): peak at ~5s
     hrf = stats.gamma.pdf(t_highres, a1, scale=b1)
 
@@ -635,6 +638,8 @@ def get_canonical_hrf_library(
         c = 0.15 + (i / n_hrfs) * 0.15  # Undershoot ratio: 0.15-0.30
 
         param_variations.append((a1, a2, c))
+
+    from scipy import stats
 
     # Generate HRFs
     hrfs = []

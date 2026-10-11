@@ -141,7 +141,12 @@ class InstaCorrMode(Mode):
         self._source_key = layer.key
         self._affine = np.asarray(layer.affine, dtype=float)
         self._tr = float(res.info.tr)
-        self._zooms = tuple(float(abs(layer.affine[i, i])) or 1.0 for i in range(3))
+        from fastfuncstuff.viewer.tools.smooth import voxel_sizes
+
+        # Column norms, not the diagonal: an oblique run's diagonal understates
+        # each spacing, and a run stored with permuted axes has zeros there --
+        # both of which mis-sized the blur and the seed sphere.
+        self._zooms = voxel_sizes(layer.affine)
         self._dirty = True
         return True
 

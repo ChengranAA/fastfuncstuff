@@ -466,6 +466,27 @@ def test_leaving_instacorr_keeps_the_map(corr_session):
     assert corr_session.state.layers.find_by_source("mode:instacorr") is not None
 
 
+def test_instacorr_measures_voxels_on_a_run_stored_with_permuted_axes(tmp_path):
+    """A sagittally stored run has zeros on its affine's diagonal. Read off the
+    diagonal, every spacing became 1 mm, so a 6 mm seed sphere spanned six
+    3 mm voxels each way instead of two, and the blur was 3x too wide."""
+    rng = np.random.default_rng(6)
+    aff = np.array(
+        [[0.0, 0.0, 3.0, -12.0], [3.0, 0.0, 0.0, -15.0], [0.0, 2.0, 0.0, -9.0], [0, 0, 0, 1.0]]
+    )
+    img = nib.Nifti1Image(rng.normal(size=(10, 9, 8, 20)).astype(np.float32), aff)
+    img.header["pixdim"][4] = 2.0
+    img.header.set_xyzt_units("mm", "sec")
+    nib.save(img, str(tmp_path / "bold.nii.gz"))
+
+    s = ViewerSession(device=CPU)
+    s.do(SetUnderlay(str(tmp_path / "bold.nii.gz")))
+    s.store.ensure_ram(s.state.layers.keys[0])
+    s.do(SetMode("instacorr"))
+    assert s.mode._zooms == pytest.approx((3.0, 2.0, 3.0))
+    s.close()
+
+
 def test_a_seed_on_a_finer_underlay_lands_on_the_right_run_voxel(tmp_path):
     """The seed is a display-grid voxel -- the anatomy's. Indexing a 2x coarser
     run with it pointed off the edge, and ctrl-click drew nothing at all."""

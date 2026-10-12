@@ -606,6 +606,19 @@ def bytes_per_voxel_ica_varnorm(
     return n_timepoints * 4 * 2
 
 
+def bytes_per_voxel_phasereg(n_timepoints: int, explore: bool = False) -> int:
+    """Working memory per voxel for one chunk of ``phasereg.core.phase_regress``.
+
+    Each chunk holds the raw magnitude and phase, their detrended and
+    task-residual versions, the filtered phase, the phi FFT spectra and the
+    corrected / macro outputs: about 16 float32 series live at the peak. 24 is
+    allowed for the transients (temporal unwrap, transposed copies for the host
+    transfer). The data-driven SGF search adds a candidate filter bank.
+    """
+    n_series = 24 + (8 if explore else 0)
+    return n_timepoints * 4 * n_series
+
+
 def bytes_per_voxel_arma_search(
     n_timepoints: int,
     n_regressors: int,
@@ -1558,6 +1571,9 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_voxel_prf(n_timepoints, n_regressors)
     elif operation == "arma":
         bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
+    elif operation == "phasereg":
+        # n_trials > 1 flags the data-driven SGF search (phase_filter="explore").
+        bytes_per_voxel = bytes_per_voxel_phasereg(n_timepoints, explore=n_trials > 1)
     elif operation == "arma_search":
         bytes_per_voxel = bytes_per_voxel_arma_search(n_timepoints, n_regressors)
     elif operation == "arma_dsort":

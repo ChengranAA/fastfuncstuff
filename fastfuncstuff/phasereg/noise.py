@@ -77,7 +77,7 @@ def estimate_variance_ratio(
     tr: float,
     method: str = "fft",
     design: torch.Tensor | None = None,
-    freq_range: tuple[float, float | None] = (0.1, None),
+    freq_range: tuple[float, float | None] = (0.15, None),
 ) -> torch.Tensor:
     """Estimate phi = Var(eps_magnitude) / Var(eps_phase) per voxel.
 

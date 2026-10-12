@@ -319,7 +319,7 @@ def phase_regress(
     max_poly_degree: int = 3,
     phi: float | torch.Tensor | None = None,
     phi_method: str = "fft",
-    phi_freq_range: tuple[float, float | None] = (0.1, None),
+    phi_freq_range: tuple[float, float | None] = (0.15, None),
     regression: str = "deming",
     max_slope_ratio: float | None = 2.0,
     slope_on: str = "data",
@@ -375,7 +375,8 @@ def phase_regress(
     phi_method : {"fft", "residual"}
         How to estimate phi when phi=None.
     phi_freq_range : tuple (lo_hz, hi_hz)
-        Frequency range for FFT-based noise estimation.
+        Frequency range for FFT-based noise estimation. Default 0.15 Hz to
+        Nyquist, as ffs_phasereg -freq_range (Stanley 2021, phaseprep).
     regression : {"deming", "ols"}
         Regression method.
     max_slope_ratio : float or None

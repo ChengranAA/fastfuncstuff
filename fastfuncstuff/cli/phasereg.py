@@ -1,117 +1,13 @@
 #!/usr/bin/env python3
 
 """
-ffs_phasereg - Phase regression for macrovascular BOLD suppression
+ffs_phasereg - phase regression for macrovascular BOLD suppression.
 
-Regresses magnitude fMRI signal on phase to remove the contribution of
-oriented macrovasculature (pial veins, cerebral veins).  The corrected
-output retains microvascular BOLD.
-
-Uses Deming regression (errors-in-variables) by default — equivalent to
-scipy.odr (Menon 2002, Curtis 2014, Stanley 2021); see Liem 2023 /
-phaseprep for the canonical reference implementation.
-
-INPUTS REQUIRED UPSTREAM
-  - Coil-combination preserving phase (SVD / VRC / COMPOSER).
-  - Motion correction in real/imag space (so phase isn't scrambled).
-  - Temporal phase unwrap.  (First-volume subtraction is optional —
-    polynomial detrending here absorbs the constant shift.)
-  - Phase passed in must be radians.
-
-OUTPUT MODES
-  Default (analysis endpoint): drift dropped, output re-centered on per-
-  voxel mean. Matches phaseprep / Stanley 2021 §2.2.3 exactly.
-
-  -keep_drift (GLM input): drift preserved. Use when the corrected mag
-  feeds a downstream GLM.
-
-  Phaseprep parity needs -shrink odr -no_phase_unwrap -polort 1 (the
-  defaults are -shrink none and a conservative temporal unwrap).
-
-RECOMMENDED PIPELINES
-
-  Phaseprep / Stanley parity (default for analysis):
-    ffs_phasereg -magnitude run_mag.nii.gz -phase run_phase.nii.gz \\
-                 -prefix out_pr -polort 1 -shrink odr -no_phase_unwrap
-
-  Task data, output feeds a GLM (preserves drift + task variance):
-    ffs_phasereg -magnitude run*.nii.gz -phase run*_phase.nii.gz \\
-                 -prefix epi_pr \\
-                 -task_removal tent -onsets stim_A.1D stim_B.1D \\
-                 -tent_window 20 -keep_drift
-
-  Resting-state, 7T (noisy phase, regularise via Savitzky-Golay):
-    ffs_phasereg -magnitude rest_mag.nii.gz -phase rest_phase.nii.gz \\
-                 -prefix rest_pr -polort 1 -phase_filter sgf
-
-  Resting-state, 3T (NORDIC upstream is assumed; see Knudsen 2023):
-    ffs_phasereg -magnitude rest_mag.nii.gz -phase rest_phase.nii.gz \\
-                 -prefix rest_pr -polort 1
-
-  OLS variant (no errors-in-variables term; Vu & Gallant 2015's choice):
-    ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
-                 -prefix pr -regression ols
-
-  Knudsen 2023 residual-φ approach (requires task model):
-    ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
-                 -prefix pr -task_removal tent -onsets stim.1D \\
-                 -phi_method residual
-
-  Data-driven phase smoothing (Barry & Gore 2014, expensive):
-    ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
-                 -prefix pr -phase_filter explore
-
-  7T laminar: veins SURVIVE standard PR (Vu & Gallant 2015 sPR).
-  A vein about the size of a voxel has almost no phase of its own, so
-  standard PR either leaves it untouched or blows up an ill-conditioned
-  slope and flattens the voxel. -spr borrows phase from the vein-adjacent
-  neighbour that does carry it; -shrink none stops half the fitted macro
-  component being discarded before subtraction:
-    ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
-                 -prefix pr -spr -shrink none -phase_filter explore
-
-  Layer extraction: EXCLUDE vessel voxels instead of correcting them.
-  Writes prefix_vein_keep as the inverse mask to feed a layer profile.
-  Regression preserves laminar structure (all layers go in, outer ones
-  suppressed); the mask is the complementary "drop it" option:
-    ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
-                 -prefix pr -vein_mask -vein_fdr 0.01
-
-OUTPUTS
-  prefix_corrected.nii.gz   M_micro time series (4D)
-  prefix_macro.nii.gz       what was subtracted (4D)
-  prefix_macro_std.nii.gz   temporal std of the macro (3D, QC overlay)
-  prefix_slope.nii.gz       per-voxel A (3D, raw Deming slope)
-  prefix_phi.nii.gz         per-voxel variance ratio used (3D)
-  prefix_r2.nii.gz          ODR-style R² matching phaseprep (3D) [-r2_mode odr|both]
-  prefix_r2_naive.nii.gz    naive R² (voxels most affected) (3D) [-r2_mode naive|both]
-  prefix_mask.nii.gz        analysis mask (3D)
-  prefix_sgf_window.nii.gz  per-voxel SGF window chosen (3D) [-phase_filter explore]
-  prefix_sgf_order.nii.gz   per-voxel SGF order chosen (3D) [-phase_filter explore]
-  prefix_spr_donor_corr.nii.gz    corr(mag, donor phase) at chosen donor (3D) [-spr]
-  prefix_spr_donor_offset.nii.gz  distance in voxels to the donor, 0=self (3D) [-spr]
-  prefix_vein_mask.nii.gz   voxels to EXCLUDE as vessel-dominated (3D) [-vein_mask]
-  prefix_vein_keep.nii.gz   its complement within the analysis mask (3D) [-vein_mask]
-  prefix_vein_p.nii.gz      p-value of magnitude-phase coupling (3D) [-vein_mask]
-  prefix_coupling_r.nii.gz  corr(magnitude, phase) the test is built on (3D) [-vein_mask]
-
-  Intermediates (written with -save_intermediates):
-  prefix_mag_dt.nii.gz      magnitude after poly detrending (4D)
-  prefix_pha_dt.nii.gz      phase after poly detrending (4D)
-  prefix_pha_dt_filt.nii.gz phase after poly detrending + SGF filter (4D)
-  prefix_mag_res.nii.gz     magnitude after poly + task removal (4D)
-  prefix_pha_res_filt.nii.gz phase after poly + task removal + SGF (4D)
-
-References
-----------
-Menon RS (2002). MRM 47:1-9.
-Barry RL & Gore JC (2014). Hum Brain Mapp 35:3832-3840.
-Curtis AT et al (2014). NeuroImage 100:51-59.
-Stanley OW et al (2021). NeuroImage 117631.
-Knudsen L et al (2023). NeuroImage 271:120011.
-Chang WT, Lin W & Giovanello KS (2023). eLife 12:RP92805.
-Liem BT (2023). MSc thesis, Western University. (phaseprep)
-Bodenschatz JC & Rowe DB (2026). Magn Reson Imaging 131:110696.
+Regresses each voxel's magnitude on its phase (Deming, errors-in-variables;
+Menon 2002) and subtracts the phase-explained part: oriented veins change both,
+randomly oriented microvasculature only magnitude. The user documentation is
+the -h text built below; method notes and measurements are in the wiki
+(software/ffs_phasereg.md, concepts/Phase regression.md).
 """
 
 from __future__ import annotations
@@ -127,6 +23,7 @@ import torch
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_bids_events_args,
+    add_device_arg,
     add_ortvec_arguments,
     add_verbose_arg,
     check_bids_event_args,
@@ -134,307 +31,129 @@ from fastfuncstuff.cli_utils import (
     spinner,
 )
 
-# Printed at the end of -h. Kept self-contained (no wiki required): it tells a
-# first-time user what each file is FOR and how to read it, then how the flags
-# reshape those files. Any literal percent sign must be doubled (%%) — argparse
-# runs this text through %-formatting.
+_DESCRIPTION = """\
+Remove the phase-explained (macrovascular) part of magnitude BOLD.
+
+Each voxel's magnitude is regressed on its phase with a Deming (errors-in-
+variables) fit and A*phase is subtracted. Runs passed together share one slope
+per voxel (drift removed per run) and are written back one file per run.
+
+UPSTREAM, in order (phase in radians, voxel-matched to the magnitude):
+  NORDIC on complex data -> temporal unwrap (ROMEO) -> ffs_phasedrift (per-slice
+  field drift, native space) -> resample magnitude and phase through the same
+  warps. ffs_autoproc -phase_proc does all four. Skipping ffs_phasedrift leaves
+  phase noise several times thermal and weakens every slope.
+
+RECIPES
+  GLM input (the usual case):
+    ffs_phasereg -magnitude run*_mag.nii.zst -phase run*_phase.nii.zst \\
+                 -prefix pr -keep_drift
+  Veins survive, sub-mm 7T: add -spr (see that flag).
+  Drop vein voxels instead of correcting them: add -vein_mask.
+  phaseprep / Stanley 2021 parity:  -polort 1 -shrink odr -no_phase_unwrap
+"""
+
+# Printed at the end of -h: what each output is for and how to read it. Flag
+# behaviour lives in the flag help, not here. A literal percent sign must be
+# doubled (%%): argparse %-formats this text.
 _EPILOG = """\
-READING THE OUTPUTS
--------------------
-Every run writes these (3D = one value per voxel, 4D = a time series).
-With several input runs the slope is fitted once per voxel over all of them,
-and each 4D output is written per run, in input order: prefix_corrected_run-01,
-prefix_corrected_run-02, ... (-concat_output writes one concatenated file).
+OUTPUTS  (4D files are written per run as prefix_<name>_run-NN when several
+runs go in; -concat_output gives one file. 3D maps are one per fit.)
 
-  prefix_corrected.nii.gz  (4D)  THE DELIVERABLE. Magnitude with the phase-
-      correlated (macrovascular) fluctuations removed; what you feed to your
-      GLM or connectivity analysis. In the default mode it is re-centered on
-      each voxel's mean and polynomial drift is dropped; with -keep_drift the
-      drift is preserved (see below). Under -shrink odr, voxels the fit
-      could not constrain fall back to their mean (or to no correction with
-      -keep_drift); under the default -shrink none they get the full A*phase,
-      so an exploding slope (see prefix_slope) shows up as added noise.
+  prefix_corrected (4D)  The deliverable: magnitude minus A*phase. Drift is
+      dropped and the series re-centred on its mean, unless -keep_drift.
+  prefix_macro     (4D)  What was subtracted (input - corrected).
+  prefix_macro_std (3D)  Its temporal std: THE QC overlay. It should trace pial
+      veins and sinuses, not a diffuse haze; a haze means the fit is chasing
+      phase noise (check upstream phase processing first).
+  prefix_slope     (3D)  A, magnitude units per radian. Read it with phi.
+  prefix_phi       (3D)  Var(magnitude noise)/Var(phase noise) used by Deming.
+  prefix_r2        (3D)  ODR R^2, for phaseprep parity only. It saturates at
+      0.5-0.8 brain-wide in raw-unit data, so it does not show where the
+      correction acted; use macro_std (or -r2_mode naive).
+  prefix_mask      (3D)  Voxels fitted.
+  [-spr]       prefix_spr_donor_offset (0 = own phase), prefix_spr_donor_corr
+  [-vein_mask] prefix_vein_mask, prefix_vein_keep, prefix_vein_p, prefix_coupling_r
+  [-phase_filter explore]  prefix_sgf_window, prefix_sgf_order
 
-  prefix_macro.nii.gz      (4D)  What was subtracted, exactly
-      (mag_orig - corrected). This is your estimate of the macrovascular
-      signal. QC LOOK: the temporal std / variance of this map should light
-      up pial veins, the sagittal/transverse sinuses and other large vessels
-      — vessel-shaped, not a diffuse whole-brain haze. Diffuse structure means
-      the fit is capturing noise (check phase preprocessing / phi / polort).
-
-  prefix_macro_std.nii.gz  (3D)  Temporal std of prefix_macro, i.e. the QC
-      overlay described above precomputed for you. THIS is the map to overlay
-      on anatomy to see WHERE suppression acted — bright on veins/sinuses when
-      the fit is good. Prefer it over prefix_r2, which saturates (see below).
-
-  prefix_r2.nii.gz         (3D)  ODR-shrinkage R^2 — the phaseprep / Stanley
-      2021 parity metric: fraction of magnitude variance explained once the
-      1/(1 + A^2/phi) shrinkage is folded in. Report it for parity, but DO NOT
-      read it as a "where did the correction act" map. The shrinkage factor
-      also multiplies the residual, which puts a floor under R^2 (~ 1 -
-      shrink^2). When magnitude is in raw scanner units phi is large and
-      A^2/phi sits near 1, so shrink ~ 0.5 and R^2 saturates high (~0.5-0.8)
-      across the WHOLE brain — it does NOT fall to ~0 in weakly-coupled voxels,
-      so a bright R^2 does not mean that voxel was actually changed. To see
-      where suppression genuinely happened, use prefix_macro_std or
-      prefix_r2_naive instead.
-
-  prefix_slope.nii.gz      (3D)  Per-voxel regression slope A (magnitude units
-      per radian). Larger |A| = stronger magnitude<->phase coupling. Read it
-      WITH phi and R^2, never alone: a large A on low-quality data is an
-      ill-conditioned noise fit, not strong signal. -shrink odr damps such
-      voxels by 1/(1 + A^2/phi), at the cost of shrinking good ones too.
-
-  prefix_phi.nii.gz        (3D)  Variance ratio phi = Var(mag noise)/Var(phase
-      noise) used by the Deming fit. Mostly a diagnostic: it sets how much the
-      errors-in-variables fit trusts phase vs magnitude, and it drives the
-      shrinkage above. Constant across the brain only if you passed -phi.
-
-  prefix_spr_donor_offset.nii.gz  (3D)  [-spr] Distance in voxels to the
-      neighbour whose phase was borrowed; 0 = the voxel kept its own phase
-      (i.e. standard PR). QC LOOK: non-zero values should trace vessels, not
-      scatter uniformly. A vessel-shaped rim of 1s is sPR doing its job. Salt-
-      and-pepper 1s everywhere means the donor search is fitting noise — raise
-      phase SNR (NORDIC, -phase_filter explore) before trusting the result.
-
-  prefix_spr_donor_corr.nii.gz    (3D)  [-spr] Signed corr(magnitude, donor
-      phase) at the chosen donor — Vu & Gallant's z-scored sPR slope. Low
-      |values| brain-wide mean no neighbour had usable phase either.
-
-  IF VEINS SURVIVE PHASE REGRESSION (the common 7T laminar complaint), the
-  slope map is the first thing to read. Two distinct failure modes look
-  similar in an activation map but differ completely in prefix_slope:
-    * Slope ~ 0: the voxel's phase carries no task signal, so nothing is
-      subtracted and the vein passes straight through. This is the vein-about-
-      the-size-of-a-voxel / magic-angle case. Fix: -spr.
-    * Slope enormous (1e3-1e5): an ill-conditioned fit against phase noise.
-      The 1/(1+A^2/phi) shrinkage then collapses the voxel to its mean, which
-      LOOKS like perfect suppression but has destroyed the voxel's thermal
-      noise along with everything else. Check prefix_corrected's temporal std:
-      if it is far below neighbouring grey matter, the voxel was flattened,
-      not corrected. Fix: -spr gives the voxel a real regressor and the slope
-      drops to a sane value.
-  A third, quieter cause is the shrinkage itself under -keep_drift: in raw
-  scanner units A^2/phi ~ 1, so roughly half the fitted macro component is
-  left in the output even in well-behaved voxels. (Without -keep_drift the same
-  factor instead scales down the micro residual.) See -shrink none.
-  A fourth is the regressor: slow phase variance with no magnitude
-  counterpart (breathing, B0 drift, per-volume recon offsets) attenuates every
-  slope toward zero. See -phase_global_order.
-
-  prefix_mask.nii.gz       (3D)  Which voxels were actually fit (1) vs skipped
-      as air/skull/low-SNR (0). Everything outside it is zero in the 3D maps.
-
-  prefix_r2_naive.nii.gz   (3D)  [only with -r2_mode naive|both] Raw R^2 with
-      NO shrinkage. A QC/where-did-it-act map, NOT a metric to report: it is
-      bright wherever phase regression had the largest raw effect, including
-      ill-conditioned noise voxels. Use it (or macro variance) to see which
-      voxels changed most; prefix_r2 is the phaseprep-parity number to report.
-
-  prefix_sgf_window.nii.gz / prefix_sgf_order.nii.gz  (3D)  [only with
-      -phase_filter explore] The window length and polynomial order the
-      per-voxel search picked. Read them together: large window + low order =
-      the search wanted heavy smoothing there (noisy phase); small window =
-      it left the phase nearly untouched (already clean). A useful sanity
-      check that explore is adapting sensibly and not smoothing signal away.
-
-QC in one pass: overlay prefix_macro_std (or prefix_r2_naive) on anatomy and
-confirm the bright voxels sit on veins/sinuses. Prefer macro_std over prefix_r2
-here — the ODR R^2 saturates in raw-unit runs (see above) and makes a poor QC
-overlay. If suppression looks diffuse or noisy, suspect phase preprocessing
-(unwrap / coil combine), then phi, then polort.
-
-NUISANCE REGRESSORS & EVENTS
-----------------------------
-  -ortvec (and -ortvec_run / -ortvec_glob / -ortvec_concat) are all REPEATABLE
-      and STACK: pass one file per source and every column is concatenated into
-      that run's nuisance design, then projected out before the slope fit. A file
-      can have any number of columns. Give each a distinct LABEL:
-        -ortvec motion.1D motion -ortvec physio.1D physio -ortvec extra.1D extra
-      -ortvec expects FULL-LENGTH files (rows = total TRs across all runs);
-      -ortvec_run FILE LABEL RUN is the per-run form (zero-padded elsewhere);
-      -ortvec_glob / -ortvec_concat are convenience globs over per-run file sets.
-      Mix freely in one call.
-
-  -event_cols ONSET DUR TYPE selects columns BY NAME, mapping your TSV's headers
-      to the three roles (onset, duration, trial_type); default names are
-      onset / duration / trial_type. ONLY these three columns are read — every
-      other column in the TSV is ignored. The trial_type column defines the
-      conditions (one TENT/canonical set per unique value); use -event_ignore to
-      drop specific values. Durations come from the TSV, so -durations is not
-      needed with -events. (No parametric-modulation column is supported — only
-      the three roles.)
-
-HOW THE FLAGS CHANGE WHAT YOU GET
----------------------------------
-  -keep_drift        Rewrites prefix_corrected AND prefix_macro. Default:
-                     drift dropped, output = mean + shrunk residual. On:
-                     drift kept, output = mag_orig - A_eff*(phase-mean) with
-                     A_eff = A/(1+A^2/phi). The two modes put the -shrink odr
-                     factor s = 1/(1+A^2/phi) in DIFFERENT places: the default
-                     removes all of A*phase and then scales what is left
-                     (micro signal included) by s; -keep_drift removes only
-                     s*A*phase, leaving (1-s) of the macro in. -shrink none
-                     makes both remove exactly A*phase. slope/phi/r2 are unchanged; only
-                     the two 4D files differ. Use it when a GLM downstream
-                     will model the drift; use default for an analysis
-                     endpoint.
-
-  -task_removal / -onsets / -events
-                     Builds a task model used to estimate phi from TASK-
-                     RESIDUAL noise (Knudsen 2023, Menon 2002's notch). The
-                     slope is still fit on the task-preserved series, as in
-                     every reference implementation: a vein's task-locked
-                     mag/phase covariance is what pins its slope down. Add
-                     -slope_on residual to fit the slope after task removal
-                     too (guards against micro signal being removed with the
-                     macro, but leaves the slope to noise at low SNR).
-
-  -regression ols    Fills prefix_slope with an ordinary least-squares slope
-                     (no errors-in-variables term) instead of Deming. phi is
-                     still estimated and still governs the shrinkage/R^2.
-
-  -phase_filter sgf  Fits and corrects on a Savitzky-Golay-smoothed phase,
-                     suppressing high-frequency phase noise before the slope
-                     fit; recommended at 7T. Changes slope/macro (and r2). Was
-                     a silent no-op prior to this build — verify your output
-                     differs from -phase_filter none. Tune with -sgf_window /
-                     -sgf_order.
-
-  -phase_filter explore
-                     Searches SGF parameters PER VOXEL, keeping the window/
-                     order that maximises |corr(smoothed phase, mag)| (Barry &
-                     Gore 2014). Adaptive but expensive. -sgf_window/-sgf_order
-                     are IGNORED here; tune the search grid with -sgf_window_max
-                     / -sgf_order_max / -sgf_step. Writes prefix_sgf_window and
-                     prefix_sgf_order so you can see what it chose per voxel.
-
-  -polort N          Higher order removes more drift from both series before
-                     the fit. Removes more nuisance low-frequency content but
-                     can also absorb shared low-frequency mag/phase you may
-                     want to keep. -polort 1 = exact phaseprep parity.
-
-  -phi VALUE         Pins prefix_phi to a constant (no per-voxel estimation).
-
-  -signal_thresh 0   Disables signal gating. Air/noise voxels get fitted
-                     (noisy prefix_corrected there), and prefix_r2 will show
-                     bright values in air/noise — the ODR metric reads
-                     unfittable voxels as "perfect within the noise budget".
-                     A visual artifact, not a bug.
-
-  -r2_mode           Selects which R^2 map(s) are written (odr / naive / both).
-
-  -save_intermediates
-                     Adds prefix_mag_dt, _pha_dt, _pha_dt_filt, _mag_res,
-                     _pha_res_filt (4D) for step-by-step inspection of the
-                     detrend -> filter -> task-removal chain.
+IF VEINS SURVIVE, read prefix_slope at the vein:
+  * Slope ~0: the voxel's own phase carries nothing (phase cancels within a
+    voxel-sized vein, or the vessel is near the magic angle). Use -spr.
+  * Slope huge (1e3-1e5): an ill-conditioned fit to phase noise. Under -shrink
+    odr the voxel collapses to its mean, which looks like suppression but is
+    not; with the default -shrink none it shows as added noise. -spr gives it
+    a real regressor.
+  * Slopes small everywhere: phase noise dominates the regressor. Run
+    ffs_phasedrift upstream.
 """
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = FfsArgumentParser(
-        description="Phase regression for macrovascular BOLD suppression",
+        description=_DESCRIPTION,
         epilog=_EPILOG,
         formatter_class=FfsHelpFormatter,
     )
 
-    # ── Required ─────────────────────────────────────────────────────────
     req = parser.add_argument_group("Required Arguments")
     req.add_argument(
         "-magnitude",
         nargs="+",
         metavar="FILE",
         required=True,
-        help="Magnitude fMRI data files (one per run). Supports wildcards.",
+        help="Magnitude series, one file per run.",
     )
     req.add_argument(
         "-phase",
         nargs="+",
         metavar="FILE",
         required=True,
-        help="Phase fMRI data files (radians, unwrapped, one per run). "
-        "Must match magnitude files in order and dimensions.",
+        help="Phase series in radians, one per run, in the same order and on the same "
+        "grid as -magnitude.",
     )
     req.add_argument(
         "-prefix",
         required=True,
         metavar="OUTPUT",
-        help="Output file prefix (e.g. results/epi_pr). Outputs take the first "
-        "magnitude input's format (.nii.zst in, .nii.zst out) unless the prefix "
-        "names one: results/epi_pr.nii.gz.",
+        help="Output prefix. Outputs take the first magnitude input's format (.nii.zst "
+        "in, .nii.zst out) unless the prefix names one (pr.nii.gz).",
     )
 
-    # ── Task removal ─────────────────────────────────────────────────────
-    task = parser.add_argument_group("Task Removal Options")
-    task.add_argument(
-        "-task_removal",
-        choices=["none", "tent", "canonical"],
-        default="none",
-        help="Task model for the phi (noise) estimate — see -slope_on: "
-        "'none' (direct regression, OK after NORDIC or for RS), "
-        "'tent' (TENT/FIR basis - model-free, recommended), "
-        "'canonical' (SPM HRF convolution).",
-    )
-    task.add_argument(
-        "-onsets",
-        nargs="+",
-        metavar="FILE",
-        help="AFNI-format onset timing files (one per condition, "
-        "each with one row per run). Mutually exclusive with -events.",
-    )
-    add_bids_events_args(
-        task,
-        events_help="BIDS events TSV files (one per run). Mutually exclusive with -onsets.",
-    )
-    task.add_argument(
-        "-tent_window",
-        type=float,
-        default=20.0,
-        metavar="SECONDS",
-        help="TENT window duration in seconds (for -task_removal tent).",
-    )
-    task.add_argument(
-        "-durations",
-        nargs="+",
-        metavar="SECONDS",
-        help="Per-condition stimulus durations for auto window estimation "
-        "(with -onsets). With -events, durations come from the TSV.",
-    )
-
-    # ── Regression options ───────────────────────────────────────────────
-    reg = parser.add_argument_group("Regression Options")
+    reg = parser.add_argument_group("Regression")
     reg.add_argument(
         "-regression",
         choices=["deming", "ols"],
         default="deming",
-        help="Regression method. 'deming' is the closed-form Deming/ODR "
-        "(equivalent to scipy.odr at fMRI φ scales — see Menon 2002, "
-        "Curtis 2014, Stanley 2021, phaseprep). 'ols' regresses mag on "
-        "phase without the errors-in-variables term, so a noisy phase "
-        "attenuates the slope (Vu & Gallant 2015 use it to avoid over-"
-        "correction).",
+        help="'deming': errors-in-variables, equivalent to scipy.odr (Menon 2002, "
+        "Stanley 2021, phaseprep). 'ols': no phase-noise term, so noisy phase "
+        "attenuates the slope and suppresses less (Vu & Gallant 2015's choice, "
+        "against over-correction).",
+    )
+    reg.add_argument(
+        "-shrink",
+        choices=["odr", "none"],
+        default="none",
+        help="'none': subtract A*phase, leave the residual intact. 'odr': phaseprep "
+        "parity. It also applies ODR's factor s = 1/(1+A^2/phi): by default the "
+        "residual (micro BOLD included) is scaled by s, so betas shrink most near "
+        "veins; with -keep_drift only s*A*phase is removed, leaving (1-s) of the "
+        "macro in.",
     )
     reg.add_argument(
         "-phi",
         type=float,
         default=None,
         metavar="VALUE",
-        help="Fixed variance ratio for Deming regression. "
-        "If not set, estimated automatically per voxel via -phi_method.",
+        help="Fixed variance ratio for Deming. Default: estimated per voxel (-phi_method).",
     )
     reg.add_argument(
         "-phi_method",
         choices=["fft", "residual"],
         default="fft",
-        help="How to estimate phi (Var(eps_mag)/Var(eps_phase)): "
-        "'fft' uses out-of-band spectral power above -freq_range "
-        "(Curtis 2014, phaseprep default; works for task and rest). "
-        "'residual' uses temporal variance of (poly+task+nuisance)-"
-        "projected residuals (Knudsen 2023). "
-        "WARNING: 'residual' without -task_removal on task data will "
-        "include task variance in the noise estimate and inflate phi. "
-        "Pair 'residual' with -task_removal {tent,canonical} for "
-        "task data; 'fft' is safe for both.",
+        help="'fft': noise power above -freq_range (Curtis 2014, phaseprep); safe for "
+        "task and rest. 'residual': variance after detrend, nuisance and task "
+        "removal (Knudsen 2023); on task data it needs -task_removal, or the task "
+        "counts as noise.",
     )
     reg.add_argument(
         "-freq_range",
@@ -442,200 +161,128 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=[0.15],
         metavar="HZ",
-        help="Frequency range for FFT noise estimation. "
-        "One value = lower bound (upper = Nyquist). "
-        "Two values = lower and upper bounds. "
-        "Default 0.15 Hz matches Stanley 2021 §2.2.3 and phaseprep "
-        "(noise_lb=0.15). Curtis 2014 used 0.1 Hz; either is reasonable.",
+        help="Band for -phi_method fft: LO (to Nyquist) or LO HI. Default 0.15 Hz "
+        "(Stanley 2021, phaseprep).",
     )
-
-    # ── Phase filtering ──────────────────────────────────────────────────
-    pfilt = parser.add_argument_group("Phase Filtering Options (Barry & Gore 2014)")
-    pfilt.add_argument(
-        "-phase_filter",
-        choices=["none", "sgf", "explore"],
-        default="none",
-        help="Pre-filter phase time series before regression. "
-        "'none': no filtering (Stanley/phaseprep default). "
-        "'sgf': Savitzky-Golay with -sgf_window/-sgf_order — same fit "
-        "behaviour as 'none' but on a smoother phase, which acts as a "
-        "phase-noise regulariser: it removes high-frequency phase content "
-        "before the slope fit, changing slope/macro (and r2). "
-        "'explore': per-voxel data-driven parameter search. Barry & Gore "
-        "define the optimal (N, p) as the pair MINIMISING the temporal "
-        "variance of the phase-regressed magnitude, i.e. maximising "
-        "R2 = 1 - sigma_PR/sigma_orig. We maximise |Pearson r(filtered_phase, "
-        "mag_dt)| instead, which for an OLS fit is the identical argmax "
-        "(residual variance = var_mag * (1 - r^2)) but costs one correlation "
-        "rather than a full refit per grid point. Under Deming the two "
-        "criteria can differ slightly, since the ODR shrinkage 1/(1+A^2/phi) "
-        "also moves with the fit. The unfiltered series competes as a "
-        "candidate, so voxels with good phase SNR can decline filtering "
-        "(Barry & Gore step 3); those report window=order=0. Expensive. "
-        "Recommended at 7T where phase SNR is low (Hagberg et al 2008 "
-        "found k_phi >> k_mag).",
-    )
-    pfilt.add_argument(
-        "-sgf_window",
-        type=int,
-        default=None,
-        metavar="N",
-        help="SGF window length in TRs (must be odd; auto-incremented if "
-        "even). Larger = more smoothing. Default: auto = round(20s / TR), "
-        "floored at 5. Treat that default as a placeholder, not a "
-        "recommendation: it is NOT from Barry & Gore, who explored N over "
-        "5..n_TR/2 per voxel precisely because the right window is not "
-        "knowable a priori. Note 20 s is also close to the duration of the "
-        "HRF itself, so this window can smooth away the task-locked phase "
-        "modulation you are trying to regress with, especially in block "
-        "designs. Prefer -phase_filter explore, or set this deliberately from "
-        "your design's timescale. Only used with -phase_filter sgf.",
-    )
-    pfilt.add_argument(
-        "-sgf_order",
-        type=int,
-        default=3,
-        metavar="P",
-        help="SGF polynomial order (must be < window length). Lower = "
-        "more smoothing. Only used with -phase_filter sgf.",
-    )
-    pfilt.add_argument(
-        "-sgf_window_max",
-        type=int,
-        default=None,
-        metavar="N",
-        help="EXPLORE grid: largest window (odd) searched per voxel. "
-        "Default: n_TRs // 2, matching Barry & Gore (N <= 49 for their 96-TR "
-        "runs, N <= 97 for their 192-TR PRESTO runs). Only used with "
-        "-phase_filter explore.",
-    )
-    pfilt.add_argument(
-        "-sgf_order_max",
-        type=int,
-        default=None,
-        metavar="P",
-        help="EXPLORE grid: largest polynomial order searched per voxel "
-        "(min is 2). Default: sgf_window_max // 4, i.e. ~12 for a 96-TR run "
-        "and ~24 for 192 TRs, matching Barry & Gore. The previous default of "
-        "5 was not from the paper and made only the heavily-smoothing corner "
-        "of the grid reachable. Only used with -phase_filter explore.",
-    )
-    pfilt.add_argument(
-        "-sgf_step",
-        type=int,
-        default=4,
-        metavar="N",
-        help="EXPLORE grid: window step (odd-ified) between candidate "
-        "windows. Smaller = finer, slower search. Default: 4. Only used "
-        "with -phase_filter explore.",
-    )
-
-    parser.add_argument(
-        "-shrink",
-        choices=["odr", "none"],
-        default="none",
-        help="Whether the ODR shrinkage factor s = 1/(1+A^2/phi) is applied. "
-        "'none' (default) subtracts A*phase and leaves the residual — your micro "
-        "BOLD — intact. 'odr' is phaseprep/Stanley parity: ODR treats everything "
-        "phase does not explain as noise and returns its noise estimate, so by "
-        "default it removes all of A*phase and then scales the residual by s "
-        "(t unchanged within a voxel, betas/PSC shrunk by a per-voxel factor "
-        "smallest near veins, which tilts beta layer profiles); with -keep_drift "
-        "it removes only s*A*phase, leaving (1-s) of the macro in. Its one "
-        "benefit is that ill-conditioned voxels decay to their mean rather than "
-        "speckle; check prefix_slope instead. Verbose output reports s.",
-    )
-
     reg.add_argument(
         "-slope_on",
         choices=["data", "residual"],
         default="data",
-        help="Series the slope is fit on when a task model is given. 'data' "
-        "(default; Menon 2002, Stanley 2021, Knudsen 2023): nuisance-detrended, "
-        "task preserved; the task model only feeds phi. 'residual': after task "
-        "removal (the pre-2026-10 behaviour of -task_removal).",
+        help="'data': fit the slope on the detrended, task-preserved series (Menon "
+        "2002, Stanley 2021, Knudsen 2023); a vein's task response is what pins its "
+        "slope. 'residual': fit after task removal (needs -task_removal).",
     )
-    pcond = parser.add_argument_group("Phase Conditioning")
+
+    task = parser.add_argument_group(
+        "Task model (only used for phi with -phi_method residual, or with -slope_on residual)"
+    )
+    task.add_argument(
+        "-task_removal",
+        choices=["none", "tent", "canonical"],
+        default="none",
+        help="'tent': FIR basis, model-free. 'canonical': SPM HRF.",
+    )
+    task.add_argument(
+        "-onsets",
+        nargs="+",
+        metavar="FILE",
+        help="AFNI timing files, one per condition, one row per run.",
+    )
+    add_bids_events_args(
+        task,
+        events_help="BIDS events TSVs, one per run (instead of -onsets).",
+    )
+    task.add_argument(
+        "-tent_window",
+        type=float,
+        default=20.0,
+        metavar="SECONDS",
+        help="TENT window for -task_removal tent.",
+    )
+    task.add_argument(
+        "-durations",
+        nargs="+",
+        metavar="SECONDS",
+        help="Per-condition durations for -onsets (-events reads them from the TSV).",
+    )
+
+    pcond = parser.add_argument_group("Phase conditioning")
     pcond.add_argument(
         "-no_phase_unwrap",
         action="store_true",
-        help="Skip the temporal unwrap. By default each run's phase is unwrapped "
-        "along time about the voxel's circular mean: a no-op (up to a constant) "
-        "on unwrapped input, and what makes wrapped input — e.g. from ffs_nwarp "
-        "-phase_warp split/circular/complex — usable.",
+        help="Skip the temporal unwrap. By default each run is unwrapped along time "
+        "about the voxel's circular mean, correcting only steps a multiple of 2pi "
+        "brings under pi/2: a no-op on unwrapped input, and what makes wrapped "
+        "input usable.",
     )
     pcond.add_argument(
         "-phase_global_order",
         type=int,
         default=-1,
         metavar="N",
-        help="Remove a per-volume spatial phase term before the fit. -1 (default) "
-        "off; 0 a robust brain-wide offset per volume; N>=1 a spatial Legendre "
-        "polynomial of total degree N. Breathing, B0 drift and recon offsets "
-        "move the whole brain's phase together; that is regressor variance with "
-        "no magnitude counterpart and pulls every slope toward 0 (Menon 2002 "
-        "used a navigator echo; Bodenschatz & Rowe 2026 fit a low-order spatial "
-        "polynomial per volume). Vessel phase is a local dipole, which a low-"
-        "order brain-wide fit cannot absorb. Keep N small with partial coverage.",
+        help="Remove a per-volume spatial phase term on the final grid: -1 off "
+        "(default), 0 a brain-wide offset, N>=1 a Legendre polynomial of degree N "
+        "(Bodenschatz & Rowe 2026). A fallback: ffs_phasedrift upstream does this "
+        "per slice in native space and removes much more.",
+    )
+    pcond.add_argument(
+        "-phase_filter",
+        choices=["none", "sgf", "explore"],
+        default="none",
+        help="Smooth the phase before the fit (Barry & Gore 2014). 'sgf': "
+        "Savitzky-Golay with -sgf_window/-sgf_order. 'explore': per-voxel search "
+        "over the -sgf_*_max grid, keeping the unfiltered series as a candidate; "
+        "maximises |r(phase, magnitude)|, the same argmax as their minimum-residual "
+        "rule under OLS. Slow.",
+    )
+    pcond.add_argument(
+        "-sgf_window",
+        type=int,
+        default=None,
+        metavar="N",
+        help="[sgf] Window in TRs, odd. Default round(20 s/TR), min 5: a placeholder "
+        "close to an HRF's length, which can smooth away task-locked phase. Set it "
+        "from your design, or use explore.",
+    )
+    pcond.add_argument(
+        "-sgf_order",
+        type=int,
+        default=3,
+        metavar="P",
+        help="[sgf] Polynomial order, below the window.",
+    )
+    pcond.add_argument(
+        "-sgf_window_max",
+        type=int,
+        default=None,
+        metavar="N",
+        help="[explore] Largest window. Default n_TRs // 2 (Barry & Gore).",
+    )
+    pcond.add_argument(
+        "-sgf_order_max",
+        type=int,
+        default=None,
+        metavar="P",
+        help="[explore] Largest order, min 2. Default sgf_window_max // 4 (Barry & Gore).",
+    )
+    pcond.add_argument(
+        "-sgf_step",
+        type=int,
+        default=4,
+        metavar="N",
+        help="[explore] Window step.",
     )
 
-    vg = parser.add_argument_group("Vein Exclusion Mask")
-    vg.add_argument(
-        "-vein_mask",
-        action="store_true",
-        help="Also write a vein EXCLUSION mask: voxels whose magnitude covaries "
-        "with phase more than chance. Randomly-oriented microvasculature "
-        "produces magnitude change with no coherent phase change, so a "
-        "significant magnitude-phase correlation is direct evidence of an "
-        "oriented vessel. Intended for laminar / layer-extraction workflows "
-        "that would rather DROP contaminated voxels than trust a subtraction: "
-        "no slope is applied, so nothing can be over- or under-corrected. "
-        "Complements the corrected output rather than replacing it — the "
-        "corrected series is unchanged by this flag. Same logic as the "
-        "H_c-vs-H_a contrast of Rowe 2005, without fitting the full "
-        "complex-valued GLM. "
-        "INTERACTION WITH -spr, a real trade-off: without -spr the test uses "
-        "the voxel's OWN phase, which is specific (grey matter phase is not "
-        "task-locked) but MISSES the phase-blind veins -spr exists for. With "
-        "-spr the test uses the donor's phase, which catches them, but also "
-        "flags healthy grey matter that merely borrowed a strong nearby phase "
-        "source — in practice dilating the mask by about one voxel around each "
-        "source. For a conservative exclusion mask that dilation may be what "
-        "you want (vein-adjacent voxels are partly contaminated anyway); for a "
-        "tight one, omit -spr. Inspect prefix_coupling_r before committing.",
-    )
-    vg.add_argument(
-        "-vein_fdr",
-        type=float,
-        default=0.05,
-        metavar="Q",
-        help="Benjamini-Hochberg q for -vein_mask. Lower = fewer voxels "
-        "excluded. The correlation is Sidak-corrected for the sPR donor argmax "
-        "before FDR, so -spr does not silently inflate the mask. Default: 0.05.",
-    )
-
-    # ── Source-localized phase regression ────────────────────────────────
-    sprg = parser.add_argument_group("Source-Localized Phase Regression (sPR; Vu & Gallant 2015)")
+    sprg = parser.add_argument_group("Source-localized PR (sPR; Vu & Gallant 2015)")
     sprg.add_argument(
         "-spr",
         action="store_true",
-        help="Regress each voxel's magnitude on the phase of whichever "
-        "neighbour best tracks it, instead of on its own phase. Targets the "
-        "dominant PR failure mode at 7T: a vein roughly the size of a voxel "
-        "straddles the whole off-resonance dipole, so its sampled field "
-        "offsets cancel and its own phase fSNR is near zero — huge magnitude "
-        "change, no phase to regress it away with, vein survives. Adjacent "
-        "voxels sample one polarity of the dipole and DO have high phase "
-        "fSNR. Also recovers veins near the magic angle (~54.7 deg), where "
-        "intravascular phase accrual vanishes. "
-        "NOTE sPR has two separable halves and they pull in OPPOSITE "
-        "directions. (1) Donor borrowing (this flag) finds phase where the "
-        "voxel had none, so it suppresses MORE. (2) Vu also swaps Menon's "
-        "chi-squared loss for plain OLS, which suppresses LESS — that half "
-        "exists to fix over-correction (Nencka & Rowe 2007), a problem you "
-        "only have if PR is eating your grey-matter signal. If your complaint "
-        "is that veins SURVIVE, take the donor and keep -regression deming. "
-        "Use -regression ols only for literal Vu & Gallant parity.",
+        help="Regress each voxel's magnitude on the phase of whichever neighbour "
+        "(or itself) tracks it best. For veins whose own phase is ~0: field "
+        "offsets cancel inside a voxel-sized vein, or the vessel is near the magic "
+        "angle, while a neighbour sees one lobe of the field. Vu also used OLS, "
+        "which suppresses less; keep -regression deming if veins survive. QC: "
+        "prefix_spr_donor_offset should trace vessels, not speckle.",
     )
     sprg.add_argument(
         "-spr_neighborhood",
@@ -645,143 +292,104 @@ def create_parser() -> argparse.ArgumentParser:
         default=6,
         dest="spr_neighborhood",
         metavar="K",
-        help="Donor search neighbourhood: 6 = face-adjacent (Vu & Gallant's "
-        "7-voxel set: self + 6 faces), 18 adds edges, 26 the full 3x3x3. "
-        "Vu chose 6 as the smallest sensible increment over standard PR and "
-        "left larger neighbourhoods explicitly open. Bigger K searches harder "
-        "but the argmax overfits more (see -spr_select_run). Default: 6.",
+        help="Donor neighbourhood: 6 faces (Vu & Gallant), 18, or 26. Larger K overfits more.",
     )
     sprg.add_argument(
         "-spr_select_run",
         type=int,
         default=None,
         metavar="R",
-        help="0-based run used ONLY to pick donors, which are then applied to "
-        "all runs. Vu & Gallant set aside their first run for exactly this, so "
-        "the argmax over neighbours is not chosen and evaluated on the same "
-        "data. Omit (default) to select on all runs concatenated — required "
-        "for single-run data, but then donor selection is in-sample and biases "
-        "mildly toward over-suppression.",
+        help="0-based run used only to choose donors (Vu & Gallant held out a run). "
+        "Default: all runs, in-sample, which biases toward over-suppression.",
     )
 
-    # ── Processing options ───────────────────────────────────────────────
-    proc = parser.add_argument_group("Processing Options")
+    vg = parser.add_argument_group("Vein exclusion mask")
+    vg.add_argument(
+        "-vein_mask",
+        action="store_true",
+        help="Also write prefix_vein_mask: voxels whose magnitude and phase "
+        "correlate beyond chance (oriented vessels; cf. Rowe 2005). For layer "
+        "profiles that would rather drop those voxels than trust a subtraction. "
+        "The corrected series is unchanged. With -spr the test uses the donor's "
+        "phase, which catches phase-blind veins but dilates the mask by about a "
+        "voxel.",
+    )
+    vg.add_argument(
+        "-vein_fdr",
+        type=float,
+        default=0.05,
+        metavar="Q",
+        help="BH-FDR q for -vein_mask, after a Sidak correction for the -spr donor argmax.",
+    )
+
+    proc = parser.add_argument_group("Processing")
+    proc.add_argument(
+        "-keep_drift",
+        action="store_true",
+        help="Keep polynomial drift in prefix_corrected (output = input - A*phase). "
+        "Use when a GLM follows, as it models drift itself. Default: drift dropped "
+        "and the series re-centred on its mean (phaseprep).",
+    )
     proc.add_argument(
         "-polort",
         type=str,
         default="A",
         metavar="N",
-        help="Polynomial drift order (Legendre, per run). 'A' = auto "
-        "(AFNI formula based on run duration). Integer for fixed "
-        "order. -1 for none. Use -polort 1 for exact phaseprep parity "
-        "(linear-only detrend, what PreprocessPhase + DetrendMag do). "
-        "Higher orders remove more drift before the fit but can absorb "
-        "shared low-frequency mag-phase content that you may want to "
-        "keep — there's a tradeoff.",
+        help="Legendre drift order per run, removed from both series before the fit. "
+        "'A' (default) = AFNI's rule from run length; 1 = phaseprep; -1 none.",
     )
     proc.add_argument(
         "-tr",
         type=float,
         metavar="SECONDS",
-        help="Repetition time. Default: read from NIfTI pixdim/zooms. "
-        "Override here if your header is wrong.",
+        help="Repetition time. Default: the magnitude header.",
     )
     proc.add_argument(
         "-mask",
         metavar="FILE",
-        help="Brain mask (restricts analysis to mask voxels). "
-        "If not provided, voxels are filtered by -signal_thresh.",
+        help="Analysis mask. Default: an automask of the mean magnitude.",
+    )
+    proc.add_argument(
+        "-no_auto_mask",
+        action="store_true",
+        help="Without -mask, fit every voxel above -signal_thresh instead of automasking.",
     )
     proc.add_argument(
         "-signal_thresh",
         type=float,
         default=0.03,
         metavar="FRAC",
-        help="Minimum mean-signal fraction to include a voxel in "
-        "regression (default 0.03 = 3%% of max, matching phaseprep). "
-        "Voxels below this have slope=0 and R²=0. "
-        "Set to 0 to disable: air/noise voxels are then fitted too, "
-        "and the R² map shows bright noise "
-        "voxels because ODR-style R² reads unfittable data as "
-        "'perfect within noise budget' — visual artifact, not a bug.",
-    )
-    proc.add_argument(
-        "-no_auto_mask",
-        action="store_true",
-        help="Disable automatic brain masking when -mask is not provided. "
-        "By default, ffs_phasereg computes a brain mask from the mean "
-        "magnitude (using AFNI-compatible automask) to exclude air, "
-        "skull, and non-brain tissue before regression.",
+        help="Skip voxels whose mean is below this fraction of the maximum (phaseprep). "
+        "0 fits everything, air included.",
     )
     proc.add_argument(
         "-concat_output",
         action="store_true",
-        help="With several runs, write each 4D output (corrected, macro, and "
-        "-save_intermediates) as ONE file concatenated over runs. Default: one file "
-        "per run, prefix_<name>_run-NN in input order, so each lines up with the run "
-        "it came from. The fit pools the runs either way.",
-    )
-    proc.add_argument(
-        "-keep_drift",
-        action="store_true",
-        help="GLM-friendly output mode. Default (off) is phaseprep parity: "
-        "corrected = mean + shrunk_residual, drift dropped, ill-"
-        "conditioned voxels collapse to per-voxel mean. With this flag "
-        "ON, corrected = mag_orig - A_eff·(phase_dt - mean), where "
-        "A_eff = A/(1 + A²/φ) is the shrunken slope. Polynomial drift "
-        "is preserved (your downstream GLM models it), and A_eff is "
-        "naturally bounded by √φ/2 so high-Deming-slope voxels still "
-        "produce a clean correction instead of speckle. "
-        "Recommended when the corrected mag is the input to a GLM "
-        "rather than the analysis endpoint.",
+        help="Write each 4D output as one file concatenated over runs, not per run.",
     )
     proc.add_argument(
         "-motion",
         nargs="+",
         metavar="FILE",
-        help="(DEPRECATED — use -ortvec_run instead.) "
-        "Motion parameter files, one per run (AFNI dfile format). "
-        "Equivalent to passing each as -ortvec_run FILE motion RUN. "
-        "Added as nuisance regressors.",
+        help="(Deprecated: -ortvec_run FILE motion RUN.) Motion files, one per run.",
     )
     add_ortvec_arguments(proc)
 
-    # ── Hardware ─────────────────────────────────────────────────────────
-    hw = parser.add_argument_group("Hardware Options")
-    hw.add_argument(
-        "-device",
-        type=str,
-        default=None,
-        help="PyTorch device: cpu, cuda, mps (default: auto-detect).",
-    )
-
-    # ── Output ───────────────────────────────────────────────────────────
-    out = parser.add_argument_group("Output Options")
+    out = parser.add_argument_group("Output and hardware")
     out.add_argument(
         "-r2_mode",
         choices=["odr", "naive", "both"],
         default="odr",
-        help="Which R² map(s) to write. 'odr' (default): ODR-shrinkage R² "
-        "matching phaseprep / Stanley 2021 — the canonical metric. "
-        "'naive': 1 - SS_res(observed) / SS_tot without shrinkage — "
-        "highlights voxels with the largest raw phase-regression effect, "
-        "useful for spotting which voxels were most changed even when "
-        "ODR inflation makes the canonical R² appear small. "
-        "'both': write prefix_r2.nii.gz (ODR) and prefix_r2_naive.nii.gz.",
+        help="R^2 map(s): 'odr' (phaseprep parity), 'naive' (no shrinkage: where the "
+        "correction was largest), or both.",
     )
     out.add_argument(
         "-save_intermediates",
         action="store_true",
-        help="Write intermediate time-series volumes for step-by-step inspection: "
-        "prefix_mag_dt (poly-detrended magnitude), "
-        "prefix_pha_dt (poly-detrended phase), "
-        "prefix_pha_dt_filt (detrended + SGF-filtered phase, differs from "
-        "prefix_pha_dt only when -phase_filter sgf|explore is active), "
-        "prefix_mag_res (magnitude after poly + task removal, used for "
-        "slope estimation), and "
-        "prefix_pha_res_filt (phase after poly + task + SGF, used for phi "
-        "estimation and slope estimation).",
+        help="Also write the detrended, filtered and task-residual series "
+        "(prefix_mag_dt, _pha_dt, _pha_dt_filt, _mag_res, _pha_res_filt).",
     )
+    add_device_arg(out)
     add_verbose_arg(out, default=0)
 
     return parser

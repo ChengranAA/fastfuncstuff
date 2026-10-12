@@ -232,7 +232,7 @@ def _apply_sgf(
     verbose : bool
     sgf_window_max, sgf_order_max, sgf_step : int or None
         Explore-mode grid bounds (max window, max order, window step).
-        None = library defaults (min(n_tp, 97), 5, 4).
+        None = n_timepoints // 2, max_window // 4, and 4 (Barry & Gore 2014).
     run_lengths : list of int, optional
         Runs concatenated along time; each is filtered on its own.
 
@@ -357,8 +357,8 @@ def phase_regress(
     tr : float
         Repetition time in seconds.
     task_removal : {"none", "tent", "canonical"}
-        How to remove task-correlated signal before estimating the
-        regression slope.
+        Task model. Feeds the phi estimate (``phi_method="residual"``) and,
+        only with ``slope_on="residual"``, the slope fit.
     onsets_per_condition : list of list of ndarray, optional
         Onset times structured as [condition][run] -> ndarray.
     nuisance_per_run : list of Tensor, optional
@@ -376,16 +376,11 @@ def phase_regress(
     regression : {"deming", "ols"}
         Regression method.
     slope_on : {"data", "residual"}
-        Which series the slope is fit on when ``task_removal`` is active.
-        "data" (default) fits the nuisance-detrended, task-PRESERVED series,
-        as Menon 2002, Stanley 2021 and Knudsen 2023 all do; the task model
-        then only feeds the noise (phi) estimate. A vein's task-locked
-        magnitude/phase covariance is most of what determines its slope, so
-        removing it first leaves the fit to spontaneous fluctuations and
-        noise. "residual" fits the task-residual series instead: it guards
-        against a micro task response that co-varies with macro phase being
-        removed with it (over-suppression), at the price of a far noisier
-        slope.
+        Series the slope is fit on. "data" (default; Menon 2002, Stanley
+        2021, Knudsen 2023): detrended, task preserved, because a vein's
+        task-locked magnitude/phase covariance is what pins its slope.
+        "residual": after task removal, which guards against over-suppression
+        at the price of a far noisier slope.
     tent_window : float
         TENT window duration in seconds.
     phase_filter : {"none", "sgf", "explore"}
@@ -394,81 +389,60 @@ def phase_regress(
         - "sgf": Savitzky-Golay with sgf_window/sgf_order.
         - "explore": per-voxel data-driven SGF search (Barry & Gore 2014).
     sgf_window : int or None
-        SGF window length (odd) for phase_filter="sgf".
-        None = auto: ~20s of TRs (HRF-duration based), rounded to odd.
+        SGF window length (odd) for phase_filter="sgf". None = round(20 s/TR),
+        made odd, min 5.
     sgf_order : int
         SGF polynomial order for phase_filter="sgf".
     sgf_window_max, sgf_order_max, sgf_step : int or None
         Grid bounds for phase_filter="explore" (max window, max order, and
-        window step). None = library defaults (min(n_tp, 97), 5, 4).
+        window step). None = n_timepoints // 2, max_window // 4, and 4
+        (Barry & Gore 2014's grid).
     signal_thresh : float
-        Minimum mean-signal fraction to include a voxel (default 0.03,
-        matching phaseprep). Voxels below this have their slope and
-        intercept zeroed, so R² goes to 0 and corrected = mag_orig (or
-        mean(mag_orig) in default mode). Set to 0 to disable; outputs
-        stay numerically clean (ODR shrinkage caps every voxel) but the
-        R² map will show bright values in air/noise voxels because the
-        ODR-style metric reads ill-conditioned slopes as "perfect fits
-        within the noise budget" — not a bug, but visually misleading.
+        Minimum mean-signal fraction (of the brain maximum) for a voxel to be
+        fit (default 0.03, phaseprep). Voxels below it get slope 0, so
+        corrected = input (or its mean without ``keep_drift``). 0 fits all.
     phase_unwrap : bool
         Unwrap each run's phase along time about the voxel's circular mean
         before anything else (``conditioning.temporal_unwrap``). A no-op up to
         a constant on already-unwrapped phase; required for wrapped phase.
     phase_global_order : int
         -1 (default) off. 0 removes a robust per-volume brain-wide phase
-        offset; N >= 1 removes a per-volume spatial Legendre polynomial of
-        total degree N (needs ``volume_shape``). Breathing / frequency-drift
-        field changes are regressor variance with no magnitude counterpart and
-        attenuate the slope; see ``conditioning.remove_global_phase``.
+        offset; N >= 1 a per-volume spatial Legendre polynomial of degree N
+        (needs ``volume_shape``). A fallback for data that did not go through
+        ``ffs_phasedrift``, which removes the same field term per slice in
+        native space and far more of it.
     keep_drift : bool
-        If False (default, phaseprep parity), the corrected magnitude is
-        re-centered on the per-voxel mean and any polynomial drift removed
-        by ``max_poly_degree`` is dropped. If True, the original drift is
-        preserved in the corrected output (subtract macro from raw mag),
-        leaving low-order drift for a downstream GLM to model. The macro
-        magnitude removed is unaffected by this flag.
+        False (default, phaseprep): the corrected magnitude is re-centred on
+        its mean with the ``max_poly_degree`` drift dropped. True: corrected
+        = input - macro, drift kept for a downstream GLM.
     shrink_mode : {"none", "odr"}
-        Whether to apply the ODR shrinkage factor 1/(1 + A²/φ) to the
-        correction.  "none" (default) subtracts A·φ and leaves the residual
-        intact.  "odr" is phaseprep/Stanley parity and is what
-        makes ill-conditioned voxels degrade gracefully to their mean instead
-        of speckling.  ODR returns its estimate of the magnitude *noise*, and
-        the model counts micro BOLD as noise: without ``keep_drift`` all of
-        A·φ is removed and the residual is scaled by s = 1/(1 + A²/φ), so t is
-        unchanged within a voxel but betas shrink by a factor that is smallest
-        near veins; with ``keep_drift`` only s·A·φ is removed, so (1 − s) of
-        the macro stays in (A²/φ ~ 1 in raw scanner units).
+        "none" (default) subtracts A·phase and leaves the residual intact.
+        "odr" (phaseprep/Stanley parity) applies s = 1/(1 + A²/φ): without
+        ``keep_drift`` the residual, micro BOLD included, is scaled by s (t
+        unchanged, betas shrunk most near veins); with ``keep_drift`` only
+        s·A·phase is removed, leaving (1 − s) of the macro in.
     vein_mask : bool
-        Also emit a vein *exclusion* mask alongside the corrected series.
-        Rather than subtracting a macrovascular estimate, this tests whether the
-        voxel's magnitude covaries with phase more than chance; randomly-oriented
-        microvasculature produces no coherent phase change, so a significant
-        correlation is direct evidence of an oriented vessel.  Intended for
-        laminar / layer-extraction workflows that want to drop contaminated
-        voxels outright.  Does not alter the corrected time series.
+        Also emit a vein *exclusion* mask: voxels whose magnitude covaries with
+        phase beyond chance (oriented vessels). For layer workflows that drop
+        such voxels. Does not alter the corrected series.
     vein_fdr_q : float
         Benjamini-Hochberg q for the mask.  The correlation is Sidak-corrected
         for the sPR donor argmax before FDR.
     spr : bool
-        Enable source-localized phase regression (Vu & Gallant 2015).  Instead
-        of regressing each voxel's magnitude on its *own* phase, regress it on
-        the phase of whichever voxel in its spatial neighbourhood best tracks
-        it.  This recovers vein-filled voxels whose own phase fSNR is near zero
-        (vein ≈ voxel size, or near the magic angle) by borrowing phase from a
-        vein-adjacent neighbour.  Requires ``volume_shape``.  Vu's estimator is
-        plain OLS on the donor phase, so pair with ``regression="ols"``.
+        Source-localized phase regression (Vu & Gallant 2015): regress each
+        voxel's magnitude on the phase of the neighbour (or itself) that
+        tracks it best, for veins whose own phase is ~0 (cancellation inside
+        a voxel-sized vein, or the magic angle). Requires ``volume_shape``.
+        Vu used OLS, which suppresses less; for surviving veins keep
+        ``regression="deming"``.
     spr_connectivity : {6, 18, 26}
         Donor search neighbourhood.  6 (face-adjacent, Vu & Gallant's choice)
         is the default; larger neighbourhoods search harder but increase the
         selection bias described under ``spr_select_run``.
     spr_select_run : int or None
-        0-based index of the run used *only* to select donors, which are then
-        applied to every run.  Vu & Gallant do this (their first run is set
-        aside for exactly this purpose) so that the argmax over neighbours is
-        not fit and evaluated on the same data.  None (default) selects donors
-        on all runs concatenated — simpler and necessary for single-run data,
-        but the selection is then in-sample and biases mildly toward
-        over-suppression.
+        0-based run used *only* to select donors, then applied to every run
+        (Vu & Gallant held out a run). None (default) selects on all runs:
+        in-sample, biased toward over-suppression.
     volume_shape : (nx, ny, nz) or None
         Shape of the 3-D grid the voxel axis was flattened from.  Required for
         ``spr``; ignored otherwise.
@@ -482,11 +456,8 @@ def phase_regress(
     verbose : bool
         Print progress information.
     r2_mode : {"odr", "naive", "both"}
-        Which R² metric(s) to compute.  "odr" (default) is the ODR-shrinkage
-        R² that matches phaseprep/Stanley and is the canonical metric.
-        "naive" computes ``1 - SS_res(observed) / SS_tot`` without shrinkage,
-        which highlights voxels with the largest raw phase-regression effect
-        and is useful for QC/visualisation.  "both" returns both.
+        "odr" (default): the ODR-shrinkage R² of phaseprep/Stanley. "naive":
+        ``1 - SS_res / SS_tot`` without shrinkage, a where-did-it-act map.
     save_intermediates : bool
         If True, populate the intermediate-data fields of PhaseRegResult
         (mag_detrended, pha_detrended, pha_detrended_filt, mag_residual,

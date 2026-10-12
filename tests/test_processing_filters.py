@@ -181,3 +181,43 @@ class TestSavgolFilterExplore:
             metric_fn=metric,
         )
         assert out.shape == x.shape
+
+
+# ---------------------------------------------------------------------------
+# Run boundaries: a window must never straddle a join between runs
+# ---------------------------------------------------------------------------
+
+
+class TestSavgolRunBoundaries:
+    def test_changing_run_1_cannot_change_run_2(self):
+        torch.manual_seed(0)
+        run1, run2 = torch.randn(3, 60), torch.randn(3, 50)
+        a = savgol_filter_1d(torch.cat([run1, run2], dim=-1), 11, 3, [60, 50])
+        b = savgol_filter_1d(torch.cat([run1 + 100.0, run2], dim=-1), 11, 3, [60, 50])
+        torch.testing.assert_close(a[:, 60:], b[:, 60:], rtol=0, atol=0)
+        torch.testing.assert_close(a[:, 60:], savgol_filter_1d(run2, 11, 3))
+
+    def test_explore_filters_per_run_and_bounds_window_by_shortest_run(self):
+        torch.manual_seed(1)
+        run1, run2 = torch.randn(4, 120), torch.randn(4, 40)
+
+        def metric(filtered):
+            return -filtered.var(dim=-1)
+
+        def explore(x):
+            return savgol_filter_explore(
+                x,
+                n_timepoints=x.shape[-1],
+                device=torch.device("cpu"),
+                metric_fn=metric,
+                return_params=True,
+                segment_lengths=[120, 40],
+            )
+
+        out, win, order = explore(torch.cat([run1, run2], dim=-1))
+        assert int(win.max()) <= 40 // 2
+        # Run 2's output is exactly its own filter at the chosen params.
+        for v in range(4):
+            w, p = int(win[v]), int(order[v])
+            if w:
+                torch.testing.assert_close(out[v, 120:], savgol_filter_1d(run2[v], w, p))

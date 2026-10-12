@@ -216,6 +216,7 @@ def _apply_sgf(
     sgf_window_max: int | None = None,
     sgf_order_max: int | None = None,
     sgf_step: int = 4,
+    run_lengths: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Apply Savitzky-Golay filtering to phase on GPU, chunked.
 
@@ -231,6 +232,8 @@ def _apply_sgf(
     sgf_window_max, sgf_order_max, sgf_step : int or None
         Explore-mode grid bounds (max window, max order, window step).
         None = library defaults (min(n_tp, 97), 5, 4).
+    run_lengths : list of int, optional
+        Runs concatenated along time; each is filtered on its own.
 
     Returns
     -------
@@ -251,7 +254,7 @@ def _apply_sgf(
         for start in range(0, n_vox, chunk_size):
             end = min(start + chunk_size, n_vox)
             chunk = phase_detrended[:, start:end].to(device)
-            filtered = savgol_filter_1d(chunk.T, sgf_window, sgf_order).T
+            filtered = savgol_filter_1d(chunk.T, sgf_window, sgf_order, run_lengths).T
             result[:, start:end] = filtered.cpu()
         return result, None, None
 
@@ -291,6 +294,7 @@ def _apply_sgf(
                 max_order=sgf_order_max,
                 step=sgf_step,
                 return_params=True,
+                segment_lengths=run_lengths,
             )
             result[:, start:end] = filtered.T.cpu()
             window_map[start:end] = win_c.cpu()
@@ -582,6 +586,7 @@ def phase_regress(
         mag_residual_runs.append(mag_res.cpu())
         pha_residual_runs.append(pha_res.cpu())
 
+    run_lengths = [r.shape[0] for r in mag_detrended_runs]
     mag_residual = torch.cat(mag_residual_runs, dim=0)
     pha_residual = torch.cat(pha_residual_runs, dim=0)
     mag_detrended = torch.cat(mag_detrended_runs, dim=0)
@@ -627,6 +632,7 @@ def phase_regress(
         sgf_window_max=sgf_window_max,
         sgf_order_max=sgf_order_max,
         sgf_step=sgf_step,
+        run_lengths=run_lengths,
     )
     pha_residual_filt, _, _ = _apply_sgf(
         pha_residual,
@@ -640,6 +646,7 @@ def phase_regress(
         sgf_window_max=sgf_window_max,
         sgf_order_max=sgf_order_max,
         sgf_step=sgf_step,
+        run_lengths=run_lengths,
     )
 
     if verbose and sgf_window_map is not None:

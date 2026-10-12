@@ -66,6 +66,7 @@ def savgol_filter_1d(
     data: Tensor,
     window_length: int,
     poly_order: int,
+    segment_lengths: list[int] | None = None,
 ) -> Tensor:
     """Apply Savitzky-Golay filter to batched 1-D time series on GPU.
 
@@ -78,6 +79,10 @@ def savgol_filter_1d(
         Odd integer, width of the filtering window.
     poly_order : int
         Polynomial order for the local fit (< window_length).
+    segment_lengths : list of int, optional
+        Lengths of independent segments (runs) concatenated along the last
+        dimension. Each is filtered on its own, so no window straddles a run
+        join; a segment shorter than the window passes through unfiltered.
 
     Returns
     -------
@@ -87,6 +92,16 @@ def savgol_filter_1d(
         raise ValueError("window_length must be odd")
     if poly_order >= window_length:
         raise ValueError("poly_order must be < window_length")
+    if segment_lengths is not None and len(segment_lengths) > 1:
+        if sum(segment_lengths) != data.shape[-1]:
+            raise ValueError(f"segment_lengths sum to {sum(segment_lengths)}, not {data.shape[-1]}")
+        return torch.cat(
+            [
+                savgol_filter_1d(seg, window_length, poly_order)
+                for seg in data.split(list(segment_lengths), dim=-1)
+            ],
+            dim=-1,
+        )
     if data.shape[-1] < window_length:
         return data.clone()
 
@@ -125,6 +140,7 @@ def savgol_filter_explore(
     step: int = 4,
     metric_fn=None,
     return_params: bool = False,
+    segment_lengths: list[int] | None = None,
 ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
     """Data-driven SGF parameter search per voxel (Barry & Gore 2014).
 
@@ -163,6 +179,12 @@ def savgol_filter_explore(
         If True, also return the per-voxel chosen (window, order) as two
         int tensors of shape (n_voxels,).  Voxels never filtered (empty grid)
         report window=0, order=0.
+    segment_lengths : list of int, optional
+        Runs concatenated along time. Every candidate is filtered per run
+        (see :func:`savgol_filter_1d`) and scored by *metric_fn* on all runs
+        jointly, so each voxel gets one (window, order) for the whole session.
+        The window grid is bounded by the shortest run, the length Barry &
+        Gore's N <= T/2 rule refers to.
 
     Returns
     -------
@@ -184,6 +206,8 @@ def savgol_filter_explore(
     # from the paper: they let the window run to the full run length on short
     # runs while capping order so low that only the heavily-smoothing corner of
     # the grid was reachable.
+    if segment_lengths is not None and len(segment_lengths) > 1:
+        n_timepoints = min(segment_lengths)
     if max_window is None:
         max_window = max(min_window, n_timepoints // 2)
     if max_order is None:
@@ -207,7 +231,7 @@ def savgol_filter_explore(
     for w in windows:
         for p in range(min_order, min(max_order, w - 1) + 1):
             try:
-                filt = savgol_filter_1d(data, w, p)
+                filt = savgol_filter_1d(data, w, p, segment_lengths)
             except torch._C._LinAlgError:  # ty: ignore[unresolved-attribute]
                 continue
             score = metric_fn(filt)

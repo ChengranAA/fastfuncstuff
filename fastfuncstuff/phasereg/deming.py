@@ -95,10 +95,16 @@ def deming_regression(
     discriminant = diff * diff + 4.0 * phi * sxy * sxy
     sqrt_disc = torch.sqrt(discriminant.clamp(min=0.0))
 
-    numerator = diff + sqrt_disc
-    denominator = 2.0 * sxy
+    # Where diff < 0 (phi*SXX dominates, the usual case at fMRI phi ~ 1e7),
+    # diff + sqrt_disc is a difference of near-equal numbers and float32 keeps
+    # few or none of its digits: weakly coupled voxels got slopes off by 50%
+    # or more. The conjugate form 2*phi*SXY / (sqrt_disc - diff) is the same
+    # value with no cancellation there, and it goes to 0 as SXY -> 0.
+    pos = diff >= 0
+    numerator = torch.where(pos, diff + sqrt_disc, 2.0 * phi * sxy)
+    denominator = torch.where(pos, 2.0 * sxy, sqrt_disc - diff)
 
-    # Guard against sxy ~ 0 (no correlation -> slope = 0)
+    # Guard against a zero denominator (no correlation -> slope = 0)
     slope = torch.where(
         denominator.abs() > 1e-30,
         numerator / denominator,

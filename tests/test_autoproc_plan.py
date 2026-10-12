@@ -1883,10 +1883,10 @@ def _locomoco_manifest(script: str) -> str:
 
 
 def test_locomoco_gets_the_run_events_for_the_task_coupling_report(tmp_path):
-    """The task-coupling diagnostic is the thing that says whether the field is
-    reading BOLD as motion, and it only runs with -events. Per RUN, not per task."""
+    """-locomoco_task_qc: the diagnostic that says whether the field is reading BOLD
+    as motion. It needs the design, per RUN, not per task."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
-    plan = build_plan(subj, Options(locomoco=True))
+    plan = build_plan(subj, Options(locomoco=True, locomoco_task_qc=True))
     s = write_script(plan, "wd", bids_root=str(tmp_path))
 
     # The stimuli/ copy, not the BIDS original: it is what the design TOML names.
@@ -1894,13 +1894,14 @@ def test_locomoco_gets_the_run_events_for_the_task_coupling_report(tmp_path):
     line = _locomoco_manifest(s)
     assert '${ev:+-events \\"${ev}\\"}' in line
     assert '${ev:+${TR[$k]:+-tr \\"${TR[$k]}\\"}}' in line
+    assert "${ev:+-task_qc}" in line
     assert 'ev="${EVENTS[$k]:-}"' in s
 
 
 def test_locomoco_events_fall_back_to_the_bids_original_without_a_glm(tmp_path):
     """No GLM means no stimuli/ copy is written, so the script has to name the source."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
-    plan = build_plan(subj, Options(locomoco=True, run_glm=False))
+    plan = build_plan(subj, Options(locomoco=True, locomoco_task_qc=True, run_glm=False))
     s = write_script(plan, "wd", bids_root=str(tmp_path))
     src = tmp_path / "sub-X/ses-01/func/sub-X_ses-01_task-foo_run-1_events.tsv"
     assert f"EVENTS[01:foo:1]={src}" in s
@@ -1910,14 +1911,16 @@ def test_locomoco_events_fall_back_to_the_bids_original_without_a_glm(tmp_path):
 def test_a_run_without_events_simply_goes_unscored(tmp_path):
     """An unset EVENTS key must not trip `set -u`, and the run still gets corrected."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "rest", "1", events=False)])])
-    s = write_script(build_plan(subj, Options(locomoco=True)), "wd", bids_root=str(tmp_path))
+    opt = Options(locomoco=True, locomoco_task_qc=True)
+    s = write_script(build_plan(subj, opt), "wd", bids_root=str(tmp_path))
     assert "EVENTS[01:rest:1]" not in s
     assert 'ev="${EVENTS[$k]:-}"' in s
 
 
 def test_locomoco_events_are_not_emitted_without_locomoco(tmp_path):
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
-    s = write_script(build_plan(subj, Options(locomoco=False)), "wd", bids_root=str(tmp_path))
+    opt = Options(locomoco=False, locomoco_task_qc=True)
+    s = write_script(build_plan(subj, opt), "wd", bids_root=str(tmp_path))
     assert "EVENTS[01:foo:1]" not in s
 
 
@@ -1932,7 +1935,10 @@ def test_detask_is_opt_in(tmp_path):
         "wd",
         bids_root=str(tmp_path),
     )
-    assert "-detask filter:2" in _locomoco_manifest(on)
+    line = _locomoco_manifest(on)
+    assert "${ev:+-detask filter:2}" in line
+    # -detask needs the design, but asks for no QC.
+    assert "-events" in line and "-task_qc" not in line
 
 
 def _nordic_command(script: str) -> str:
@@ -1950,9 +1956,10 @@ def _nordic_command(script: str) -> str:
 def test_nordic_gets_the_run_events_for_the_task_leak_report(tmp_path):
     """NORDIC throws away what a patch's spectrum calls noise, and nothing in that
     decision knows the task. The report that says whether the response went with it
-    only runs with -events, per RUN, and the TR the design is sampled at."""
+    is -nordic_task_qc: it needs -events per RUN, and the TR the design is sampled at."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
-    s = write_script(build_plan(subj, Options(want_nordic=True)), "wd", bids_root=str(tmp_path))
+    opt = Options(want_nordic=True, nordic_task_qc=True)
+    s = write_script(build_plan(subj, opt), "wd", bids_root=str(tmp_path))
     assert "EVENTS[01:foo:1]=stimuli/sub-X_ses-01_task-foo_run-1_events.tsv" in s
     cmd = _nordic_command(s)
     assert '${ev:+-events "${ev}"}' in cmd
@@ -2036,49 +2043,53 @@ def test_dof_adjust_needs_nordic_to_have_run(tmp_path):
     assert "-adjust_dof" not in s and "dofloss" not in s
 
 
-def test_events_can_be_turned_off_per_stage(tmp_path):
-    """The two diagnostics are independent switches, and neither drags the other."""
+def test_task_qc_is_opt_in_per_stage(tmp_path):
+    """The two diagnostics are off by default, independent, and neither drags the other."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
-    both = Options(want_nordic=True, locomoco=True)
 
-    s = write_script(build_plan(subj, both), "wd", bids_root=str(tmp_path))
-    assert "-events" in _nordic_command(s) and "-events" in _locomoco_manifest(s)
+    s = write_script(
+        build_plan(subj, Options(want_nordic=True, locomoco=True)), "wd", bids_root=str(tmp_path)
+    )
+    assert "-events" not in _nordic_command(s) and "-task_qc" not in _nordic_command(s)
+    assert "-events" not in _locomoco_manifest(s) and "-task_qc" not in _locomoco_manifest(s)
 
-    plan = build_plan(subj, Options(want_nordic=True, locomoco=True, nordic_events=False))
+    plan = build_plan(subj, Options(want_nordic=True, locomoco=True, nordic_task_qc=True))
+    s = write_script(plan, "wd", bids_root=str(tmp_path))
+    assert "-events" in _nordic_command(s) and "${ev:+-task_qc}" in _nordic_command(s)
+    assert "-events" not in _locomoco_manifest(s)
+
+    plan = build_plan(subj, Options(want_nordic=True, locomoco=True, locomoco_task_qc=True))
     s = write_script(plan, "wd", bids_root=str(tmp_path))
     assert "-events" not in _nordic_command(s)
-    assert "-events" in _locomoco_manifest(s)
-
-    plan = build_plan(subj, Options(want_nordic=True, locomoco=True, locomoco_events=False))
-    s = write_script(plan, "wd", bids_root=str(tmp_path))
-    assert "-events" in _nordic_command(s)
-    assert "-events" not in _locomoco_manifest(s)
+    assert "-events" in _locomoco_manifest(s) and "${ev:+-task_qc}" in _locomoco_manifest(s)
 
 
 def test_no_events_consumer_means_no_events_array(tmp_path):
-    """With both diagnostics off, nothing should resolve or preflight an events TSV."""
+    """With no task step anywhere, nothing should resolve or preflight an events TSV."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
-    plan = build_plan(
-        subj,
-        Options(
-            want_nordic=True,
-            locomoco=True,
-            nordic_events=False,
-            locomoco_events=False,
-            run_glm=False,
-        ),
-    )
+    plan = build_plan(subj, Options(want_nordic=True, locomoco=True, run_glm=False))
     s = write_script(plan, "wd", bids_root=str(tmp_path))
     assert "EVENTS[01:foo:1]" not in s
 
 
-def test_nordic_task_rescue_needs_events_to_be_on(tmp_path):
-    """-task_rescue scores against the design; with -no_nordic_events there is none."""
+def test_nordic_task_rescue_brings_its_events_without_the_qc_flag(tmp_path):
+    """-task_rescue scores against the design, so it gets events on its own."""
     subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
-    plan = build_plan(
-        subj, Options(want_nordic=True, nordic_task_rescue="ica", nordic_events=False)
-    )
-    assert "-task_rescue" not in _nordic_command(write_script(plan, "wd", bids_root=str(tmp_path)))
+    plan = build_plan(subj, Options(want_nordic=True, nordic_task_rescue="ica"))
+    cmd = _nordic_command(write_script(plan, "wd", bids_root=str(tmp_path)))
+    assert "-events" in cmd and "${ev:+-task_rescue ica}" in cmd
+    assert "-task_qc" not in cmd
+
+
+def test_locomoco_opts_that_need_the_design_bring_events(tmp_path, monkeypatch):
+    """-reject / -ref paired passed through -locomoco_opts read the design too."""
+    from fastfuncstuff.autoproc import config
+
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    for opts, want in (("-ref paired", True), ("-ref paired_mean", True), ("-ref mean", False)):
+        monkeypatch.setitem(config.DEFAULT_OPTS, "locomoco", f"-backend flow {opts}")
+        s = write_script(build_plan(subj, Options(locomoco=True)), "wd", bids_root=str(tmp_path))
+        assert ("-events" in _locomoco_manifest(s)) is want, opts
 
 
 def _skull_script(**kw):

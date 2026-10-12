@@ -453,11 +453,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="MODE",
         help="ffs_nordic -task_rescue MODE (ica).\n"
-        "Off by default. Whenever a run's events resolve, stage00 already emits the\n"
-        "task-leak REPORT — how much of the design survives in what the denoising threw\n"
-        "away, whether it lands on responding tissue, and which removed components\n"
-        "follow the task. This ACTS on it: the flagged components go back into the\n"
-        "output. Read the report first, and note each restored component hands back a\n"
+        "Off by default. -nordic_task_qc writes the task-leak REPORT — how much of the\n"
+        "design survives in what the denoising threw away, whether it lands on\n"
+        "responding tissue, and which removed components follow the task. This ACTS on\n"
+        "it: the flagged components go back into the output (the report is written\n"
+        "too, since rescue runs on it). Note each restored component hands back a\n"
         "degree of freedom (ffs_reml -adjust_dof).",
     )
     g.add_argument(
@@ -476,14 +476,14 @@ def build_parser() -> argparse.ArgumentParser:
         "wins the comparison partly by accounting.",
     )
     g.add_argument(
-        "-no_nordic_events",
-        "-no-nordic-events",
-        dest="nordic_events",
-        action="store_false",
-        default=True,
-        help="Do not pass each run's events to ffs_nordic (turns off the stage00\n"
-        "task-leak diagnostic). The diagnostic measures and changes nothing.",
+        "-nordic_task_qc",
+        action="store_true",
+        help="Pass each run's events to ffs_nordic with -task_qc: the stage00\n"
+        "task-leak diagnostic. Off by default; it measures and changes nothing, and\n"
+        "costs a per-patch test, three task fits and an ICA scan per run.",
     )
+    # Accepted so older commands still parse; the QC is now off unless asked for.
+    g.add_argument("-no_nordic_events", action="store_true", help=argparse.SUPPRESS)
 
     g = p.add_argument_group("slice timing & motion")
     g.add_argument(
@@ -595,20 +595,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="MODE",
         help="ffs_locomoco -detask MODE (field | filter[:N] | fit[:D] | ica[:N]).\n"
-        "Off by default. The stage already emits the task-coupling REPORT whenever\n"
-        "events resolve; this ACTS on it, so read that report first — see\n"
-        "`ffs_locomoco -help` for which mode suits your design.",
+        "Off by default. -locomoco_task_qc writes the task-coupling REPORT; this\n"
+        "ACTS on it, so read that report first — see `ffs_locomoco -help` for which\n"
+        "mode suits your design. filter/fit cut the task before the estimate and run\n"
+        "no QC unless -locomoco_task_qc is given too.",
     )
 
     g.add_argument(
-        "-no_locomoco_events",
-        "-no-locomoco-events",
-        dest="locomoco_events",
-        action="store_false",
-        default=True,
-        help="Do not pass each run's events to ffs_locomoco (turns off the stage03\n"
-        "task-coupling diagnostic). The diagnostic measures and changes nothing.",
+        "-locomoco_task_qc",
+        action="store_true",
+        help="Pass each run's events to ffs_locomoco with -task_qc: the stage03\n"
+        "task-coupling diagnostic. Off by default; it measures and changes nothing,\n"
+        "and costs design fits on the data and every field axis plus an ICA sweep\n"
+        "per run.",
     )
+    g.add_argument("-no_locomoco_events", action="store_true", help=argparse.SUPPRESS)
 
     g = p.add_argument_group("cross-run / fmap / session alignment")
     g.add_argument(
@@ -2255,8 +2256,8 @@ def main(argv: list[str] | None = None) -> int:
         locomoco=eff(args.locomoco, "locomoco"),
         nordic_task_rescue=args.nordic_task_rescue,
         nordic_dof_adjust=args.nordic_dof_adjust,
-        nordic_events=args.nordic_events,
-        locomoco_events=args.locomoco_events,
+        nordic_task_qc=args.nordic_task_qc,
+        locomoco_task_qc=args.locomoco_task_qc,
         locomoco_detask=args.locomoco_detask,
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),

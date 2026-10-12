@@ -60,7 +60,7 @@ class Options:
     # the noise scans were acquired.
     cut_task_vols: dict[str, int] = field(default_factory=dict)
     # ffs_nordic -task_rescue MODE, verbatim. Off by default for the same reason
-    # locomoco_detask is: the stage00 -events diagnostic MEASURES how much of the task
+    # locomoco_detask is: the stage00 -task_qc diagnostic MEASURES how much of the task
     # went out with the noise, and this ACTS on it. Read the report first.
     nordic_task_rescue: str | None = None
     # Carry NORDIC's per-voxel component count through the warp chain and charge it
@@ -69,11 +69,12 @@ class Options:
     # dof the data has left, and the comparison against a non-NORDIC run is then a
     # comparison of two differently-optimistic p-values rather than of two denoisings.
     nordic_dof_adjust: bool = True
-    # -events on the per-run diagnostics. Both default ON: they measure and change
-    # nothing, and the question they answer ("did this stage eat my task?") is one you
-    # want answered by default rather than on request.
-    nordic_events: bool = True
-    locomoco_events: bool = True
+    # The per-run task QC (ffs_nordic / ffs_locomoco -task_qc). Both default OFF: they
+    # change nothing in the output and are slow (design fits on data and field plus an
+    # ICA sweep per run). Events still reach a stage that ACTS on them (-task_rescue,
+    # -detask, -ref paired) without these.
+    nordic_task_qc: bool = False
+    locomoco_task_qc: bool = False
     slicetiming_method: str = "integrate"  # integrate (fold into final resample) | first | none
     # Within-TR time (s) slice timing aligns every slice to; the GLM samples its
     # model there (ffs_reml -microtime_offset).  0 = the first slice.

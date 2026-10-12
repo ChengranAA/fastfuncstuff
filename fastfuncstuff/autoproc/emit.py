@@ -1508,14 +1508,36 @@ done
 """
 
 
+def _nordic_events_on(opt) -> bool:
+    """Does stage00 hand ffs_nordic the run's events? Only for a step that reads them:
+    the task-leak QC, or -task_rescue, which acts on that QC's component scan."""
+    return bool(opt.want_nordic and (opt.nordic_task_qc or opt.nordic_task_rescue))
+
+
+# ffs_locomoco flags, possibly arriving through -locomoco_opts, that need the design.
+_LOCOMOCO_EVENT_FLAGS = re.compile(r"(?:^|\s)-(?:(?:detask|reject|task_qc)\b|ref\s+paired)")
+
+
+def _locomoco_events_on(opt) -> bool:
+    """Does stage03 hand ffs_locomoco the run's events? Only for a step that reads
+    them: the task-coupling QC, -detask, or a -reject / -ref paired in -locomoco_opts."""
+    if not opt.locomoco:
+        return False
+    return bool(
+        opt.locomoco_task_qc
+        or opt.locomoco_detask
+        or _LOCOMOCO_EVENT_FLAGS.search(config.DEFAULT_OPTS["locomoco"])
+    )
+
+
 def _events_consumers(opt) -> bool:
     """Does any stage in this pipeline read a per-run events TSV?
 
     Only the stages that ASK for it: the EVENTS array and the preflight path check
-    follow the same two flags the stages do, so -no_nordic_events plus
-    -no_locomoco_events leaves no dangling reference to a file nothing opens.
+    follow the same rules the stages do, so a pipeline with no task step leaves no
+    dangling reference to a file nothing opens.
     """
-    return (opt.locomoco and opt.locomoco_events) or (opt.want_nordic and opt.nordic_events)
+    return _locomoco_events_on(opt) or _nordic_events_on(opt)
 
 
 def _dof_adjust_on(opt) -> bool:
@@ -1572,29 +1594,31 @@ def _stage_nordic(plan: Plan) -> str:
             *_split_flags(config.DEFAULT_OPTS["nordic"]),
             resid,
             numcomps,
-            # Diagnostic only: NORDIC decides what to discard from a patch's spectrum
-            # alone, and nothing in that decision knows the task, so a component
-            # carrying real response can fall under the threshold. -tr rides along for
-            # the same reason it does at stage03 -- a 3D acquisition's pixdim[4] is the
-            # per-partition time, not the volume TR the design is sampled at.
+            # The task QC is a diagnostic: NORDIC decides what to discard from a
+            # patch's spectrum alone, and nothing in that decision knows the task, so a
+            # component carrying real response can fall under the threshold. -tr rides
+            # along for the same reason it does at stage03 -- a 3D acquisition's
+            # pixdim[4] is the per-partition time, not the volume TR the design is
+            # sampled at.
             *(
                 ['${ev:+-events "${ev}"}', '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}']
-                if opt.nordic_events
+                if _nordic_events_on(opt)
                 else []
             ),
-            *([f"${{ev:+-task_rescue {rescue}}}"] if rescue and opt.nordic_events else []),
+            *(["${ev:+-task_qc}"] if opt.nordic_task_qc else []),
+            *([f"${{ev:+-task_rescue {rescue}}}"] if rescue else []),
             '-device "$DEVICE"',
         ],
     )
     return f"""
 # ============================ stage00: NORDIC ==============================={phase_note}
-# -events (per run, the same TSV the GLM models) turns on the task-leak report:
-# <prefix>_taskleak.txt, the _taskfit_input/_kept/_lost buckets, the per-patch
-# _taskpatch map, and a scan of the removed field's components. It MEASURES how much
-# of the design went out with the noise and whether it landed on responding tissue;
-# nothing about the denoising changes. This runs before motion correction, so read
-# the enrichment and the component scan, not the per-voxel R maps.
-# -nordic_task_rescue is what ACTS on it.
+# -nordic_task_qc (per run, against the same events TSV the GLM models) writes the
+# task-leak report: <prefix>_taskleak.txt, the _taskfit_input/_kept/_lost buckets,
+# the per-patch _taskpatch map, and a scan of the removed field's components. It
+# MEASURES how much of the design went out with the noise and whether it landed on
+# responding tissue; nothing about the denoising changes. This runs before motion
+# correction, so read the enrichment and the component scan, not the per-voxel R
+# maps. -nordic_task_rescue is what ACTS on it.
 echo '== stage00: NORDIC denoise =='
 for k in "${{RUN_KEYS[@]}}"; do
   outf="{_nordic_mag(plan)}"
@@ -1699,17 +1723,21 @@ def _stage_locomoco(plan: Plan, script_stem: str) -> str:
         '-prefix "${nlstem}.nii$FMT"',
         '-pe_dir "${pe:-y}"',
         *_split_flags(config.DEFAULT_OPTS["locomoco"]),
-        # Diagnostic only: it measures how much of the estimated field the task
-        # explains, which is exactly the failure mode a brightness-constancy data
-        # term has on a block design. -tr rides along because a 3D acquisition's
-        # header pixdim[4] is the per-partition time, not the volume TR the design
-        # is sampled at, and the design is what this fit is against.
+        # The design, for whichever step reads it. -tr rides along because a 3D
+        # acquisition's header pixdim[4] is the per-partition time, not the volume TR
+        # the design is sampled at.
         *(
             ['${ev:+-events "${ev}"}', '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}']
-            if plan.options.locomoco_events
+            if _locomoco_events_on(plan.options)
             else []
         ),
-        *([f"-detask {detask}"] if detask else []),
+        # Diagnostic only: how much of the estimated field the task explains, which
+        # is exactly the failure mode a brightness-constancy data term has on a block
+        # design.
+        *(["${ev:+-task_qc}"] if plan.options.locomoco_task_qc else []),
+        # Behind ${ev:+}: -detask without a design is refused, and one run without
+        # events would take the whole batch down with it.
+        *([f"${{ev:+-detask {detask}}}"] if detask else []),
         "-warp_format 5d",
         "-save_mean",
         "-save_max",
@@ -1727,11 +1755,11 @@ def _stage_locomoco(plan: Plan, script_stem: str) -> str:
 # existed re-runs and produces them instead of resuming into a stage07 that
 # cannot find its inputs.
 #
-# -events (per run, the same TSV the GLM models) turns on the task-coupling
-# report: _locomoco_taskcoupling.txt, the taskr/taskrms maps, and a scan of the
-# field's independent components (_locomoco_taskcomps.1D). All of it is a
-# DIAGNOSTIC -- nothing about the correction changes -- and it is what to read
-# before reaching for -locomoco_detask.
+# -locomoco_task_qc (per run, against the same events TSV the GLM models) writes
+# the task-coupling report: _locomoco_taskcoupling.txt, the taskr/taskrms maps,
+# and a scan of the field's independent components (_locomoco_taskcomps.1D). All
+# of it is a DIAGNOSTIC -- nothing about the correction changes -- and it is what
+# to read before reaching for -locomoco_detask.
 echo '== stage03: locomoco =='
 lmbatch="{script_stem}_locomocobatch.txt"; : > "$lmbatch"
 for k in "${{RUN_KEYS[@]}}"; do

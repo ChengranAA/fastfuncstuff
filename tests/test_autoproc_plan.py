@@ -662,13 +662,16 @@ def _phase_run(session, task, run, **kw):
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
 @pytest.mark.parametrize("nordic", [False, True])
 @pytest.mark.parametrize("stc", ["integrate", "first"])
-def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc):
+@pytest.mark.parametrize("drift", [True, False])
+def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc, drift):
     """-phase_proc: ROMEO unwrap happens once up front (after NORDIC when NORDIC
-    runs), the phase is untouched in between, and the SAME warp chain carries it
-    at stage10 into a separately-labelled part-phase output."""
+    runs), per-slice field drift comes off in native space right after it, the
+    phase is untouched in between, and the SAME warp chain carries it at stage10
+    into a separately-labelled part-phase output."""
     subj = Subject("X", [Session("SM", [_phase_run("SM", "primary", "1")])])
     opt = Options(
         phase_proc=True,
+        phase_drift=drift,
         want_nordic=nordic,
         noise_vols=3,
         slicetiming_method=stc,
@@ -685,11 +688,20 @@ def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc)
     )
 
     # ROMEO is an external dependency; the script's preflight must catch a missing one.
-    assert " romeo; do" in s
+    preflight = next(line for line in s.splitlines() if line.startswith("for t in ffs_"))
+    assert " romeo" in preflight
     assert "PHASE_FMT=.gz" in s  # ROMEO can't read .zst
     assert 'romeo -p "$ph" -m "$mag" -o "$uw" -t epi -v' in s
 
     unwrapped = "stage00.unwrap.${FRAG[$k]}.part-phase.nii$PHASE_FMT"
+    if drift:
+        # Native space, after ROMEO, before anything mixes the acquired slices.
+        assert " ffs_phasedrift" in preflight
+        assert 'ffs_phasedrift -input "$uw" -magnitude "$mag" -prefix "$pd"' in s
+        assert s.index("romeo -p") < s.index("ffs_phasedrift -input") < s.index("stage02: motion")
+        unwrapped = "stage00.unwrapdrift.${FRAG[$k]}.part-phase.nii$PHASE_FMT"
+    else:
+        assert "ffs_phasedrift" not in s
     if nordic:
         # NORDIC already wrote the denoised pair AND trimmed the noise volumes.
         assert 'ph="stage00.nordic.${FRAG[$k]}_phase.nii$PHASE_FMT"' in s

@@ -425,7 +425,19 @@ def build_parser() -> argparse.ArgumentParser:
         "(after NORDIC if NORDIC runs), then ride it along the magnitude's warp chain at "
         "the final resample → stage10.final.*.part-phase.*, unwrapped radians in the same "
         "space as the magnitude. Requires romeo (MRItools) on $PATH and a part-phase bold "
-        "for every run.",
+        "for every run. The unwrapped phase then has per-slice field wobble "
+        "(breathing, B0 drift) removed in native space by ffs_phasedrift — see "
+        "-no_phase_drift.",
+    )
+    g.add_argument(
+        "-no_phase_drift",
+        "-no-phase-drift",
+        action="store_true",
+        help="with -phase_proc, skip ffs_phasedrift. By default each slice's "
+        "dynamic field offset and in-plane gradient are removed per volume right "
+        "after ROMEO, while the slices are still the acquired ones; on 7T 0.8 mm "
+        "data that cut phase noise ~3x and is what lets phase regression see the "
+        "vessel phase at all. Skip it only to reproduce older output.",
     )
     g.add_argument(
         "-nordic_save_resid",
@@ -2156,6 +2168,7 @@ def main(argv: list[str] | None = None) -> int:
         recipe=args.recipe,
         want_nordic=eff(args.want_nordic, "want_nordic"),
         phase_proc=args.phase_proc,
+        phase_drift=not args.no_phase_drift,
         noise_vols=args.noise_vols,
         cut_task_vols=_resolve_cut_task_vols(args),
         slicetiming_method=_resolve_slicetiming(args, rget, subject),

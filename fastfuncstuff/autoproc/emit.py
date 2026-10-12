@@ -113,13 +113,19 @@ def _unwrapped(label: str = "unwrap") -> str:
     return _phase_file(label)
 
 
+def _phase_clean(plan: Plan) -> str:
+    """The stage00 phase every later stage reads: drift-cleaned unless
+    -no_phase_drift, else ROMEO's output."""
+    return _unwrapped("unwrapdrift") if plan.options.phase_drift else _unwrapped()
+
+
 def _phase_source(plan: Plan) -> str:
     """The phase series entering the final resample: the tshifted phase when slice
     timing ran up front (it must get the same temporal shift as its magnitude),
-    else the unwrapped phase straight out of stage00."""
+    else the stage00 phase."""
     if plan.options.slicetiming_method == "first":
         return _unwrapped("tshift")
-    return _unwrapped()
+    return _phase_clean(plan)
 
 
 def _tpattern(plan: Plan) -> str:
@@ -1401,6 +1407,8 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
     tools = [*_TOOLS, *dict.fromkeys(nl_tools)]
     if _phase_on(plan):
         tools = [*tools, "romeo"]
+        if opt.phase_drift:
+            tools = [*tools, "ffs_phasedrift"]
     if opt.presurf and _own_anat(opt):
         tools = [*tools, "ffs_util_presurf"]
     if opt.anat_skull and _own_anat(opt):
@@ -1476,7 +1484,7 @@ def _stage_tshift(plan: Plan) -> str:
         pc = _ffs(
             "ffs_slicetime",
             [
-                f'-input "{_unwrapped()}"',
+                f'-input "{_phase_clean(plan)}"',
                 '-prefix "$phout"',
                 f"-tpattern {_tpattern(plan)}",
                 '-TR "${TR[$k]}"',
@@ -3375,6 +3383,23 @@ def _stage_unwrap(plan: Plan) -> str:
     opt = plan.options
     romeo_opts = " ".join(_split_flags(config.DEFAULT_OPTS["unwrap"]))
     uw = _unwrapped()
+    drift_note = drift_vars = drift_done = drift_cmd = ""
+    if opt.phase_drift:
+        # Native space is the only place this can be done: once slice timing or
+        # the final resample has mixed slices, the per-slice field states that
+        # breathing imprints are no longer separable.
+        drift_note = (
+            "\n# Then ffs_phasedrift removes each slice's dynamic field offset + in-plane\n"
+            "# gradient per volume (breathing, B0 drift) -> stage00.unwrapdrift.*;\n"
+            "# that, not ROMEO's output, is the phase every later stage reads."
+        )
+        trace = "stage00.unwrapdrift.${FRAG[$k]}.trace.1D"
+        drift_vars = f'\n  pd="{_unwrapped("unwrapdrift")}"'
+        drift_done = ' && [ -f "$pd" ]'
+        drift_cmd = (
+            '\n  [ -f "$pd" ] || ffs_phasedrift -input "$uw" -magnitude "$mag" '
+            f'-prefix "$pd" -save_trace "{trace}" -verb 0'
+        )
     if opt.want_nordic:
         src = f'  mag="{_nordic_mag(plan)}"; ph="{_nordic_phase()}"'
         note = "# Inputs: the NORDIC-denoised pair (noise volumes already trimmed)."
@@ -3411,13 +3436,13 @@ def _stage_unwrap(plan: Plan) -> str:
 # still voxelwise aligned to its magnitude. Output is radians; nothing touches the
 # phase again until the final resample (stage10) carries it along the magnitude's
 # warp chain. ROMEO is external (MRItools) — it must be on $PATH.
-{note}
+{note}{drift_note}
 echo '== stage00: phase unwrap (ROMEO) =='
 for k in "${{RUN_KEYS[@]}}"; do
-  uw="{uw}"
-  [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ] && continue
+  uw="{uw}"{drift_vars}
+  [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ]{drift_done} && continue
 {src}
-  romeo -p "$ph" -m "$mag" -o "$uw" {romeo_opts}
+  [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ] || romeo -p "$ph" -m "$mag" -o "$uw" {romeo_opts}{drift_cmd}
 done
 """
 

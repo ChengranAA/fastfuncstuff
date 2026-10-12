@@ -47,6 +47,7 @@ class Options:
     # (after NORDIC when NORDIC runs), then ride it along the magnitude's warp
     # chain at the final resample. Nothing between those two points touches it.
     phase_proc: bool = False
+    phase_drift: bool = True  # -phase_proc: ffs_phasedrift after ROMEO
     noise_vols: int = 0
     # {task: N} from -cut_task_vols: every run of that task keeps its first N
     # volumes (a shorter run is left alone). Applied as a sub-brick selector on the

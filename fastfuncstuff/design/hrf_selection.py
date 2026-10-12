@@ -151,13 +151,13 @@ class HRFSelectionResults:
     hrf_index : torch.Tensor
         (n_voxels,) Index of best HRF for each voxel (0 to n_hrfs-1)
     xval_r2_best : torch.Tensor
-        (n_voxels,) Median cross-validated R² for the selected HRF
-    xval_r2_std : torch.Tensor
-        (n_voxels,) Std of cross-validated R² across CV splits for selected HRF
+        (n_voxels,) R² for the selected HRF: pooled over every held-out
+        timepoint under select_mode='xval', in-sample under 'full'. There is no
+        per-split R² to take a spread of, so no std map is offered.
     xval_r2_all_hrfs : torch.Tensor
-        (n_voxels, n_hrfs) Median CV R² for each HRF (for diagnostics)
+        (n_voxels, n_hrfs) The same R² for each HRF (for diagnostics)
     xval_r2_canonical : torch.Tensor
-        (n_voxels,) Median CV R² using single canonical HRF (baseline comparison)
+        (n_voxels,) The same R² using single canonical HRF (baseline comparison)
     final_results : GLMResults
         Results from final full-data fit with voxel-wise optimal HRFs
     canonical_results : GLMResults
@@ -171,7 +171,6 @@ class HRFSelectionResults:
 
     hrf_index: torch.Tensor = None
     xval_r2_best: torch.Tensor = None
-    xval_r2_std: torch.Tensor = None
     xval_r2_all_hrfs: torch.Tensor = None
     xval_r2_canonical: torch.Tensor = None  # Baseline with single canonical HRF
     canonical_full_r2: torch.Tensor | None = None  # In-sample R², canonical HRF
@@ -920,7 +919,6 @@ def fit_glm_hrf_library_with_xval(
         Container with:
         - hrf_index: (n_voxels,) best HRF per voxel
         - xval_r2_best: (n_voxels,) CV R² for selected HRF
-        - xval_r2_std: (n_voxels,) std across CV splits
         - xval_r2_all_hrfs: (n_voxels, n_hrfs) CV R² for all HRFs
         - final_results: GLMResults from full refit
         - hrf_library: The HRF library used (for ARMA reuse)
@@ -1674,8 +1672,6 @@ def fit_glm_hrf_library_with_xval(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    xval_r2_std_all = torch.zeros(n_voxels, n_hrfs, device=device)
-
     # Clear GPU cache after evaluation
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -1717,12 +1713,11 @@ def fit_glm_hrf_library_with_xval(
     # Store the canonical design matrix (task + nuisance) for saving
     canonical_design_matrix = torch.cat([canonical_design_fit, nuisance_design], dim=1)
 
-    # Select best HRF per voxel based on median CV R²
+    # Select best HRF per voxel by its CV (or in-sample) R²
     hrf_index = xval_r2_median_all.argmax(dim=1)  # (n_voxels,)
 
     # Extract R² for selected HRF
     xval_r2_best = xval_r2_median_all[torch.arange(n_voxels, device=device), hrf_index]
-    xval_r2_std = xval_r2_std_all[torch.arange(n_voxels, device=device), hrf_index]
 
     if verbose:
         print()
@@ -1815,7 +1810,6 @@ def fit_glm_hrf_library_with_xval(
 
         hrf_index = _pad_to_full(hrf_index, fill=0).long()
         xval_r2_best = _pad_to_full(xval_r2_best)
-        xval_r2_std = _pad_to_full(xval_r2_std)
         xval_r2_median_all = _pad_to_full(xval_r2_median_all)
         xval_r2_canonical = _pad_to_full(xval_r2_canonical)
         oso_gain_map = _pad_to_full(oso_gain_map)
@@ -1842,7 +1836,6 @@ def fit_glm_hrf_library_with_xval(
     results = HRFSelectionResults(
         hrf_index=hrf_index.cpu(),
         xval_r2_best=xval_r2_best.cpu(),
-        xval_r2_std=xval_r2_std.cpu(),
         xval_r2_all_hrfs=xval_r2_median_all.cpu(),
         xval_r2_canonical=xval_r2_canonical.cpu(),
         final_results=final_results,
@@ -2748,14 +2741,6 @@ def save_hrf_selection_results(
     best_r2_file = f"{output_prefix}_{r2_stem}{nii_ext}"
     _save_volume(results.xval_r2_best, best_r2_file, volume_shape, affine, voxel_mask, nifti_header)
     output_files[r2_stem] = best_r2_file
-
-    # 3. Save CV R² std (spread across CV splits; undefined in-sample)
-    if select_mode == "xval" and results.xval_r2_std is not None:
-        xval_std_file = f"{output_prefix}_xval_r2_std{nii_ext}"
-        _save_volume(
-            results.xval_r2_std, xval_std_file, volume_shape, affine, voxel_mask, nifti_header
-        )
-        output_files["xval_r2_std"] = xval_std_file
 
     # 3b. Save canonical HRF baseline R² for comparison
     if results.xval_r2_canonical is not None:

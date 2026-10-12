@@ -622,7 +622,6 @@ class TestHRFSelectionResults:
         r = HRFSelectionResults()
         assert r.hrf_index is None
         assert r.xval_r2_best is None
-        assert r.xval_r2_std is None
         assert r.final_results is None
         assert r.canonical_results is None
         assert r.canonical_full_r2 is None

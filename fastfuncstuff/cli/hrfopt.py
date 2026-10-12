@@ -1419,7 +1419,6 @@ def main():
         results = HRFSelectionResults(
             hrf_index=hrf_index,
             xval_r2_best=xval_r2_best,
-            xval_r2_std=None,  # in-sample selection has no CV spread
             xval_r2_all_hrfs=fit_r2_all.to(device),
             xval_r2_canonical=xval_r2_canonical,
             canonical_full_r2=canonical_full_r2,

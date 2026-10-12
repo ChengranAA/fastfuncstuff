@@ -208,6 +208,9 @@ class TestDeltaDenoiseSmoke:
 
         # Primary pass files
         assert Path(f"{prefix}_xval_r2.nii.gz").exists()
+        # CV R² is pooled over held-out timepoints; no per-split spread exists,
+        # and a zero-filled std map used to be written in its place.
+        assert not Path(f"{prefix}_xval_r2_std.nii.gz").exists()
         assert Path(f"{prefix}_hrf_index.nii.gz").exists()
         # Nodenoise pass files (same suite)
         assert Path(f"{prefix}_nodenoise_xval_r2.nii.gz").exists()

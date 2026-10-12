@@ -265,6 +265,12 @@ class ViewerSession:
         #: read, as ``{path: "new" | "updated"}``. Cleared per file when it is
         #: picked, and wholesale by a fresh READ.
         self.catalog_fresh: dict[Path, str] = {}
+        #: Every directory read or loaded from, in first-use order, each with
+        #: whether it was read recursively. A directory's number is its place
+        #: here plus one -- what the layer list tags a file with once files
+        #: come from more than one place -- so it only ever grows.
+        self.directories: dict[Path, bool] = {}
+        self._directory_numbers: dict[str, int | None] = {}
         self.mode: Mode = registry.get("plain")()
         #: Every mode this session has been in, by name. Switching back resumes
         #: the same instance -- its folder, its component, its unsaved labels --
@@ -322,6 +328,8 @@ class ViewerSession:
         """
         from fastfuncstuff.viewer.surfacelayers import is_surface_path
 
+        if self.directory_number(path) is None:
+            self._note_directory(Path(path).parent)
         if is_surface_path(path):
             return self._open_surface(path, key)
         res = self.store.open(path, key=key)
@@ -523,7 +531,34 @@ class ViewerSession:
         self.catalog_dir = Path(directory)
         self.catalog_recursive = bool(recursive)
         self.catalog_fresh = {}
+        self._note_directory(directory, recursive=recursive)
         return self.catalog
+
+    def _note_directory(self, directory: str | Path, *, recursive: bool = False) -> None:
+        d = Path(directory).expanduser().resolve()
+        self.directories[d] = self.directories.get(d, False) or bool(recursive)
+        self._directory_numbers.clear()
+
+    def directory_number(self, path: str | Path) -> int | None:
+        """The number of the directory a file came from, or ``None`` if from none of them.
+
+        Its own directory first; failing that, the deepest one read
+        recursively that holds it.
+        """
+        cached = self._directory_numbers.get(str(path), -1)
+        if cached != -1:
+            return cached
+        parent = Path(path).expanduser().resolve().parent
+        found = None
+        for n, (d, recursive) in enumerate(self.directories.items(), start=1):
+            if d == parent:
+                found = n
+                break
+            if recursive and parent.is_relative_to(d):
+                if found is None or len(d.parts) > len(list(self.directories)[found - 1].parts):
+                    found = n
+        self._directory_numbers[str(path)] = found
+        return found
 
     def apply_rescan(self, result: catalog_mod.Rescan) -> list[str]:
         """Take a rescan's catalog, mark what is new, reload what was overwritten.

@@ -44,6 +44,7 @@ from pathlib import Path
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer import catalog as catalog_mod
+from fastfuncstuff.viewer import favorites
 from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.colormap import available_colormaps
 from fastfuncstuff.viewer.commands import Aspect, Command
@@ -533,8 +534,24 @@ class ViewerWindow(QtWidgets.QMainWindow):
             button.clicked.connect(slot)
             bar.addWidget(button)
 
-        self.dir_label = QtWidgets.QLabel("no directory")
-        bar.addWidget(self.dir_label)
+        # Every directory read or loaded from this session, numbered as the
+        # layer list tags its files, then the favourites: picking one reads it.
+        self._favorites: list[Path] | None = None
+        self.dir_box = QtWidgets.QComboBox()
+        self.dir_box.setToolTip(
+            "Directories this session has read or loaded from, numbered as the\n"
+            "layer list tags their files, then the favourites (★). Pick one to read it."
+        )
+        self.dir_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.dir_box.activated.connect(self._pick_directory)
+        bar.addWidget(self.dir_box)
+        self.fav_button = QtWidgets.QPushButton("☆")
+        self.fav_button.setCheckable(True)
+        self.fav_button.setToolTip(
+            f"Keep this directory in the favourites, for every viewer\n({favorites.config_path()})"
+        )
+        self.fav_button.clicked.connect(self._toggle_favorite)
+        bar.addWidget(self.fav_button)
 
         # Pushed to the right end of the row: it is not part of the load
         # gesture and should not sit in the middle of it.
@@ -754,6 +771,66 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._sync_catalog()
         self._sync_layer_list()
 
+    def _sync_directories(self, *, reread: bool = False) -> None:
+        session = self.session
+        current = session.catalog_dir.expanduser().resolve() if session.catalog_dir else None
+        if reread or self._favorites is None:
+            # Re-read on READ, not per layer-list sync: another viewer may have
+            # changed the list, and a READ is when this one is looked at.
+            try:
+                self._favorites = favorites.load()
+            except OSError:
+                self._favorites = []
+        favs = self._favorites or []
+        box = self.dir_box
+        box.blockSignals(True)
+        box.clear()
+        if current is None:
+            box.addItem("no directory", userData=None)
+        for n, (d, recursive) in enumerate(session.directories.items(), start=1):
+            star = "  ★" if d in favs else ""
+            box.addItem(f"{n}  {d.name or d}{star}", userData=(str(d), recursive))
+            box.setItemData(box.count() - 1, str(d), QtCore.Qt.ItemDataRole.ToolTipRole)
+        rest = [f for f in favs if f not in session.directories]
+        if rest:
+            box.insertSeparator(box.count())
+            for f in rest:
+                box.addItem(f"★  {f.name or f}", userData=(str(f), False))
+                box.setItemData(box.count() - 1, str(f), QtCore.Qt.ItemDataRole.ToolTipRole)
+        rows = [box.itemData(r) for r in range(box.count())]
+        here = [r for r, data in enumerate(rows) if data and data[0] == str(current)]
+        box.setCurrentIndex(here[0] if here else 0)
+        box.blockSignals(False)
+        self.fav_button.setEnabled(current is not None)
+        self.fav_button.setChecked(current in favs)
+        self.fav_button.setText("★" if current in favs else "☆")
+
+    def _pick_directory(self, row: int) -> None:
+        data = self.dir_box.itemData(row)
+        if not data:
+            return
+        directory, recursive = data
+        current = self.session.catalog_dir
+        if current is not None and current.expanduser().resolve() == Path(directory):
+            return
+        try:
+            self.read_directory(directory, recursive=recursive)
+        except OSError as exc:
+            self.statusBar().showMessage(f"read {directory}: {exc}", 8000)
+            self._sync_directories()
+
+    def _toggle_favorite(self) -> None:
+        if self.session.catalog_dir is None:
+            return
+        try:
+            on = favorites.toggle(self.session.catalog_dir)
+        except OSError as exc:
+            self.statusBar().showMessage(f"favourites: {exc}", 8000)
+        else:
+            what = "added to" if on else "removed from"
+            self.statusBar().showMessage(f"{self.session.catalog_dir} {what} the favourites", 4000)
+        self._sync_directories(reread=True)
+
     def _read_dialog(self) -> None:
         start = str(self.session.catalog_dir or Path.cwd())
         directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Read directory", start)
@@ -847,9 +924,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._dispatch(ShowSurfaces(nxt))
         self.statusBar().showMessage(f"outlines: {nxt or 'off'}", 2000)
 
-    def read_directory(self, directory: str | Path) -> None:
-        self.session.do(Read(str(directory)))
+    def read_directory(self, directory: str | Path, *, recursive: bool = False) -> None:
+        self.session.do(Read(str(directory), recursive=recursive))
         self._sync_catalog()
+        self._sync_layer_list()  # a second directory turns the layer numbers on
         self.statusBar().showMessage(
             f"read {len(self.session.catalog)} datasets from {directory}", 5000
         )
@@ -934,9 +1012,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         """Fill the pickers, defaulting the underlay to the likeliest base image."""
         entries = self.session.catalog
         fresh = self.session.catalog_fresh
-        self.dir_label.setText(
-            self.session.catalog_dir.name if self.session.catalog_dir else "no directory"
-        )
+        self._sync_directories(reread=True)
         self._watch()
         c = theme.palette()
         # Two columns, monospaced and padded, so a directory can be scanned by
@@ -2241,14 +2317,22 @@ class ViewerWindow(QtWidgets.QMainWindow):
         selected = self.current_key()
         self.layer_list.blockSignals(True)
         self.layer_list.clear()
+        self._sync_directories()  # a load can add a directory
         keys = list(reversed(self.session.state.layers.keys))
+        # Which directory a file came from, by its number in the directory
+        # box -- only once there is more than one to tell apart.
+        numbered = len(self.session.directories) > 1
         for layer in reversed(list(self.session.state.layers)):
             try:
                 pending = self.session.store.get(layer.key).pending
             except KeyError:
                 pending = False
             tag = " ·computed" if layer.is_computed else (" ·loading" if pending else "")
-            item = QtWidgets.QListWidgetItem(f"{layer.name}{tag}")
+            n = self.session.directory_number(layer.path) if layer.source == "file" else None
+            where = f"{n}  " if numbered and n is not None else ""
+            item = QtWidgets.QListWidgetItem(f"{where}{layer.name}{tag}")
+            if layer.source == "file":
+                item.setToolTip(layer.path)
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
                 QtCore.Qt.CheckState.Checked if layer.visible else QtCore.Qt.CheckState.Unchecked

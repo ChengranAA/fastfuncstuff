@@ -45,3 +45,20 @@ def test_strong_coupling_recovers_the_true_slope():
         torch.from_numpy(x).float(), torch.from_numpy(y).float(), (sy / sx) ** 2
     )
     assert abs(float(slope.median()) - b1) < 0.05
+
+
+def test_default_slope_cap_never_leaves_a_voxel_noisier():
+    """Uncorrelated magnitude/phase with SYY > phi*SXX is where uncapped Deming
+    diverges; at 2x OLS the corrected series can be no noisier than the input."""
+    from fastfuncstuff.phasereg.core import phase_regress
+
+    g = torch.Generator().manual_seed(0)
+    n_vox, n_tp = 400, 120
+    pha = 0.01 * torch.randn(n_vox, n_tp, generator=g)
+    mag = 1000 + 50 * torch.randn(n_vox, n_tp, generator=g)
+    kw = dict(phi=1e4, keep_drift=True, max_poly_degree=0, device="cpu")
+    capped = phase_regress(mag, pha, 2.0, **kw)
+    free = phase_regress(mag, pha, 2.0, max_slope_ratio=None, **kw)
+    assert free.slope.abs().max() > 1e5
+    ratio = capped.magnitude_corrected.std(dim=1) / mag.std(dim=1)
+    assert ratio.max() <= 1.0 + 1e-4

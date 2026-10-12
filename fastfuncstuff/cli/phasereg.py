@@ -35,7 +35,7 @@ _DESCRIPTION = """\
 Remove the phase-explained (macrovascular) part of magnitude BOLD.
 
 Each voxel's magnitude is regressed on its phase with a Deming (errors-in-
-variables) fit and A*phase is subtracted. Runs passed together share one slope
+variables) fit, capped at twice the OLS slope, and A*phase is subtracted. Runs passed together share one slope
 per voxel (drift removed per run) and are written back one file per run.
 
 UPSTREAM, in order (phase in radians, voxel-matched to the magnitude):
@@ -50,7 +50,8 @@ RECIPES
                  -prefix pr -keep_drift
   Veins survive, sub-mm 7T: add -spr -spr_select_run 0 (see -spr).
   Drop vein voxels instead of correcting them: add -vein_mask.
-  phaseprep / Stanley 2021 parity:  -polort 1 -shrink odr -no_phase_unwrap
+  phaseprep / Stanley 2021 parity:  -polort 1 -shrink odr -no_phase_unwrap \
+                                    -max_slope_ratio 0
 """
 
 # Printed at the end of -h: what each output is for and how to read it. Flag
@@ -128,6 +129,19 @@ def create_parser() -> argparse.ArgumentParser:
         "Stanley 2021, phaseprep). 'ols': no phase-noise term, so noisy phase "
         "attenuates the slope and suppresses less (Vu & Gallant 2015's choice, "
         "against over-correction).",
+    )
+    reg.add_argument(
+        "-max_slope_ratio",
+        type=float,
+        default=2.0,
+        metavar="R",
+        help="Cap the Deming |A| at R times the voxel's OLS slope; 0 = no cap. "
+        "Residual variance is lowest at the OLS slope and back to the input's at "
+        "2x, so R=2 never leaves a voxel noisier than it was. Uncapped, Deming "
+        "goes to ~1e9 where magnitude and phase are uncorrelated (5.8%% of "
+        "MindsEye voxels had a >10 sd removal). MindsEye split-half, share of the "
+        "task effect kept: veins 0.84 OLS / 0.71 R=2 / 0.65 R=3 / 0.59 R=10; "
+        "controls 0.98 / 0.97 / 0.96 / 0.94.",
     )
     reg.add_argument(
         "-shrink",
@@ -283,10 +297,11 @@ def create_parser() -> argparse.ArgumentParser:
         "angle, while a neighbour sees one lobe of the field. Vu also used OLS, "
         "which suppresses less; keep -regression deming if veins survive. "
         "Choose donors on a held-out run (-spr_select_run): in-sample selection "
-        "over-suppresses. On 7T 0.8 mm data (split-half, held-out donors) it took "
-        "phase-blind voxels' magnitude t from 0.71x to 0.54x of baseline, at a "
-        "cost of 0.95x -> 0.88x in vessel-free controls, because most voxels "
-        "borrow on noise. QC: prefix_spr_donor_offset should trace vessels.",
+        "over-suppresses. On 7T 0.8 mm data (split-half, held-out donors, share "
+        "of the task effect kept) it took phase-blind voxels from 0.91 to 0.72 "
+        "and veins from 0.71 to 0.65, at a cost of 0.97 -> 0.94 in vessel-free "
+        "controls, because most voxels borrow on noise. QC: "
+        "prefix_spr_donor_offset should trace vessels.",
     )
     sprg.add_argument(
         "-spr_neighborhood",
@@ -736,6 +751,7 @@ def main(argv: list[str] | None = None) -> int:
         phi_method=args.phi_method,
         phi_freq_range=freq_range,
         regression=args.regression,
+        max_slope_ratio=args.max_slope_ratio or None,
         slope_on=args.slope_on,
         tent_window=tent_window,
         phase_filter=args.phase_filter,

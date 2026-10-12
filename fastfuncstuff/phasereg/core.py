@@ -321,6 +321,7 @@ def phase_regress(
     phi_method: str = "fft",
     phi_freq_range: tuple[float, float | None] = (0.1, None),
     regression: str = "deming",
+    max_slope_ratio: float | None = 2.0,
     slope_on: str = "data",
     tent_window: float = 20.0,
     phase_filter: str = "none",
@@ -377,6 +378,13 @@ def phase_regress(
         Frequency range for FFT-based noise estimation.
     regression : {"deming", "ols"}
         Regression method.
+    max_slope_ratio : float or None
+        Cap |slope| at this multiple of the voxel's OLS slope (Deming only).
+        The residual variance of ``mag - A*phase`` is smallest at the OLS slope
+        and is back to the input's at twice it, so the default 2 can never
+        leave a voxel noisier than it found it. Uncapped, the Deming slope
+        diverges (diff/SXY as SXY -> 0) wherever magnitude and phase are
+        uncorrelated but SYY > phi*SXX. None: no cap.
     slope_on : {"data", "residual"}
         Series the slope is fit on. "data" (default; Menon 2002, Stanley
         2021, Knudsen 2023): detrended, task preserved, because a vein's
@@ -815,6 +823,10 @@ def phase_regress(
 
         if regression == "deming":
             s, b = deming_regression(fit_pha, fit_mag, phi_c)
+            if max_slope_ratio is not None:
+                s_ols, _ = ols_regression(fit_pha, fit_mag)
+                s = torch.sign(s) * torch.minimum(s.abs(), max_slope_ratio * s_ols.abs())
+                b = fit_mag.mean(dim=0) - s * fit_pha.mean(dim=0)
         else:
             s, b = ols_regression(fit_pha, fit_mag)
         bad = ~good | flat

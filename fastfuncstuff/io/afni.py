@@ -1155,6 +1155,19 @@ def _voxel_major_numpy(data_np: np.ndarray, n_threads: int = 1) -> np.ndarray:
     return out.reshape(n_voxels, n_tps)
 
 
+def _file_order_index(mask_flat: np.ndarray, shape3d: tuple[int, ...]) -> np.ndarray:
+    """File-order (x fastest) position of each voxel a C-order mask selects.
+
+    A boolean mask selects in C order; an integer index keeps its own order.
+    """
+    nx, ny, nz = shape3d
+    mask = np.asarray(mask_flat)
+    idx_c = np.flatnonzero(mask) if mask.dtype == bool else mask.astype(np.int64)
+    x, rem = np.divmod(idx_c, ny * nz)
+    y, z = np.divmod(rem, nz)
+    return x + nx * (y + ny * z)
+
+
 def _voxel_major_masked_numpy(
     data_np: np.ndarray, mask_flat: np.ndarray, n_threads: int = 1
 ) -> np.ndarray:
@@ -1165,14 +1178,10 @@ def _voxel_major_masked_numpy(
     is 0.5 s against 2.4 s for reorder-then-mask. Needs the untouched layout
     (x fastest), as ``_voxel_major_cuda`` does.
     """
-    nx, ny, nz, nt = data_np.shape
-    mask = np.asarray(mask_flat)
-    idx_c = np.flatnonzero(mask) if mask.dtype == bool else mask.astype(np.int64)
-    x, rem = np.divmod(idx_c, ny * nz)
-    y, z = np.divmod(rem, nz)
-    file_idx = x + nx * (y + ny * z)
+    nt = data_np.shape[3]
+    file_idx = _file_order_index(mask_flat, data_np.shape[:3])
     by_time = data_np.T.reshape(nt, -1)  # (t, voxels in file order), a view
-    out = np.empty((idx_c.size, nt), dtype=np.float32)
+    out = np.empty((file_idx.size, nt), dtype=np.float32)
 
     # Blocks over time keep each worker's reads within a few volumes.
     n_blocks = max(1, min(nt, 4 * n_threads))
@@ -1204,6 +1213,45 @@ def to_voxel_major(data_4d: np.ndarray, n_threads: int | None = None) -> np.ndar
         n_cpu, _ = resolve_cpu_threads()
         n_threads = max(1, min(8, n_cpu))
     return _voxel_major_numpy(data_4d, n_threads)
+
+
+def from_voxel_major(
+    data: np.ndarray,
+    shape3d: tuple[int, int, int],
+    mask_flat: np.ndarray | None = None,
+    n_threads: int | None = None,
+) -> np.ndarray:
+    """Inverse of :func:`to_voxel_major`: ``(n_voxels, t)`` to a 4D volume in file order.
+
+    With ``mask_flat`` the rows are the in-mask voxels (boolean C-order mask or
+    integer index, as the loader takes it) and everything else is 0. The
+    result is F-contiguous, so ``save_nifti`` writes it without a reorder; the
+    usual route (scatter into a C-order volume, then reorder for the write)
+    costs two full passes over the grid where this is one over the mask.
+    """
+    nt = data.shape[1]
+    if mask_flat is None:
+        return _to_file_order(np.asarray(data).reshape(*shape3d, nt), n_threads)
+    if n_threads is None:
+        n_cpu, _ = resolve_cpu_threads()
+        n_threads = max(1, min(8, n_cpu))
+    out = np.zeros((*shape3d, nt), dtype=np.float32, order="F")
+    by_time = out.T.reshape(nt, -1)  # view: (t, voxels in file order)
+    file_idx = _file_order_index(mask_flat, shape3d)
+    n_blocks = max(1, min(nt, 4 * n_threads))
+    bounds = np.linspace(0, nt, n_blocks + 1).astype(int)
+
+    def _scatter(k: int) -> None:
+        lo, hi = bounds[k], bounds[k + 1]
+        by_time[lo:hi, file_idx] = data[:, lo:hi].T
+
+    if n_threads <= 1:
+        for k in range(n_blocks):
+            _scatter(k)
+    else:
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            list(pool.map(_scatter, range(n_blocks)))
+    return out
 
 
 def _voxel_major_cuda(

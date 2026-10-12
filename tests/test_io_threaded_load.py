@@ -23,6 +23,7 @@ from fastfuncstuff.io.afni import (
     _voxel_major_cuda,
     _voxel_major_masked_numpy,
     _voxel_major_numpy,
+    from_voxel_major,
     load_and_concatenate_runs,
     resolve_load_threads,
     save_nifti,
@@ -180,6 +181,20 @@ def test_voxel_major_masked_numpy_matches_reorder_then_mask(n_threads, as_index)
     got = _voxel_major_masked_numpy(arr, sel, n_threads)
     assert np.array_equal(got, _naive_voxel_major(arr)[sel])
     assert got.flags["C_CONTIGUOUS"]
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_from_voxel_major_inverts_the_masked_gather(masked):
+    rng = np.random.default_rng(5)
+    arr = rng.normal(0, 1, (5, 6, 4, 7)).astype(np.float32)
+    mask = rng.random(5 * 6 * 4) < 0.4 if masked else None
+    rows = _naive_voxel_major(arr) if mask is None else _naive_voxel_major(arr)[mask]
+    got = from_voxel_major(rows, arr.shape[:3], mask, n_threads=3)
+    expected = arr.copy()
+    if mask is not None:
+        expected[~mask.reshape(arr.shape[:3])] = 0
+    assert got.flags["F_CONTIGUOUS"]
+    assert np.array_equal(got, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

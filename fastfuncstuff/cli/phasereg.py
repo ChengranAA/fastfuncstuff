@@ -359,7 +359,9 @@ def create_parser() -> argparse.ArgumentParser:
         "-prefix",
         required=True,
         metavar="OUTPUT",
-        help="Output file prefix (e.g. results/epi_pr).",
+        help="Output file prefix (e.g. results/epi_pr). Outputs take the first "
+        "magnitude input's format (.nii.zst in, .nii.zst out) unless the prefix "
+        "names one: results/epi_pr.nii.gz.",
     )
 
     # ── Task removal ─────────────────────────────────────────────────────
@@ -795,23 +797,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from fastfuncstuff.cli_utils import (
             auto_polort,
+            input_nifti_ext,
             parse_device_arg,
             parse_prefix,
         )
         from fastfuncstuff.io.afni import (
-            get_tr_from_file,
             load_afni_mask,
-            load_nifti,
+            load_and_concatenate_runs,
             save_nifti,
-            to_voxel_major,
         )
+        from fastfuncstuff.io.headers import nifti_shape, read_nifti_header
         from fastfuncstuff.phasereg.core import phase_regress
         from fastfuncstuff.utils import configure_torch_backends, get_device  # noqa: F401
     except ImportError as e:
         print(f"ERROR: Could not import fastfuncstuff: {e}", file=sys.stderr)
         return 1
 
-    pfx = parse_prefix(args.prefix)
+    pfx = parse_prefix(args.prefix, default_ext=input_nifti_ext(args.magnitude[0]))
     args.prefix = pfx.stem
     nii_ext = pfx.nifti_ext
 
@@ -859,64 +861,59 @@ def main(argv: list[str] | None = None) -> int:
     if args.verb >= 1:
         print("\nLoading data...")
 
-    mag_list = []
-    pha_list = []
+    for p in (*args.magnitude, *args.phase):
+        if not Path(p).exists():
+            print(f"ERROR: File not found: {p}", file=sys.stderr)
+            return 1
+
+    # Shapes and TRs from the headers alone: a .nii.zst run is gigabytes, and
+    # nothing here needs its data to be checked.
     n_tp_per_run = []
     tr_values = []
     nx = ny = nz = None
     ref_img_path = args.magnitude[0]
-
-    for i in range(n_runs):
-        mag_path = args.magnitude[i]
-        pha_path = args.phase[i]
-
-        for p in (mag_path, pha_path):
-            if not Path(p).exists():
-                print(f"ERROR: File not found: {p}", file=sys.stderr)
-                return 1
-
-        mag_img = load_nifti(mag_path)
-        pha_img = load_nifti(pha_path)
-
-        mag_data = mag_img.get_fdata(dtype=np.float32)
-        pha_data = pha_img.get_fdata(dtype=np.float32)
-
-        if mag_data.ndim != 4:
-            print(f"ERROR: Expected 4D data, got {mag_data.ndim}D: {mag_path}", file=sys.stderr)
+    for mag_path, pha_path in zip(args.magnitude, args.phase, strict=True):
+        mag_hdr = read_nifti_header(mag_path)
+        mag_shape = nifti_shape(mag_path)
+        pha_shape = nifti_shape(pha_path)
+        if len(mag_shape) != 4:
+            print(f"ERROR: Expected 4D data, got {len(mag_shape)}D: {mag_path}", file=sys.stderr)
             return 1
-        if pha_data.shape != mag_data.shape:
+        if pha_shape != mag_shape:
             print(
-                f"ERROR: Phase shape {pha_data.shape} != magnitude shape {mag_data.shape}",
+                f"ERROR: Phase shape {pha_shape} != magnitude shape {mag_shape}",
                 file=sys.stderr,
             )
             return 1
-
         if nx is None:
-            nx, ny, nz = mag_data.shape[:3]
-
-        n_tp = mag_data.shape[3]
-        n_tp_per_run.append(n_tp)
-
-        if args.tr is None:
-            tr_values.append(get_tr_from_file(mag_path))
-
-        # nibabel hands back an F-CONTIGUOUS (x, y, z, t) array, so the C-order
-        # flatten to (n_voxels, n_tp) is a full four-axis memory reversal -- 378 ms
-        # per localizer run when done as a single-threaded reshape. to_voxel_major
-        # threads that copy (~4.7x measured) and returns it C-contiguous, so
-        # from_numpy then wraps it for free. Same voxel order: both are a C-order
-        # flatten of (x, y, z), matching mask.flatten().
-        mag_list.append(torch.from_numpy(to_voxel_major(mag_data)))
-        pha_list.append(torch.from_numpy(to_voxel_major(pha_data)))
-
+            nx, ny, nz = mag_shape[:3]
+        elif mag_shape[:3] != (nx, ny, nz):
+            print(
+                f"ERROR: {mag_path} grid {mag_shape[:3]} != first run's {(nx, ny, nz)}",
+                file=sys.stderr,
+            )
+            return 1
+        n_tp_per_run.append(int(mag_shape[3]))
+        tr_values.append(float(mag_hdr.get_zooms()[3]))
         if args.verb >= 1:
-            print(f"  Run {i + 1}: {mag_path} ({n_tp} TRs)")
+            print(f"  Run {len(n_tp_per_run)}: {mag_path} ({mag_shape[3]} TRs)")
+
+    # One threaded load of every file (magnitude runs, then phase runs), split
+    # back into per-run (voxels, time) views. Kept on the CPU: phase_regress
+    # streams voxel chunks to the device itself.
+    both, _ = load_and_concatenate_runs([*args.magnitude, *args.phase], keep_on_cpu=True)
+    per_file = list(torch.split(both, n_tp_per_run * 2, dim=1))
+    del both
+    mag_list, pha_list = per_file[:n_runs], per_file[n_runs:]
 
     if args.tr is None:
         if len(set(tr_values)) > 1:
             print(f"ERROR: Inconsistent TRs: {tr_values}", file=sys.stderr)
             return 1
         tr = tr_values[0]
+        if not tr > 0:
+            print("ERROR: No TR in the magnitude header; pass -tr.", file=sys.stderr)
+            return 1
     else:
         tr = args.tr
 

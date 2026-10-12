@@ -12,15 +12,15 @@ def _write_runs(tmp_path, lengths, seed=0):
     slope = rng.normal(0, 30, shape)
     mags, phas = [], []
     for i, nt in enumerate(lengths):
-        pha = rng.normal(0, 0.1, (*shape, nt))
-        mag = 1000 + slope[..., None] * pha + rng.normal(0, 5, (*shape, nt))
+        pha = rng.normal(0, 0.3, (*shape, nt))
+        mag = 1000 + slope[..., None] * pha + rng.normal(0, 1, (*shape, nt))
         for kind, arr, out in (("mag", mag, mags), ("pha", pha, phas)):
             img = nib.Nifti1Image(arr.astype(np.float32), np.eye(4))
             img.header["pixdim"][4] = 2.0
             path = tmp_path / f"{kind}{i + 1}.nii.gz"
             nib.save(img, path)
             out.append(str(path))
-    return mags, phas
+    return mags, phas, slope
 
 
 def _run(tmp_path, mags, phas, prefix, *extra):
@@ -32,7 +32,7 @@ def test_runs_are_fitted_together_and_written_apart(tmp_path):
     """Each run's corrected series lands in its own file with its own length, and
     the files are exactly the concatenated output cut at the run boundaries."""
     lengths = (40, 33)
-    mags, phas = _write_runs(tmp_path, lengths)
+    mags, phas, planted = _write_runs(tmp_path, lengths)
     _run(tmp_path, mags, phas, "split")
     _run(tmp_path, mags, phas, "cat", "-concat_output")
 
@@ -48,12 +48,50 @@ def test_runs_are_fitted_together_and_written_apart(tmp_path):
             np.asarray(nib.load(tmp_path / f"split_corrected_run-{i + 1:02d}.nii.gz").dataobj)
         )
     np.testing.assert_allclose(np.concatenate(parts, axis=3), cat, rtol=1e-5, atol=1e-3)
-    # One slope map for the pooled fit, not one per run.
-    assert (tmp_path / "split_slope.nii.gz").exists()
+    # One slope map for the pooled fit, not one per run -- and it is the planted one,
+    # which a loader that mixed up magnitude and phase, or voxel order, would miss.
+    slope = np.asarray(nib.load(tmp_path / "split_slope.nii.gz").dataobj)
+    fitted = slope != 0
+    assert fitted.mean() > 0.5
+    r = np.corrcoef(slope[fitted], planted[fitted])[0, 1]
+    assert r > 0.95
 
 
 def test_single_run_names_are_unchanged(tmp_path):
-    mags, phas = _write_runs(tmp_path, (40,))
+    mags, phas, _ = _write_runs(tmp_path, (40,))
     _run(tmp_path, mags, phas, "one")
     assert (tmp_path / "one_corrected.nii.gz").exists()
     assert not list(tmp_path.glob("one_corrected_run-*"))
+
+
+def test_outputs_inherit_the_input_format(tmp_path):
+    """.nii.zst in -> .nii.zst out with a bare prefix; an explicit extension still wins."""
+    import shutil
+    import subprocess
+
+    import pytest
+
+    if shutil.which("zstd") is None:
+        pytest.skip("zstd not installed")
+    mags, phas, _ = _write_runs(tmp_path, (30, 30))
+    zst = []
+    for f in [*mags, *phas]:
+        plain = f.replace(".nii.gz", ".nii")
+        nib.save(nib.load(f), plain)
+        subprocess.run(["zstd", "-q", "-f", "--rm", plain, "-o", plain + ".zst"], check=True)
+        zst.append(plain + ".zst")
+    _run(tmp_path, zst[:2], zst[2:], "z")
+    assert (tmp_path / "z_corrected_run-01.nii.zst").exists()
+    assert (tmp_path / "z_slope.nii.zst").exists()
+    assert not list(tmp_path.glob("z_*.nii.gz"))
+    _run(tmp_path, zst[:2], zst[2:], "g.nii.gz")
+    assert (tmp_path / "g_slope.nii.gz").exists()
+
+
+def test_input_nifti_ext():
+    from fastfuncstuff.cli_utils import input_nifti_ext
+
+    assert input_nifti_ext("a/run.nii.zst") == ".nii.zst"
+    assert input_nifti_ext("run.nii.zst[0..9]") == ".nii.zst"
+    assert input_nifti_ext("run.nii") == ".nii"
+    assert input_nifti_ext("run+orig.HEAD") == ".nii.gz"

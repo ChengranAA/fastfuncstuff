@@ -177,6 +177,21 @@ def parse_prefix(prefix: str, default_ext: str = ".nii.gz") -> PrefixInfo:
     return PrefixInfo(stem=prefix, nifti_ext=default_ext)
 
 
+def input_nifti_ext(path: str, fallback: str = ".nii.gz") -> str:
+    """The NIfTI extension of an input file, for an output to inherit.
+
+    Pass it as ``parse_prefix(..., default_ext=input_nifti_ext(args.input[0]))`` so
+    a bare ``-prefix`` writes the format the data came in: ``.nii.zst`` in gives
+    ``.nii.zst`` out instead of a pigz pass over gigabytes. An extension on the
+    prefix still wins. Selector suffixes (``run.nii.zst[0..9]``) are ignored.
+    """
+    clean = str(path).split("[", 1)[0]
+    for ext in (".nii.zst", ".nii.gz", ".nii"):
+        if clean.endswith(ext):
+            return ext
+    return fallback
+
+
 def clean_condition_labels(raw_labels: list[str]) -> list[str]:
     """Strip common prefix and suffix from condition labels.
 

@@ -78,7 +78,7 @@ def test_files_are_numbered_by_the_directory_they_came_from(tmp_path):
 def test_the_window_lists_directories_switches_and_tags_layers(tmp_path, config):
     pytest.importorskip("PySide6")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6 import QtWidgets
+    from PySide6 import QtCore, QtWidgets
 
     from fastfuncstuff.viewer import favorites
     from fastfuncstuff.viewer.session import ViewerSession
@@ -106,9 +106,14 @@ def test_the_window_lists_directories_switches_and_tags_layers(tmp_path, config)
         assert texts[0].startswith("2  stats") and texts[1].startswith("1  anat")
         box = w.dir_box
         items = [box.itemText(r) for r in range(box.count())]
-        assert items[0].startswith("1  one") and items[1].startswith("2  two")
-        assert items[-1] == "★  fav"
-        assert box.currentText().startswith("2  two")
+        assert items[0] == "1  one" and items[1] == "2  two" and items[-1] == "★  fav"
+        assert box.currentText() == "2  two"
+        assert box.itemData(0, QtCore.Qt.ItemDataRole.ToolTipRole) == str(one.resolve())
+        # A deep path never sets the window's width.
+        assert box.minimumSizeHint().width() < 300
+        # A row of its own, not squeezed into the button bar.
+        assert w.toolBarArea(box.parent().parent()) == QtCore.Qt.ToolBarArea.TopToolBarArea
+        assert w.read_button.parent() is not box.parent().parent()
         # Back to the first: the catalog is its files again.
         w._pick_directory(0)
         assert session.catalog_dir.resolve() == one.resolve()

@@ -6,6 +6,8 @@ because it applies to every dropdown in the viewer at once.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6 import QtCore, QtWidgets
 
 
@@ -28,6 +30,10 @@ class RowSizedList(QtWidgets.QListWidget):
         super().__init__()
         self._max_rows = max_rows
         self._min_rows = min_rows
+        #: Pixels the list is never shorter than, asked at measure time -- for
+        #: a list sharing a row with something taller, so it fills that
+        #: height with rows rather than leaving a gap under itself.
+        self.floor: Callable[[], int] | None = None
         # Fixed, or the enclosing layout hands it spare height anyway and the
         # hint this class exists to compute is never consulted.
         self.setSizePolicy(
@@ -38,6 +44,8 @@ class RowSizedList(QtWidgets.QListWidget):
         rows = max(self._min_rows, min(self.count(), self._max_rows))
         step = self.sizeHintForRow(0) if self.count() else 0
         height = rows * max(step, 18) + 2 * self.frameWidth() + 2
+        if self.floor is not None:
+            height = max(height, self.floor())
         return QtCore.QSize(super().sizeHint().width(), height)
 
     def rows_changed(self) -> None:

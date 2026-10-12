@@ -534,25 +534,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
             button.clicked.connect(slot)
             bar.addWidget(button)
 
-        # Every directory read or loaded from this session, numbered as the
-        # layer list tags its files, then the favourites: picking one reads it.
-        self._favorites: list[Path] | None = None
-        self.dir_box = QtWidgets.QComboBox()
-        self.dir_box.setToolTip(
-            "Directories this session has read or loaded from, numbered as the\n"
-            "layer list tags their files, then the favourites (★). Pick one to read it."
-        )
-        self.dir_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.dir_box.activated.connect(self._pick_directory)
-        bar.addWidget(self.dir_box)
-        self.fav_button = QtWidgets.QPushButton("☆")
-        self.fav_button.setCheckable(True)
-        self.fav_button.setToolTip(
-            f"Keep this directory in the favourites, for every viewer\n({favorites.config_path()})"
-        )
-        self.fav_button.clicked.connect(self._toggle_favorite)
-        bar.addWidget(self.fav_button)
-
         # Pushed to the right end of the row: it is not part of the load
         # gesture and should not sit in the middle of it.
         spacer = QtWidgets.QWidget()
@@ -571,6 +552,43 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         self.debug_button.clicked.connect(self._write_debug_report)
         bar.addWidget(self.debug_button)
+
+        # Its own row, under the buttons, so the directory in use and the way
+        # back to the others are always on screen. Every directory read or
+        # loaded from this session, numbered as the layer list tags its
+        # files, then the favourites: picking one reads it.
+        dirs = QtWidgets.QToolBar("directories")
+        dirs.setMovable(False)
+        self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, dirs)
+        dir_host = QtWidgets.QWidget()
+        dir_row = QtWidgets.QHBoxLayout(dir_host)
+        dir_row.setContentsMargins(0, 0, 0, 0)
+        dir_row.setSpacing(5)
+        dir_row.addWidget(self._head("DIR"))
+        self._favorites: list[Path] | None = None
+        self.dir_box = QtWidgets.QComboBox()
+        self.dir_box.setFont(QtGui.QFont(MONO))
+        self.dir_box.setToolTip(
+            "Directories this session has read or loaded from, numbered as the\n"
+            "layer list tags their files, then the favourites (★). Pick one to read it."
+        )
+        # Never sized by its longest entry: a deep path would set the window's
+        # minimum width. The full path is the item's tooltip.
+        self.dir_box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.dir_box.setMinimumContentsLength(12)
+        self.dir_box.activated.connect(self._pick_directory)
+        dir_row.addWidget(self.dir_box, 1)
+        self.fav_button = QtWidgets.QPushButton("☆")
+        self.fav_button.setCheckable(True)
+        self.fav_button.setToolTip(
+            f"Keep this directory in the favourites, for every viewer\n({favorites.config_path()})"
+        )
+        self.fav_button.clicked.connect(self._toggle_favorite)
+        dir_row.addWidget(self.fav_button)
+        dirs.addWidget(dir_host)
 
         picks = QtWidgets.QToolBar("data")
         picks.setMovable(False)
@@ -1362,32 +1380,41 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # _row_selected and this are the only two that know about the flip.
         self.layer_list.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
         self.layer_list.model().rowsMoved.connect(self._rows_moved)
-        v.addWidget(self.layer_list)
 
-        # Two rows of three: five buttons in one row is wider than the panel,
-        # and a panel wider than its window scrolls sideways.
-        stack_row = QtWidgets.QGridLayout()
-        stack_row.setSpacing(4)
-        for position, (text, key, tip, slot) in enumerate(
+        # The stack's buttons in a narrow column beside the list rather than
+        # full-width rows under it: layer names are mostly short, so the list
+        # gives up width it was not using and the panel gets the height back.
+        stack_column = QtWidgets.QWidget()
+        stack_buttons = QtWidgets.QVBoxLayout(stack_column)
+        stack_buttons.setContentsMargins(0, 0, 0, 0)
+        stack_buttons.setSpacing(2)
+        for text, key, tip, slot in (
+            ("LOWER", "{", "Move the selected layer down the stack", lambda: self._reorder(-1)),
+            ("RAISE", "}", "Move the selected layer up the stack", lambda: self._reorder(1)),
+            ("UNDERLAY", "u", "Make the selected layer the underlay", self._make_underlay),
+            ("DROP", "del", "Remove the selected layer", self._drop_layer),
             (
-                ("LOWER", "{", "Move the selected layer down the stack", lambda: self._reorder(-1)),
-                ("RAISE", "}", "Move the selected layer up the stack", lambda: self._reorder(1)),
-                ("UNDERLAY", "u", "Make the selected layer the underlay", self._make_underlay),
-                ("DROP", "del", "Remove the selected layer", self._drop_layer),
-                (
-                    "SAVE",
-                    "\u21e7S",
-                    "Write the selected layer to a NIfTI file",
-                    self._save_layer_dialog,
-                ),
-            )
+                "SAVE",
+                "\u21e7S",
+                "Write the selected layer to a NIfTI file",
+                self._save_layer_dialog,
+            ),
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
             b.setToolTip(f"{tip} ({key})")
-            b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 2px 5px; }}")
+            b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 1px 5px; }}")
             b.clicked.connect(slot)
-            stack_row.addWidget(b, *divmod(position, 3))
-        v.addLayout(stack_row)
+            stack_buttons.addWidget(b)
+        stack_buttons.addStretch(1)
+        stack_column.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Preferred
+        )
+        self.layer_list.floor = lambda: stack_column.sizeHint().height()
+        layer_row = QtWidgets.QHBoxLayout()
+        layer_row.setSpacing(4)
+        layer_row.addWidget(self.layer_list, 1)
+        layer_row.addWidget(stack_column, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+        v.addLayout(layer_row)
 
         # The layer form and the colour bar side by side: the bar stands on end
         # to the right of the pickers, so the numbers that define it sit in the

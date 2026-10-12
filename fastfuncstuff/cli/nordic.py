@@ -292,10 +292,12 @@ Examples:
         "component rank); shows where factor*lambda lands on each patch's spectrum.",
     )
 
-    task_group = parser.add_argument_group("Task-leak diagnostic (-events)")
+    task_group = parser.add_argument_group("Task design (-events) and the task-leak QC (-task_qc)")
     add_bids_events_args(
         task_group,
-        events_help="BIDS *_events.tsv for this run — switches on the task-leak diagnostic.\n"
+        events_help="BIDS *_events.tsv for this run: the design for -task_qc (the "
+        "task-leak diagnostic described here) and -task_rescue. On its own it does "
+        "nothing.\n"
         "NORDIC decides what to discard from a patch's singular-value spectrum alone; "
         "nothing in that decision knows the task, so a component carrying a real BOLD "
         "response can fall under the threshold. This measures how much of the design "
@@ -319,6 +321,15 @@ Examples:
         "if the answer is bad. NOTE the input is not motion-corrected at this stage, so "
         "the per-voxel fits are worse than a preprocessed run's — read the enrichment, "
         "not the R maps.",
+    )
+    task_group.add_argument(
+        "-task_qc",
+        action="store_true",
+        help="Run the task-leak diagnostic described under -events (needs -events).\n"
+        "Off by default: the per-patch test inside the denoising loop, the three task "
+        "fits and the -task_comps ICA scan of the removed series all cost time, and the "
+        "denoised output is the same either way. -task_rescue runs it too, because it "
+        "acts on that scan.",
     )
     task_group.add_argument(
         "-tr",
@@ -450,7 +461,7 @@ Examples:
         "NORDIC actually loses, and it keeps its sign — unlike -save-residual-map, "
         "which is the modulus of the removed complex field and so is half-rectified "
         "and offset by the Rician mean of the thermal noise it mostly consists of. "
-        "Implied by -events; on its own it is the series to hand to an ICA of what "
+        "Implied by -task_qc; on its own it is the series to hand to an ICA of what "
         "was discarded.",
     )
 
@@ -1185,10 +1196,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.retain_dof is not None and args.retain_dof <= 0:
         print("ERROR: -retain-dof must be positive (integer components or a fraction in (0,1))")
         sys.exit(1)
-    # The diagnostic scores the loss series, so -events has to produce it.
-    save_task_loss = args.save_task_loss or args.events is not None
+    if args.task_qc and args.events is None:
+        print("ERROR: -task_qc needs -events to know what the task is")
+        sys.exit(1)
+    # -task_rescue acts on the diagnostic's own component scan, so it runs it too.
+    task_stage = args.events is not None and bool(args.task_qc or args.task_rescue)
+    if args.events is not None and not task_stage:
+        print("NOTE: -events has no effect without -task_qc or -task_rescue")
+    # The diagnostic scores the loss series, so it has to be produced.
+    save_task_loss = args.save_task_loss or task_stage
     task_design = None
-    if args.events is not None:
+    if task_stage:
         # Built up front, before any denoising: the per-patch test runs INSIDE the LLR
         # loop (it needs the discarded singular vectors), so a design resolved
         # afterwards would be too late, and a bad -tr should fail in a second rather
@@ -1214,9 +1232,9 @@ def main(argv: list[str] | None = None) -> None:
     run_sweep_path = (
         args.factor_sweep or args.save_imgs or args.save_factor_img or args.save_eigen_img
     )
-    if run_sweep_path and args.events is not None:
+    if run_sweep_path and task_stage:
         print(
-            "ERROR: -events is a diagnostic on the denoised run; it does not apply to "
+            "ERROR: -task_qc / -task_rescue act on the denoised run; they do not apply to "
             "the -factor-sweep path (which never writes one)."
         )
         sys.exit(1)
@@ -1264,7 +1282,7 @@ def main(argv: list[str] | None = None) -> None:
         save_num_comps=args.save_num_comps,
         save_task_loss=save_task_loss,
         task_design=task_design,
-        task_polort=task_polort if args.events is not None else 1,
+        task_polort=task_polort if task_stage else 1,
         task_fdr_q=args.task_fdr_q,
         make_complex_nii=args.make_complex_nii,
         nifti_ext=prefix_info.nifti_ext,
@@ -1324,7 +1342,7 @@ def main(argv: list[str] | None = None) -> None:
         ]
     elapsed = time.time() - t0
 
-    if args.events is not None:
+    if task_stage:
         print_cli_section("Task-leak diagnostic")
         for i, outputs in enumerate(all_outputs):
             label = f" [echo {i + 1}]" if n_echoes > 1 else ""
@@ -1359,7 +1377,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  Residual output: {outputs.residual_file}")
         if outputs.task_loss_file is not None:
             print(f"  Task-loss output: {outputs.task_loss_file}")
-            if args.events is not None:
+            if task_stage:
                 stem = str(outputs.task_loss_file).partition("_taskloss")[0]
                 print(f"  Task-leak report: {stem}_taskleak.txt")
         if outputs.task_patch_file is not None:

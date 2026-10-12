@@ -1042,7 +1042,7 @@ def _planted_task_run(tmp_path, seed=3, tr=1.0, nt=120, amp=0.0):
 
 
 def test_events_writes_the_task_leak_report(tmp_path):
-    """-events runs end to end and writes both fits plus the report."""
+    """-events -task_qc runs end to end and writes both fits plus the report."""
     from fastfuncstuff.cli.nordic import main
 
     magn_file, ev = _planted_task_run(tmp_path, amp=20.0)
@@ -1066,6 +1066,7 @@ def test_events_writes_the_task_leak_report(tmp_path):
             "8",
             "-events",
             str(ev),
+            "-task_qc",
             "-device",
             "cpu",
         ]
@@ -1077,6 +1078,33 @@ def test_events_writes_the_task_leak_report(tmp_path):
     # The kept fit leads with full_model_R, then Coef/Correl per condition.
     fit = nib.load(tmp_path / "NORD_taskfit_kept.nii.gz")
     assert fit.shape[3] == 3
+
+
+def test_events_alone_skip_the_task_leak_qc(tmp_path):
+    """-events is only the design: without -task_qc no task stage runs.
+
+    autoproc hands every run's events to ffs_nordic, so with the diagnostic keyed on
+    -events alone every run paid for the patch test, three fits and an ICA scan."""
+    from fastfuncstuff.cli.nordic import main
+
+    magn_file, ev = _planted_task_run(tmp_path, amp=20.0)
+    # fmt: off
+    main([
+        "-input-magn", str(magn_file), "-prefix", str(tmp_path / "NORD"), "-magnitude-only",
+        "-kernel-size-pca", "3", "3", "3", "-kernel-size-gfactor", "3", "3", "1",
+        "-gfactor-nvols", "8", "-events", str(ev), "-device", "cpu",
+    ])
+    # fmt: on
+    assert (tmp_path / "NORD.nii.gz").exists()
+    assert not list(tmp_path.glob("NORD_task*")), sorted(p.name for p in tmp_path.iterdir())
+
+
+def test_task_qc_without_events_is_refused(tmp_path):
+    from fastfuncstuff.cli.nordic import main
+
+    magn_file, _ev = _planted_task_run(tmp_path, amp=0.0)
+    with pytest.raises(SystemExit):
+        main(["-input-magn", str(magn_file), "-prefix", str(tmp_path / "N"), "-task_qc"])
 
 
 def test_task_leak_enrichment_is_flat_when_nothing_was_planted(tmp_path):
@@ -1109,6 +1137,7 @@ def test_task_leak_enrichment_is_flat_when_nothing_was_planted(tmp_path):
             "8",
             "-events",
             str(ev),
+            "-task_qc",
             "-device",
             "cpu",
         ]
@@ -1156,6 +1185,7 @@ def test_task_leak_enrichment_rises_when_denoising_over_removes(tmp_path):
                 factor,
                 "-events",
                 str(ev),
+                "-task_qc",
                 "-device",
                 "cpu",
             ]
@@ -1211,6 +1241,7 @@ def _run_patch_test(tmp_path, tag, magn_file, ev):
             "8",
             "-events",
             str(ev),
+            "-task_qc",
             "-device",
             "cpu",
         ]
@@ -1270,6 +1301,7 @@ def _nordic_task_run(tmp_path, prefix, magn_file, ev, *extra):
             "4.0",
             "-events",
             str(ev),
+            "-task_qc",
             "-device",
             "cpu",
             *extra,

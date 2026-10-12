@@ -21,6 +21,7 @@ from fastfuncstuff.io.afni import (
     _peek_run_length,
     _to_file_order,
     _voxel_major_cuda,
+    _voxel_major_masked_numpy,
     _voxel_major_numpy,
     load_and_concatenate_runs,
     resolve_load_threads,
@@ -165,6 +166,19 @@ def test_voxel_major_numpy_matches_naive_reshape(n_threads):
     arr = np.asfortranarray(rng.normal(0, 1, (5, 6, 4, 9)).astype(np.float32))
     got = _voxel_major_numpy(arr, n_threads)
     assert np.array_equal(got, _naive_voxel_major(arr))
+    assert got.flags["C_CONTIGUOUS"]
+
+
+@pytest.mark.parametrize("n_threads", [1, 3])
+@pytest.mark.parametrize("as_index", [False, True])
+def test_voxel_major_masked_numpy_matches_reorder_then_mask(n_threads, as_index):
+    rng = np.random.default_rng(4)
+    arr = np.asfortranarray(rng.normal(0, 1, (5, 6, 4, 9)).astype(np.float32))
+    mask = rng.random(5 * 6 * 4) < 0.3
+    # an integer index keeps the caller's order, unsorted included
+    sel = rng.permutation(np.flatnonzero(mask)) if as_index else mask
+    got = _voxel_major_masked_numpy(arr, sel, n_threads)
+    assert np.array_equal(got, _naive_voxel_major(arr)[sel])
     assert got.flags["C_CONTIGUOUS"]
 
 

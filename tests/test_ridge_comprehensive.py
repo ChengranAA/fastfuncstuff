@@ -607,3 +607,36 @@ class TestRidgeFullPipeline:
         assert torch.all(torch.isfinite(results.betas_single_trial))
 
         print(f"  Per-voxel HRF ridge: mean R² = {results.r2.mean().item():.3f}")
+
+
+def test_per_voxel_designs_with_equal_sums_are_fitted_separately(device):
+    """Two different designs with the same total mass (one is the other shifted
+    in time) must each fit their own voxel, as if fitted alone."""
+    n_tp, n_trials = 60, 4
+    run_starts = [0, n_tp]
+    design_a = torch.zeros(2 * n_tp, n_trials)
+    for trial, onset in enumerate([5, 30, 65, 95]):  # integer kernel ⇒ exact sums
+        design_a[onset : onset + 4, trial] = torch.tensor([1.0, 3.0, 2.0, 1.0])
+    design_b = torch.cat([design_a[:n_tp].roll(7, 0), design_a[n_tp:].roll(7, 0)])
+    assert design_a.sum() == design_b.sum() and not torch.equal(design_a, design_b)
+
+    generator = torch.Generator().manual_seed(0)
+    betas = torch.tensor([[1.0, -2.0, 3.0, 0.5], [2.0, 1.0, -1.0, 4.0]])
+    data = torch.stack([design_a @ betas[0], design_b @ betas[1]])
+    data += 0.1 * torch.randn(data.shape, generator=generator)
+
+    common = dict(
+        run_starts=run_starts,
+        tr=1.0,
+        trial_condition_ids=torch.tensor([0, 1, 0, 1]),
+        condition_design=design_a.reshape(2 * n_tp, 2, 2).sum(-1),
+        fracs=np.array([0.5, 1.0]),
+        polort=1,
+        cv_splits=generate_cv_splits(n_runs=2, strategy=1, n_perms=2),
+        device=device,
+    )
+    both = fit_ridge_single_trial(
+        data=data, design_matrix=torch.stack([design_a, design_b]), **common
+    )
+    alone = fit_ridge_single_trial(data=data[1:], design_matrix=design_b, **common)
+    torch.testing.assert_close(both.betas_single_trial[1], alone.betas_single_trial[0])

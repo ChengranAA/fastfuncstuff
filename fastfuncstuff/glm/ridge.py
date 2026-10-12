@@ -904,18 +904,13 @@ def _fit_ridge_chunk_with_per_voxel_designs(
     n_trials = design_per_voxel[0].shape[1]
     n_fracs = len(fracs)
 
-    # Group voxels by unique designs
-    # Hash each design to find duplicates (vectorized - single GPU→CPU transfer)
-    # Stack designs to compute hashes all at once
-    # design_per_voxel is a list of (n_timepoints, n_trials) tensors
+    # Group voxels by exactly equal designs. A cheaper key (the design's sum)
+    # let two different HRFs with equal mass share one fit.
     designs_stacked = torch.stack(design_per_voxel, dim=0)  # (chunk_voxels, n_timepoints, n_trials)
-    design_hashes = designs_stacked.sum(dim=(1, 2)).tolist()  # (chunk_voxels,) → list
-
-    # Find unique design hashes and group voxels
-    unique_hashes = list(set(design_hashes))
-    groups = {}
-    for hash_val in unique_hashes:
-        groups[hash_val] = [i for i, h in enumerate(design_hashes) if h == hash_val]
+    _, design_ids = torch.unique(designs_stacked.flatten(1), dim=0, return_inverse=True)
+    groups: dict[int, list[int]] = {}
+    for i, gid in enumerate(design_ids.tolist()):
+        groups.setdefault(gid, []).append(i)
 
     # Allocate output arrays
     betas_all = torch.zeros(chunk_voxels, n_trials, device=device)
@@ -1081,9 +1076,7 @@ def fit_ridge_single_trial(
             n_trials = design_matrix.shape[2]
             design_per_voxel_list = [design_matrix[i, :, :] for i in range(n_voxels)]
             if verbose:
-                n_unique_hrfs = len(
-                    set(int(design.sum().item()) for design in design_per_voxel_list[:100])
-                )
+                n_unique_hrfs = len(torch.unique(design_matrix[:100].flatten(1), dim=0))
                 print(
                     f"  Per-voxel HRF designs detected (~{n_unique_hrfs} unique designs in first 100 voxels)"
                 )

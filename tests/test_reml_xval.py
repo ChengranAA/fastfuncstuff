@@ -12,7 +12,12 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.glm.reml_xval import compute_xval_r2_arma
+from fastfuncstuff.glm.arma import build_arma11_covariance
+from fastfuncstuff.glm.reml_xval import (
+    _whiten_per_run,
+    censor_xval_inputs,
+    compute_xval_r2_arma,
+)
 from fastfuncstuff.glm.xval import compute_xval_r2
 
 
@@ -149,3 +154,58 @@ class TestArmaXval:
                 device=torch.device("cpu"),
                 verbose=False,
             )
+
+
+class TestCensoredXval:
+    def test_censored_trs_cannot_influence_the_score(self):
+        """Two datasets differing only at censored TRs must score identically,
+        across both runs, under ARMA whitening."""
+        design, run_starts, n_timepoints, n_conditions = _design(n_runs=3, run_length=120)
+        generator = torch.Generator().manual_seed(1)
+        betas = torch.randn(40, design.shape[1], generator=generator)
+        clean = betas @ torch.from_numpy(design).T + torch.randn(
+            40, n_timepoints, generator=generator
+        )
+        censored = [5, 6, 130, 250, 251, 252]  # holes in all three runs
+        good = [t for t in range(n_timepoints) if t not in set(censored)]
+
+        def score(data):
+            d, x, starts, tau = censor_xval_inputs(data, design, run_starts, good)
+            assert tau is not None and d.shape[1] == len(good) == x.shape[0]
+            return compute_xval_r2_arma(
+                data=d,
+                design_matrix=x,
+                run_starts=starts,
+                stim_indices=list(range(n_conditions)),
+                nuisance_indices=list(range(n_conditions, design.shape[1])),
+                cv_splits=_splits(len(starts)),
+                arma_params=torch.tensor([[0.6, 0.2]]).expand(40, 2),
+                device=torch.device("cpu"),
+                verbose=False,
+                tau=tau,
+            )["r2"]
+
+        spiked = clean.clone()
+        spiked[:, censored] += 1e4
+        torch.testing.assert_close(score(clean), score(spiked), rtol=0, atol=0)
+
+    def test_no_censoring_is_a_passthrough(self):
+        design, run_starts, n_timepoints, _ = _design(n_runs=2, run_length=50)
+        data = torch.randn(3, n_timepoints)
+        d, x, starts, tau = censor_xval_inputs(data, design, run_starts, None)
+        assert d is data and x is design and starts == run_starts and tau is None
+
+    def test_whitening_across_a_hole_is_gls_on_the_kept_submatrix(self):
+        """With tau, the whitened Gram is X_k' S_kk^-1 X_k for the kept rows of
+        the full-run covariance S -- the exact marginal, not a lag-1 squeeze."""
+        a, b, n = 0.7, 0.3, 30
+        keep = torch.tensor([t for t in range(n) if t not in (10, 11, 20)])
+        x = torch.randn(n, 3, dtype=torch.float64)
+        full = build_arma11_covariance(a, b, n, torch.device("cpu"), dtype=torch.float64)
+        assert full is not None
+        s_kk = full[keep][:, keep]
+        xk = x[keep]
+        expected = xk.T @ torch.linalg.solve(s_kk, xk)
+
+        xw, _ = _whiten_per_run(xk, xk.clone(), [(0, 0, len(keep))], a, b, {}, tau=keep)
+        torch.testing.assert_close(xw.T @ xw, expected)

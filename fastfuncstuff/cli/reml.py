@@ -1216,7 +1216,7 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
     """
     import torch as _torch
 
-    from fastfuncstuff.glm.reml_xval import compute_xval_r2_arma
+    from fastfuncstuff.glm.reml_xval import censor_xval_inputs, compute_xval_r2_arma
     from fastfuncstuff.glm.xval import generate_cv_splits
 
     arma_params = getattr(results, "arma_params", None)
@@ -1251,6 +1251,16 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
     stim_indices = list(design_info["stim_indices"])
     nuisance_indices = list(design_info["nuisance_indices"])
 
+    # Score only the TRs the fit kept, as the fit did: a censored motion spike
+    # in a held-out run would otherwise dominate its residual. tau carries the
+    # true time gaps into the ARMA whitening across each censored hole.
+    data, design, run_starts, tau = censor_xval_inputs(
+        data, design, run_starts, design_info.get("good_list")
+    )
+    if len(run_starts) < 2:
+        print("  ⚠️  -xval_r2 needs at least 2 runs with uncensored TRs; skipped.")
+        return
+
     strategy = parse_cv_strategy(str(args.cv_strategy))
     cv_splits = generate_cv_splits(len(run_starts), strategy=strategy)
     print()
@@ -1266,6 +1276,7 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
         arma_params=arma_params.detach().cpu(),
         device=device,
         verbose=args.verb >= 1,
+        tau=tau,
     )
     xval_r2 = xval["r2"]
     assert isinstance(xval_r2, _torch.Tensor)

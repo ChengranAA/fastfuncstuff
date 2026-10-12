@@ -52,7 +52,8 @@ def _whiten_per_run(
     segments: list[tuple[int, int, int]],
     a: float,
     b: float,
-    cholesky_cache: dict[tuple[float, float, int], torch.Tensor],
+    cholesky_cache: dict[tuple, torch.Tensor],
+    tau: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply the ARMA(1,1) whitening transform run by run.
 
@@ -65,27 +66,60 @@ def _whiten_per_run(
 
     Cholesky factors are cached on ``(a, b, run_length)`` because runs of equal
     length share a factor, and the same factors recur across folds.
+
+    ``tau`` (aligned with the rows of ``design``) is each row's within-run time
+    index when censored TRs were dropped: survivors flanking a hole are then
+    correlated at the true lag, not lag 1. The cache key becomes that run's
+    tau pattern.
     """
     design_white = torch.empty_like(design)
     data_white = torch.empty_like(data)
 
     for _, offset, length in segments:
-        key = (a, b, length)
+        block = slice(offset, offset + length)
+        tau_block = None if tau is None else tau[block].cpu()
+        key = (a, b, length) if tau_block is None else (a, b, tuple(tau_block.tolist()))
         factor = cholesky_cache.get(key)
         if factor is None:
             covariance = build_arma11_covariance(
-                a, b, length, torch.device("cpu"), dtype=torch.float64
+                a, b, length, torch.device("cpu"), dtype=torch.float64, tau=tau_block
             )
             if covariance is None:
                 raise ValueError(f"invalid ARMA(1,1) parameters a={a}, b={b}")
             factor = torch.linalg.cholesky(covariance).to(design.device, dtype=design.dtype)
             cholesky_cache[key] = factor
 
-        block = slice(offset, offset + length)
         design_white[block] = torch.linalg.solve_triangular(factor, design[block], upper=False)
         data_white[block] = torch.linalg.solve_triangular(factor, data[block], upper=False)
 
     return design_white, data_white
+
+
+def censor_xval_inputs(
+    data: torch.Tensor,
+    design: np.ndarray,
+    run_starts: list[int],
+    good_list: list[int] | torch.Tensor | None,
+) -> tuple[torch.Tensor, np.ndarray, list[int], torch.Tensor | None]:
+    """Reduce full-timeline xval inputs to the TRs the fit kept.
+
+    Cross-validation must score the same timepoints the fit used: a censored
+    motion spike in a held-out run would otherwise dominate its residual.
+    Returns ``(data, design, run_starts, tau)`` in retained space, ready for
+    :func:`compute_xval_r2_arma`; a wholly censored run drops out of
+    ``run_starts``. With nothing censored the inputs come back unchanged and
+    ``tau`` is None.
+    """
+    from fastfuncstuff.glm.arma import build_censor_run_info
+
+    n_full = data.shape[1]
+    if good_list is None or len(good_list) >= n_full:
+        return data, design, list(run_starts), None
+    keep = torch.as_tensor(list(good_list), dtype=torch.long)
+    if design.shape[0] == n_full:
+        design = design[keep.numpy()]
+    run_starts_kept, tau = build_censor_run_info(run_starts, n_full, good_list=keep)
+    return data[:, keep.to(data.device)], design, run_starts_kept, tau
 
 
 def compute_xval_r2_arma(
@@ -99,6 +133,7 @@ def compute_xval_r2_arma(
     device: torch.device | None = None,
     metric: str = "cod",
     verbose: bool = True,
+    tau: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor | int]:
     """Held-out R2 on the condition-level design, using GLS betas.
 
@@ -117,6 +152,10 @@ def compute_xval_r2_arma(
     ----------
     arma_params : (n_voxels, 2) tensor
         Per-voxel ``(a, b)`` from the whole-data REML fit; held fixed here.
+    tau : (n_timepoints,) tensor, optional
+        For censored data: ``data``/``design_matrix``/``run_starts`` are already
+        in retained (post-censor) space and ``tau`` is each row's original
+        within-run time index, from :func:`glm.arma.build_censor_run_info`.
     """
     from fastfuncstuff.utils import get_device, to_tensor
 
@@ -152,7 +191,7 @@ def compute_xval_r2_arma(
     sum_sq_actual = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
     n_scored = 0
 
-    cholesky_cache: dict[tuple[float, float, int], torch.Tensor] = {}
+    cholesky_cache: dict[tuple, torch.Tensor] = {}
 
     for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
         # Only the training block is whitened: the test prediction and its R2
@@ -168,6 +207,7 @@ def compute_xval_r2_arma(
             start = run_starts[run_idx]
             test_tps.extend(range(start, start + int(run_lengths[run_idx])))
 
+        train_tau = None if tau is None else tau[train_tps]
         train_design = design_matrix[train_tps, :]
         test_design = design_matrix[test_tps, :]
 
@@ -200,7 +240,13 @@ def compute_xval_r2_arma(
 
             group_data = train_data_all[voxel_mask.to(train_data_all.device)]
             design_white, data_white = _whiten_per_run(
-                train_design, group_data.T.contiguous(), train_segments, a, b, cholesky_cache
+                train_design,
+                group_data.T.contiguous(),
+                train_segments,
+                a,
+                b,
+                cholesky_cache,
+                tau=train_tau,
             )
 
             # GLS betas = OLS on the whitened pair. The full design is fitted so
@@ -256,4 +302,4 @@ def compute_xval_r2_arma(
     }
 
 
-__all__ = ["compute_xval_r2_arma"]
+__all__ = ["censor_xval_inputs", "compute_xval_r2_arma"]

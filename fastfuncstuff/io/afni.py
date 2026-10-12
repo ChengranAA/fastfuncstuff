@@ -3368,7 +3368,22 @@ def _reference_geometry_cached(path: str, mtime_ns: int, size: int):
 
     Only the geometry is retained -- never the data array -- so an entry
     costs a few KB regardless of how big the reference file is.
+
+    A ``.nii.zst`` reference is read header-only (with its extensions): the
+    full decode cost 3.4 s on a 4.4 GB run against 7 ms, and a tool writing
+    per-run outputs references every run once. ``.nii`` / ``.nii.gz`` are
+    already lazy under nibabel. The three fields reset below are the ones
+    nibabel resets once it has read a file's data, so the header matches what
+    ``load_nifti(path).header`` would hand back.
     """
+    if path.endswith(".nii.zst") and "[" not in path:
+        from fastfuncstuff.io.dsetinfo import _read_nifti_header_with_ext
+
+        header = _read_nifti_header_with_ext(Path(path))
+        header["vox_offset"] = 0
+        header["scl_slope"] = np.nan
+        header["scl_inter"] = np.nan
+        return header.get_best_affine(), header
     ref_img = load_nifti(path)
     return ref_img.affine, ref_img.header.copy()
 

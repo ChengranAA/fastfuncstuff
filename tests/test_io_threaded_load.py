@@ -246,3 +246,28 @@ def test_per_run_fn_runs_before_the_mask(tmp_path):
     assert widths == [n_voxels] * len(paths)  # full volume, not the mask
     expected, _ = load_and_concatenate_runs(paths, device=torch.device("cpu"), mask_flat=mask)
     assert torch.equal(got, expected)
+
+
+def test_zst_reference_geometry_is_header_only_and_identical(tmp_path, monkeypatch):
+    """save_nifti's reference header for a .nii.zst comes from the header bytes alone,
+    and is byte-identical (extensions too) to what a full load_nifti gives."""
+    if shutil.which("zstd") is None:
+        pytest.skip("zstd not installed")
+    from fastfuncstuff.io import afni
+    from fastfuncstuff.io.afni import _reference_geometry_cached, load_nifti, save_nifti
+
+    ref = tmp_path / "ref.nii.zst"
+    data = np.random.default_rng(0).normal(size=(5, 4, 3, 6)).astype(np.float32)
+    save_nifti(data, str(ref), affine=np.diag([0.8, 0.8, 0.8, 1.0]), brick_labels=list("abcdef"))
+    full = load_nifti(str(ref))
+
+    def no_full_load(*a, **k):
+        raise AssertionError("reference geometry decoded the whole file")
+
+    monkeypatch.setattr(afni, "load_nifti", no_full_load)
+    affine, header = _reference_geometry_cached(str(ref), 0, 0)
+    assert np.allclose(affine, full.affine)
+    assert header.binaryblock == full.header.binaryblock
+    assert [e.get_content() for e in header.extensions] == [
+        e.get_content() for e in full.header.extensions
+    ]

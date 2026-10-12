@@ -11,13 +11,16 @@ A time series gives depth x time as well: the region's mean at every depth
 and volume, with the time cursor -- the depth timecourses a laminar analysis
 starts from -- and EXPORT writes them as a table, ``(n_time, K)``.
 
+PIN freezes the current mean +- SD as a coloured trace, so another overlay,
+dataset or region can be laid over it; the axes stretch to hold every trace.
+
 The region is published to the surface store, so a surface window shows
 which cortex the profile came from.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +52,24 @@ class DepthResult:
     #: Every vertex, depth and volume, kept so stepping through time slices it
     #: instead of re-sampling the whole series (dropped above ~512 MB).
     series: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class PinnedProfile:
+    """A profile kept on the plot after the region or overlay moved on."""
+
+    label: str
+    fractions: np.ndarray  # (K,)
+    mean: np.ndarray  # (K,)
+    sd: np.ndarray  # (K,)
+    n_vertices: int
+
+    @classmethod
+    def of(cls, result: DepthResult, label: str) -> PinnedProfile:
+        with np.errstate(all="ignore"):
+            mean = np.nanmean(result.profiles, axis=0)
+            sd = np.nanstd(result.profiles, axis=0)
+        return cls(label, result.fractions.copy(), mean, sd, result.n_vertices)
 
 
 def depth_profiles(
@@ -98,6 +119,7 @@ class DepthPlot(QtWidgets.QWidget):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.result: DepthResult | None = None
+        self.pins: list[PinnedProfile] = []
         self.message = "click cortex to profile it"
         self.setMinimumSize(200, 160)
 
@@ -106,26 +128,35 @@ class DepthPlot(QtWidgets.QWidget):
         c = theme.palette()
         p.fillRect(self.rect(), QtGui.QColor(c.bg))
         r = self.result
-        if r is None or r.n_vertices == 0:
+        live = r is not None and r.n_vertices > 0
+        if not live and not self.pins:
             p.setPen(QtGui.QColor(c.faint))
             p.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, self.message)
             p.end()
             return
         plot = QtCore.QRectF(48, 22, max(self.width() - 60, 10), max(self.height() - 48, 10))
-        x = r.fractions
-        prof = r.profiles
-        mean = np.nanmean(prof, axis=0)
-        sd = np.nanstd(prof, axis=0)
         # Scale to the mean +- 2 SD rather than to every vertex's extremes, so
-        # one wild vertex does not flatten the profile everyone came to see.
-        lo = float(np.nanmin(mean - 2 * sd))
-        hi = float(np.nanmax(mean + 2 * sd))
-        if not np.isfinite(lo) or hi <= lo:
+        # one wild vertex does not flatten the profile everyone came to see --
+        # and over every pinned trace too, so none of them runs off the plot.
+        spans = [(q.fractions, q.mean - 2 * q.sd, q.mean + 2 * q.sd) for q in self.pins]
+        if live:
+            assert r is not None
+            prof = r.profiles
+            with np.errstate(all="ignore"):
+                mean = np.nanmean(prof, axis=0)
+                sd = np.nanstd(prof, axis=0)
+            spans.append((r.fractions, mean - 2 * sd, mean + 2 * sd))
+        with np.errstate(all="ignore"):
+            lo = float(np.nanmin([np.nanmin(s[1]) for s in spans]))
+            hi = float(np.nanmax([np.nanmax(s[2]) for s in spans]))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = (lo - 1, lo + 1) if np.isfinite(lo) else (0.0, 1.0)
+        x0 = min(float(s[0][0]) for s in spans)
+        x1 = max(float(s[0][-1]) for s in spans)
 
         def pt(xv: float, yv: float) -> QtCore.QPointF:
             return QtCore.QPointF(
-                plot.left() + (xv - x[0]) / (x[-1] - x[0]) * plot.width(),
+                plot.left() + (xv - x0) / (x1 - x0) * plot.width(),
                 plot.bottom() - (yv - lo) / (hi - lo) * plot.height(),
             )
 
@@ -140,9 +171,66 @@ class DepthPlot(QtWidgets.QWidget):
             p.drawLine(a, b)
             p.drawText(QtCore.QPointF(a.x() + 3, plot.top() + 12), name)
         if lo < 0 < hi:
-            p.drawLine(pt(x[0], 0.0), pt(x[-1], 0.0))
+            p.drawLine(pt(x0, 0.0), pt(x1, 0.0))
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-        accent = QtGui.QColor(c.accent)
+        for n, pin in enumerate(self.pins):
+            self._draw_trace(p, pt, pin.fractions, pin.mean, pin.sd, _pin_color(n), 0.12)
+        if live:
+            assert r is not None
+            self._draw_live(p, pt, r.fractions, prof, mean, sd)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        p.setPen(QtGui.QColor(c.faint))
+        right = QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
+        p.drawText(QtCore.QRectF(0, plot.top() - 7, 44, 14), right, f"{hi:.3g}")
+        p.drawText(QtCore.QRectF(0, plot.bottom() - 7, 44, 14), right, f"{lo:.3g}")
+        p.drawText(
+            QtCore.QPointF(plot.left(), plot.bottom() + 16),
+            "WM  <-  depth (white 0, pial 1)  ->  CSF",
+        )
+        p.setPen(QtGui.QColor(c.text))
+        title = (
+            f"{r.layer_name} · {r.region} · {r.n_vertices} vertices · mean +- SD"
+            if live and r is not None
+            else "pinned profiles"
+        )
+        p.drawText(QtCore.QPointF(plot.left(), 15), title)
+        metrics = p.fontMetrics()
+        for n, pin in enumerate(self.pins):
+            p.setPen(_pin_color(n))
+            row = QtCore.QRectF(
+                plot.left() + 6,
+                plot.top() + 16 + n * metrics.height(),
+                plot.width() - 12,
+                metrics.height(),
+            )
+            text = metrics.elidedText(
+                f"{n + 1}  {pin.label}", QtCore.Qt.TextElideMode.ElideMiddle, int(row.width())
+            )
+            p.drawText(row, QtCore.Qt.AlignmentFlag.AlignRight, text)
+        p.end()
+
+    @staticmethod
+    def _draw_trace(p, pt, x, mean, sd, colour: QtGui.QColor, band_alpha: float) -> None:
+        band = QtGui.QPolygonF(
+            [pt(x[k], mean[k] + sd[k]) for k in range(x.size)]
+            + [pt(x[k], mean[k] - sd[k]) for k in reversed(range(x.size))]
+        )
+        fill = QtGui.QColor(colour)
+        fill.setAlphaF(band_alpha)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        p.drawPolygon(band)
+        pen = QtGui.QPen(colour)
+        pen.setWidthF(2.2)
+        p.setPen(pen)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        path = QtGui.QPainterPath(pt(x[0], mean[0]))
+        for k in range(1, x.size):
+            path.lineTo(pt(x[k], mean[k]))
+        p.drawPath(path)
+
+    def _draw_live(self, p, pt, x, prof, mean, sd) -> None:
+        accent = QtGui.QColor(theme.palette().accent)
         faint = QtGui.QColor(accent)
         faint.setAlphaF(0.08 if prof.shape[0] > 50 else 0.2)
         p.setPen(QtGui.QPen(faint))
@@ -155,38 +243,13 @@ class DepthPlot(QtWidgets.QWidget):
             for k in range(1, x.size):
                 path.lineTo(pt(x[k], row[k]))
             p.drawPath(path)
-        band = QtGui.QPolygonF(
-            [pt(x[k], mean[k] + sd[k]) for k in range(x.size)]
-            + [pt(x[k], mean[k] - sd[k]) for k in reversed(range(x.size))]
-        )
-        fill = QtGui.QColor(accent)
-        fill.setAlphaF(0.22)
-        p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(fill)
-        p.drawPolygon(band)
-        pen = QtGui.QPen(accent)
-        pen.setWidthF(2.2)
-        p.setPen(pen)
-        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        path = QtGui.QPainterPath(pt(x[0], mean[0]))
-        for k in range(1, x.size):
-            path.lineTo(pt(x[k], mean[k]))
-        p.drawPath(path)
-        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
-        p.setPen(QtGui.QColor(c.faint))
-        right = QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
-        p.drawText(QtCore.QRectF(0, plot.top() - 7, 44, 14), right, f"{hi:.3g}")
-        p.drawText(QtCore.QRectF(0, plot.bottom() - 7, 44, 14), right, f"{lo:.3g}")
-        p.drawText(
-            QtCore.QPointF(plot.left(), plot.bottom() + 16),
-            "WM  <-  depth (white 0, pial 1)  ->  CSF",
-        )
-        p.setPen(QtGui.QColor(c.text))
-        p.drawText(
-            QtCore.QPointF(plot.left(), 15),
-            f"{r.layer_name} · {r.region} · {r.n_vertices} vertices · mean +- SD",
-        )
-        p.end()
+        self._draw_trace(p, pt, x, mean, sd, accent, 0.22)
+
+
+def _pin_color(n: int) -> QtGui.QColor:
+    # The first series colour is the accent, which the live trace already wears.
+    series = theme.palette().series[1:]
+    return QtGui.QColor.fromRgbF(*series[n % len(series)][:3])
 
 
 class DepthTimePlot(QtWidgets.QWidget):
@@ -305,6 +368,15 @@ class DepthWindow(QtWidgets.QWidget):
         self.roi_box.activated.connect(self._changed)
         bar.addWidget(self.roi_box)
         bar.addStretch(1)
+        pin = QtWidgets.QPushButton("PIN")
+        pin.setToolTip("Keep this profile on the plot to compare against (p; shift+p clears)")
+        pin.clicked.connect(self.pin)
+        bar.addWidget(pin)
+        self.unpin_button = QtWidgets.QPushButton("UNPIN")
+        self.unpin_button.setToolTip("Clear every pinned profile (shift+p)")
+        self.unpin_button.clicked.connect(self.clear_pins)
+        self.unpin_button.setEnabled(False)
+        bar.addWidget(self.unpin_button)
         export = QtWidgets.QPushButton("EXPORT")
         export.setToolTip("Write the profile (and depth timecourses) as a table")
         export.clicked.connect(self._export_dialog)
@@ -325,6 +397,8 @@ class DepthWindow(QtWidgets.QWidget):
                 Key("(", "smaller disc", lambda: self._radius_by(1 / 1.25), group="depth"),
                 Key(")", "larger disc", lambda: self._radius_by(1.25), group="depth"),
                 Key("f", "follow the crosshair / pin the region", self._toggle_follow, group="depth"),
+                Key("p", "pin this profile to compare against", self.pin, group="depth"),
+                Key("shift+p", "clear the pinned profiles", self.clear_pins, group="depth"),
                 Key("click (heatmap)", "go to that volume", None, group="depth"),
                 Key("h", "this list", self.help.toggle, group="window"),
                 Key("ctrl+w", "close this window", self.close, group="window"),
@@ -369,6 +443,25 @@ class DepthWindow(QtWidgets.QWidget):
         vp = self._viewport()
         if vp is not None:
             self._dispatch(SetSurfaceEquivolume(self.vid, not vp.equivolume))
+
+    def pin(self) -> None:
+        r = self.result
+        if r is None or r.n_vertices == 0:
+            return
+        vp = self._viewport()
+        label = f"{r.layer_name} · {r.region}"
+        if r.timecourses is not None:
+            label += f" · vol {r.time_index}"
+        if vp is not None and not vp.equivolume:
+            label += " · equidistant"
+        self.plot.pins.append(PinnedProfile.of(r, label))
+        self.unpin_button.setEnabled(True)
+        self.plot.update()
+
+    def clear_pins(self) -> None:
+        self.plot.pins.clear()
+        self.unpin_button.setEnabled(False)
+        self.plot.update()
 
     def _toggle_follow(self) -> None:
         self.follow = not self.follow
@@ -474,7 +567,14 @@ class DepthWindow(QtWidgets.QWidget):
             )
             keep = samples if samples is not None and samples.nbytes < 512 * 2**20 else None
             self.result = DepthResult(
-                fractions, profiles, courses, n, self._region_name(vp), layer.name, idx, keep
+                fractions,
+                profiles,
+                courses,
+                n,
+                self._region_name(vp),
+                _shown(layer, idx),
+                idx,
+                keep,
             )
             self._built = key
         elif self.result is not None and self.result.timecourses is not None:
@@ -509,16 +609,26 @@ class DepthWindow(QtWidgets.QWidget):
             self, "Export depth profile", "depth_profile.tsv", "Tables (*.tsv *.txt)"
         )
         if path:
-            export_table(self.result, Path(path))
+            export_table(self.result, Path(path), self.plot.pins)
 
 
-def export_table(result: DepthResult, path: Path) -> None:
+def _shown(layer, idx: int) -> str:
+    """The layer, and for a bucket the sub-brick -- a coef and its t share a name."""
+    if layer.time_linked or layer.n_volumes <= 1:
+        return layer.name
+    brick = layer.labels[idx] if 0 <= idx < len(layer.labels) and layer.labels[idx] else f"#{idx}"
+    return f"{layer.name} [{brick}]"
+
+
+def export_table(result: DepthResult, path: Path, pins: Sequence[PinnedProfile] = ()) -> None:
     """Write the region's depth profile; with a series, its ``(T, K)`` depth timecourses.
 
     Columns are depths (fractions, white 0 to pial 1, the margins outside).
     Without a series: rows ``mean``, ``sd``, ``n``. With one: a row per volume
     -- the shape laminar models read -- and the profile in a ``.profile.tsv``
-    beside it.
+    beside it. Each pinned profile on the same depths adds ``pinN mean`` /
+    ``pinN sd`` / ``pinN n`` rows to the profile, and its label to a comment
+    line at the top.
     """
     header = "\t".join(f"{f:.4f}" for f in result.fractions)
     mean = np.nanmean(result.profiles, axis=0)
@@ -531,6 +641,22 @@ def export_table(result: DepthResult, path: Path) -> None:
             "n\t" + "\t".join(str(result.n_vertices) for _ in mean),
         ]
     )
+    same = [
+        (n, q)
+        for n, q in enumerate(pins, start=1)
+        if q.fractions.shape == result.fractions.shape
+        and np.allclose(q.fractions, result.fractions)
+    ]
+    if same:
+        notes = "".join(f"# pin{n}: {q.label}\n" for n, q in same)
+        rows = [profile]
+        for n, q in same:
+            rows += [
+                f"pin{n} mean\t" + "\t".join(f"{x:.6g}" for x in q.mean),
+                f"pin{n} sd\t" + "\t".join(f"{x:.6g}" for x in q.sd),
+                f"pin{n} n\t" + "\t".join(str(q.n_vertices) for _ in q.mean),
+            ]
+        profile = notes + "\n".join(rows)
     if result.timecourses is None:
         path.write_text(profile + "\n")
         return
@@ -542,4 +668,11 @@ def export_table(result: DepthResult, path: Path) -> None:
     path.with_name(path.stem + ".profile.tsv").write_text(profile + "\n")
 
 
-__all__ = ["DepthPlot", "DepthResult", "DepthWindow", "depth_profiles", "export_table"]
+__all__ = [
+    "DepthPlot",
+    "DepthResult",
+    "DepthWindow",
+    "PinnedProfile",
+    "depth_profiles",
+    "export_table",
+]

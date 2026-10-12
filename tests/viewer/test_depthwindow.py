@@ -74,3 +74,43 @@ def test_a_closing_depth_window_does_not_dispatch_for_its_gone_viewport(tmp_path
         app.processEvents()
     finally:
         session.close()
+
+
+def test_a_pinned_profile_stays_through_a_move_and_exports_beside_the_live_one(tmp_path):
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.depthwindow import DepthWindow, export_table
+    from fastfuncstuff.viewer.vocab import LoadSurfaces, OpenView, SetDepthView, SetXYZ
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session = ViewerSession(device=torch.device("cpu"))
+    try:
+        session.load(str(_anat(tmp_path)))
+        session.load(str(_shell_anat(tmp_path)))
+        session.do(LoadSurfaces(str(_subject(tmp_path)), "lh"))
+        session.do(SetXYZ(0.0, 0.0, 22.0))
+        session.do(OpenView("D1", "depth", "axial"))
+        session.do(SetDepthView("D1", "disc", 4.0, "", ""))
+        win = DepthWindow("D1", session, session.do)
+        win.apply(session.state.viewports.get("D1"))
+        first = win.result
+        assert first is not None
+        win.pin()
+        session.do(SetDepthView("D1", "disc", 8.0, "", ""))
+        win.refresh(SetDepthView.aspects)
+        assert win.result is not first and len(win.plot.pins) == 1
+        pin = win.plot.pins[0]
+        assert "4 mm disc" in pin.label
+        np.testing.assert_allclose(pin.mean, np.nanmean(first.profiles, axis=0))
+        win.plot.resize(400, 300)
+        win.plot.grab()  # paints the pin and the live trace without raising
+        out = tmp_path / "p.tsv"
+        export_table(win.result, out, win.plot.pins)
+        lines = out.read_text().splitlines()
+        assert lines[0].startswith("# pin1: ") and "4 mm disc" in lines[0]
+        assert any(ln.startswith("pin1 mean\t") for ln in lines)
+        win.clear_pins()
+        assert win.plot.pins == [] and not win.unpin_button.isEnabled()
+        win.close()
+    finally:
+        session.close()
+        app.processEvents()

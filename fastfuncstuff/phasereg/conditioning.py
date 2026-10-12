@@ -64,12 +64,12 @@ def temporal_unwrap(phase: torch.Tensor, run_lengths: list[int] | None = None) -
 
 
 def _legendre_basis(coords: torch.Tensor, order: int) -> torch.Tensor:
-    """Total-degree <= order products of Legendre polynomials in x, y, z."""
+    """Total-degree <= order products of Legendre polynomials in each coordinate."""
     c = coords.double()
     lo, hi = c.min(0).values, c.max(0).values
     u = (2.0 * (c - lo) / (hi - lo).clamp(min=1.0) - 1.0).numpy()
     cols = []
-    for degs in itertools.product(range(order + 1), repeat=3):
+    for degs in itertools.product(range(order + 1), repeat=u.shape[1]):
         if sum(degs) <= order:
             col = np.ones(u.shape[0])
             for axis, deg in enumerate(degs):
@@ -78,12 +78,23 @@ def _legendre_basis(coords: torch.Tensor, order: int) -> torch.Tensor:
     return torch.from_numpy(np.stack(cols, axis=1))
 
 
+def _fit_term(centred: torch.Tensor, keep: torch.Tensor, order: int, coords) -> torch.Tensor:
+    """Per-volume term fit on ``keep`` voxels, evaluated at every column."""
+    if order == 0:
+        g = centred[:, keep].median(dim=1).values
+        return g.unsqueeze(1).expand_as(centred)
+    basis = _legendre_basis(coords, order).to(centred.device)
+    coef = torch.linalg.lstsq(basis[keep], centred[:, keep].T.double()).solution
+    return (basis @ coef).T.to(centred.dtype)
+
+
 def remove_global_phase(
     phase: torch.Tensor,
     order: int,
     fit_mask: torch.Tensor,
     coords: torch.Tensor | None = None,
     run_lengths: list[int] | None = None,
+    groups: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Subtract a per-volume spatial polynomial from temporally-centred phase.
 
@@ -94,20 +105,30 @@ def remove_global_phase(
     (edge, seam and vessel voxels) so it describes bulk tissue; it is then
     subtracted from every voxel.
 
+    With ``groups`` (one integer label per voxel, e.g. the acquired slice) the
+    term is fit and removed within each group separately. That is the right
+    unit for 2-D multi-slice EPI: slices are read at different moments of the
+    breathing cycle, so one volume carries as many field states as it has
+    acquisition times, and only native-space (pre-resampling) data keeps them
+    apart.
+
     Parameters
     ----------
     phase : Tensor (n_timepoints, n_voxels), temporally continuous radians.
-    order : 0 = per-volume robust (median) offset; N >= 1 = spatial Legendre
-        polynomial of total degree N, which needs ``coords``.
+    order : 0 = robust (median) offset; N >= 1 = Legendre polynomial of total
+        degree N in ``coords``.
     fit_mask : Tensor (n_voxels,) bool — voxels allowed to inform the fit.
-    coords : Tensor (n_voxels, 3) grid coordinates, required for order >= 1.
+    coords : Tensor (n_voxels, D) coordinates, required for order >= 1; with
+        ``groups``, pass the in-group (in-plane) coordinates only.
     run_lengths : per-run lengths for the temporal centring.
+    groups : Tensor (n_voxels,) int or None.
 
     Returns
     -------
     cleaned : Tensor like ``phase``.
-    global_term : Tensor (n_timepoints,) — the fitted term averaged over
-        ``fit_mask``, a QC trace of what was removed.
+    term : the fitted term averaged over each group's ``fit_mask`` voxels —
+        (n_timepoints,) without groups, (n_timepoints, n_groups) with them, in
+        ``torch.unique(groups)`` order. A QC trace of what was removed.
     """
     if order < 0:
         raise ValueError(f"order must be >= 0, got {order}")
@@ -118,20 +139,23 @@ def remove_global_phase(
         centred[a:b] -= centred[a:b].mean(0)
 
     fm = fit_mask.bool()
-    var = centred[:, fm].var(0)
-    keep = torch.zeros_like(fm)
-    keep[fm] = var <= torch.quantile(var.double(), 0.9).to(var.dtype)
-    if int(keep.sum()) < 10:
-        raise ValueError("too few voxels to estimate the global phase term")
-
-    if order == 0:
-        g = centred[:, keep].median(dim=1).values
-        fitted = g.unsqueeze(1).expand_as(phase)
-        return phase - fitted, g
-
-    assert coords is not None
-    basis = _legendre_basis(coords, order).to(phase.dtype)
-    xk = basis[keep]
-    coef = torch.linalg.lstsq(xk.double(), centred[:, keep].T.double()).solution
-    fitted = (basis.double() @ coef).T.to(phase.dtype)
-    return phase - fitted, fitted[:, fm].mean(1)
+    labels = torch.zeros(phase.shape[1], dtype=torch.long) if groups is None else groups.long()
+    fitted = torch.zeros_like(phase)
+    traces = []
+    for lab in torch.unique(labels):
+        sel = labels == lab
+        sub = centred[:, sel]
+        sub_fm = fm[sel]
+        if int(sub_fm.sum()) < 10:
+            if groups is None:
+                raise ValueError("too few voxels to estimate the global phase term")
+            traces.append(torch.zeros(phase.shape[0], dtype=phase.dtype))
+            continue
+        var = sub[:, sub_fm].var(0)
+        keep = torch.zeros_like(sub_fm)
+        keep[sub_fm] = var <= torch.quantile(var.double(), 0.9).to(var.dtype)
+        term = _fit_term(sub, keep, order, None if coords is None else coords[sel])
+        fitted[:, sel] = term
+        traces.append(term[:, sub_fm].mean(1))
+    trace = traces[0] if groups is None else torch.stack(traces, dim=1)
+    return phase - fitted, trace

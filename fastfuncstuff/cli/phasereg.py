@@ -45,7 +45,7 @@ RECOMMENDED PIPELINES
     ffs_phasereg -magnitude rest_mag.nii.gz -phase rest_phase.nii.gz \\
                  -prefix rest_pr -polort 1
 
-  OLS variant (Chang & Giovanello 2026 approach for 3T):
+  OLS variant (no errors-in-variables term; Vu & Gallant 2015's choice):
     ffs_phasereg -magnitude epi.nii.gz -phase epi_phase.nii.gz \\
                  -prefix pr -regression ols
 
@@ -106,7 +106,7 @@ Barry RL & Gore JC (2014). Hum Brain Mapp 35:3832-3840.
 Curtis AT et al (2014). NeuroImage 100:51-59.
 Stanley OW et al (2021). NeuroImage 117631.
 Knudsen L et al (2023). NeuroImage 271:120011.
-Chang WT & Giovanello KS (2026). eLife 12:RP92805.
+Chang WT, Lin W & Giovanello KS (2023). eLife 12:RP92805.
 Liem BT (2023). MSc thesis, Western University. (phaseprep)
 Bodenschatz JC & Rowe DB (2026). Magn Reson Imaging 131:110696.
 """
@@ -411,8 +411,9 @@ def create_parser() -> argparse.ArgumentParser:
         help="Regression method. 'deming' is the closed-form Deming/ODR "
         "(equivalent to scipy.odr at fMRI φ scales — see Menon 2002, "
         "Curtis 2014, Stanley 2021, phaseprep). 'ols' regresses mag on "
-        "phase without errors-in-variables correction (Chang & "
-        "Giovanello 2026 use OLS at 3T after NORDIC).",
+        "phase without the errors-in-variables term, so a noisy phase "
+        "attenuates the slope (Vu & Gallant 2015 use it to avoid over-"
+        "correction).",
     )
     reg.add_argument(
         "-phi",

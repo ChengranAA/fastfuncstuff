@@ -279,6 +279,15 @@ class TestConvolveDesignHrf:
         assert (result[:, 0] != 0).sum() > 1
         assert (result[:, 1] != 0).sum() > 1
 
+    def test_is_causal(self):
+        """An impulse at t must return the HRF starting at t, not centred on it."""
+        design = torch.zeros(8, 1, device=DEVICE)
+        design[2, 0] = 1.0
+        hrf = torch.tensor([1.0, 2.0, 3.0], device=DEVICE)
+        result = convolve_design_hrf(design, hrf, device=DEVICE)[:, 0].cpu()
+        expected = torch.tensor([0, 0, 1, 2, 3, 0, 0, 0]) / 3.0  # peak-normalised
+        torch.testing.assert_close(result, expected)
+
     def test_preserves_shape(self):
         design = torch.randn(100, 5, device=DEVICE)
         hrf = torch.randn(15, device=DEVICE)

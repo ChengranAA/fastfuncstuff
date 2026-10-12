@@ -1343,8 +1343,10 @@ def convolve_design_hrf(
     # Kernel shape for groups: (n_regressors, 1, kernel_len)
     hrf_kernel = hrf.flip(0).unsqueeze(0).unsqueeze(0).expand(n_regressors, 1, -1)
 
-    # Depthwise convolution: each regressor convolved independently
-    conv_result = F.conv1d(design_batch, hrf_kernel, padding=len(hrf) // 2, groups=n_regressors)
+    # Causal: left-pad by len-1 so an onset at t drives samples t, t+1, ... and
+    # never earlier. Symmetric padding shifted every response len//2 TRs early.
+    design_batch = F.pad(design_batch, (len(hrf) - 1, 0))
+    conv_result = F.conv1d(design_batch, hrf_kernel, groups=n_regressors)
     convolved = conv_result.squeeze(0).T[:n_timepoints]
 
     return convolved

@@ -8,14 +8,15 @@ phase-predicted magnitude component yields a microvascular-weighted signal.
 
 Pipeline
 --------
-1. Polynomial detrending (Legendre, per run) of both magnitude and phase.
-2. Optional Savitzky-Golay filtering of phase (Barry & Gore 2014).
-3. Optional task removal from both (TENT/FIR or canonical HRF).
+1. Phase conditioning: temporal unwrap; optional per-volume global field removal.
+2. Polynomial (+ nuisance) detrending, per run, of magnitude and phase.
+3. Optional task model (TENT/FIR or canonical HRF) — used for the phi estimate
+   and, only with slope_on="residual", for the slope fit.
 4. Signal-based voxel masking (skip air / skull / low-SNR).
-5. Estimate variance ratio phi from cleaned residuals (FFT or residual).
-6. Deming regression on residuals -> per-voxel slope.
-7. Apply correction to detrended magnitude.
-8. Return corrected magnitude + diagnostics.
+5. Optional Savitzky-Golay filtering of phase (Barry & Gore 2014).
+6. Estimate variance ratio phi (FFT band or task-residual variance).
+7. Deming (or OLS) regression -> per-voxel slope.
+8. Apply correction; return corrected magnitude + diagnostics.
 """
 
 from __future__ import annotations
@@ -318,6 +319,7 @@ def phase_regress(
     phi_method: str = "fft",
     phi_freq_range: tuple[float, float | None] = (0.1, None),
     regression: str = "deming",
+    slope_on: str = "data",
     tent_window: float = 20.0,
     phase_filter: str = "none",
     sgf_window: int | None = None,
@@ -326,6 +328,8 @@ def phase_regress(
     sgf_order_max: int | None = None,
     sgf_step: int = 4,
     signal_thresh: float = 0.03,
+    phase_unwrap: bool = True,
+    phase_global_order: int = -1,
     keep_drift: bool = False,
     shrink_mode: str = "odr",
     vein_mask: bool = False,
@@ -371,6 +375,17 @@ def phase_regress(
         Frequency range for FFT-based noise estimation.
     regression : {"deming", "ols"}
         Regression method.
+    slope_on : {"data", "residual"}
+        Which series the slope is fit on when ``task_removal`` is active.
+        "data" (default) fits the nuisance-detrended, task-PRESERVED series,
+        as Menon 2002, Stanley 2021 and Knudsen 2023 all do; the task model
+        then only feeds the noise (phi) estimate. A vein's task-locked
+        magnitude/phase covariance is most of what determines its slope, so
+        removing it first leaves the fit to spontaneous fluctuations and
+        noise. "residual" fits the task-residual series instead: it guards
+        against a micro task response that co-varies with macro phase being
+        removed with it (over-suppression), at the price of a far noisier
+        slope.
     tent_window : float
         TENT window duration in seconds.
     phase_filter : {"none", "sgf", "explore"}
@@ -395,6 +410,16 @@ def phase_regress(
         R² map will show bright values in air/noise voxels because the
         ODR-style metric reads ill-conditioned slopes as "perfect fits
         within the noise budget" — not a bug, but visually misleading.
+    phase_unwrap : bool
+        Unwrap each run's phase along time about the voxel's circular mean
+        before anything else (``conditioning.temporal_unwrap``). A no-op up to
+        a constant on already-unwrapped phase; required for wrapped phase.
+    phase_global_order : int
+        -1 (default) off. 0 removes a robust per-volume brain-wide phase
+        offset; N >= 1 removes a per-volume spatial Legendre polynomial of
+        total degree N (needs ``volume_shape``). Breathing / frequency-drift
+        field changes are regressor variance with no magnitude counterpart and
+        attenuate the slope; see ``conditioning.remove_global_phase``.
     keep_drift : bool
         If False (default, phaseprep parity), the corrected magnitude is
         re-centered on the per-voxel mean and any polynomial drift removed
@@ -512,6 +537,32 @@ def phase_regress(
         .mean(dim=0)
     )
 
+    vox_mask = orig_mean > signal_thresh * orig_mean.max()
+
+    # ── 1b. Phase conditioning: temporal unwrap, global field removal ────
+    if phase_unwrap or phase_global_order >= 0:
+        from fastfuncstuff.phasereg.conditioning import remove_global_phase, temporal_unwrap
+
+        pha_all = torch.cat([p.T for p in phase], dim=0).float()
+        if phase_unwrap:
+            pha_all = temporal_unwrap(pha_all, n_tp_per_run)
+        if phase_global_order >= 0:
+            coords = None
+            if phase_global_order >= 1:
+                if volume_shape is None:
+                    raise ValueError("phase_global_order >= 1 needs volume_shape")
+                coords = _voxel_coords(volume_shape, mask_flat)
+            pha_all, g = remove_global_phase(
+                pha_all, phase_global_order, vox_mask, coords, n_tp_per_run
+            )
+            if verbose:
+                print(
+                    f"  Global phase (order {phase_global_order}) removed: "
+                    f"per-volume term std={g.std().item():.4f} rad"
+                )
+        phase = list(torch.split(pha_all.T, n_tp_per_run, dim=1))
+        del pha_all
+
     # ── 2. Build per-run polynomial + nuisance regressors ────────────────
     from fastfuncstuff.design.builder import legendre_polynomials
 
@@ -596,8 +647,6 @@ def phase_regress(
     del mag_residual_runs, pha_residual_runs
 
     # ── 4. Signal-based voxel masking ────────────────────────────────────
-    orig_thresh = signal_thresh * orig_mean.max()
-    vox_mask = orig_mean > orig_thresh
     n_good = int(vox_mask.sum().item())
     if verbose:
         n_bad = n_voxels - n_good
@@ -752,12 +801,18 @@ def phase_regress(
     intercept_all = torch.zeros(n_voxels)
 
     pha_mean = pha_detrended_filt.mean(dim=0)
+    if slope_on == "data":
+        fit_mag, fit_pha = mag_detrended, pha_detrended_filt
+    elif slope_on == "residual":
+        fit_mag, fit_pha = mag_residual, pha_residual_filt
+    else:
+        raise ValueError(f"Unknown slope_on: {slope_on!r}. Use 'data' or 'residual'.")
     # Gate on the series the slope is FIT on, not the one it is applied to.
     # With task_removal='none' these are the same tensor; with task removal
     # active they differ, and gating on the wrong one lets a voxel whose
     # residual phase is flat (all its variance absorbed by the task model)
     # through to a Cov/Var slope that explodes.
-    pha_var = pha_residual_filt.var(dim=0)
+    pha_var = fit_pha.var(dim=0)
 
     # Phase variance floor: in voxels where the phase barely varies
     # (air, skull, or genuinely flat phase), Var(phase) → 0 makes the
@@ -778,8 +833,8 @@ def phase_regress(
         if not chunk_mask.any():
             continue
 
-        chunk_mag = mag_residual[:, start:end].to(device)
-        chunk_pha = pha_residual_filt[:, start:end].to(device)
+        chunk_mag = fit_mag[:, start:end].to(device)
+        chunk_pha = fit_pha[:, start:end].to(device)
         chunk_phi = phi_tensor[start:end].to(device)
 
         if regression == "deming":
@@ -811,8 +866,8 @@ def phase_regress(
     if vein_mask:
         from fastfuncstuff.phasereg.veinmask import coupling_pvalue, fdr_threshold
 
-        mc = mag_residual - mag_residual.mean(dim=0, keepdim=True)
-        pc = pha_residual_filt - pha_residual_filt.mean(dim=0, keepdim=True)
+        mc = fit_mag - fit_mag.mean(dim=0, keepdim=True)
+        pc = fit_pha - fit_pha.mean(dim=0, keepdim=True)
         denom = (mc.norm(dim=0) * pc.norm(dim=0)).clamp(min=1e-30)
         coupling_r = (mc * pc).sum(dim=0) / denom
         del mc, pc
@@ -820,7 +875,8 @@ def phase_regress(
         # Every regressor projected out of both series costs a degree of
         # freedom, as do the fitted slope and intercept.
         n_nuisance = sum(p.shape[1] for p in poly_per_run)
-        n_nuisance += sum(t.shape[1] for t in task_per_run if t is not None)
+        if slope_on == "residual":
+            n_nuisance += sum(t.shape[1] for t in task_per_run if t is not None)
         df = sum(n_tp_per_run) - n_nuisance - 2
 
         n_cand = (spr_connectivity + 1) if spr else 1
@@ -925,10 +981,13 @@ def phase_regress(
             )
         else:
             frac = (1.0 / infl_good).median().item()
-            print(
-                f"    shrink_mode='odr': median {100.0 * (1 - frac):.0f}% of the "
-                f"fitted macro component is discarded before subtraction."
+            # The two output modes put the same factor in different places.
+            what = (
+                "of the fitted macro component is left IN the output"
+                if keep_drift
+                else "of the residual (micro signal + noise) is removed WITH the macro"
             )
+            print(f"    shrink_mode='odr': median {100.0 * (1 - frac):.0f}% {what}.")
         n_total = int(vox_mask.sum().item())
         print(f"  R2 distribution over {n_total:,} masked voxels:")
         for thresh in (0.01, 0.05, 0.10, 0.20, 0.30, 0.50):

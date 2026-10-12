@@ -108,6 +108,7 @@ Stanley OW et al (2021). NeuroImage 117631.
 Knudsen L et al (2023). NeuroImage 271:120011.
 Chang WT & Giovanello KS (2026). eLife 12:RP92805.
 Liem BT (2023). MSc thesis, Western University. (phaseprep)
+Bodenschatz JC & Rowe DB (2026). Magn Reson Imaging 131:110696.
 """
 
 from __future__ import annotations
@@ -200,9 +201,13 @@ Every run writes these (3D = one value per voxel, 4D = a time series):
       if it is far below neighbouring grey matter, the voxel was flattened,
       not corrected. Fix: -spr gives the voxel a real regressor and the slope
       drops to a sane value.
-  A third, quieter cause is the shrinkage itself: in raw scanner units
-  A^2/phi ~ 1, so roughly half the fitted macro component is discarded before
-  subtraction even in well-behaved voxels. See -shrink none.
+  A third, quieter cause is the shrinkage itself under -keep_drift: in raw
+  scanner units A^2/phi ~ 1, so roughly half the fitted macro component is
+  left in the output even in well-behaved voxels. (Without -keep_drift the same
+  factor instead scales down the micro residual.) See -shrink none.
+  A fourth is the regressor: slow phase variance with no magnitude
+  counterpart (breathing, B0 drift, per-volume recon offsets) attenuates every
+  slope toward zero. See -phase_global_order.
 
   prefix_mask.nii.gz       (3D)  Which voxels were actually fit (1) vs skipped
       as air/skull/low-SNR (0). Everything outside it is zero in the 3D maps.
@@ -252,18 +257,25 @@ HOW THE FLAGS CHANGE WHAT YOU GET
   -keep_drift        Rewrites prefix_corrected AND prefix_macro. Default:
                      drift dropped, output = mean + shrunk residual. On:
                      drift kept, output = mag_orig - A_eff*(phase-mean) with
-                     A_eff = A/(1+A^2/phi). slope/phi/r2 are unchanged; only
+                     A_eff = A/(1+A^2/phi). The two modes put the -shrink odr
+                     factor s = 1/(1+A^2/phi) in DIFFERENT places: the default
+                     removes all of A*phase and then scales what is left
+                     (micro signal included) by s; -keep_drift removes only
+                     s*A*phase, leaving (1-s) of the macro in. -shrink none
+                     makes both remove exactly A*phase. slope/phi/r2 are unchanged; only
                      the two 4D files differ. Use it when a GLM downstream
                      will model the drift; use default for an analysis
                      endpoint.
 
   -task_removal / -onsets / -events
-                     Estimates slope and phi on TASK-RESIDUAL data, so A
-                     reflects vessel coupling rather than a shared task
-                     response. Changes slope, phi and r2 (and therefore the
-                     correction). The correction is still applied to the full
-                     detrended series. Pair with -phi_method residual on task
-                     data; 'fft' is safe either way.
+                     Builds a task model used to estimate phi from TASK-
+                     RESIDUAL noise (Knudsen 2023, Menon 2002's notch). The
+                     slope is still fit on the task-preserved series, as in
+                     every reference implementation: a vein's task-locked
+                     mag/phase covariance is what pins its slope down. Add
+                     -slope_on residual to fit the slope after task removal
+                     too (guards against micro signal being removed with the
+                     macro, but leaves the slope to noise at low SNR).
 
   -regression ols    Fills prefix_slope with an ordinary least-squares slope
                      (no errors-in-variables term) instead of Deming. phi is
@@ -343,7 +355,7 @@ def create_parser() -> argparse.ArgumentParser:
         "-task_removal",
         choices=["none", "tent", "canonical"],
         default="none",
-        help="Task removal before slope estimation: "
+        help="Task model for the phi (noise) estimate — see -slope_on: "
         "'none' (direct regression, OK after NORDIC or for RS), "
         "'tent' (TENT/FIR basis - model-free, recommended), "
         "'canonical' (SPM HRF convolution).",
@@ -522,14 +534,47 @@ def create_parser() -> argparse.ArgumentParser:
         "-shrink",
         choices=["odr", "none"],
         default="odr",
-        help="Whether the ODR shrinkage factor 1/(1+A^2/phi) is applied to the "
-        "correction. 'odr' (default) is phaseprep/Stanley parity and makes "
-        "ill-conditioned voxels decay to their mean rather than speckle. It is "
-        "not free: with magnitude in raw scanner units A^2/phi sits near 1 over "
-        "much of the brain, so roughly HALF the fitted macrovascular component "
-        "is thrown away before it is subtracted. If veins are surviving phase "
-        "regression, try 'none' — it applies the textbook M - A*phi at full "
-        "strength. Verbose output reports how much parity mode is discarding.",
+        help="Whether the ODR shrinkage factor s = 1/(1+A^2/phi) is applied. "
+        "'odr' (default) is phaseprep/Stanley parity and makes ill-conditioned "
+        "voxels decay to their mean rather than speckle. It is not free, and "
+        "its cost depends on the output mode: by default all of A*phase is "
+        "removed and the remaining residual — micro BOLD included — is scaled "
+        "by s; with -keep_drift only s*A*phase is removed, so with A^2/phi near "
+        "1 (raw scanner units) about HALF the macro stays in. 'none' applies "
+        "the textbook M - A*phase in both modes. Verbose output reports s.",
+    )
+
+    reg.add_argument(
+        "-slope_on",
+        choices=["data", "residual"],
+        default="data",
+        help="Series the slope is fit on when a task model is given. 'data' "
+        "(default; Menon 2002, Stanley 2021, Knudsen 2023): nuisance-detrended, "
+        "task preserved; the task model only feeds phi. 'residual': after task "
+        "removal (the pre-2026-10 behaviour of -task_removal).",
+    )
+    pcond = parser.add_argument_group("Phase Conditioning")
+    pcond.add_argument(
+        "-no_phase_unwrap",
+        action="store_true",
+        help="Skip the temporal unwrap. By default each run's phase is unwrapped "
+        "along time about the voxel's circular mean: a no-op (up to a constant) "
+        "on unwrapped input, and what makes wrapped input — e.g. from ffs_nwarp "
+        "-phase_warp split/circular/complex — usable.",
+    )
+    pcond.add_argument(
+        "-phase_global_order",
+        type=int,
+        default=-1,
+        metavar="N",
+        help="Remove a per-volume spatial phase term before the fit. -1 (default) "
+        "off; 0 a robust brain-wide offset per volume; N>=1 a spatial Legendre "
+        "polynomial of total degree N. Breathing, B0 drift and recon offsets "
+        "move the whole brain's phase together; that is regressor variance with "
+        "no magnitude counterpart and pulls every slope toward 0 (Menon 2002 "
+        "used a navigator echo; Bodenschatz & Rowe 2026 fit a low-order spatial "
+        "polynomial per volume). Vessel phase is a local dipole, which a low-"
+        "order brain-wide fit cannot absorb. Keep N small with partial coverage.",
     )
 
     vg = parser.add_argument_group("Vein Exclusion Mask")
@@ -1067,6 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
         phi_method=args.phi_method,
         phi_freq_range=freq_range,
         regression=args.regression,
+        slope_on=args.slope_on,
         tent_window=tent_window,
         phase_filter=args.phase_filter,
         sgf_window=sgf_window,
@@ -1075,6 +1121,8 @@ def main(argv: list[str] | None = None) -> int:
         sgf_order_max=args.sgf_order_max,
         sgf_step=args.sgf_step,
         signal_thresh=args.signal_thresh,
+        phase_unwrap=not args.no_phase_unwrap,
+        phase_global_order=args.phase_global_order,
         keep_drift=args.keep_drift,
         shrink_mode=args.shrink,
         vein_mask=args.vein_mask,

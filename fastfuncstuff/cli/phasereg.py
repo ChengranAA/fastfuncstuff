@@ -141,7 +141,10 @@ from fastfuncstuff.cli_utils import (
 _EPILOG = """\
 READING THE OUTPUTS
 -------------------
-Every run writes these (3D = one value per voxel, 4D = a time series):
+Every run writes these (3D = one value per voxel, 4D = a time series).
+With several input runs the slope is fitted once per voxel over all of them,
+and each 4D output is written per run, in input order: prefix_corrected_run-01,
+prefix_corrected_run-02, ... (-concat_output writes one concatenated file).
 
   prefix_corrected.nii.gz  (4D)  THE DELIVERABLE. Magnitude with the phase-
       correlated (macrovascular) fluctuations removed; what you feed to your
@@ -709,6 +712,14 @@ def create_parser() -> argparse.ArgumentParser:
         "skull, and non-brain tissue before regression.",
     )
     proc.add_argument(
+        "-concat_output",
+        action="store_true",
+        help="With several runs, write each 4D output (corrected, macro, and "
+        "-save_intermediates) as ONE file concatenated over runs. Default: one file "
+        "per run, prefix_<name>_run-NN in input order, so each lines up with the run "
+        "it came from. The fit pools the runs either way.",
+    )
+    proc.add_argument(
         "-keep_drift",
         action="store_true",
         help="GLM-friendly output mode. Default (off) is phaseprep parity: "
@@ -1159,17 +1170,25 @@ def main(argv: list[str] | None = None) -> int:
             return vol.reshape(nx, ny, nz)
 
     outputs = {}
+    split_runs = n_runs > 1 and not args.concat_output
+    run_edges = np.cumsum([0, *n_tp_per_run])
+
+    def _save_4d(key, data_flat):
+        """One file per run (each on its own run's header), or one concatenated."""
+        if not split_runs:
+            fname = f"{args.prefix}_{key}{nii_ext}"
+            save_nifti(_to_volume(data_flat, is_4d=True), fname, reference_img=ref_img_path)
+            outputs[key] = fname
+            return
+        for i in range(n_runs):
+            fname = f"{args.prefix}_{key}_run-{i + 1:02d}{nii_ext}"
+            vol = _to_volume(data_flat[:, run_edges[i] : run_edges[i + 1]], is_4d=True)
+            save_nifti(vol, fname, reference_img=args.magnitude[i])
+            outputs[f"{key}_run-{i + 1:02d}"] = fname
 
     with spinner("Writing outputs"):
-        corrected_np = result.magnitude_corrected.numpy()
-        fname = f"{args.prefix}_corrected{nii_ext}"
-        save_nifti(_to_volume(corrected_np, is_4d=True), fname, reference_img=ref_img_path)
-        outputs["corrected"] = fname
-
-        macro_np = result.macrovascular_component.numpy()
-        fname = f"{args.prefix}_macro{nii_ext}"
-        save_nifti(_to_volume(macro_np, is_4d=True), fname, reference_img=ref_img_path)
-        outputs["macro"] = fname
+        _save_4d("corrected", result.magnitude_corrected.numpy())
+        _save_4d("macro", result.macrovascular_component.numpy())
 
         # Temporal std of what was subtracted: the recommended QC overlay for
         # localising suppression (vessel-shaped), since the ODR R² saturates.
@@ -1264,20 +1283,18 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.save_intermediates:
             interm_specs = [
-                ("mag_dt", result.mag_detrended, True, "poly-detrended magnitude"),
-                ("pha_dt", result.pha_detrended, True, "poly-detrended phase"),
-                ("pha_dt_filt", result.pha_detrended_filt, True, "detrended + filtered phase"),
-                ("mag_res", result.mag_residual, True, "magnitude task-residual"),
-                ("pha_res_filt", result.pha_residual_filt, True, "phase task-residual + filtered"),
+                ("mag_dt", result.mag_detrended, "poly-detrended magnitude"),
+                ("pha_dt", result.pha_detrended, "poly-detrended phase"),
+                ("pha_dt_filt", result.pha_detrended_filt, "detrended + filtered phase"),
+                ("mag_res", result.mag_residual, "magnitude task-residual"),
+                ("pha_res_filt", result.pha_residual_filt, "phase task-residual + filtered"),
             ]
-            for key, data, is_4d, label in interm_specs:
+            for key, data, label in interm_specs:
                 if data is None:
                     continue
-                fname = f"{args.prefix}_{key}{nii_ext}"
-                save_nifti(_to_volume(data.numpy(), is_4d=is_4d), fname, reference_img=ref_img_path)
-                outputs[key] = fname
+                _save_4d(key, data.numpy())
                 if args.verb >= 1:
-                    print(f"  {key} ({label}): {fname}")
+                    print(f"  {key}: {label}")
 
     if args.verb >= 1:
         for name, path in outputs.items():
@@ -1286,6 +1303,13 @@ def main(argv: list[str] | None = None) -> int:
         print("Phase regression complete!")
         print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'=' * 70}")
+    elif split_runs:
+        print(
+            f"Phase regression complete. Main output: {args.prefix}_corrected_run-NN{nii_ext}, "
+            f"one per run in input order:"
+        )
+        for i in range(n_runs):
+            print(f"  run-{i + 1:02d} <- {args.magnitude[i]}")
     else:
         print(f"Phase regression complete. Main output: {outputs['corrected']}")
 

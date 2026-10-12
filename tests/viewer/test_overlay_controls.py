@@ -508,6 +508,26 @@ def test_cutting_on_another_sub_brick_shows_both_numbers(session):
     assert line.startswith("A#0_Coef ") and line.endswith(f"A#0_Tstat {t:.4g}")
 
 
+def test_a_narrow_pane_shortens_the_name_and_keeps_the_numbers(qapp):
+    from PySide6 import QtGui
+
+    from fastfuncstuff.viewer.session import ValueLine, _short
+    from fastfuncstuff.viewer.ui.panes import fit_readout_line
+
+    name = _short("sub-01_task-motor_run-all_stats_REML_blur4.nii.gz")
+    assert name.startswith("sub-01") and name.endswith("blur4") and "…" in name
+    line = ValueLine(name + "  ", "A#0_Coef 1.234   A#0_Tstat 5.678")
+    metrics = QtGui.QFontMetrics(QtGui.QFont())
+    width = metrics.horizontalAdvance(line) // 2 + metrics.horizontalAdvance("abcdefgh")
+    fitted = fit_readout_line(line, metrics, width)
+    assert fitted.endswith("A#0_Coef 1.234   A#0_Tstat 5.678")
+    assert metrics.horizontalAdvance(fitted) <= width
+    # Too narrow even for the numbers: the last one still shows.
+    assert fit_readout_line(line, metrics, metrics.horizontalAdvance("Tstat 5.678")).endswith(
+        "5.678"
+    )
+
+
 def test_outside_the_overlay_reads_as_a_dash_not_a_zero(session):
     from fastfuncstuff.viewer.vocab import SetIJK
 

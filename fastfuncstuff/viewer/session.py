@@ -168,10 +168,30 @@ def _overlay_cut(overlay: ComputedOverlay) -> dict[str, object]:
     return {"threshold_index": 1, "threshold_follow": "fixed", "stataux": stataux}
 
 
-def _short(name: str, limit: int = 24) -> str:
+def _short(name: str, limit: int = 32) -> str:
     for ext in (".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh", ".HEAD", ".func.gii", ".shape.gii"):
         name = name.removesuffix(ext)
-    return name if len(name) <= limit else "…" + name[-(limit - 1) :]
+    if len(name) <= limit:
+        return name
+    # Both ends: results sharing a subject prefix differ at the tail, and ones
+    # sharing a suffix (``_stats``) differ at the head.
+    head = (limit - 1) // 2
+    return name[:head] + "…" + name[-(limit - 1 - head) :]
+
+
+class ValueLine(str):
+    """A readout line whose first ``name_end`` characters name what the rest measures.
+
+    Still a plain ``str`` to everything that compares or prints it; a pane too
+    narrow for the whole line shortens the name and keeps the numbers.
+    """
+
+    name_end: int
+
+    def __new__(cls, name: str, values: str) -> ValueLine:
+        line = super().__new__(cls, name + values)
+        line.name_end = len(name)
+        return line
 
 
 def resample_mask_nearest(
@@ -1028,7 +1048,7 @@ class ViewerSession:
                 if stat_vol is not None:
                     stat = voxel_value(stat_vol, st.grid, layer.affine, st.crosshair)
                     parts.append(f"{_brick_name(layer, layer.threshold_index)}{_fmt(stat)}")
-            lines.append(prefix + "   ".join(parts))
+            lines.append(ValueLine(prefix, "   ".join(parts)))
         # The region the crosshair is in, from the subject's own parcellation
         # and label volume -- whatever else is loaded.
         lines.extend(self.surfaces.region_lines(st.crosshair_mm, st.surface_annot, st.volume_atlas))

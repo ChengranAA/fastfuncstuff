@@ -46,6 +46,26 @@ def _segment_path(segments: np.ndarray) -> QtGui.QPainterPath:
     return path
 
 
+def fit_readout_line(line: str, metrics: QtGui.QFontMetrics, width: int) -> str:
+    """``line`` shortened to ``width`` pixels, losing the name before the numbers.
+
+    A value line (``session.ValueLine``) gives up the middle of its layer name
+    first, then the front of what is left, so the last number always shows;
+    any other line (a region name) is cut at its end, as before.
+    """
+    if metrics.horizontalAdvance(line) <= width:
+        return line
+    name_end = getattr(line, "name_end", None)
+    if name_end is None:
+        return metrics.elidedText(line, QtCore.Qt.TextElideMode.ElideRight, width)
+    name, values = line[:name_end], line[name_end:]
+    room = width - metrics.horizontalAdvance(values + "  ")
+    if name and room >= metrics.horizontalAdvance("ab…yz"):
+        short = metrics.elidedText(name.rstrip(), QtCore.Qt.TextElideMode.ElideMiddle, room)
+        return short + "  " + values
+    return metrics.elidedText(values, QtCore.Qt.TextElideMode.ElideLeft, width)
+
+
 class ImagePane(QtWidgets.QWidget):
     """One display plane."""
 
@@ -534,7 +554,7 @@ class ImagePane(QtWidgets.QWidget):
             row = QtCore.QRect(
                 plate.x() + pad, plate.y() + pad + n * line_h, width - 2 * pad, line_h
             )
-            text = metrics.elidedText(line, QtCore.Qt.TextElideMode.ElideRight, row.width())
+            text = fit_readout_line(line, metrics, row.width())
             p.drawText(
                 row, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, text
             )

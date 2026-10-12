@@ -22,14 +22,17 @@ OUTPUT MODES
   Default (analysis endpoint): drift dropped, output re-centered on per-
   voxel mean. Matches phaseprep / Stanley 2021 §2.2.3 exactly.
 
-  -keep_drift (GLM input): drift preserved, slope shrunk to A_eff =
-  A/(1 + A²/φ). Use when the corrected mag feeds a downstream GLM.
+  -keep_drift (GLM input): drift preserved. Use when the corrected mag
+  feeds a downstream GLM.
+
+  Phaseprep parity needs -shrink odr -no_phase_unwrap -polort 1 (the
+  defaults are -shrink none and a conservative temporal unwrap).
 
 RECOMMENDED PIPELINES
 
   Phaseprep / Stanley parity (default for analysis):
     ffs_phasereg -magnitude run_mag.nii.gz -phase run_phase.nii.gz \\
-                 -prefix out_pr -polort 1
+                 -prefix out_pr -polort 1 -shrink odr -no_phase_unwrap
 
   Task data, output feeds a GLM (preserves drift + task variance):
     ffs_phasereg -magnitude run*.nii.gz -phase run*_phase.nii.gz \\
@@ -137,10 +140,10 @@ Every run writes these (3D = one value per voxel, 4D = a time series):
       correlated (macrovascular) fluctuations removed; what you feed to your
       GLM or connectivity analysis. In the default mode it is re-centered on
       each voxel's mean and polynomial drift is dropped; with -keep_drift the
-      drift is preserved (see below). Voxels the fit could not constrain fall
-      back to their mean (default) or to no correction (-keep_drift) rather
-      than being corrupted — so a "flat" voxel here means "nothing removed",
-      not "broken".
+      drift is preserved (see below). Under -shrink odr, voxels the fit
+      could not constrain fall back to their mean (or to no correction with
+      -keep_drift); under the default -shrink none they get the full A*phase,
+      so an exploding slope (see prefix_slope) shows up as added noise.
 
   prefix_macro.nii.gz      (4D)  What was subtracted, exactly
       (mag_orig - corrected). This is your estimate of the macrovascular
@@ -169,8 +172,8 @@ Every run writes these (3D = one value per voxel, 4D = a time series):
   prefix_slope.nii.gz      (3D)  Per-voxel regression slope A (magnitude units
       per radian). Larger |A| = stronger magnitude<->phase coupling. Read it
       WITH phi and R^2, never alone: a large A on low-quality data is an
-      ill-conditioned noise fit, not strong signal — which is exactly why the
-      correction is shrunk by 1/(1 + A^2/phi) before it is applied.
+      ill-conditioned noise fit, not strong signal. -shrink odr damps such
+      voxels by 1/(1 + A^2/phi), at the cost of shrinking good ones too.
 
   prefix_phi.nii.gz        (3D)  Variance ratio phi = Var(mag noise)/Var(phase
       noise) used by the Deming fit. Mostly a diagnostic: it sets how much the
@@ -303,8 +306,8 @@ HOW THE FLAGS CHANGE WHAT YOU GET
 
   -phi VALUE         Pins prefix_phi to a constant (no per-voxel estimation).
 
-  -signal_thresh 0   Disables signal gating. prefix_corrected stays clean
-                     (shrinkage caps every voxel), but prefix_r2 will show
+  -signal_thresh 0   Disables signal gating. Air/noise voxels get fitted
+                     (noisy prefix_corrected there), and prefix_r2 will show
                      bright values in air/noise — the ODR metric reads
                      unfittable voxels as "perfect within the noise budget".
                      A visual artifact, not a bug.
@@ -534,15 +537,17 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-shrink",
         choices=["odr", "none"],
-        default="odr",
+        default="none",
         help="Whether the ODR shrinkage factor s = 1/(1+A^2/phi) is applied. "
-        "'odr' (default) is phaseprep/Stanley parity and makes ill-conditioned "
-        "voxels decay to their mean rather than speckle. It is not free, and "
-        "its cost depends on the output mode: by default all of A*phase is "
-        "removed and the remaining residual — micro BOLD included — is scaled "
-        "by s; with -keep_drift only s*A*phase is removed, so with A^2/phi near "
-        "1 (raw scanner units) about HALF the macro stays in. 'none' applies "
-        "the textbook M - A*phase in both modes. Verbose output reports s.",
+        "'none' (default) subtracts A*phase and leaves the residual — your micro "
+        "BOLD — intact. 'odr' is phaseprep/Stanley parity: ODR treats everything "
+        "phase does not explain as noise and returns its noise estimate, so by "
+        "default it removes all of A*phase and then scales the residual by s "
+        "(t unchanged within a voxel, betas/PSC shrunk by a per-voxel factor "
+        "smallest near veins, which tilts beta layer profiles); with -keep_drift "
+        "it removes only s*A*phase, leaving (1-s) of the macro in. Its one "
+        "benefit is that ill-conditioned voxels decay to their mean rather than "
+        "speckle; check prefix_slope instead. Verbose output reports s.",
     )
 
     reg.add_argument(
@@ -699,8 +704,8 @@ def create_parser() -> argparse.ArgumentParser:
         help="Minimum mean-signal fraction to include a voxel in "
         "regression (default 0.03 = 3%% of max, matching phaseprep). "
         "Voxels below this have slope=0 and R²=0. "
-        "Set to 0 to disable: corrected output stays clean (ODR "
-        "shrinkage caps every voxel), but R² map shows bright noise "
+        "Set to 0 to disable: air/noise voxels are then fitted too, "
+        "and the R² map shows bright noise "
         "voxels because ODR-style R² reads unfittable data as "
         "'perfect within noise budget' — visual artifact, not a bug.",
     )

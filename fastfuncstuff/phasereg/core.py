@@ -331,7 +331,7 @@ def phase_regress(
     phase_unwrap: bool = True,
     phase_global_order: int = -1,
     keep_drift: bool = False,
-    shrink_mode: str = "odr",
+    shrink_mode: str = "none",
     vein_mask: bool = False,
     vein_fdr_q: float = 0.05,
     spr: bool = False,
@@ -427,17 +427,17 @@ def phase_regress(
         preserved in the corrected output (subtract macro from raw mag),
         leaving low-order drift for a downstream GLM to model. The macro
         magnitude removed is unaffected by this flag.
-    shrink_mode : {"odr", "none"}
+    shrink_mode : {"none", "odr"}
         Whether to apply the ODR shrinkage factor 1/(1 + A²/φ) to the
-        correction.  "odr" (default) is phaseprep/Stanley parity and is what
+        correction.  "none" (default) subtracts A·φ and leaves the residual
+        intact.  "odr" is phaseprep/Stanley parity and is what
         makes ill-conditioned voxels degrade gracefully to their mean instead
-        of speckling.  But it is *not* free: in raw scanner units A²/φ sits
-        near 1 across much of the brain, so roughly half the fitted
-        macrovascular component is discarded before it is subtracted.  If
-        your complaint is that veins survive phase regression, this is a
-        prime suspect — "none" applies the textbook M − A·φ at full strength.
-        Expect speckle in low-phase-variance voxels if you do; keep
-        ``signal_thresh`` on and inspect the slope map.
+        of speckling.  ODR returns its estimate of the magnitude *noise*, and
+        the model counts micro BOLD as noise: without ``keep_drift`` all of
+        A·φ is removed and the residual is scaled by s = 1/(1 + A²/φ), so t is
+        unchanged within a voxel but betas shrink by a factor that is smallest
+        near veins; with ``keep_drift`` only s·A·φ is removed, so (1 − s) of
+        the macro stays in (A²/φ ~ 1 in raw scanner units).
     vein_mask : bool
         Also emit a vein *exclusion* mask alongside the corrected series.
         Rather than subtracting a macrovascular estimate, this tests whether the

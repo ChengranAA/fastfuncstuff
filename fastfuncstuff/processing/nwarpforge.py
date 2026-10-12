@@ -2583,6 +2583,10 @@ def nwarpforge(
 
         if phase_data is not None:
             ph_vol = (phase_data[t] if is_4d else phase_data).to(device)
+            # -no_neg is a magnitude guard against kernel overshoot. Phase, real,
+            # imag, cos and sin are signed, so the channels are warped unclamped and
+            # only the magnitude is clamped below (the space-time path does the same
+            # per channel in _phase_spacetime_channels).
 
             if phase_warp == "complex":
                 # Current approach: convert mag+phase -> real/imag, warp
@@ -2596,7 +2600,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
-                    no_neg=no_neg,
+                    no_neg=False,
                     plan=apply_plan,
                 )
                 warped = torch.sqrt(warped_real**2 + warped_imag**2)
@@ -2614,7 +2618,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
-                    no_neg=no_neg,
+                    no_neg=False,
                     plan=apply_plan,
                 )
                 warped_phase = torch.atan2(warped_imag, warped_real)
@@ -2629,7 +2633,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
-                    no_neg=no_neg,
+                    no_neg=False,
                     plan=apply_plan,
                 )
 
@@ -2645,7 +2649,7 @@ def nwarpforge(
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
                     interp=interp,
-                    no_neg=no_neg,
+                    no_neg=False,
                     plan=apply_plan,
                 )
                 warped_phase = torch.atan2(warped_sin, warped_cos)
@@ -2655,6 +2659,8 @@ def nwarpforge(
                     f"Unknown phase_warp: {phase_warp!r}. "
                     "Use 'complex', 'split', 'direct', or 'circular'."
                 )
+            if no_neg:
+                warped = warped.clamp_min(0.0)
             phase_volumes.append(_stash(warped_phase))
         else:
             warped = apply_composed_warp(

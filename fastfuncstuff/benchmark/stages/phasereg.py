@@ -268,6 +268,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-prefix {FFS_PREFIX} "
         f"-polort 1 "
         f"-task_removal none "
+        f"-shrink odr -no_phase_unwrap "
         f"-mask {MASK_FILE} "
         f"-verbose"
         f"{ctx.ffs_device_flag()}"

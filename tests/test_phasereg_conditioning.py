@@ -32,6 +32,14 @@ def test_temporal_unwrap_recovers_wrapped_series():
     assert torch.allclose(k, k.round(), atol=1e-4)
 
 
+def test_temporal_unwrap_leaves_non_wrap_steps_alone():
+    # A step that no multiple of 2*pi makes small is not a wrap (motion, seam,
+    # noise-floor phase); "correcting" it only adds a random level shift.
+    p = torch.zeros(10, 1)
+    p[5:] = 3.6  # 3.6 - 2*pi = -2.68: still large either way
+    assert torch.equal(temporal_unwrap(p), p)
+
+
 def test_temporal_unwrap_leaves_continuous_phase_alone():
     torch.manual_seed(1)
     p = torch.randn(100, 20) * 0.3 + 7.0

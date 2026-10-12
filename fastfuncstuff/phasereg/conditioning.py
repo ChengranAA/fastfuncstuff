@@ -3,11 +3,10 @@
 Phase regression needs each voxel's *temporal* phase change only, so two things
 that are irrelevant to the fit but large in real data are removed here:
 
-* **2π temporal wraps.** ``temporal_unwrap`` re-references each voxel to its
-  circular temporal mean and unwraps along time. On already-unwrapped input it
-  changes nothing but a per-voxel constant (absorbed by detrending); on wrapped
-  input (complex-domain resampling, raw scanner phase) it is what makes the
-  series fittable at all. No spatial unwrapping is needed or attempted.
+* **2π temporal wraps.** ``temporal_unwrap`` adds a multiple of 2π at each
+  step that looks like a wrap. On already-unwrapped input it changes nothing; on
+  wrapped input (complex-domain resampling, raw scanner phase) it is what makes
+  the series fittable at all. No spatial unwrapping is needed or attempted.
 
 * **Per-volume global field fluctuation.** Breathing, frequency drift and
   recon-level phase offsets shift the whole brain's phase together from one
@@ -35,31 +34,34 @@ def _segments(n_tp: int, run_lengths: list[int] | None) -> list[tuple[int, int]]
 
 
 def temporal_unwrap(phase: torch.Tensor, run_lengths: list[int] | None = None) -> torch.Tensor:
-    """Unwrap phase along time, per run, about each voxel's circular mean.
+    """Remove 2π wraps along time, per run.
+
+    A step of at least π is corrected by the multiple of 2π that brings it under
+    π/2, and left alone if no such multiple exists. A genuine wrap of a smooth
+    series lands near zero once corrected. A step that does not (motion,
+    interpolation across a spatial unwrap seam, phase at the noise floor) is not
+    a wrap, and "unwrapping" it would only add a random 2π level shift. np.unwrap
+    corrects every step and so does exactly that; the phaseprep parity data has
+    such steps in a quarter of its voxels.
 
     Parameters
     ----------
-    phase : Tensor (n_timepoints, n_voxels), radians, wrapped or not.
+    phase : Tensor (n_timepoints, n_voxels), radians.
     run_lengths : per-run lengths; each run is unwrapped on its own so a jump
         across a run boundary is never "corrected".
 
     Returns
     -------
-    Tensor (n_timepoints, n_voxels): continuous in time within each run, equal
-    to the input modulo 2π, centred near the voxel's circular mean.
+    Tensor like ``phase``, equal to it modulo 2π at every sample.
     """
-    out = torch.empty_like(phase)
+    out = phase.clone()
     two_pi = 2.0 * torch.pi
     for a, b in _segments(phase.shape[0], run_lengths):
-        p = phase[a:b]
-        ref = torch.atan2(torch.sin(p).sum(0), torch.cos(p).sum(0))
-        # Wrap the deviation into (-pi, pi]; small deviations are then exact.
-        d = torch.remainder(p - ref + torch.pi, two_pi) - torch.pi
-        step = d[1:] - d[:-1]
+        step = phase[a + 1 : b] - phase[a : b - 1]
         wrapped_step = torch.remainder(step + torch.pi, two_pi) - torch.pi
-        correction = torch.where(step.abs() >= torch.pi, wrapped_step - step, 0.0)
-        d[1:] = d[1:] + torch.cumsum(correction, dim=0)
-        out[a:b] = d + ref
+        is_wrap = (step.abs() >= torch.pi) & (wrapped_step.abs() < torch.pi / 2)
+        correction = torch.where(is_wrap, wrapped_step - step, 0.0)
+        out[a + 1 : b] += torch.cumsum(correction, dim=0)
     return out
 
 

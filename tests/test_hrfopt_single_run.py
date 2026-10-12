@@ -127,3 +127,17 @@ def test_multi_run_full_without_repeats(monkeypatch, tmp_path):
     inputs, events, _ = _make_run(tmp_path, n_runs=2)
     prefix = _run(monkeypatch, tmp_path, inputs, events, ["-select", "full"])
     _assert_insample_outputs(prefix)
+
+
+def test_event_filter_reaches_the_design(monkeypatch, tmp_path):
+    """-event_filter_out drops rows before conditions are collected."""
+    inputs, events, _ = _make_run(tmp_path)
+    prefix = _run(
+        monkeypatch,
+        tmp_path,
+        inputs,
+        events,
+        ["-event_filter_out", "trial_type", "houses_r0"],
+    )
+    meta = json.loads(Path(f"{prefix}_metadata.json").read_text())
+    assert meta["condition_labels"] == ["faces_r0"]

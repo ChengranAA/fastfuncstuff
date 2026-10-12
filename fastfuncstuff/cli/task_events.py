@@ -22,14 +22,14 @@ def task_design_from_events(args, n_timepoints: int, tr: float, device):
     """
     import torch
 
+    from fastfuncstuff.cli_utils import bids_event_kwargs
     from fastfuncstuff.design.bids_events import parse_bids_events
     from fastfuncstuff.design.builder import spm_canonical_hrf
     from fastfuncstuff.design.matrices import build_task_design, commensurate_microtime_dt
 
     onsets, durations, labels = parse_bids_events(
         event_files=list(args.events),
-        event_ignore=args.event_ignore,
-        event_cols=tuple(args.event_cols) if args.event_cols else None,
+        **bids_event_kwargs(args),
         n_runs=1,
     )
     # Catch a wrong TR HERE, where the numbers are still interpretable, rather than

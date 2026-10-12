@@ -44,7 +44,9 @@ from fastfuncstuff.cli.task_events import (
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
+    add_bids_events_args,
     add_device_arg,
+    check_bids_event_args,
     collect_batch_jobs,
     print_cli_footer,
     print_cli_header,
@@ -1331,12 +1333,9 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     task = p.add_argument_group("Task-coupling diagnostic (-events)")
-    task.add_argument(
-        "-events",
-        nargs="+",
-        default=None,
-        metavar="TSV",
-        help="BIDS *_events.tsv for THIS run — switches on the task-coupling "
+    add_bids_events_args(
+        task,
+        events_help="BIDS *_events.tsv for THIS run — switches on the task-coupling "
         "diagnostic. Every backend here closes a brightness-constancy data term, so a "
         "strong block design gives it an intensity change it cannot distinguish from a "
         "sub-voxel shift. This measures how much of the estimated field the task "
@@ -1366,22 +1365,6 @@ def create_parser() -> argparse.ArgumentParser:
         "The fico p is NOMINAL — no autocorrelation correction — so it is there to "
         "threshold and colour the maps, not to be reported.\n"
         "Diagnostic only: nothing about the correction changes.",
-    )
-    task.add_argument(
-        "-event_ignore",
-        "-event-ignore",
-        nargs="+",
-        default=None,
-        metavar="LABEL",
-        help="trial_type values to exclude from the task design (e.g. fixation).",
-    )
-    task.add_argument(
-        "-event_cols",
-        "-event-cols",
-        nargs=3,
-        default=None,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help="Custom -events column names. Default: onset duration trial_type.",
     )
     task.add_argument(
         "-tr",
@@ -4550,7 +4533,7 @@ def _parse(argv: list[str], namespace: argparse.Namespace | None = None) -> argp
     -batch manifest line, so a batched run is byte-identical to a solo one."""
     from fastfuncstuff.processing.locomoco import normalize_axis_argv
 
-    return create_parser().parse_args(
+    args = create_parser().parse_args(
         normalize_axis_argv(
             argv,
             {
@@ -4566,6 +4549,8 @@ def _parse(argv: list[str], namespace: argparse.Namespace | None = None) -> argp
         ),
         namespace or argparse.Namespace(),
     )
+    check_bids_event_args(args)
+    return args
 
 
 def _expected_outputs(args: argparse.Namespace) -> list[str]:

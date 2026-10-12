@@ -13,8 +13,10 @@ import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
+    add_bids_events_args,
     add_device_arg,
     add_verbose_arg,
+    check_bids_event_args,
     parse_prefix,
     print_cli_header,
     print_cli_section,
@@ -291,12 +293,9 @@ Examples:
     )
 
     task_group = parser.add_argument_group("Task-leak diagnostic (-events)")
-    task_group.add_argument(
-        "-events",
-        nargs="+",
-        default=None,
-        metavar="TSV",
-        help="BIDS *_events.tsv for this run — switches on the task-leak diagnostic.\n"
+    add_bids_events_args(
+        task_group,
+        events_help="BIDS *_events.tsv for this run — switches on the task-leak diagnostic.\n"
         "NORDIC decides what to discard from a patch's singular-value spectrum alone; "
         "nothing in that decision knows the task, so a component carrying a real BOLD "
         "response can fall under the threshold. This measures how much of the design "
@@ -320,22 +319,6 @@ Examples:
         "if the answer is bad. NOTE the input is not motion-corrected at this stage, so "
         "the per-voxel fits are worse than a preprocessed run's — read the enrichment, "
         "not the R maps.",
-    )
-    task_group.add_argument(
-        "-event_ignore",
-        "-event-ignore",
-        nargs="+",
-        default=None,
-        metavar="LABEL",
-        help="trial_type values to exclude from the task design (e.g. fixation).",
-    )
-    task_group.add_argument(
-        "-event_cols",
-        "-event-cols",
-        nargs=3,
-        default=None,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help="Custom -events column names. Default: onset duration trial_type.",
     )
     task_group.add_argument(
         "-tr",
@@ -1168,6 +1151,7 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    check_bids_event_args(args)
 
     magn_files: list[str] = list(args.input_magn)
     phase_files: list[str] | None = list(args.input_phase) if args.input_phase is not None else None

@@ -80,6 +80,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     from fastfuncstuff.cli_utils import (
+        add_bids_events_args,
         add_device_arg,
         add_load_threads_arg,
         add_microtime_offset_arg,
@@ -88,6 +89,8 @@ try:
         add_verbose_arg,
         append_nuisance_blocks,
         apply_trim_to_timing,
+        bids_event_kwargs,
+        check_bids_event_args,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         microtime_offset_bins,
@@ -350,34 +353,9 @@ def create_parser() -> argparse.ArgumentParser:
             "roughly D/2 and mis-scales the amplitude."
         ),
     )
-    onset_grp.add_argument(
-        "-events",
-        nargs="+",
-        default=None,
-        metavar="TSV",
-        help="BIDS *_events.tsv files, one per run.  Paired with -input BY POSITION, never sorted.",
-    )
-    # Each event-related flag accepts both hyphen and underscore forms
-    # (``-event-cols`` and ``-event_cols``) so muscle memory from AFNI /
-    # older ffs_* tools works.  argparse dispatches both to the same
-    # ``args.event_cols`` attribute via the canonical dest.
-    onset_grp.add_argument(
-        "-event-ignore",
-        "-event_ignore",
-        dest="event_ignore",
-        nargs="+",
-        default=None,
-        metavar="LABEL",
-        help="trial_type values to drop from BIDS events.",
-    )
-    onset_grp.add_argument(
-        "-event-cols",
-        "-event_cols",
-        dest="event_cols",
-        nargs=3,
-        default=None,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help="Override BIDS column names (default: onset duration trial_type).",
+    add_bids_events_args(
+        onset_grp,
+        events_help="BIDS *_events.tsv files, one per run.  Paired with -input BY POSITION, never sorted.",
     )
     onset_grp.add_argument(
         "-round-onsets",
@@ -2486,12 +2464,7 @@ def main() -> int:
     if has_onsets and args.durations is None:
         print("ERROR: -durations is required with -onsets.")
         return 1
-    if args.event_cols and not has_events:
-        print("ERROR: -event-cols requires -events.")
-        return 1
-    if args.event_ignore and not has_events:
-        print("ERROR: -event-ignore requires -events.")
-        return 1
+    check_bids_event_args(args, has_events=has_events)
 
     # ── Parse inputs / events ───────────────────────────────────────
     input_files = parse_input_files(args.input)
@@ -2510,8 +2483,7 @@ def main() -> int:
             onsets=args.onsets,
             durations_arg=args.durations,
             n_runs=n_runs,
-            event_ignore=args.event_ignore,
-            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            **bids_event_kwargs(args),
             round_durations=args.round_durations,
             input_files=input_files,
         )

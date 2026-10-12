@@ -49,6 +49,7 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_bids_events_args,
         add_device_arg,
         add_load_threads_arg,
         add_microtime_offset_arg,
@@ -59,6 +60,8 @@ try:
         append_nuisance_blocks,
         apply_trim_to_timing,
         auto_polort,
+        bids_event_kwargs,
+        check_bids_event_args,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         load_hrf_index_for_input,
@@ -216,35 +219,12 @@ Notes:
         help="Stimulus durations in seconds. Either single value or one per condition. "
         "Required with -onsets.",
     )
-    required.add_argument(
-        "-events",
-        nargs="+",
-        default=None,
-        metavar="TSV",
-        help="BIDS *_events.tsv files, one per run, or a single shared TSV broadcast "
+    add_bids_events_args(
+        required,
+        events_help="BIDS *_events.tsv files, one per run, or a single shared TSV broadcast "
         "across all runs. Files are sorted by run number (run-1 and run-01 both work). "
         "Conditions and durations are derived from the TSV. "
         "Mutually exclusive with -onsets/-durations.",
-    )
-    # Both hyphen and underscore forms, matching the other ffs_* GLM tools.
-    required.add_argument(
-        "-event-ignore",
-        "-event_ignore",
-        dest="event_ignore",
-        nargs="+",
-        default=None,
-        metavar="LABEL",
-        help="trial_type values to drop from BIDS events (e.g. fixation null rest).",
-    )
-    required.add_argument(
-        "-event-cols",
-        "-event_cols",
-        dest="event_cols",
-        nargs=3,
-        default=None,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help="Custom column names for -events TSVs, replacing the BIDS defaults "
-        "(onset, duration, trial_type).",
     )
     required.add_argument(
         "-round-durations",
@@ -994,12 +974,7 @@ def main():
     if args.durations and args.events:
         print("ERROR: -durations is not used with -events (durations come from the TSV)")
         sys.exit(1)
-    if args.event_ignore and not args.events:
-        print("ERROR: -event_ignore requires -events")
-        sys.exit(1)
-    if args.event_cols and not args.events:
-        print("ERROR: -event_cols requires -events")
-        sys.exit(1)
+    check_bids_event_args(args)
     if bool(args.test_input) != bool(args.test_events):
         print("ERROR: -test_input and -test_events must be given together")
         sys.exit(1)
@@ -1066,8 +1041,7 @@ def main():
             onsets=args.onsets,
             durations_arg=args.durations,
             n_runs=n_runs,
-            event_ignore=args.event_ignore,
-            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            **bids_event_kwargs(args),
             round_durations=args.round_durations,
             input_files=input_files,
         )
@@ -1709,8 +1683,7 @@ def main():
                 onsets=None,
                 durations_arg=None,
                 n_runs=n_test_runs,
-                event_ignore=args.event_ignore,
-                event_cols=tuple(args.event_cols) if args.event_cols else None,
+                **bids_event_kwargs(args),
                 round_durations=args.round_durations,
                 input_files=test_files,
             )

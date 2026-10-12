@@ -57,6 +57,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     from fastfuncstuff.cli_utils import (
+        add_bids_events_args,
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_ortvec_arguments,
@@ -64,12 +65,14 @@ try:
         add_verbose_arg,
         apply_automask,
         apply_trim_to_timing,
+        check_bids_event_args,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_device_arg,
         parse_input_files,
         parse_prefix,
         preflight_check,
+        resolve_event_filters,
         resolve_microtime_offset,
         run_lengths_from_starts,
         spinner,
@@ -244,31 +247,9 @@ Notes:
         default=None,
         help="Stimulus durations (s).  Single value or one per condition.",
     )
-    onset_grp.add_argument(
-        "-events",
-        nargs="+",
-        default=None,
-        metavar="TSV",
-        help="BIDS *_events.tsv files (one per run).",
-    )
-    onset_grp.add_argument(
-        "-event-ignore",
-        nargs="+",
-        default=None,
-        metavar="LABEL",
-        help="trial_type values to drop from BIDS events.",
-    )
-    onset_grp.add_argument(
-        "-event-cols",
-        nargs=3,
-        default=None,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help=(
-            "Override BIDS column names for onset / duration / "
-            "trial_type.  Use when the events TSVs use non-standard "
-            "names like 'event_onset' instead of 'onset'.  Only valid "
-            "with -events."
-        ),
+    add_bids_events_args(
+        onset_grp,
+        events_help="BIDS *_events.tsv files (one per run).",
     )
     add_microtime_offset_arg(onset_grp)
     onset_grp.add_argument(
@@ -1936,12 +1917,7 @@ def main() -> None:
     if has_onsets and args.durations is None:
         print("ERROR: -durations is required with -onsets.")
         sys.exit(1)
-    if args.event_cols and not has_events:
-        print("ERROR: -event-cols requires -events.")
-        sys.exit(1)
-    if args.event_ignore and not has_events:
-        print("ERROR: -event-ignore requires -events.")
-        sys.exit(1)
+    check_bids_event_args(args, has_events=has_events)
 
     # --- Parse inputs ---------------------------------------------------------
     input_files = parse_input_files(args.input)
@@ -1991,6 +1967,7 @@ def main() -> None:
             n_runs=n_runs,
             event_ignore=args.event_ignore,
             event_cols=event_cols,
+            event_filters=resolve_event_filters(args),
             round_durations=args.round_durations,
             input_files=input_files,
         )

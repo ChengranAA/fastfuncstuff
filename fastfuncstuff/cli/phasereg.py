@@ -125,7 +125,14 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_ortvec_arguments, add_verbose_arg, spinner
+from fastfuncstuff.cli_utils import (
+    add_bids_events_args,
+    add_ortvec_arguments,
+    add_verbose_arg,
+    check_bids_event_args,
+    resolve_event_filters,
+    spinner,
+)
 
 # Printed at the end of -h. Kept self-contained (no wiki required): it tells a
 # first-time user what each file is FOR and how to read it, then how the flags
@@ -370,25 +377,9 @@ def create_parser() -> argparse.ArgumentParser:
         help="AFNI-format onset timing files (one per condition, "
         "each with one row per run). Mutually exclusive with -events.",
     )
-    task.add_argument(
-        "-events",
-        nargs="+",
-        metavar="TSV",
-        help="BIDS events TSV files (one per run). Mutually exclusive with -onsets.",
-    )
-    task.add_argument(
-        "-event_ignore",
-        nargs="+",
-        metavar="CONDITION",
-        help="trial_type values to skip when using -events.",
-    )
-    task.add_argument(
-        "-event_cols",
-        nargs=3,
-        metavar=("ONSET", "DUR", "TYPE"),
-        help="Custom column names for -events, mapping to (onset, duration, "
-        "trial_type) by name (default: onset, duration, trial_type). Only these "
-        "three columns are read; any others in the TSV are ignored.",
+    add_bids_events_args(
+        task,
+        events_help="BIDS events TSV files (one per run). Mutually exclusive with -onsets.",
     )
     task.add_argument(
         "-tent_window",
@@ -787,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
     """Main entry point for ffs_phasereg."""
     parser = create_parser()
     args = parser.parse_args(argv)
+    check_bids_event_args(args)
 
     # ── Imports ──────────────────────────────────────────────────────────
     try:
@@ -1019,6 +1011,7 @@ def main(argv: list[str] | None = None) -> int:
                 event_files=args.events,
                 event_ignore=args.event_ignore,
                 event_cols=event_cols,
+                event_filters=resolve_event_filters(args),
                 n_runs=n_runs,
             )
         except (FileNotFoundError, ValueError) as exc:

@@ -22,7 +22,10 @@ import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
+    add_bids_events_args,
     add_microtime_offset_arg,
+    bids_event_kwargs,
+    check_bids_event_args,
     parse_input_files,
     parse_timing_spec,
     pool_timing,
@@ -68,17 +71,9 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="AFNI timing files, one per condition, one row per run.",
     )
-    timing.add_argument(
-        "-events", nargs="+", metavar="TSV", help="BIDS events.tsv, one per run (or one shared)."
-    )
-    timing.add_argument(
-        "-event_ignore", nargs="+", metavar="COND", help="trial_types to leave out."
-    )
-    timing.add_argument(
-        "-event_cols",
-        nargs=3,
-        metavar=("ONSET", "DURATION", "TRIAL_TYPE"),
-        help="Non-standard events.tsv columns.",
+    add_bids_events_args(
+        timing,
+        events_help="BIDS events.tsv, one per run (or one shared).",
     )
     runs = parser.add_argument_group("Acquisition (from -input, or given)")
     runs.add_argument(
@@ -269,6 +264,7 @@ def format_report(report: TimingReport) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = create_parser().parse_args(argv)
+    check_bids_event_args(args)
     input_files = parse_input_files(args.input) if args.input else []
     if args.TR is None and not input_files:
         print("ERROR: give -input or -TR", file=sys.stderr)
@@ -292,8 +288,7 @@ def main(argv: list[str] | None = None) -> int:
             onsets=args.onsets,
             durations_arg=None,
             n_runs=n_runs,
-            event_ignore=args.event_ignore,
-            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            **bids_event_kwargs(args),
             input_files=input_files or None,
             verbose=False,
             allow_missing_durations=True,

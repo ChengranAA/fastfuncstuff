@@ -44,11 +44,14 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 # fastfuncstuff imports
 try:
     from fastfuncstuff.cli_utils import (
+        add_bids_events_args,
         add_device_arg,
         add_verbose_arg,
+        check_bids_event_args,
         parse_input_files,
         parse_prefix,
         print_cli_header,
+        resolve_event_filters,
         setup_device,
         spinner,
     )
@@ -3886,31 +3889,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Durations: one value for all or one per condition. Required with -onsets.",
     )
-    task.add_argument(
-        "-events",
-        nargs="+",
-        default=None,
-        metavar="TSV",
-        help="BIDS *_events.tsv files for task annotation (one per run). "
+    add_bids_events_args(
+        task,
+        events_help="BIDS *_events.tsv files for task annotation (one per run). "
         "Fits the whole design to every component timecourse and writes "
         "<prefix>_task_glm.tsv: full-model R2/F/p per component (which ones hold "
         "task) plus joint beta/t per condition (which conditions). "
         "Mutually exclusive with -onsets.",
-    )
-    task.add_argument(
-        "-event_ignore",
-        nargs="+",
-        default=None,
-        metavar="LABEL",
-        help="trial_type values to exclude. Only valid with -events.",
-    )
-    task.add_argument(
-        "-event_cols",
-        nargs=3,
-        default=None,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help="Custom column names for onset, duration, trial_type. "
-        "Default: onset duration trial_type. Only valid with -events.",
     )
     task.add_argument(
         "-microtime_dt", type=float, default=0.1, help="Microtime resolution for task regressors"
@@ -4432,12 +4417,7 @@ def main() -> None:
     if _has_onsets and _has_events:
         print("ERROR: Specify only one of -onsets or -events for task annotation")
         sys.exit(1)
-    if getattr(args, "event_ignore", None) and not _has_events:
-        print("ERROR: -event_ignore requires -events")
-        sys.exit(1)
-    if getattr(args, "event_cols", None) and not _has_events:
-        print("ERROR: -event_cols requires -events")
-        sys.exit(1)
+    check_bids_event_args(args, has_events=_has_events)
 
     # Parse BIDS events (if provided) for task annotation
     bids_task_onsets = None  # list[list[ndarray]] — all_onsets[cond][run]
@@ -4463,6 +4443,7 @@ def main() -> None:
             event_files=args.events,
             event_ignore=getattr(args, "event_ignore", None),
             event_cols=event_cols,
+            event_filters=resolve_event_filters(args),
             n_runs=n_event_runs,
         )
         print(

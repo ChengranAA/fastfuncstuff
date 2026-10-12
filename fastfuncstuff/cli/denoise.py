@@ -43,6 +43,7 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_bids_events_args,
         add_cv_blur_arg,
         add_cv_metric_arg,
         add_cv_strategy_arg,
@@ -59,7 +60,9 @@ try:
         add_verbose_arg,
         apply_trim_to_timing,
         auto_polort,
+        bids_event_kwargs,
         blur_masked_data,
+        check_bids_event_args,
         collect_noise_comp_blocks,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
@@ -293,28 +296,10 @@ Notes:
 
     # BIDS events options
     bids_opts = parser.add_argument_group("BIDS Events (alternative to -onsets/-durations)")
-    bids_opts.add_argument(
-        "-events",
-        nargs="+",
-        default=None,
-        metavar="TSV",
-        help="BIDS *_events.tsv files, one per run. Sorted by run number automatically. "
+    add_bids_events_args(
+        bids_opts,
+        events_help="BIDS *_events.tsv files, one per run. Sorted by run number automatically. "
         "Mutually exclusive with -onsets.",
-    )
-    bids_opts.add_argument(
-        "-event_ignore",
-        nargs="+",
-        default=None,
-        metavar="LABEL",
-        help="trial_type values to exclude. Only valid with -events.",
-    )
-    bids_opts.add_argument(
-        "-event_cols",
-        nargs=3,
-        default=None,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help="Custom column names for onset, duration, trial_type. "
-        "Default: onset duration trial_type. Only valid with -events.",
     )
     bids_opts.add_argument(
         "-round_onsets",
@@ -2078,12 +2063,7 @@ def main():
     if not _has_onsets and not _has_events:
         print("ERROR: Must specify one of -onsets/-durations or -events")
         sys.exit(1)
-    if args.event_ignore and not _has_events:
-        print("ERROR: -event_ignore requires -events")
-        sys.exit(1)
-    if args.event_cols and not _has_events:
-        print("ERROR: -event_cols requires -events")
-        sys.exit(1)
+    check_bids_event_args(args, has_events=_has_events)
     if _has_onsets and args.durations is None:
         print("ERROR: -durations is required when using -onsets")
         sys.exit(1)
@@ -2097,8 +2077,7 @@ def main():
             onsets=args.onsets,
             durations_arg=args.durations,
             n_runs=n_runs,
-            event_ignore=args.event_ignore,
-            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            **bids_event_kwargs(args),
             round_durations=args.round_durations,
             input_files=input_files,
         )
@@ -2855,8 +2834,7 @@ def main():
             args.events,
             run_starts,
             args.tr,
-            event_ignore=args.event_ignore,
-            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            **bids_event_kwargs(args),
             n_runs=n_runs,
             n_basis=n_basis if not is_fir_model else 1,
         )

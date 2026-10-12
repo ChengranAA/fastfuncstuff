@@ -66,6 +66,7 @@ except ImportError:
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
+        add_bids_events_args,
         add_cv_metric_arg,
         add_cv_strategy_arg,
         add_device_arg,
@@ -77,6 +78,8 @@ try:
         append_nuisance_blocks,
         apply_trim_to_timing,
         auto_polort,
+        bids_event_kwargs,
+        check_bids_event_args,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_cv_strategy,
@@ -136,32 +139,13 @@ def parse_args():
             "each with one row per run).  Mutually exclusive with -events."
         ),
     )
-    required.add_argument(
-        "-events",
-        nargs="+",
-        metavar="TSV",
-        help=(
-            "BIDS events TSV files, one per run.  Mutually exclusive with -onsets. "
-            "Files are sorted by run number automatically (run-1 and run-01 both work). "
-            "Conditions come from unique trial_type values; durations are read from the TSV "
-            "and used to auto-estimate per-condition HRF windows unless -window is given. "
-            "Use -event-ignore to skip conditions; -event-cols for non-standard column names."
-        ),
-    )
-    required.add_argument(
-        "-event-ignore",
-        nargs="+",
-        metavar="CONDITION",
-        help="trial_type values to exclude when using -events (e.g. -event-ignore fixation null).",
-    )
-    required.add_argument(
-        "-event-cols",
-        nargs=3,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help=(
-            "Custom column names for -events TSV files, replacing BIDS defaults. "
-            "E.g. -event-cols onset_time duration_s condition_name"
-        ),
+    add_bids_events_args(
+        required,
+        events_help="BIDS events TSV files, one per run.  Mutually exclusive with -onsets. "
+        "Files are sorted by run number automatically (run-1 and run-01 both work). "
+        "Conditions come from unique trial_type values; durations are read from the TSV "
+        "and used to auto-estimate per-condition HRF windows unless -window is given. "
+        "Use -event-ignore to skip conditions; -event-cols for non-standard column names.",
     )
 
     required.add_argument(
@@ -1082,9 +1066,7 @@ def main(argv: list[str] | None = None):
     if args.onsets and args.events:
         print("ERROR: -onsets and -events are mutually exclusive", file=sys.stderr)
         return 1
-    if (args.event_ignore or args.event_cols) and not args.events:
-        print("ERROR: -event-ignore and -event-cols require -events", file=sys.stderr)
-        return 1
+    check_bids_event_args(args)
 
     if args.verb >= 1:
         print_cli_header("ffs_deconvolve", "FIR / TENT / CSPLIN deconvolution")
@@ -1102,8 +1084,7 @@ def main(argv: list[str] | None = None):
             onsets=args.onsets,
             durations_arg=args.durations,
             n_runs=n_runs,
-            event_ignore=args.event_ignore,
-            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            **bids_event_kwargs(args),
             round_durations=args.round_durations,
             input_files=input_files,
             verbose=args.verb >= 1,

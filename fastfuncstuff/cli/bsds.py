@@ -41,6 +41,9 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
+    add_bids_events_args,
+    bids_event_kwargs,
+    check_bids_event_args,
     parse_input_files,
     parse_prefix,
     print_cli_header,
@@ -385,27 +388,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="pdf",
         help="Vector format for -plots all publication figures.",
     )
-    p.add_argument(
-        "-events",
-        nargs="+",
-        default=None,
-        help="BIDS *_events.tsv, one per run (same order/count as -input). Enables "
+    add_bids_events_args(
+        p,
+        events_help="BIDS *_events.tsv, one per run (same order/count as -input). Enables "
         "state<->task alignment (correlation + contingency + NMI, and a QC figure).",
-    )
-    p.add_argument(
-        "-event_ignore",
-        "-event-ignore",
-        nargs="+",
-        default=None,
-        help="trial_type values to exclude from the task alignment (e.g. fixation rest).",
-    )
-    p.add_argument(
-        "-event_cols",
-        "-event-cols",
-        nargs=3,
-        default=None,
-        metavar=("ONSET", "DURATION", "TRIAL_TYPE"),
-        help="Custom events.tsv column names (default: onset duration trial_type).",
     )
     p.add_argument(
         "-hrf_delay",
@@ -576,8 +562,7 @@ def _compute_task_alignment(model, args, device):
         raise SystemExit(f"ERROR: {exc}") from exc
     all_onsets, durations, condition_labels = parse_bids_events(
         args.events,
-        event_ignore=args.event_ignore,
-        event_cols=tuple(args.event_cols) if args.event_cols else None,
+        **bids_event_kwargs(args),
         n_runs=n_runs,
     )
     align = align_states_to_task(
@@ -716,6 +701,7 @@ def _save_outputs(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    check_bids_event_args(args)
     print_cli_header("ffs_bsds", "Bayesian Switching Dynamical Systems")
     device = setup_device(args.device, tf32=REGISTRATION_TF32)
 

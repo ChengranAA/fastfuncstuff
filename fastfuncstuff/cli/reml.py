@@ -39,9 +39,9 @@ except ImportError:
 try:
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
+        add_bids_events_args,
         add_cv_strategy_arg,
         add_device_arg,
-        add_event_filter_arguments,
         add_microtime_offset_arg,
         add_noise_ceiling_args,
         add_noise_comps_arguments,
@@ -1061,39 +1061,15 @@ Examples:
         nargs="+",
         help="Stimulus durations. Single value, per-condition, or 'value,count'. Required with -onsets.",
     )
-    onset_group.add_argument(
-        "-events",
-        nargs="+",
-        metavar="TSV",
-        help=(
-            "BIDS events TSV files, one per run (e.g. sub-01_task-loc_run-01_events.tsv). "
-            "Mutually exclusive with -matrix and -onsets. Files are sorted by run number "
-            "automatically (handles both run-1 and run-01 zero-padding). "
-            "The TSV must contain 'onset', 'duration', and 'trial_type' columns "
-            "(override with -event_cols). "
-            "Conditions are derived from unique trial_type values (sorted). "
-            "Durations are derived from the TSV data."
-        ),
-    )
-    add_event_filter_arguments(onset_group)
-    onset_group.add_argument(
-        "-event_ignore",
-        nargs="+",
-        metavar="CONDITION",
-        help=(
-            "Condition names (trial_type values) to exclude from modeling when using -events. "
-            "E.g. -event_ignore fixation null rest"
-        ),
-    )
-    onset_group.add_argument(
-        "-event_cols",
-        nargs=3,
-        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
-        help=(
-            "Custom column names for -events TSV files, replacing the BIDS defaults. "
-            "Provide exactly 3 names: the columns mapped to onset, duration, and trial_type. "
-            "E.g. -event_cols onset_time duration_s condition_name"
-        ),
+    add_bids_events_args(
+        onset_group,
+        events_help="BIDS events TSV files, one per run (e.g. sub-01_task-loc_run-01_events.tsv). "
+        "Mutually exclusive with -matrix and -onsets. Files are sorted by run number "
+        "automatically (handles both run-1 and run-01 zero-padding). "
+        "The TSV must contain 'onset', 'duration', and 'trial_type' columns "
+        "(override with -event_cols). "
+        "Conditions are derived from unique trial_type values (sorted). "
+        "Durations are derived from the TSV data.",
     )
     onset_group.add_argument(
         "-round_onsets",

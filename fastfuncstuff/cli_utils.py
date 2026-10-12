@@ -3022,6 +3022,80 @@ def add_event_filter_arguments(parser_or_group) -> None:
         )
 
 
+def add_bids_events_args(group, *, events_help: str, required: bool = False) -> None:
+    """Register ``-events`` and every flag that shapes how the TSVs are read.
+
+    One registration for every tool that takes BIDS events, so ``-event_cols``
+    and the row filters cannot exist in one CLI and be missing from the next.
+    ``events_help`` stays per tool: what the events are *for*, and how files
+    pair with runs, genuinely differ. Pair with :func:`check_bids_event_args`
+    and :func:`bids_event_kwargs`.
+    """
+    group.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        required=required,
+        metavar="TSV",
+        help=events_help,
+    )
+    group.add_argument(
+        "-event_ignore",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to exclude (e.g. -event_ignore fixation null). "
+        "Only valid with -events.",
+    )
+    group.add_argument(
+        "-event_cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help="Columns read as onset, duration and trial_type, in that order "
+        "(default: onset duration trial_type), e.g. -event_cols onset duration "
+        "stim_type. Only valid with -events.",
+    )
+    add_event_filter_arguments(group)
+
+
+def check_bids_event_args(args, *, has_events: bool | None = None) -> None:
+    """Exit if an events-shaping flag was given without events to shape.
+
+    ``has_events`` overrides ``bool(args.events)`` for tools with a second
+    events source (e.g. ``-test_events``).
+    """
+    import sys
+
+    if has_events is None:
+        has_events = bool(getattr(args, "events", None))
+    if not has_events:
+        for flag in ("event_ignore", "event_cols", "event_filter_in", "event_filter_out"):
+            if getattr(args, flag, None):
+                print(f"ERROR: -{flag} requires -events")
+                sys.exit(1)
+    try:
+        resolve_event_filters(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+
+
+def bids_event_kwargs(args) -> dict:
+    """``event_ignore`` / ``event_cols`` / ``event_filters`` from parsed args.
+
+    Every reader of the same TSVs (``parse_timing_spec``, ``parse_bids_events``,
+    ``write_single_trial_event_table``) must get all three, or a trial table
+    stops lining up with the betas it describes.
+    """
+    cols = getattr(args, "event_cols", None)
+    return {
+        "event_ignore": getattr(args, "event_ignore", None),
+        "event_cols": tuple(cols) if cols else None,
+        "event_filters": resolve_event_filters(args),
+    }
+
+
 def resolve_event_filters(args) -> list:
     """``[EventFilter]`` from ``-event_filter_in`` / ``-event_filter_out``, in/out order."""
     from fastfuncstuff.design.bids_events import EventFilter

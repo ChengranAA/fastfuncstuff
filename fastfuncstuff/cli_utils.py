@@ -1738,8 +1738,8 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
     the same file can enter twice — once raw, once differenced — without a
     parallel flag family per transform.
     """
-    transform_note = (
-        " LABEL may carry a transform modifier: LABEL:deriv (per-run backward "
+    full_note = (
+        "\nLABEL may carry a transform modifier: LABEL:deriv (per-run backward "
         "difference, as 1d_tool.py -derivative), LABEL:deriv_fwd (forward "
         "difference), LABEL:deriv_back (explicit synonym of :deriv), LABEL:spikes "
         "(a censor keep mask from ffs_moco -censor, expanded to one 1-at-the-TR "
@@ -1759,6 +1759,13 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
     # on them matching what collect_nuisance_blocks(prefix=...) looks up.
     p = prefix
     dash = prefix.replace("_", "-")
+    # The modifier/selector note is spelled out once, on the first flag registered;
+    # repeating it on every sibling tripled the help without adding anything.
+    first = f"-{p}ortvec" if include_legacy else f"-{p}ortvec_run"
+    notes = iter([full_note])
+
+    def note() -> str:
+        return next(notes, f"\nLABEL modifiers and FILE selectors: as {first}.")
     if include_legacy:
         parser_or_group.add_argument(
             f"-{p}ortvec",
@@ -1769,7 +1776,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
             help=(
                 "Full-length nuisance regressors (pre-concatenated across all runs). "
                 f"Repeatable: -{p}ortvec motion.1D motion -{p}ortvec physio.1D physio"
-                + transform_note
+                + note()
             ),
         )
     parser_or_group.add_argument(
@@ -1782,7 +1789,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
         help=(
             "Per-run nuisance regressors; RUN is 1-based run index. Other runs are zero-padded. "
             f"Repeatable: -{p}ortvec_run motion_r1.1D motion 1 "
-            f"-{p}ortvec_run motion_r2.1D motion 2" + transform_note
+            f"-{p}ortvec_run motion_r2.1D motion 2" + note()
         ),
     )
     parser_or_group.add_argument(
@@ -1795,7 +1802,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
         help=(
             "Glob matching per-run nuisance files; run index inferred from filename "
             "(BIDS-style `_run-N_` preferred). Missing runs zero-padded. "
-            f"Repeatable: -{p}ortvec_glob 'motion_run-*.1D' motion" + transform_note
+            f"Repeatable: -{p}ortvec_glob 'motion_run-*.1D' motion" + note()
         ),
     )
     parser_or_group.add_argument(

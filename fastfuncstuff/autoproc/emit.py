@@ -3015,13 +3015,17 @@ def _final_master(plan: Plan) -> str:
         if opt.do_mni:
             # ...and with -do_mni the shared space is MNI, one link further out.
             return f"$(ls {gr}/stage09.*_al_mni.nii* 2>/dev/null | head -1 || true)"
-        # `|| true` so a miss leaves MASTER empty for the guard below to report,
-        # rather than tripping `set -o pipefail` with no explanation.
+        # The trailing `true` lets a miss leave MASTER empty for the guard below to
+        # report, rather than tripping `set -e` with no explanation.
         # _al_anat_nl first: with -anat_nonlin that is the shape the reference's
         # own data landed in, and the affine-only _al_anat is one link short of it.
+        # stage09.anat is the same anchor under its pre-926966c5 name, so references
+        # processed before that rename still resolve. First match in pattern order,
+        # not `ls | head`: ls sorts its output, and "_al_anat." sorts before
+        # "_al_anat_nl.", which silently picked the affine-only anchor.
         return (
-            f"$(ls {gr}/stage09.*_al_anat_nl.nii* {gr}/stage09.*_al_anat.nii* "
-            "2>/dev/null | head -1 || true)"
+            f"$(for f in {gr}/stage09.*_al_anat_nl.nii* {gr}/stage09.*_al_anat.nii* "
+            f'{gr}/stage09.anat.nii*; do [ -e "$f" ] && {{ echo "$f"; break; }}; done; true)'
         )
     if opt.do_mni:
         return _al_mni(plan)

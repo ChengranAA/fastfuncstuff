@@ -498,6 +498,43 @@ def test_warpmaster_defines_grid_mask_and_stats():
     assert "stage10.anat_in_epi_fov.nii.gz" not in borrow
 
 
+@pytest.mark.parametrize(
+    ("present", "expected"),
+    [
+        (["stage09.anat.nii.zst"], "stage09.anat.nii.zst"),  # pre-rename reference
+        (
+            ["stage09.anat.nii.zst", "stage09.grandmean_al_anat.nii.zst"],
+            "stage09.grandmean_al_anat.nii.zst",
+        ),
+        (
+            ["stage09.grandmean_al_anat.nii.zst", "stage09.grandmean_al_anat_nl.nii.zst"],
+            "stage09.grandmean_al_anat_nl.nii.zst",
+        ),
+    ],
+)
+def test_grand_reference_master_resolves_old_and_new_names(tmp_path, present, expected):
+    """The borrowed master is found whichever name the reference wrote its anchor
+    under. A reference processed before the _al_anat rename only has stage09.anat,
+    and stage10a used to stop there with "no master dataset"."""
+    ref = tmp_path / "floc.results"
+    ref.mkdir()
+    for name in present:
+        (ref / name).touch()
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+    s = write_script(
+        build_plan(subj, Options(grand_reference=str(ref), run_glm=True)), "wd", bids_root="/bids"
+    )
+    line = next(ln for ln in s.splitlines() if ln.startswith('MASTER="'))
+    out = subprocess.run(
+        ["bash", "-c", f'set -euo pipefail; {line}; echo "$MASTER"'],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={"PATH": "/usr/bin:/bin"},
+    ).stdout.strip()
+    assert out == f"{ref}/{expected}"
+
+
 def _two_fmap_subject():
     """One session, two fieldmap groups (floc = reference), each with a run."""
     f1 = FmapGroup(

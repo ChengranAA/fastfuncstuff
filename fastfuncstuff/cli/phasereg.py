@@ -48,7 +48,7 @@ RECIPES
   GLM input (the usual case):
     ffs_phasereg -magnitude run*_mag.nii.zst -phase run*_phase.nii.zst \\
                  -prefix pr -keep_drift
-  Veins survive, sub-mm 7T: add -spr (see that flag).
+  Veins survive, sub-mm 7T: add -spr -spr_select_run 0 (see -spr).
   Drop vein voxels instead of correcting them: add -vein_mask.
   phaseprep / Stanley 2021 parity:  -polort 1 -shrink odr -no_phase_unwrap
 """
@@ -281,8 +281,12 @@ def create_parser() -> argparse.ArgumentParser:
         "(or itself) tracks it best. For veins whose own phase is ~0: field "
         "offsets cancel inside a voxel-sized vein, or the vessel is near the magic "
         "angle, while a neighbour sees one lobe of the field. Vu also used OLS, "
-        "which suppresses less; keep -regression deming if veins survive. QC: "
-        "prefix_spr_donor_offset should trace vessels, not speckle.",
+        "which suppresses less; keep -regression deming if veins survive. "
+        "Choose donors on a held-out run (-spr_select_run): in-sample selection "
+        "over-suppresses. On 7T 0.8 mm data (split-half, held-out donors) it took "
+        "phase-blind voxels' magnitude t from 0.71x to 0.54x of baseline, at a "
+        "cost of 0.95x -> 0.88x in vessel-free controls, because most voxels "
+        "borrow on noise. QC: prefix_spr_donor_offset should trace vessels.",
     )
     sprg.add_argument(
         "-spr_neighborhood",

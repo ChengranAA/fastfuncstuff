@@ -159,6 +159,23 @@ class TestNoCrossRunStructure:
             )
         assert "Add -single_trials." in capsys.readouterr().out
 
+    def test_in_sample_condition_selection_needs_no_repeats(self):
+        # ffs_hrfopt -select full (the one-run default) scores the
+        # condition-level design in-sample: no held-out run, nothing to share.
+        repeats = summarize_trial_repeats(self.UNIQUE)
+        assert (
+            _resolve(
+                "auto",
+                False,
+                repeats,
+                parameter="HRF",
+                single_needs_repeats=False,
+                condition_needs_repeats=False,
+                manual_hint="Add -single_trials.",
+            )
+            == "condition"
+        )
+
 
 class TestFlagWiring:
     """The two flags must exist, and be independent, in both CLIs."""

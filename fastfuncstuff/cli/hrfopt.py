@@ -154,6 +154,9 @@ Outputs:
                                      Use sub-brick [1] to threshold the index map in AFNI
   {prefix}_xval_r2.nii.gz         - Cross-validated R² for selected HRF (standalone copy)
   {prefix}_xval_r2_all_hrfs.nii.gz - 4D: CV R² for each HRF (volume per HRF)
+                                     With -select full (the one-run default) and on the
+                                     single-trial selection path, these are in-sample and
+                                     named {prefix}_insample_r2* instead.
   {prefix}_selected_hrfs.nii.gz   - 4D: the winning HRF shape per voxel (x,y,z,hrf_timepoints at microtime_dt)
   {prefix}_stats.nii.gz           - Final GLM betas and t-stats (AFNI bucket format)
   {prefix}_hrf_library.pt         - HRF library + voxel assignments for ARMA reuse
@@ -346,7 +349,7 @@ Notes:
             "{prefix}_oso_gain.nii.gz: held-out R2 with the extra\n"
             "columns minus without, per voxel.  The honest test of\n"
             "whether they paid for themselves -- and it costs a\n"
-            "second selection pass over the data."
+            "second selection pass over the data.  Needs -select xval."
         ),
     )
 
@@ -399,12 +402,17 @@ Notes:
     cv_opts.add_argument(
         "-select",
         choices=["xval", "full"],
-        default="xval",
+        # None, not "xval": a one-run input falls back to 'full' only when the
+        # user did not explicitly ask for cross-validation.
+        default=None,
         help=(
             "HRF selection criterion. "
-            "'xval': cross-validated R² (LORO or split-half, default). "
+            "'xval': cross-validated R² (LORO or split-half; default with 2+ runs). "
             "'full': in-sample R² on all data (GLMsingle FITHRF behaviour; "
-            "faster, automatically chosen when only one run is present)."
+            "faster, and the default with one run). In-sample R² maps are "
+            "written as {prefix}_insample_r2* instead of {prefix}_xval_r2*, "
+            "and CV-only diagnostics (beta-series CV, noise ceiling) are "
+            "skipped when they cannot be computed."
         ),
     )
     cv_opts.add_argument(
@@ -578,7 +586,8 @@ Notes:
             "changed HRF selection. Re-runs the entire selection pass with "
             "ortvec stripped, then writes a second set of outputs under "
             "{prefix}_nodenoise_* and four delta maps under {prefix}_delta_*: "
-            "_delta_xval_r2 (with − without), _delta_hrfopt_r2 (same for in-sample), "
+            "_delta_xval_r2 (with − without; _delta_insample_r2 under -select full), "
+            "_delta_hrfopt_r2 (same for in-sample), "
             "_delta_hrf_changed (1 where selected HRF differs), and "
             "_delta_hrf_index (signed shift in HRF index). "
             "Requires at least one -ortvec. Not supported with -cv_design single."
@@ -704,8 +713,14 @@ def main():
     input_files = parse_input_files(args.input)
     n_runs = len(input_files)
 
-    if n_runs < 2:
-        print("ERROR: At least 2 runs required for cross-validation")
+    if args.select is None:
+        args.select = "xval" if n_runs >= 2 else "full"
+        if n_runs < 2:
+            print("  One input run: no held-out run to cross-validate against, so the")
+            print("  HRF is selected on in-sample R² (-select full). CV maps are not written.")
+    elif args.select == "xval" and n_runs < 2:
+        print("ERROR: -select xval needs at least 2 runs; drop it (or use -select full)")
+        print("  to select the HRF on in-sample R².")
         sys.exit(1)
 
     # Validate onset/events mutual exclusivity
@@ -767,6 +782,7 @@ def main():
         # beta per trial, so complexity is equal), which makes it the one path
         # that survives an events file with no cross-run repeats at all.
         single_needs_repeats=False,
+        condition_needs_repeats=args.select == "xval",
         manual_hint=(
             "Add -single_trials: its HRF selection is in-sample and needs no repeats. "
             "Otherwise give -events a trial_type column that repeats across runs "
@@ -807,6 +823,11 @@ def main():
             sys.exit(1)
     if args.oso_gain and args.oso_mode == "off":
         print("ERROR: -oso_gain needs -oso_mode joint or staged (there is nothing to compare).")
+        sys.exit(1)
+    if args.oso_gain and args.select != "xval":
+        # In-sample, the extra onset/offset columns can only raise R², so the
+        # "gain" would be positive by construction and test nothing.
+        print("ERROR: -oso_gain needs cross-validated selection (-select xval, 2+ runs).")
         sys.exit(1)
 
     # Pre-flight checks (before slow data loading)
@@ -1310,8 +1331,6 @@ def main():
         # Create HRFSelectionResults object
         from fastfuncstuff.design.hrf_selection import HRFSelectionResults
 
-        xval_r2_std = torch.zeros_like(xval_r2_best)  # Not meaningful for in-sample R²
-
         # Compute HRF usage counts for reporting
         hrf_usage_counts = torch.bincount(hrf_index_cpu, minlength=n_hrfs).tolist()
 
@@ -1323,76 +1342,84 @@ def main():
         canonical_full_r2 = fit_r2_all[:, 0]  # canonical HRF, in-sample
         hrfopt_full_r2 = xval_r2_best  # best-HRF per voxel, in-sample
 
-        # Beta-series CV R² (genuine cross-validated)
-        from fastfuncstuff.glm.xval import compute_xval_r2_single_trials, generate_cv_splits
+        # Beta-series CV R² (genuine cross-validated). It needs a held-out run
+        # that shares a condition with the training runs; without one there is
+        # no CV evidence to report, not a zero-valued one.
+        canonical_xval_r2 = None
+        hrfopt_xval_r2 = None
+        if n_runs >= 2 and trial_repeats.n_predictable_trials > 0:
+            from fastfuncstuff.glm.xval import compute_xval_r2_single_trials, generate_cv_splits
 
-        # Honour -cv_strategy here too: this block used to hardcode LORO, so
-        # the flag silently did nothing for the beta-series CV while shaping
-        # the HRF selection above it.
-        cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy)
+            # Honour -cv_strategy here too: this block used to hardcode LORO, so
+            # the flag silently did nothing for the beta-series CV while shaping
+            # the HRF selection above it.
+            cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy)
 
-        print()
-        print("Computing beta-series CV R² (canonical HRF)...")
-        canonical_cv = compute_xval_r2_single_trials(
-            canonical_betas,
-            cond_ids,
-            run_ids,
-            cv_splits,
-            metric="cod",
-            device=device,
-        )
-        canonical_xval_r2 = canonical_cv["r2"]
-        assert isinstance(canonical_xval_r2, torch.Tensor)  # "r2" key is always a tensor
-
-        print("Computing beta-series CV R² (optimal HRF per voxel)...")
-        hrfopt_cv = compute_xval_r2_single_trials(
-            best_betas,
-            cond_ids,
-            run_ids,
-            cv_splits,
-            metric="cod",
-            device=device,
-        )
-        hrfopt_xval_r2 = hrfopt_cv["r2"]
-        assert isinstance(hrfopt_xval_r2, torch.Tensor)  # "r2" key is always a tensor
-
-        # Ceiling on the CV R² just computed. Built from the per-voxel best-HRF
-        # betas, matching hrfopt_xval_r2 rather than the canonical baseline --
-        # the selected model is the one the explainable fraction is about.
-        # compute_xval_r2_single_trials does not z-score, so neither does this.
-        beta_ceiling = None
-        if args.noise_ceiling in ("auto", "ncsnr"):
-            from fastfuncstuff.stats.noise_ceiling import beta_space_ceiling
-
-            beta_ceiling = beta_space_ceiling(
-                betas=best_betas.cpu(),
-                condition_ids=cond_ids.cpu(),
-                run_ids=run_ids.cpu(),
-                cv_splits=cv_splits,
-                xval_r2=hrfopt_xval_r2.cpu(),
-                zscore_by_run=False,
-                metric="cod",
-            )
             print()
-            print(
-                f"  Noise ceiling (beta space, m={beta_ceiling.n_train_repeats:.1f} "
-                "training trials/condition):"
+            print("Computing beta-series CV R² (canonical HRF)...")
+            canonical_cv = compute_xval_r2_single_trials(
+                canonical_betas,
+                cond_ids,
+                run_ids,
+                cv_splits,
+                metric="cod",
+                device=device,
             )
-            print(f"    {beta_ceiling.result.summarize(beta_ceiling.explainable)}")
-            for note in beta_ceiling.result.notes:
-                print(f"    NOTE: {note}")
+            canonical_xval_r2 = canonical_cv["r2"]
+            assert isinstance(canonical_xval_r2, torch.Tensor)  # "r2" key is always a tensor
+
+            print("Computing beta-series CV R² (optimal HRF per voxel)...")
+            hrfopt_cv = compute_xval_r2_single_trials(
+                best_betas,
+                cond_ids,
+                run_ids,
+                cv_splits,
+                metric="cod",
+                device=device,
+            )
+            hrfopt_xval_r2 = hrfopt_cv["r2"]
+            assert isinstance(hrfopt_xval_r2, torch.Tensor)  # "r2" key is always a tensor
+
+            # Ceiling on the CV R² just computed. Built from the per-voxel best-HRF
+            # betas, matching hrfopt_xval_r2 rather than the canonical baseline --
+            # the selected model is the one the explainable fraction is about.
+            # compute_xval_r2_single_trials does not z-score, so neither does this.
+            if args.noise_ceiling in ("auto", "ncsnr"):
+                from fastfuncstuff.stats.noise_ceiling import beta_space_ceiling
+
+                beta_ceiling = beta_space_ceiling(
+                    betas=best_betas.cpu(),
+                    condition_ids=cond_ids.cpu(),
+                    run_ids=run_ids.cpu(),
+                    cv_splits=cv_splits,
+                    xval_r2=hrfopt_xval_r2.cpu(),
+                    zscore_by_run=False,
+                    metric="cod",
+                )
+                print()
+                print(
+                    f"  Noise ceiling (beta space, m={beta_ceiling.n_train_repeats:.1f} "
+                    "training trials/condition):"
+                )
+                print(f"    {beta_ceiling.result.summarize(beta_ceiling.explainable)}")
+                for note in beta_ceiling.result.notes:
+                    print(f"    NOTE: {note}")
+        else:
+            print()
+            print("  Beta-series CV skipped: no condition repeats across runs to hold out.")
 
         del canonical_betas, best_betas  # Free ~1.4 GB
 
         print(f"  Canonical in-sample R²: mean={canonical_full_r2.mean():.4f}")
         print(f"  HRFopt   in-sample R²: mean={hrfopt_full_r2.mean():.4f}")
-        print(f"  Canonical CV R²:        mean={canonical_xval_r2.mean():.4f}")
-        print(f"  HRFopt   CV R²:         mean={hrfopt_xval_r2.mean():.4f}")
+        if canonical_xval_r2 is not None and hrfopt_xval_r2 is not None:
+            print(f"  Canonical CV R²:        mean={canonical_xval_r2.mean():.4f}")
+            print(f"  HRFopt   CV R²:         mean={hrfopt_xval_r2.mean():.4f}")
 
         results = HRFSelectionResults(
             hrf_index=hrf_index,
             xval_r2_best=xval_r2_best,
-            xval_r2_std=xval_r2_std,
+            xval_r2_std=None,  # in-sample selection has no CV spread
             xval_r2_all_hrfs=fit_r2_all.to(device),
             xval_r2_canonical=xval_r2_canonical,
             canonical_full_r2=canonical_full_r2,
@@ -1404,6 +1431,7 @@ def main():
             hrf_library=hrf_library,
             hrf_metadata={
                 "mode": "single_trial_insample_r2",
+                "select_mode": "full",  # single-trial selection is always in-sample
                 "n_hrfs": n_hrfs,
                 "hrf_usage_counts": hrf_usage_counts,
             },
@@ -1681,7 +1709,7 @@ def main():
 
     if beta_ceiling is not None and beta_ceiling.result.n_usable:
         # Restacked onto _hrfopt_xval_r2, the beta-space CV map the ceiling was
-        # built from -- NOT _xval_r2, which is the in-sample best-HRF R2. Those
+        # built from -- NOT _insample_r2, the in-sample best-HRF R2. Those
         # two live on different scales and their ratio would mean nothing.
         output_files["hrfopt_xval_r2"] = save_r2_ceiling_stack(
             [
@@ -1740,14 +1768,17 @@ def main():
         )
 
         # ---- Delta maps (primary − nodenoise) ----
-        # xval R² delta: positive where nuisance helped (CV-honest metric).
+        # Selection R² delta: positive where nuisance helped. Only CV-honest
+        # under -select xval; in-sample, extra nuisance columns cannot lower it.
         # Compute on CPU so devices match regardless of where each pass lived.
         r2_primary = results.xval_r2_best.detach().cpu()
         r2_nd = results_nodenoise.xval_r2_best.detach().cpu()
         delta_xval = r2_primary - r2_nd
+        sel_stem = "xval_r2" if args.select == "xval" else "insample_r2"
+        sel_label = "xval R²" if args.select == "xval" else "in-sample R²"
         _save_volume(
             delta_xval,
-            f"{args.prefix}_delta_xval_r2{_nii_ext}",
+            f"{args.prefix}_delta_{sel_stem}{_nii_ext}",
             volume_shape,
             affine,
             voxel_mask,
@@ -1811,9 +1842,12 @@ def main():
         print("Δ summary: primary (with -ortvec) − nodenoise")
         print("=" * 70)
         print(f"  Voxels with changed HRF: {n_changed:,} / {n_voxels:,} ({pct_changed:.2f}%)")
-        print(f"  Median Δ xval R² (all voxels):           {med_dxval:+.4f}")
+        print(f"  Median Δ {sel_label} (all voxels):".ljust(43) + f"{med_dxval:+.4f}")
         if n_changed > 0:
-            print(f"  Median Δ xval R² (HRF-changed voxels):   {med_dxval_changed:+.4f}")
+            print(
+                f"  Median Δ {sel_label} (HRF-changed voxels):".ljust(43)
+                + f"{med_dxval_changed:+.4f}"
+            )
             print(f"  Median |Δ HRF index| (changed voxels):   {med_abs_shift_changed:.1f}")
         if delta_hrfopt is not None:
             print(
@@ -1906,7 +1940,8 @@ def main():
 
     # Print final summary
     print_cli_section("Summary")
-    print(f"  Mean xval R²: {results.xval_r2_best.mean().item():.4f}")
+    _sel_label = "xval R²" if results.hrf_metadata.get("select_mode") == "xval" else "in-sample R²"
+    print(f"  Mean {_sel_label}: {results.xval_r2_best.mean().item():.4f}")
     if results.xval_r2_canonical is not None:
         canonical_r2 = results.xval_r2_canonical.mean().item()
         best_r2 = results.xval_r2_best.mean().item()

@@ -3777,6 +3777,7 @@ def resolve_cv_design(
     parameter: str,
     manual_hint: str,
     single_needs_repeats: bool = True,
+    condition_needs_repeats: bool = True,
     verbose: bool = True,
 ) -> str:
     """Turn ``-cv_design {auto,condition,single}`` into 'condition' or 'single'.
@@ -3797,6 +3798,9 @@ def resolve_cv_design(
     single_needs_repeats : bool
         False when the tool's single-trial selection is in-sample rather than
         cross-validated.
+    condition_needs_repeats : bool
+        False when the tool's condition-level selection is in-sample (e.g.
+        ``ffs_hrfopt -select full``), which needs no held-out run at all.
 
     Raises
     ------
@@ -3817,7 +3821,7 @@ def resolve_cv_design(
     # Condition-level CV predicts held-out runs from the others, so it needs the
     # same cross-run condition overlap that beta-space CV needs.  A design where
     # every condition is confined to one run cannot be cross-validated at all.
-    viable_condition = has_repeats
+    viable_condition = has_repeats or not condition_needs_repeats
     viable_single = single_trials and (has_repeats or not single_needs_repeats)
 
     if verbose:
@@ -3884,7 +3888,8 @@ def resolve_cv_design(
                     f" — auto fell back: {100 * frac:.0f}% of trials predictable "
                     f"across runs, below {100 * CV_DESIGN_MIN_PREDICTABLE_FRACTION:.0f}%"
                 )
-            print(f"  {parameter} selection: timeseries CV on the condition-level design{why}")
+            how = "timeseries CV" if condition_needs_repeats else "in-sample R²"
+            print(f"  {parameter} selection: {how} on the condition-level design{why}")
             if single_trials:
                 print("  Single-trial betas are still estimated and saved.")
 

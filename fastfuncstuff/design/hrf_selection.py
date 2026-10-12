@@ -2741,19 +2741,25 @@ def save_hrf_selection_results(
     )
     output_files["hrf_index"] = hrf_index_file
 
-    # 2. Save CV R² for best HRF (standalone, for compatibility / plotting)
-    xval_r2_file = f"{output_prefix}_xval_r2{nii_ext}"
-    _save_volume(results.xval_r2_best, xval_r2_file, volume_shape, affine, voxel_mask, nifti_header)
-    output_files["xval_r2"] = xval_r2_file
+    # 2. Save R² for best HRF (standalone, for compatibility / plotting). The
+    #    stem says how the R² was measured: an in-sample map must never be
+    #    readable as cross-validated evidence.
+    r2_stem = "xval_r2" if select_mode == "xval" else "insample_r2"
+    best_r2_file = f"{output_prefix}_{r2_stem}{nii_ext}"
+    _save_volume(results.xval_r2_best, best_r2_file, volume_shape, affine, voxel_mask, nifti_header)
+    output_files[r2_stem] = best_r2_file
 
-    # 3. Save CV R² std
-    xval_std_file = f"{output_prefix}_xval_r2_std{nii_ext}"
-    _save_volume(results.xval_r2_std, xval_std_file, volume_shape, affine, voxel_mask, nifti_header)
-    output_files["xval_r2_std"] = xval_std_file
+    # 3. Save CV R² std (spread across CV splits; undefined in-sample)
+    if select_mode == "xval" and results.xval_r2_std is not None:
+        xval_std_file = f"{output_prefix}_xval_r2_std{nii_ext}"
+        _save_volume(
+            results.xval_r2_std, xval_std_file, volume_shape, affine, voxel_mask, nifti_header
+        )
+        output_files["xval_r2_std"] = xval_std_file
 
     # 3b. Save canonical HRF baseline R² for comparison
     if results.xval_r2_canonical is not None:
-        canonical_r2_file = f"{output_prefix}_xval_r2_canonical{nii_ext}"
+        canonical_r2_file = f"{output_prefix}_{r2_stem}_canonical{nii_ext}"
         _save_volume(
             results.xval_r2_canonical,
             canonical_r2_file,
@@ -2762,20 +2768,20 @@ def save_hrf_selection_results(
             voxel_mask,
             nifti_header,
         )
-        output_files["xval_r2_canonical"] = canonical_r2_file
+        output_files[f"{r2_stem}_canonical"] = canonical_r2_file
 
-    # 3c. Save CV R² for ALL HRFs as 4D volume (n_voxels, n_hrfs)
+    # 3c. Save R² for ALL HRFs as 4D volume (n_voxels, n_hrfs)
     if results.xval_r2_all_hrfs is not None:
-        xval_r2_all_file = f"{output_prefix}_xval_r2_all_hrfs{nii_ext}"
+        all_r2_file = f"{output_prefix}_{r2_stem}_all_hrfs{nii_ext}"
         _save_volume_4d(
             results.xval_r2_all_hrfs,
-            xval_r2_all_file,
+            all_r2_file,
             volume_shape,
             affine,
             voxel_mask,
             nifti_header,
         )
-        output_files["xval_r2_all_hrfs"] = xval_r2_all_file
+        output_files[f"{r2_stem}_all_hrfs"] = all_r2_file
 
     # 3d. Save clearly-named R² maps (single-trial path)
     for field_name in [

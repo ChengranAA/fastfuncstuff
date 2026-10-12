@@ -186,7 +186,7 @@ READING THE OUTPUTS  (3D = one value/voxel, 4D = a time series)
       moved AND were separable, so it reports a finding rather than the regulariser.
 
   _taskr_pe1.nii.gz / _taskrms_pe1.nii.gz / _taskr_data.nii.gz +
-  _locomoco_taskcoupling.txt   [-events]  IS THE FIELD READING BOLD AS MOTION?
+  _locomoco_taskcoupling.txt   [-task_qc]  IS THE FIELD READING BOLD AS MOTION?
       Every backend closes a brightness-constancy data term, so a strong block design
       hands it an intensity change on the very edges it tracks. _taskr leads with
       full_model_R -- the multiple correlation of the WHOLE design, which is the "how
@@ -1332,11 +1332,12 @@ def create_parser() -> argparse.ArgumentParser:
         "wedge. The feather width is peeled on top of this automatically.",
     )
 
-    task = p.add_argument_group("Task-coupling diagnostic (-events)")
+    task = p.add_argument_group("Task design (-events) and the task-coupling QC (-task_qc)")
     add_bids_events_args(
         task,
-        events_help="BIDS *_events.tsv for THIS run — switches on the task-coupling "
-        "diagnostic. Every backend here closes a brightness-constancy data term, so a "
+        events_help="BIDS *_events.tsv for THIS run. On its own it only supplies the "
+        "design that -detask, -ref paired and -reject need; add -task_qc for the "
+        "task-coupling diagnostic described here. Every backend here closes a brightness-constancy data term, so a "
         "strong block design gives it an intensity change it cannot distinguish from a "
         "sub-voxel shift. This measures how much of the estimated field the task "
         "explains (over a circular-shift null), and whether that lands on top of the "
@@ -1367,6 +1368,15 @@ def create_parser() -> argparse.ArgumentParser:
         "Diagnostic only: nothing about the correction changes.",
     )
     task.add_argument(
+        "-task_qc",
+        action="store_true",
+        help="Run the task-coupling diagnostic described under -events (needs -events).\n"
+        "Off by default: it fits the whole design to the data and to every encode axis "
+        "of the field, writes the maps, and runs the -task_comps ICA scan, which is the "
+        "slow part. -detask field / -detask ica / -reject still compute the active mask "
+        "they act on, but skip the measure-only scan unless this is given.",
+    )
+    task.add_argument(
         "-tr",
         type=float,
         default=None,
@@ -1378,8 +1388,8 @@ def create_parser() -> argparse.ArgumentParser:
         "-task-comps",
         default="auto",
         metavar="N|auto|off",
-        help="[-events] Rank for the ICA SCAN of the field: which independent "
-        "components of the warp follow the task. Runs by default and changes nothing; "
+        help="[-task_qc] Rank for the ICA SCAN of the field: which independent "
+        "components of the warp follow the task. Runs with -task_qc and changes nothing; "
         "'off' skips it.\n"
         "It is not redundant with the enrichment above it. PCA orders by variance, so "
         "contamination worth a fraction of a percent of the field cannot surface in any "
@@ -1447,7 +1457,8 @@ def create_parser() -> argparse.ArgumentParser:
         "One file PER AXIS because the temporal basis is shared but each component has\n"
         "its own loading on each axis — sub-brick k of the two files is the same\n"
         "component seen two ways. Loadings are raw and signed; the brick label carries\n"
-        "the variance share, and the task enrichment too when -events is given.\n"
+        "the variance share, and the task enrichment too when the task stage runs\n"
+        "(-task_qc, or a -detask / -reject that acts on it).\n"
         "Works without -events (unscored). The temporal side is -want_pcs, which writes\n"
         "the matching time courses as .1D.",
     )
@@ -2855,6 +2866,25 @@ def _warp_recon_one(result, data, args, resp, mask, device, design, polort, comp
     return rebuilt, keep, (bad_tc if method == "ica" else None)
 
 
+def _task_stage_on(args) -> bool:
+    """Does the post-estimation task stage run?
+
+    For -task_qc, which asks for the diagnostic, and for the modes that act on the
+    estimated field and need its active mask (-detask field / ica, -warp_recon,
+    -reject). -events alone does not: it may be there only for a pre-estimation
+    -detask filter/fit or -ref paired, which are done by the time the field exists.
+    """
+    if not args.events:
+        return False
+    return bool(
+        args.task_qc
+        or args.detask_field
+        or args.detask_ica
+        or args.warp_recon
+        or args.reject is not None
+    )
+
+
 def _task_scan_rank(args):
     """``-task_comps`` -> the rank the measure-only ICA scan should use, or None.
 
@@ -3028,7 +3058,8 @@ def _me_task_stage(result, datas, echo_mean, stem, ext, affine, args, tr, device
         _write_pc_maps(result.per_echo[0], stem, ext, affine, args, resp, mask, device)
 
     # The field is shared across echoes, so one scan of echo 1's covers the set.
-    _run_task_scan(result.per_echo[0], datas[0], args, resp, mask, device, design, polort)
+    if args.task_qc:
+        _run_task_scan(result.per_echo[0], datas[0], args, resp, mask, device, design, polort)
 
     # ── component rejection / reconstruction, decomposed ONCE on the shared field ──
     if args.warp_recon or args.detask_ica:
@@ -3276,7 +3307,8 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
         _write_pc_maps(result, stem, ext, affine, args, resp, mask, device)
 
     # Measure-only, and skipped when a mode that acts on the same decomposition is on.
-    _run_task_scan(result, data, args, resp, mask, device, design, polort)
+    if args.task_qc:
+        _run_task_scan(result, data, args, resp, mask, device, design, polort)
 
     # PC reconstruction runs BEFORE -detask: it rebuilds the field, so a field
     # projection afterwards acts on what was actually kept.
@@ -4409,7 +4441,7 @@ def _run_multiecho(
     echo_mean = datas[0] if len(datas) == 1 else np.mean(np.stack(datas), axis=0)
     _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args, echo_mean)
 
-    if args.events and tr_sec:
+    if _task_stage_on(args) and tr_sec:
         result = _me_task_stage(result, datas, echo_mean, stem, ext, affine, args, tr_sec, device)
 
     print_cli_section("Outputs")
@@ -4649,6 +4681,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         print(
             "❌ -reject needs -events: it scores each component against WHERE the task "
             "response is, which the design defines.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.task_qc and not args.events:
+        print(
+            "❌ -task_qc needs -events: the diagnostic fits the design they define.",
             file=sys.stderr,
         )
         return 2
@@ -5316,7 +5354,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # Task coupling runs BEFORE any output: it must measure the ORIGINAL field (running
     # it after -detask would report the fix's own output and always say "no task"), and
     # -detask has to replace the field before the warp/corrected series are written.
-    if args.events and tr_sec:
+    if _task_stage_on(args) and tr_sec:
         result = _task_stage(result, data, stem, ext, affine, args, tr_sec, device)
     elif args.write_pc_maps is not None:
         # Without -events there is no active mask, so the maps go out unscored. Looking

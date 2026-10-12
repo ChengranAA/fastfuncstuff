@@ -1273,3 +1273,43 @@ def test_cli_flow_field_also_preserves_the_source_tr(tmp_path):
     assert rc == 0
     out_tr = float(nib.load(f"{stem}_flow.nii.gz").header.get_zooms()[3])
     assert out_tr == pytest.approx(0.67), out_tr
+
+
+def _mk_events(tmp_path, nt, tr=2.0):
+    ev = tmp_path / "events.tsv"
+    rows = [f"{t:g}\t{2 * tr:g}\ttask" for t in range(0, int(nt * tr), int(4 * tr))]
+    ev.write_text("onset\tduration\ttrial_type\n" + "\n".join(rows) + "\n")
+    return str(ev)
+
+
+@pytest.mark.parametrize("qc", [False, True])
+def test_events_alone_skip_the_task_qc(tmp_path, capsys, qc):
+    """-events supplies the design; only -task_qc buys the slow task-coupling report.
+
+    autoproc hands every run's events to locomoco, so with the diagnostic keyed on
+    -events alone every run paid for it whether anyone wanted to read it or not."""
+    nt = 24
+    inp = _mkseries(tmp_path, nt=nt)
+    stem = str(tmp_path / "o")
+    rc = _run(
+        [
+            "-input", inp, "-prefix", stem, "-pe_dir", "x", "-device", "cpu", "-no_movie",
+            "-no_warp", "-levels", "1", "-iters", "1", "-refine", "0",
+            "-events", _mk_events(tmp_path, nt), "-tr", "2.0", "-task_comps", "off",
+            *(["-task_qc"] if qc else []),
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    # The stage's first line; the static synthetic series then has nothing to score.
+    assert ("Task coupling:" in capsys.readouterr().out) is qc
+
+
+def test_task_qc_without_events_is_refused(tmp_path):
+    inp = _mkseries(tmp_path)
+    rc = _run(
+        [
+            "-input", inp, "-prefix", str(tmp_path / "q"), "-pe_dir", "x",
+            "-device", "cpu", "-no_movie", "-no_warp", "-task_qc",
+        ]
+    )  # fmt: skip
+    assert rc == 2

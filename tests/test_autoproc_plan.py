@@ -2920,3 +2920,34 @@ def test_target_blur_flag_consistency():
     assert any("needs -glm_blur_tsnr" in e for e in errs(to=6.0, max_fwhm=6.0))
     assert any("_nbhd is for" in e for e in errs(to=6.0, nbhd=5.0))
     assert any("positive" in e for e in errs(tsnr=-1.0))
+
+
+@pytest.mark.parametrize("acq_3d", [False, True])
+def test_phasedrift_fits_per_volume_for_3d(acq_3d):
+    """3-D EPI has no acquired slices, so ffs_phasedrift must fit per volume."""
+    subj = Subject("X", [Session("SM", [_phase_run("SM", "primary", "1")])])
+    opt = Options(phase_proc=True, acq_3d=acq_3d, go_to_anat=False, distortion=False)
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    assert ("-by volume" in s) is acq_3d
+    assert ("-by slice" in s) is not acq_3d
+
+
+def test_resolve_acq_3d_evidence_order(capsys):
+    from types import SimpleNamespace
+
+    from fastfuncstuff.cli.autoproc import _resolve_acq_3d
+
+    def subj(*runs):
+        return SimpleNamespace(sessions=[SimpleNamespace(bold_runs=list(runs))])
+
+    def run(acq=None, st=False):
+        return SimpleNamespace(mr_acquisition_type=acq, has_slice_timing=st)
+
+    args = SimpleNamespace(acq="auto", slicetiming=None)
+    assert _resolve_acq_3d(args, subj(run("3D", st=True))) is True  # explicit wins
+    assert _resolve_acq_3d(args, subj(run("2D"))) is False
+    assert _resolve_acq_3d(args, subj(run(st=True), run())) is False  # any SliceTiming
+    assert _resolve_acq_3d(args, subj(run(), run())) is True  # no slice info at all
+    assert "assuming 3D" in capsys.readouterr().err
+    assert _resolve_acq_3d(SimpleNamespace(acq="auto", slicetiming="st.txt"), subj(run())) is False
+    assert _resolve_acq_3d(SimpleNamespace(acq="2d", slicetiming=None), subj(run("3D"))) is False

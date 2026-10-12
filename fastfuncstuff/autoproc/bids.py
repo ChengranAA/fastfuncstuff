@@ -203,6 +203,12 @@ class BoldRun:
         return bool(self.json.get("SliceTiming"))
 
     @property
+    def mr_acquisition_type(self) -> str | None:
+        """BIDS ``MRAcquisitionType`` ("2D" / "3D"), or None when absent."""
+        v = self.json.get("MRAcquisitionType")
+        return str(v).upper() if v else None
+
+    @property
     def task_name(self) -> str:
         # quirk: TaskName is absent from every func sidecar in some
         # data; derive it from the entity so downstream (BIDS validator, GLM)

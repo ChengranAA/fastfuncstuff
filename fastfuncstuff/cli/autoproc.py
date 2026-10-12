@@ -487,6 +487,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("slice timing & motion")
     g.add_argument(
+        "-acq",
+        choices=["auto", "2d", "3d"],
+        default="auto",
+        help="2-D multi-slice or 3-D EPI. auto (default): the sidecars' "
+        "MRAcquisitionType if present, else 2d when any run has SliceTiming (or "
+        "-slicetiming is given), else 3d — no slice information means no acquired "
+        "slices to rely on. The decision is printed at generation time; pass 2d "
+        "if your 2-D data merely lost SliceTiming in conversion.",
+    )
+    g.add_argument(
         "-slicetiming_method",
         "-slicetiming-method",
         choices=["integrate", "first", "none"],
@@ -1824,6 +1834,41 @@ def _resolve_slicetiming(args, rget, subject) -> str:
     return "none"
 
 
+def _resolve_acq_3d(args, subject) -> bool:
+    """2-D multi-slice or 3-D, decided once and printed.
+
+    Several stages care (slice timing, anything fit per acquired slice), and a
+    wrong guess is silent downstream, so the decision and the evidence for it are
+    shown at generation time, like the anat and fmap choices."""
+    runs = [r for s in subject.sessions for r in s.bold_runs]
+    types = {r.mr_acquisition_type for r in runs} - {None}
+    n_st = sum(r.has_slice_timing for r in runs)
+    if args.acq != "auto":
+        is_3d = args.acq == "3d"
+        why = f"-acq {args.acq}"
+    elif len(types) == 1:
+        is_3d = types == {"3D"}
+        why = f"MRAcquisitionType={next(iter(types))} in the sidecars"
+    elif len(types) > 1:
+        is_3d = False
+        why = f"sidecars disagree (MRAcquisitionType {sorted(types)}); treating as 2D"
+    elif n_st or args.slicetiming:
+        is_3d = False
+        why = f"SliceTiming in {n_st} of {len(runs)} sidecars" if n_st else "-slicetiming given"
+    else:
+        is_3d = True
+        why = "no MRAcquisitionType and no SliceTiming in any sidecar: assuming 3D"
+    label = "3D (one field state per volume)" if is_3d else "2D multi-slice"
+    print(f"== acquisition: {label} — {why} ==", file=sys.stderr)
+    if args.acq == "auto" and is_3d and not types:
+        print(
+            "  Not 3D? The slice information was lost in conversion: pass -acq 2d "
+            "(and -slicetiming FILE) and regenerate.",
+            file=sys.stderr,
+        )
+    return is_3d
+
+
 def _fmt_time(sec: float | None) -> str:
     if sec is None:
         return "  --:--:-- "
@@ -2117,6 +2162,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _report_fmap_assignment(subject)
+    acq_3d = _resolve_acq_3d(args, subject)
 
     anat_paths, tpm_source = _resolve_anat(args)
     unused: list[Path] = []
@@ -2169,6 +2215,7 @@ def main(argv: list[str] | None = None) -> int:
         want_nordic=eff(args.want_nordic, "want_nordic"),
         phase_proc=args.phase_proc,
         phase_drift=not args.no_phase_drift,
+        acq_3d=acq_3d,
         noise_vols=args.noise_vols,
         cut_task_vols=_resolve_cut_task_vols(args),
         slicetiming_method=_resolve_slicetiming(args, rget, subject),

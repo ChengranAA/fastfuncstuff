@@ -48,6 +48,9 @@ class Options:
     # chain at the final resample. Nothing between those two points touches it.
     phase_proc: bool = False
     phase_drift: bool = True  # -phase_proc: ffs_phasedrift after ROMEO
+    # 3-D (slab/partition-encoded) vs 2-D multi-slice EPI. Decides whether
+    # anything per-slice (ffs_phasedrift) has acquired slices to work on.
+    acq_3d: bool = False
     noise_vols: int = 0
     # {task: N} from -cut_task_vols: every run of that task keeps its first N
     # volumes (a shorter run is left alone). Applied as a sub-brick selector on the

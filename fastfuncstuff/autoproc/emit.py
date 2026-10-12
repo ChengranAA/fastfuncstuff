@@ -3396,9 +3396,11 @@ def _stage_unwrap(plan: Plan) -> str:
         trace = "stage00.unwrapdrift.${FRAG[$k]}.trace.1D"
         drift_vars = f'\n  pd="{_unwrapped("unwrapdrift")}"'
         drift_done = ' && [ -f "$pd" ]'
+        # 3-D EPI has no acquired slices: one field state per volume.
+        by = "volume" if opt.acq_3d else "slice"
         drift_cmd = (
             '\n  [ -f "$pd" ] || ffs_phasedrift -input "$uw" -magnitude "$mag" '
-            f'-prefix "$pd" -save_trace "{trace}" -verb 0'
+            f'-prefix "$pd" -by {by} -save_trace "{trace}" -verb 0'
         )
     if opt.want_nordic:
         src = f'  mag="{_nordic_mag(plan)}"; ph="{_nordic_phase()}"'

@@ -62,16 +62,16 @@ runs go in; -concat_output gives one file. 3D maps are one per fit.)
 
   prefix_corrected (4D)  The deliverable: magnitude minus A*phase. Drift is
       dropped and the series re-centred on its mean, unless -keep_drift.
-  prefix_macro     (4D)  What was subtracted (input - corrected).
-  prefix_macro_std (3D)  Its temporal std: THE QC overlay. It should trace pial
-      veins and sinuses, not a diffuse haze; a haze means the fit is chasing
-      phase noise (check upstream phase processing first).
+  prefix_macro_std (3D)  Temporal std of what was subtracted: THE QC overlay.
+      It should trace pial veins and sinuses, not a diffuse haze; a haze means
+      the fit is chasing phase noise (check upstream phase processing first).
   prefix_slope     (3D)  A, magnitude units per radian. Read it with phi.
   prefix_phi       (3D)  Var(magnitude noise)/Var(phase noise) used by Deming.
   prefix_r2        (3D)  ODR R^2, for phaseprep parity only. It saturates at
       0.5-0.8 brain-wide in raw-unit data, so it does not show where the
       correction acted; use macro_std (or -r2_mode naive).
   prefix_mask      (3D)  Voxels fitted.
+  [-save_macro] prefix_macro (4D): what was subtracted, input - corrected.
   [-spr]       prefix_spr_donor_offset (0 = own phase), prefix_spr_donor_corr
   [-vein_mask] prefix_vein_mask, prefix_vein_keep, prefix_vein_p, prefix_coupling_r
   [-phase_filter explore]  prefix_sgf_window, prefix_sgf_order
@@ -388,6 +388,12 @@ def create_parser() -> argparse.ArgumentParser:
         "correction was largest), or both.",
     )
     out.add_argument(
+        "-save_macro",
+        action="store_true",
+        help="Also write prefix_macro, the 4D series that was subtracted. Off by "
+        "default: it is exactly input - corrected and doubles the write time.",
+    )
+    out.add_argument(
         "-save_intermediates",
         action="store_true",
         help="Also write the detrended, filtered and task-residual series "
@@ -414,6 +420,7 @@ def main(argv: list[str] | None = None) -> int:
             parse_prefix,
         )
         from fastfuncstuff.io.afni import (
+            from_voxel_major,
             load_afni_mask,
             load_and_concatenate_runs,
             save_nifti,
@@ -510,13 +517,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb >= 1:
             print(f"  Run {len(n_tp_per_run)}: {mag_path} ({mag_shape[3]} TRs)")
 
-    # One threaded load of every file (magnitude runs, then phase runs), split
-    # back into per-run (voxels, time) views. Kept on the CPU: phase_regress
-    # streams voxel chunks to the device itself.
-    both, _ = load_and_concatenate_runs([*args.magnitude, *args.phase], keep_on_cpu=True)
-    per_file = list(torch.split(both, n_tp_per_run * 2, dim=1))
-    del both
-    mag_list, pha_list = per_file[:n_runs], per_file[n_runs:]
+    # Magnitude first: the automask is built from its mean, and the phase is
+    # then loaded through that mask, which skips reordering the ~75% of the
+    # grid outside it. Kept on the CPU: phase_regress streams voxel chunks to
+    # the device itself.
+    mask_np = None
+    if args.mask:
+        mask_np = load_afni_mask(args.mask)
+        if mask_np.shape != (nx, ny, nz):
+            print(
+                f"ERROR: Mask shape {mask_np.shape} != data shape {(nx, ny, nz)}", file=sys.stderr
+            )
+            return 1
+        mask_np = mask_np.flatten().astype(bool)
+    mags, _ = load_and_concatenate_runs(args.magnitude, keep_on_cpu=True, mask_flat=mask_np)
 
     if args.tr is None:
         if len(set(tr_values)) > 1:
@@ -548,37 +562,28 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # ── Mask ─────────────────────────────────────────────────────────────
-    mask = None
     n_all_voxels = nx * ny * nz
-    if args.mask:
-        mask = load_afni_mask(args.mask)
-        if mask.shape != (nx, ny, nz):
-            print(f"ERROR: Mask shape {mask.shape} != data shape {(nx, ny, nz)}", file=sys.stderr)
-            return 1
-        mask_flat = mask.flatten()
-        n_voxels = int(mask_flat.sum())
-        mag_list = [m[mask_flat.astype(bool)] for m in mag_list]
-        pha_list = [p[mask_flat.astype(bool)] for p in pha_list]
+    if mask_np is not None:
         if args.verb >= 1:
-            print(f"  Mask (provided): {n_voxels:,} / {n_all_voxels:,} voxels")
+            print(f"  Mask (provided): {int(mask_np.sum()):,} / {n_all_voxels:,} voxels")
     elif not args.no_auto_mask:
         from fastfuncstuff.processing.mask import automask
 
-        mean_mag = torch.stack([m.mean(dim=1) for m in mag_list]).mean(dim=0)
-        mean3d = mean_mag.reshape(nx, ny, nz)
-        mask3d = automask(mean3d, dilate_extra=1, device=device, verbose=args.verb >= 1)
-        mask_flat = mask3d.flatten().cpu()
-        n_voxels = int(mask_flat.sum().item())
-        mask_bool = mask_flat.bool()
-        mag_list = [m[mask_bool] for m in mag_list]
-        pha_list = [p[mask_bool] for p in pha_list]
+        mean_mag = torch.stack([m.mean(dim=1) for m in mags.split(n_tp_per_run, dim=1)]).mean(0)
+        mask3d = automask(
+            mean_mag.reshape(nx, ny, nz), dilate_extra=1, device=device, verbose=args.verb >= 1
+        )
+        mask_np = mask3d.flatten().cpu().numpy().astype(bool)
+        mags = mags[torch.from_numpy(mask_np)]
         if args.verb >= 1:
-            print(f"  Mask (auto): {n_voxels:,} / {n_all_voxels:,} voxels")
-    else:
-        mask_flat = None
-        n_voxels = n_all_voxels
-        if args.verb >= 1:
-            print(f"  Mask: none (using all {n_all_voxels:,} voxels)")
+            print(f"  Mask (auto): {int(mask_np.sum()):,} / {n_all_voxels:,} voxels")
+    elif args.verb >= 1:
+        print(f"  Mask: none (using all {n_all_voxels:,} voxels)")
+    mask_flat = None if mask_np is None else torch.from_numpy(mask_np)
+
+    phas, _ = load_and_concatenate_runs(args.phase, keep_on_cpu=True, mask_flat=mask_np)
+    mag_list = list(mags.split(n_tp_per_run, dim=1))
+    pha_list = list(phas.split(n_tp_per_run, dim=1))
 
     # ── Polort ───────────────────────────────────────────────────────────
     polort_str = str(args.polort).strip().upper()
@@ -763,20 +768,13 @@ def main(argv: list[str] | None = None) -> int:
 
     def _to_volume(data_flat, is_4d=False):
         if is_4d:
-            n_tp = data_flat.shape[1]
-            if mask_flat is not None:
-                vol = np.zeros((n_all_voxels, n_tp), dtype=np.float32)
-                vol[np.asarray(mask_flat, dtype=bool)] = data_flat
-            else:
-                vol = data_flat
-            return vol.reshape(nx, ny, nz, n_tp)
+            return from_voxel_major(data_flat, (nx, ny, nz), mask_np)
+        if mask_np is not None:
+            vol = np.zeros(n_all_voxels, dtype=np.float32)
+            vol[mask_np] = data_flat
         else:
-            if mask_flat is not None:
-                vol = np.zeros(n_all_voxels, dtype=np.float32)
-                vol[np.asarray(mask_flat, dtype=bool)] = data_flat
-            else:
-                vol = data_flat
-            return vol.reshape(nx, ny, nz)
+            vol = data_flat
+        return vol.reshape(nx, ny, nz)
 
     outputs = {}
     split_runs = n_runs > 1 and not args.concat_output
@@ -797,7 +795,8 @@ def main(argv: list[str] | None = None) -> int:
 
     with spinner("Writing outputs"):
         _save_4d("corrected", result.magnitude_corrected.numpy())
-        _save_4d("macro", result.macrovascular_component.numpy())
+        if args.save_macro:
+            _save_4d("macro", result.macrovascular_component.numpy())
 
         # Temporal std of what was subtracted: the recommended QC overlay for
         # localising suppression (vessel-shaped), since the ODR R² saturates.

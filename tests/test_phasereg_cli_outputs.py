@@ -33,12 +33,13 @@ def test_runs_are_fitted_together_and_written_apart(tmp_path):
     the files are exactly the concatenated output cut at the run boundaries."""
     lengths = (40, 33)
     mags, phas, planted = _write_runs(tmp_path, lengths)
-    _run(tmp_path, mags, phas, "split")
+    _run(tmp_path, mags, phas, "split", "-save_macro")
     _run(tmp_path, mags, phas, "cat", "-concat_output")
 
     cat = np.asarray(nib.load(tmp_path / "cat_corrected.nii.gz").dataobj)
     assert cat.shape[3] == sum(lengths)
     assert not (tmp_path / "split_corrected.nii.gz").exists()
+    assert not (tmp_path / "cat_macro.nii.gz").exists(), "macro 4D is opt-in"
     parts = []
     for i, nt in enumerate(lengths):
         for key in ("corrected", "macro"):
@@ -95,3 +96,19 @@ def test_input_nifti_ext():
     assert input_nifti_ext("run.nii.zst[0..9]") == ".nii.zst"
     assert input_nifti_ext("run.nii") == ".nii"
     assert input_nifti_ext("run+orig.HEAD") == ".nii.gz"
+
+
+def test_a_given_mask_is_applied_at_load_and_matches_the_unmasked_fit(tmp_path):
+    """-mask loads only in-mask voxels; inside it the fit is the unmasked one, outside 0."""
+    mags, phas, _ = _write_runs(tmp_path, (40, 33))
+    rng = np.random.default_rng(9)
+    mask = rng.random((6, 5, 4)) < 0.5
+    mask_path = tmp_path / "mask.nii.gz"
+    nib.save(nib.Nifti1Image(mask.astype(np.float32), np.eye(4)), mask_path)
+    _run(tmp_path, mags, phas, "m", "-mask", str(mask_path), "-signal_thresh", "0")
+    _run(tmp_path, mags, phas, "all", "-no_auto_mask", "-signal_thresh", "0")
+    for i in (1, 2):
+        got = np.asarray(nib.load(tmp_path / f"m_corrected_run-0{i}.nii.gz").dataobj)
+        ref = np.asarray(nib.load(tmp_path / f"all_corrected_run-0{i}.nii.gz").dataobj)
+        np.testing.assert_allclose(got[mask], ref[mask], rtol=1e-5)
+        assert not got[~mask].any()

@@ -259,7 +259,10 @@ def _separable_smooth_3d(
     sigmas = (sigma, sigma, sigma) if isinstance(sigma, (int, float)) else sigma
 
     for axis, axis_sigma in zip((2, 3, 4), sigmas, strict=True):
-        if vol.shape[axis] > 1:
+        # A zero extent is the identity on that axis. Bug of record: a 0.31x0.31x0.8
+        # GRE base decimated to 0.8 mm asked for sigma 0 along z, and the Gaussian
+        # kernel exp(-(x/0)^2) came back NaN, so allineate saw an all-NaN base.
+        if vol.shape[axis] > 1 and axis_sigma > 0:
             kernel = _make_kernel_1d(kernel_type, axis_sigma, vol.device)
             vol = _conv1d_along_axis(vol, kernel, axis, n_groups)
 

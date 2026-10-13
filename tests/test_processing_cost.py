@@ -680,3 +680,18 @@ def test_local_cc_cost_matches_the_unbatched_reference():
     reference = -(w * (cov * cov / (va * vb))).sum() / w.sum().clamp(min=_EPS)
 
     torch.testing.assert_close(_local_cc_cost(a, b, 3, w), reference)
+
+
+def test_separable_smooth_zero_sigma_axis_is_identity():
+    """Bug of record: sigma 0 on one axis (an anisotropic base already at the
+    work resolution along z) built a NaN kernel and NaN'd the whole volume."""
+    import torch
+
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+
+    vol = torch.rand(6, 10, 12)
+    out = _separable_smooth_3d(vol, (0.0, 1.0, 1.0))
+    assert torch.isfinite(out).all()
+    # No smoothing along z: z-profiles of a z-only pattern survive untouched.
+    zonly = torch.arange(6.0).reshape(6, 1, 1).expand(6, 10, 12).contiguous()
+    assert torch.allclose(_separable_smooth_3d(zonly, (0.0, 1.0, 1.0)), zonly, atol=1e-5)

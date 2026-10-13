@@ -278,6 +278,8 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
     if tok == "xref_lin":
         return [stem(NameKey("xref")) + ".aff12.1D"]
     if tok == "anat_nl":
+        if opt.anat_nonlin_method == "register":
+            return [stem(NameKey("nlanat")) + f"_WARP{fmt}"]
         return [stem(NameKey("nlanat")) + f"_invwarp{fmt}"]
     if tok == "xses_nl":
         return [_ses_stem(pr, "xses") + f"_nl_WARP{fmt}"]
@@ -597,7 +599,7 @@ def _fmapmean_sessions(plan: Plan) -> list[str | None]:
     want: list[str | None] = []
     if opt.go_to_anat:
         requests = [opt.anat_source]
-        if opt.anat_nonlin:
+        if opt.anat_nonlin and opt.anat_nonlin_method == "segment":
             requests.append(opt.anat_nonlin_input)
         if any(effective_anat_source(plan, r) == "mean_fmap" for r in requests):
             want.append(_anchor_session(plan))
@@ -1418,6 +1420,8 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         tools = [*tools, "mri_synthstrip"]
     if opt.do_mni and _own_anat(opt):
         tools = [*tools, config.nl_command(opt.mni_backend).split()[0]]
+    if opt.anat_nonlin and opt.anat_nonlin_method == "register":
+        tools = [*dict.fromkeys([*tools, _nl_tool(opt, "anat_nl").split()[0]])]
     return f"""
 # =============================== stage: preflight ===========================
 echo '== preflight: inputs + tools =='
@@ -2580,7 +2584,10 @@ def _stage_anat(plan: Plan) -> str:
         )
         seg_mats = "stage09.anat.aff12.1D"
 
-    if opt.anat_nonlin:
+    if opt.anat_nonlin and opt.anat_nonlin_method == "register":
+        out.append(_anat_nl_register(plan, seg_mats))
+        out.append(_anat_nl_anchor_call(plan))
+    elif opt.anat_nonlin:
         # Optionally build a subject TPM from FreeSurfer (SUMA) first, so no SPM
         # TPM is needed ahead of time.
         if opt.fs_tpm:
@@ -2615,6 +2622,39 @@ def _stage_anat(plan: Plan) -> str:
     out.append(_qc_anat(plan))
     out.append(_stage_mni(plan))
     return "\n".join(p for p in out if p) + "\n"
+
+
+def _anat_nl_register(plan: Plan, matrix: str) -> str:
+    """-anat_nonlin_method register: refine the anat anchor onto the anat with the
+    anat_nl backend, along the PE axis only.
+
+    In the anchor's own frame (-matrix): the base is pulled onto the anchor's grid,
+    the native EPI grid every run's pre-chain ends on, so the PE axis is a grid
+    axis there and -no?dis on the other two is exact rather than approximate on an
+    oblique slab. A warp in that frame acts after anat_lin on the output
+    coordinate, which is the anat_nl slot the chain already has. What it can fix is
+    what a rigid anat matrix cannot: distortion left over along PE."""
+    pe = _pe_axis(plan)
+    frozen = [f"-no{a.upper()}dis" for a in "xyz" if a != pe]
+    call = _ffs(
+        _nl_tool(plan.options, "anat_nl"),
+        [
+            f'-base "{_anat_box()}"',
+            f'-source "{_anat_source_image(plan)}"',
+            f'-matrix "{matrix}"',
+            '-prefix "stage09.nlanat.nii$FMT"',
+            "-save_warp",
+            '-warp_prefix "stage09.nlanat"',
+            *frozen,
+            *_split_flags(config.DEFAULT_OPTS["anat_nl"]),
+            '-device "$DEVICE"',
+        ],
+    )
+    return (
+        f"# nonlinear anat by registration, PE axis ({pe}) only: {' '.join(frozen)}\n"
+        f'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.nlanat_WARP.nii$FMT" ]; then\n'
+        f"{call}\nfi"
+    )
 
 
 def _mni_lin_anat() -> str:

@@ -206,6 +206,10 @@ class Options:
     xrun_nl_backend: str = config.DEFAULT_NL_BACKEND
     xfmap_nl_backend: str = config.DEFAULT_NL_BACKEND
     xses_nl_backend: str = config.DEFAULT_NL_BACKEND
+    anat_nl_backend: str = config.DEFAULT_NL_BACKEND
+    # -anat_nonlin by ffs_segment (TPM-driven) or by registering the anat anchor
+    # to the anat along the PE axis with the anat_nl backend.
+    anat_nonlin_method: str = "segment"
     ref_ses: str | None = None
     fmap_ref: list[str] | None = None
     # -ref_image: which EPI-contrast image REPRESENTS a level. One vocabulary at

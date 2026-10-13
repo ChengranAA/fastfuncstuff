@@ -51,6 +51,11 @@ DEFAULT_OPTS: dict[str, str] = {
     "xses": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
     "xses_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
+    # anat nonlinear by registration (-anat_nonlin_method register): the anat
+    # anchor refined onto the anat in the anchor's own frame, PE axis only (the
+    # emitter adds the -no?dis flags from the runs' PE direction).
+    "anat_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # anat linear (cross-modal EPI→anat) — lpc with EPI masked to brain.
     "anat": "-rigid -cost lpc -source_automask -autoweight -interp cubic -cmass -fast -final wsinc5",
     # anat nonlinear (ffs_segment). Two tunings: the FS-derived TPM has 8
@@ -101,7 +106,7 @@ DEFAULT_OPTS: dict[str, str] = {
 # these same backends, and a name that means one thing to the tuner and another
 # to the pipeline is how a tuned setting ends up applied to the wrong engine.
 # ---------------------------------------------------------------------------
-NL_STAGE_KEYS: tuple[str, ...] = ("xrun_nl", "xfmap_nl", "xses_nl")
+NL_STAGE_KEYS: tuple[str, ...] = ("xrun_nl", "xfmap_nl", "xses_nl", "anat_nl")
 DEFAULT_NL_BACKEND = "formwarp"
 
 

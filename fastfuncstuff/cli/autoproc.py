@@ -177,7 +177,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_const",
         const=True,
         default=None,
-        help="ffs_segment nonlinear anat warp (needs -tpm or -suma)",
+        help="nonlinear anat warp; how it is found is -anat_nonlin_method",
+    )
+    g.add_argument(
+        "-anat_nonlin_method",
+        "-anat-nonlin-method",
+        choices=["segment", "register"],
+        default="segment",
+        help="segment (default): ffs_segment's PE-axis warp, driven by a tissue "
+        "template (needs -tpm or -suma). register: the anat anchor registered to the "
+        "anat by the -anat_nl_backend engine (default -nl_backend), in the anchor's "
+        "own frame and along the PE axis only, so it can only undo residual "
+        "distortion. For an anat with no usable tissue contrast for a template, "
+        "e.g. a thin-slab multi-echo GRE.",
     )
     g.add_argument(
         "-surface_target",
@@ -680,6 +692,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("xrun", "cross-run"),
         ("xfmap", "cross-fmap-group"),
         ("xses", "cross-session"),
+        ("anat", "EPI-to-anat (-anat_nonlin_method register)"),
     ):
         suggest(
             g.add_argument(
@@ -1182,7 +1195,13 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "The in-scope session(s) had no T1w — e.g. The T1w might be in a different session, "
             "not the functional session."
         )
-    if opt.anat_nonlin and not opt.tpm and not opt.fs_tpm:
+    if opt.anat_nonlin and opt.anat_nonlin_method == "register" and opt.has_grand_ref:
+        errors.append(
+            "-anat_nonlin_method register refines this data's own anat alignment; with "
+            "-grand_reference / -ref_file the anat link is borrowed (a chain of matrices "
+            "the backend's single -matrix cannot take). Use -grand_reference_nonlin."
+        )
+    if opt.anat_nonlin and opt.anat_nonlin_method == "segment" and not opt.tpm and not opt.fs_tpm:
         skull = (
             " -anat_skull yes strips the anat but derives no tissue priors, so the "
             "nonlinear step needs -tpm even so."
@@ -2241,7 +2260,7 @@ def main(argv: list[str] | None = None) -> int:
     # from FreeSurfer outputs (no ahead-of-time SPM TPM needed).
     tpm = args.tpm
     fs_tpm = False
-    if anat_nonlin and not tpm and args.suma:
+    if anat_nonlin and args.anat_nonlin_method == "segment" and not tpm and args.suma:
         fs_tpm = True
         tpm = "tpm_work/sub_specific_fsTPM.nii.gz"  # produced by the FS-TPM stage
 
@@ -2318,6 +2337,7 @@ def main(argv: list[str] | None = None) -> int:
         mni_backend=mni_backend,
         mni_template=mni_template,
         anat_nonlin_input=args.anat_nonlin_input,
+        anat_nonlin_method=args.anat_nonlin_method,
         anat_path=anat_path if go_to_anat else None,
         anat_extra=anat_paths[1:] if go_to_anat else [],
         moco_ref=args.moco_ref,

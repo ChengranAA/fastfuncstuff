@@ -3065,3 +3065,19 @@ def test_stage04_writes_a_before_after_distortion_stack(tmp_path):
         ).returncode
         == 0
     )
+
+
+def test_anat_nonlin_register_refines_along_pe_in_the_anchor_frame():
+    """-anat_nonlin_method register: a thin-slab GRE anat has no tissue contrast a
+    template can drive, so the anchor is registered to the anat instead. It is
+    solved in the anchor's (EPI) frame via -matrix, so the PE axis is a grid axis
+    and the other two are frozen exactly; the warp takes the existing anat_nl slot,
+    acting after anat_lin, and no TPM is needed."""
+    s = _skull_script(anat_skull=True, anat_nonlin=True, anat_nonlin_method="register")
+    st9 = s[s.index("stage09: anatomical alignment") :]
+    assert "ffs_segment \\" not in st9
+    assert '-matrix "stage09.anat.aff12.1D"' in st9
+    assert "-noXdis" in st9 and "-noZdis" in st9 and "-noYdis" not in st9
+    chain = next(line for line in s.splitlines() if line.startswith("CHAIN["))
+    links = chain.split('="')[1].rstrip('"').split()
+    assert links[:2] == ["stage09.anat.aff12.1D", "stage09.nlanat_WARP.nii$FMT"]

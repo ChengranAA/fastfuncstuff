@@ -344,6 +344,7 @@ def phase_regress(
     spr: bool = False,
     spr_connectivity: int = 6,
     spr_select_run: int | None = None,
+    spr_select_on: str = "data",
     volume_shape: tuple[int, int, int] | None = None,
     mask_flat: torch.Tensor | None = None,
     device: str | torch.device = "cpu",
@@ -461,6 +462,13 @@ def phase_regress(
         0-based run used *only* to select donors, then applied to every run
         (Vu & Gallant held out a run). None (default) selects on all runs:
         in-sample, biased toward over-suppression.
+    spr_select_on : {"data", "residual"}
+        Series the donor argmax is taken on. "data" (Vu & Gallant): the
+        detrended magnitude and phase, task included. "residual": both with the
+        task model projected out (needs ``task_removal``), so a neighbour wins by
+        sharing the voxel's spontaneous and physiological coupling rather than
+        merely carrying the task, which on task-locked data makes the argmax
+        pick task-responsive phase anywhere and suppress tissue response.
     volume_shape : (nx, ny, nz) or None
         Shape of the 3-D grid the voxel axis was flattened from.  Required for
         ``spr``; ignored otherwise.
@@ -754,9 +762,16 @@ def phase_regress(
 
         # Time-major views of the voxel-major stores, so each donor lookup is
         # a contiguous row gather.
+        if spr_select_on not in ("data", "residual"):
+            raise ValueError(f"spr_select_on must be 'data' or 'residual', got {spr_select_on!r}")
+        if spr_select_on == "residual" and not has_task:
+            raise ValueError("spr_select_on='residual' needs a task model (task_removal)")
+        sel_mag, sel_pha = (
+            ("mag_res", "pha_res_filt") if spr_select_on == "residual" else ("mag_dt", "pha_filt")
+        )
         spr_donor, spr_donor_corr = select_phase_donor(
-            stored["mag_dt"][:, lo_t:hi_t].T,
-            stored["pha_filt"][:, lo_t:hi_t].T,
+            stored[sel_mag][:, lo_t:hi_t].T,
+            stored[sel_pha][:, lo_t:hi_t].T,
             neighbors,
             device=device,
             chunk_size=chunk_size,

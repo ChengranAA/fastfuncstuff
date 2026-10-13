@@ -322,6 +322,15 @@ def create_parser() -> argparse.ArgumentParser:
         help="0-based run used only to choose donors (Vu & Gallant held out a run). "
         "Default: all runs, in-sample, which biases toward over-suppression.",
     )
+    sprg.add_argument(
+        "-spr_select_on",
+        choices=("data", "residual"),
+        default="data",
+        help="Series donors are chosen on. data (Vu & Gallant): task included, so a "
+        "neighbour can win just by carrying the task, and sPR then removes tissue "
+        "response. residual: task model projected out first (needs -task_removal), "
+        "so donors are chosen on shared spontaneous coupling.",
+    )
 
     vg = parser.add_argument_group("Vein exclusion mask")
     vg.add_argument(
@@ -778,6 +787,7 @@ def main(argv: list[str] | None = None) -> int:
         spr=args.spr,
         spr_connectivity=args.spr_neighborhood,
         spr_select_run=args.spr_select_run,
+        spr_select_on=args.spr_select_on,
         volume_shape=(nx, ny, nz),
         mask_flat=mask_flat,
         device=str(device),

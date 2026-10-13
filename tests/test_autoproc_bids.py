@@ -629,3 +629,31 @@ def test_anat_skull_defaults_to_stripping_all_but_the_suma_brain():
     assert not strip("auto", suma="/fs/SUMA")  # brain.nii.gz is already stripped
     assert not strip("no")
     assert strip("no", presurf=True)  # the MPRAGEised head always has one
+
+
+def test_acq_split_and_legacy_phase_suffix(tmp_path: Path):
+    """ds003427 shape: acq-ge and acq-se runs of one task share run numbers, and
+    the GE phase uses the pre-1.5 ``_phase`` suffix. Bug of record: (task, run)
+    grouping let the SE magnitude silently replace the GE one in every run."""
+    func = tmp_path / "sub-03" / "func"
+    for run in ("01", "02"):
+        for acq in ("ge", "se"):
+            _touch(
+                func / f"sub-03_task-cb_acq-{acq}_run-{run}_bold.nii.gz", {"RepetitionTime": 2.5}
+            )
+        _touch(func / f"sub-03_task-cb_acq-ge_run-{run}_phase.nii.gz")
+
+    runs = scan_subject(tmp_path, "03").sessions[0].bold_runs
+    by = {(r.task, r.run): r for r in runs}
+    assert set(by) == {("cbGe", "01"), ("cbGe", "02"), ("cbSe", "01"), ("cbSe", "02")}
+    assert "acq-ge" in by["cbGe", "01"].mag_path.name
+    assert "acq-se" in by["cbSe", "01"].mag_path.name
+    assert by["cbGe", "02"].phase_path is not None
+    assert by["cbGe", "02"].phase_path.name.endswith("_run-02_phase.nii.gz")
+    assert by["cbSe", "01"].phase_path is None
+
+
+def test_single_acq_task_keeps_its_name(tmp_path: Path):
+    func = tmp_path / "sub-1" / "func"
+    _touch(func / "sub-1_task-Foo_acq-mb4_run-01_bold.nii.gz", {"RepetitionTime": 1.0})
+    assert scan_subject(tmp_path, "1").sessions[0].bold_runs[0].task == "Foo"

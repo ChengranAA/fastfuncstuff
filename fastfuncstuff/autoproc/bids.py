@@ -177,6 +177,13 @@ def _acq_seconds(value) -> float | None:
         return None
 
 
+def task_unit(task: str, acq: str) -> str:
+    """The task label a run carries once its task is split by acquisition:
+    ``checkerboard`` + ``ge`` → ``checkerboardGe``. Alphanumeric, so it stays a
+    valid BIDS label inside every ``task-<T>`` token the pipeline writes."""
+    return f"{task}{acq[:1].upper()}{acq[1:]}" if acq else task
+
+
 @dataclass
 class BoldRun:
     subject: str
@@ -429,9 +436,9 @@ def _scan_session(
 ) -> Session:
     sess = Session(session=ses_label)
 
-    # ---- func: group by (task, run) so mag/phase/sbref land on one BoldRun ----
+    # ---- func: group by (task, acq, run) so mag/phase/sbref land on one BoldRun ----
     func_dir = sdir / "func"
-    grouped: dict[tuple[str, str], dict] = {}
+    grouped: dict[tuple[str, str, str], dict] = {}
     if func_dir.is_dir():
         for nf in sorted(func_dir.glob("*.nii*")):
             if not _NIFTI_RE.search(nf.name):
@@ -444,7 +451,7 @@ def _scan_session(
             if want_task is not None and task not in want_task:
                 continue
             run = ents.get("run", "")
-            slot = grouped.setdefault((task, run), {})
+            slot = grouped.setdefault((task, ents.get("acq", ""), run), {})
             if suffix == "sbref":
                 if _is_phase(nf, ents, bids_root):
                     slot.setdefault("sbref_phase", nf)  # quirk file; unused now
@@ -461,16 +468,29 @@ def _scan_session(
                     slot.setdefault("phase_quirk", nf)
                 else:
                     slot["mag"] = nf
+            elif suffix == "phase":
+                # Pre-1.5 BIDS named the phase timeseries ``_phase.nii.gz`` (now
+                # ``part-phase_bold``); OpenNeuro still serves datasets in that form.
+                slot["phase"] = nf
 
-    for (task, run), slot in sorted(grouped.items()):
+    # Two acquisitions of one task (acq-ge / acq-se, acq-mb4 / acq-mb1) number
+    # their runs independently, so (task, run) alone collides and one silently
+    # replaces the other. Such a task splits into one task unit per acquisition:
+    # each gets its own runs, names and GLM, as two contrasts must.
+    acqs_by_task: dict[str, set[str]] = {}
+    for task, acq, _run in grouped:
+        acqs_by_task.setdefault(task, set()).add(acq)
+
+    for (task, acq, run), slot in sorted(grouped.items()):
         mag = slot.get("mag")
         if mag is None:
             continue  # no magnitude BOLD → nothing to process
+        unit = task_unit(task, acq) if len(acqs_by_task[task]) > 1 else task
         sess.bold_runs.append(
             BoldRun(
                 subject=sub_label,
                 session=ses_label,
-                task=task,
+                task=unit,
                 run=run,
                 mag_path=mag,
                 json=load_sidecar(mag, bids_root),
@@ -855,14 +875,20 @@ def _resolve_intended(fmap_json: dict, tag: str, bold_runs: list[BoldRun]) -> li
         if isinstance(intended, str):
             intended = [intended]
         pairs: list[tuple[str, str]] = []
+        units = {r.task for r in bold_runs}
         for entry in intended:
             e = str(entry)
             # BIDS entities are alphanumeric (no separators) — don't let \w
             # swallow the trailing _part-mag etc. (would yield '01_part').
             rt = re.search(r"task-([A-Za-z0-9]+)", e)
+            ra = re.search(r"acq-([A-Za-z0-9]+)", e)
             rr = re.search(r"run-([A-Za-z0-9]+)", e)
             if rr:
-                pairs.append((rt.group(1) if rt else "", rr.group(1)))
+                task = rt.group(1) if rt else ""
+                # A task split by acquisition (see _scan_session) answers to its unit.
+                if ra and task not in units and task_unit(task, ra.group(1)) in units:
+                    task = task_unit(task, ra.group(1))
+                pairs.append((task, rr.group(1)))
         if pairs:
             return pairs
     # fmap tag names a task → that task's runs.

@@ -216,14 +216,16 @@ def create_parser() -> argparse.ArgumentParser:
     match = parser.add_argument_group("EPI matching")
     match.add_argument(
         "-sign",
-        choices=("auto", "1", "-1"),
+        # Not "1"/"-1": -1Dmatrix_apply makes argparse read "-1" as an option.
+        choices=("auto", "keep", "flip"),
         default="auto",
         help="Which way the field displaces the EPI. How a scanner's phase sign relates "
         "to the PE polarity is a vendor and sequence convention (FSL and SPM make you "
         "supply it and check by eye), so auto places the undistorted magnitude on the "
         "EPI once, forward-distorts it both ways, and keeps the sign whose image "
-        "correlates better (local Pearson) with the EPI. 1 / -1 force it. auto needs "
-        "the match step; with -no_match or -1Dmatrix_apply the sign is 1.",
+        "correlates better (local Pearson) with the EPI, printing both scores. keep / "
+        "flip force it. auto needs the match step; with -no_match or -1Dmatrix_apply "
+        "it keeps the sign as measured.",
     )
     match.add_argument(
         "-no_match",
@@ -471,8 +473,8 @@ def main(argv: list[str] | None = None) -> int:
         _, inv_f, tdim = B.field_to_pe_warp(f, readout * (epi_pe_mm / fmap_pe_mm), pe_dir)
         return B.synthesize_distorted(_to_tensor(mag_arr, device), inv_f, tdim)
 
-    if args.sign != "auto":
-        field = field * float(args.sign)
+    if args.sign == "flip":
+        field = -field
     wfmag = None
     if mag_arr is not None:
         wfmag = forward_distort(field)
@@ -554,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
                 if verb >= 1:
                     print(
                         f"  sign: local correlation with the EPI {scores[1.0]:.4f} (+1) vs "
-                        f"{scores[-1.0]:.4f} (-1) -> {sign:+.0f}"
+                        f"{scores[-1.0]:.4f} (-1) -> {'keep' if sign > 0 else 'flip'}"
                     )
                 if sign < 0:
                     field = -field

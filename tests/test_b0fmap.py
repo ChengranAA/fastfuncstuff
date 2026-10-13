@@ -354,3 +354,12 @@ def test_phasediff_with_two_magnitudes_uses_the_first(tmp_path, monkeypatch):
     with pytest.raises(StopError):
         util_b0fmap.main(argv)
     assert seen["mag"].shape[-1] == 1 and float(seen["mag"].max()) == 100.0
+
+
+def test_sign_flag_parses_both_forced_values():
+    """Bug of record: choices '1'/'-1' could never be given, because the parser
+    also has -1Dmatrix_apply and so reads '-1' as an option."""
+    from fastfuncstuff.cli.util_b0fmap import create_parser
+
+    for v in ("auto", "keep", "flip"):
+        assert create_parser().parse_args(["-prefix", "x", "-sign", v]).sign == v

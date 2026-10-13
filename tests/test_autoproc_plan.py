@@ -3046,3 +3046,22 @@ def test_invocation_note_requotes_values_with_spaces():
     note = _invocation_note(shlex.join(argv))
     cmd = " ".join(ln.lstrip("#").strip().rstrip("\\").strip() for ln in note.splitlines()[2:])
     assert shlex.split(cmd) == argv
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_stage04_writes_a_before_after_distortion_stack(tmp_path):
+    """The corrected image alone cannot show a wrong-sign field (ds003427's made
+    the distortion worse); the uncorrected image beside it on the same grid can."""
+    fmap = _b0_fmap(intended=[("foo", "1")])
+    subj = Subject("X", [Session("01", [_b0_run("01", "foo", "1")], [fmap])])
+    s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    st4 = _stage04(s)
+    assert "stage04.identity.aff12.1D" in st4
+    assert 'qc_tcat "stage04.QC.blip.ses-01.fmap-b0.nii.gz" "uncorrected corrected"' in st4
+    assert '"stage04.blip.ses-01.fmap-b0_mean.nii$FMT"' in st4
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True
+        ).returncode
+        == 0
+    )

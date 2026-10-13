@@ -814,16 +814,39 @@ def main(argv: list[str] | None = None) -> int:
     split_runs = n_runs > 1 and not args.concat_output
     run_edges = np.cumsum([0, *n_tp_per_run])
 
+    def _corrected_volume(data_flat, runs):
+        """The corrected series with every voxel outside the fit mask carried over
+        from the input unchanged. Zeros there would read downstream as a voxel
+        with no signal and silently drop it from any GLM run on the output."""
+        if mask_np is None:
+            return _to_volume(data_flat, is_4d=True)
+        full, _ = load_and_concatenate_runs(
+            [args.magnitude[i] for i in runs], keep_on_cpu=True, mask_flat=None
+        )
+        full = full.numpy()
+        full[mask_np] = data_flat
+        return from_voxel_major(full, (nx, ny, nz), None)
+
     def _save_4d(key, data_flat):
         """One file per run (each on its own run's header), or one concatenated."""
         if not split_runs:
             fname = f"{args.prefix}_{key}{nii_ext}"
-            save_nifti(_to_volume(data_flat, is_4d=True), fname, reference_img=ref_img_path)
+            vol = (
+                _corrected_volume(data_flat, range(n_runs))
+                if key == "corrected"
+                else _to_volume(data_flat, is_4d=True)
+            )
+            save_nifti(vol, fname, reference_img=ref_img_path)
             outputs[key] = fname
             return
         for i in range(n_runs):
             fname = f"{args.prefix}_{key}_run-{i + 1:02d}{nii_ext}"
-            vol = _to_volume(data_flat[:, run_edges[i] : run_edges[i + 1]], is_4d=True)
+            run_data = data_flat[:, run_edges[i] : run_edges[i + 1]]
+            vol = (
+                _corrected_volume(run_data, [i])
+                if key == "corrected"
+                else _to_volume(run_data, is_4d=True)
+            )
             save_nifti(vol, fname, reference_img=args.magnitude[i])
             outputs[f"{key}_run-{i + 1:02d}"] = fname
 

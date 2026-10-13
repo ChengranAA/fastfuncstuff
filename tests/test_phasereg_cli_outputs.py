@@ -99,7 +99,9 @@ def test_input_nifti_ext():
 
 
 def test_a_given_mask_is_applied_at_load_and_matches_the_unmasked_fit(tmp_path):
-    """-mask loads only in-mask voxels; inside it the fit is the unmasked one, outside 0."""
+    """-mask loads only in-mask voxels; inside it the fit is the unmasked one, and
+    outside it the corrected series IS the input. Bug of record: it was zero
+    there, so a GLM on the output silently lost every voxel the fit skipped."""
     mags, phas, _ = _write_runs(tmp_path, (40, 33))
     rng = np.random.default_rng(9)
     mask = rng.random((6, 5, 4)) < 0.5
@@ -111,4 +113,5 @@ def test_a_given_mask_is_applied_at_load_and_matches_the_unmasked_fit(tmp_path):
         got = np.asarray(nib.load(tmp_path / f"m_corrected_run-0{i}.nii.gz").dataobj)
         ref = np.asarray(nib.load(tmp_path / f"all_corrected_run-0{i}.nii.gz").dataobj)
         np.testing.assert_allclose(got[mask], ref[mask], rtol=1e-5)
-        assert not got[~mask].any()
+        inp = np.asarray(nib.load(mags[i - 1]).dataobj)
+        np.testing.assert_array_equal(got[~mask], inp[~mask])

@@ -361,3 +361,17 @@ def test_default_tzero_zero_adds_no_glm_offset():
     s = write_script(build_plan(subj, Options(slicetiming_method="first")), "wd", bids_root="/bids")
     assert "-tzero 0" in s
     assert "-microtime_offset" not in s
+
+
+def test_phasereg_without_phase_proc_is_refused(tmp_path, monkeypatch, capsys):
+    from fastfuncstuff.cli.autoproc import main
+
+    bids = _minimal_bids(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    rc = main(
+        ["-bids_dir", str(bids), "-subject", "Y", "-recipe", "bare_bones", "-no_anat",
+         "-phasereg", "-out", str(tmp_path / "p.sh"), "-work_dir", str(tmp_path / "w")]
+    )  # fmt: skip
+    assert rc != 0
+    cap = capsys.readouterr()
+    assert "-phasereg needs -phase_proc" in cap.out + cap.err

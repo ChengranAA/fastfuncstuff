@@ -3088,3 +3088,76 @@ def test_anat_nonlin_register_refines_along_pe_in_the_anchor_frame():
     chain = next(line for line in s.splitlines() if line.startswith("CHAIN["))
     links = chain.split('="')[1].rstrip('"').split()
     assert links[:2] == ["stage09.anat.aff12.1D", "stage09.nlanat_WARP.nii$FMT"]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_phasereg_stage_writes_into_its_folder_with_vein_mask_and_glm(tmp_path: Path):
+    """-phasereg: post-preprocessing, so its outputs live in phasereg/ (no new
+    stageNN files): the vein mask from the anat tissue fractions, the corrected
+    runs with -spr confined to that mask, a QC stack, and the same GLM spec fit on
+    the corrected runs. Without tissue maps there is no mask and no -spr."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+
+    func = _bids_with_events(tmp_path)
+    for mag in func.glob("*_part-mag_bold.nii.gz"):
+        (func / mag.name.replace("part-mag", "part-phase")).write_bytes(mag.read_bytes())
+    subj = scan_subject(tmp_path, "ME1")
+    assert all(r.phase_path for s in subj.sessions for r in s.bold_runs)
+    tissue = ["/t/c1.nii.gz", "/t/c2.nii.gz", "/t/c3.nii.gz"]
+    opt = Options(run_glm=True, phase_proc=True, phasereg=True, tissue=tissue)
+    s = write_script(build_plan(subj, opt), str(tmp_path / "wd"), bids_root=str(tmp_path))
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True
+        ).returncode
+        == 0
+    )
+
+    stage = s.split("phasereg: phase regression")[1].split("stage12: GLM")[0]
+    assert "mkdir -p phasereg" in stage
+    assert "ffs_veinmask" in stage and "-tissue /t/c1.nii.gz /t/c2.nii.gz /t/c3.nii.gz" in stage
+    assert '-prefix "phasereg/veinmask"' in stage
+    assert '-prefix "phasereg/task-floc"' in stage and "-keep_drift" in stage
+    assert '-spr_mask "phasereg/veinmask_mask.nii.gz"' in stage
+    assert "phasereg/QC.veinmask.nii.gz" in stage
+    import re
+
+    written = re.findall(r'-prefix "([^"]+)"', stage) + re.findall(r'qc_tcat "([^"]+)"', stage)
+    assert written and all(w.startswith("phasereg/") for w in written)  # no new stageNN files
+    glm = s.split("stage12: GLM")[1]
+    assert '-input "phasereg/task-floc_corrected_run-01.nii$FINAL_FMT"' in glm
+    assert '-Rbuck "phasereg/stats-reml.task-floc.nii$GLM_FMT"' in glm
+    assert '-Rbuck "stage12.stats-reml.task-floc.nii$GLM_FMT"' in glm  # stage10 fit kept
+
+    plain = write_script(
+        build_plan(subj, Options(run_glm=True, phase_proc=True, phasereg=True)),
+        str(tmp_path / "wd2"),
+        bids_root=str(tmp_path),
+    )
+    assert "ffs_phasereg" in plain and "ffs_veinmask" not in plain
+    assert not re.search(r"^\s+-spr", plain, re.M)  # the flag, not the comment saying so
+
+
+def test_phasereg_vein_mask_takes_presurfs_classes_and_keeps_them_written():
+    """With -presurf and no -tissue, the vein mask reads presurfer's UNI classes:
+    presurf must then drop its default -no_classes, and rerun if an earlier run
+    skipped them."""
+    subj = Subject(
+        "X",
+        [Session("01", [_phase_run("01", "foo", "1")], anat=Path("/anat/uni.nii.gz"))],
+    )
+    opt = Options(
+        go_to_anat=True,
+        phase_proc=True,
+        phasereg=True,
+        presurf=[("/a/uni.nii.gz", "/a/inv2.nii.gz", None)],
+        presurf_tpm="/t/TPM.nii",
+    )
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    block = s.split("presurfer) ---")[1].split("\nfi")[0]
+    assert "-no_classes" not in block
+    assert '[ ! -f "presurf_work/anat1_uni_c1.nii.gz" ]' in block
+    assert "-tissue presurf_work/anat1_uni_c1.nii.gz" in s
+    # Without -phasereg nothing reads the classes: presurf keeps -no_classes.
+    opt.phasereg = False
+    assert "-no_classes" in write_script(build_plan(subj, opt), "wd", bids_root="/bids")

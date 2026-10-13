@@ -84,7 +84,7 @@ DEFAULT_OPTS: dict[str, str] = {
     # MP2RAGE inv1/inv2/uni → MPRAGEised head (ffs_util_presurf), which the strip
     # then reads instead of UNI. Its own masks are written but not used: synthstrip
     # is the one brain mask, whatever the contrast. -no_classes because nothing
-    # here reads the 12 posterior maps.
+    # reads the 12 posterior maps -- except -phasereg's vein mask, which drops it.
     "presurf": "-no_classes",
     # final compose+resample (ffs_nwarp).
     "nwarp": "-interp wsinc5 -no_neg",

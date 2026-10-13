@@ -452,6 +452,41 @@ def build_parser() -> argparse.ArgumentParser:
         "vessel phase at all. Skip it only to reproduce older output.",
     )
     g.add_argument(
+        "-phasereg",
+        action="store_true",
+        help="with -phase_proc, run ffs_phasereg on each task's runs that have phase, "
+        "after stage10, into phasereg/ (task-X_corrected_run-NN, one per run in run "
+        "order; -keep_drift, so the GLM models drift as usual). With a GLM, each task's "
+        "model is also fit on the corrected runs: phasereg/stats-*.task-X. stage10 is "
+        "untouched, so the two fits compare like for like.",
+    )
+    g.add_argument(
+        "-phasereg_opts",
+        default="",
+        metavar="'FLAGS'",
+        help='extra ffs_phasereg flags (quoted), e.g. "-shrink odr"',
+    )
+    g.add_argument(
+        "-phasereg_veins",
+        choices=["auto", "off"],
+        default="auto",
+        help="auto (default): when anat tissue maps exist (-tissue, or -presurf's own), "
+        "let phase regression borrow a neighbour's phase (-spr) only inside "
+        "ffs_veinmask's vein candidates: cortex and pial CSF darker in the EPI than the "
+        "tissue predicts. On ds003427 (7T GE vs SE) that flattened the GE depth profile "
+        "toward SE at the tissue cost of plain phase regression; unrestricted -spr "
+        "removed a third of everything. off: plain phase regression.",
+    )
+    g.add_argument(
+        "-tissue",
+        nargs="+",
+        default=None,
+        metavar="FILE",
+        help="GM, WM, CSF fractions of the anat (one 4-D file in SPM c1/c2/c3 order, or "
+        "three files), in the anat's scanner space, for -phasereg_veins. Default with "
+        "-presurf: presurfer's own UNI classes.",
+    )
+    g.add_argument(
         "-nordic_save_resid",
         "-nordic-save-resid",
         action="store_true",
@@ -1375,6 +1410,17 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 "-phase_proc: 'romeo' (MRItools) is not on $PATH. The script's preflight will "
                 "refuse to run until it is — install it or add it to PATH."
             )
+    if opt.phasereg and not opt.phase_proc:
+        errors.append("-phasereg needs -phase_proc: it regresses the phase that carries.")
+    if opt.tissue:
+        if len(opt.tissue) not in (1, 3):
+            errors.append("-tissue takes one 4-D file (GM, WM, CSF) or three files.")
+        errors += [f"-tissue not found: {t}" for t in opt.tissue if not Path(t).is_file()]
+    if opt.phasereg and opt.phasereg_veins == "auto" and not (opt.tissue or opt.presurf):
+        warnings.append(
+            "-phasereg: no anat tissue maps (-tissue, or -presurf), so no vein mask: "
+            "plain phase regression. Give -tissue to restrict -spr to vein candidates."
+        )
     if opt.fs_tpm:  # in-script TPM build needs the FS label volume
         aseg = Path(opt.suma_dir) / "aseg.auto.nii.gz"
         if not aseg.is_file():
@@ -2269,6 +2315,10 @@ def main(argv: list[str] | None = None) -> int:
         want_nordic=eff(args.want_nordic, "want_nordic"),
         phase_proc=args.phase_proc,
         phase_drift=not args.no_phase_drift,
+        phasereg=args.phasereg,
+        phasereg_opts=args.phasereg_opts,
+        phasereg_veins=args.phasereg_veins,
+        tissue=[str(Path(t).resolve()) for t in args.tissue] if args.tissue else None,
         acq_3d=acq_3d,
         noise_vols=args.noise_vols,
         cut_task_vols=_resolve_cut_task_vols(args),

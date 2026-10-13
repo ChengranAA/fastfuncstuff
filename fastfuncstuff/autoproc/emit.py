@@ -2882,9 +2882,13 @@ def _presurf_block(opt) -> str:
     which synthstrip and every cross-modal cost then have to work around.
     MPRAGEising multiplies it by the bias-corrected INV2, which is dark there."""
     tpm = shlex.quote(opt.presurf_tpm) if opt.presurf_tpm else '"${FFS_TPM:?set FFS_TPM}"'
-    flags = _split_flags(config.DEFAULT_OPTS["presurf"])
+    base_flags = _split_flags(config.DEFAULT_OPTS["presurf"])
     steps = []
     for k, (uni, inv2, inv1) in enumerate(opt.presurf, start=1):
+        # The first anat's tissue classes are -phasereg's vein-mask tissue maps
+        # (_tissue_files): keep them then, and rerun a presurf that skipped them.
+        classes = k == 1 and _presurf_classes_needed(opt)
+        flags = [f for f in base_flags if not (classes and f == "-no_classes")]
         call = _ffs(
             "ffs_util_presurf",
             [
@@ -2898,7 +2902,10 @@ def _presurf_block(opt) -> str:
                 '-device "$DEVICE"',
             ],
         )
-        steps.append(f'if [ ! -f "{_presurf_image(opt, k)}" ]; then\n{call}\nfi')
+        need = f'[ ! -f "{_presurf_image(opt, k)}" ]'
+        if classes:
+            need += f' || [ ! -f "{_tissue_files(opt)[0]}" ]'
+        steps.append(f"if {need}; then\n{call}\nfi")
     return "# --- MP2RAGE → MPRAGEised head (presurfer) ---\n" + "\n".join(steps)
 
 
@@ -3793,6 +3800,124 @@ def _dofloss_sums(plan: Plan, tasks) -> list[str]:
     return out
 
 
+PHASEREG_DIR = "phasereg"
+
+
+def _tissue_files(opt) -> list[str]:
+    """The anat's GM/WM/CSF fractions for ffs_veinmask: -tissue, else presurfer's
+    UNI classes (same scanner space as the anat it makes), else none."""
+    if opt.tissue:
+        return list(opt.tissue)
+    if opt.presurf and _own_anat(opt):
+        return [f"presurf_work/anat1_uni_c{k}.nii.gz" for k in (1, 2, 3)]
+    return []
+
+
+def _presurf_classes_needed(opt) -> bool:
+    """presurf must write its UNI classes: they are the vein mask's tissue maps."""
+    return bool(opt.phasereg and opt.phasereg_veins == "auto" and not opt.tissue and opt.presurf)
+
+
+def _phasereg_runs(plan: Plan) -> dict[str, list[PlanRun]]:
+    """Per task, the runs phase regression corrects: those carrying phase."""
+    from fastfuncstuff.autoproc.glm import runs_by_task
+
+    out = {}
+    for task, prs in runs_by_task(plan).items():
+        with_phase = [pr for pr in prs if pr.bold.phase_path]
+        if with_phase:
+            out[task] = with_phase
+    return out
+
+
+def _phasereg_corrected(task: str, i: int) -> str:
+    """ffs_phasereg's i-th (1-based, -magnitude order) output for ``task``."""
+    return f"{PHASEREG_DIR}/task-{task}_corrected_run-{i:02d}.nii$FINAL_FMT"
+
+
+def _veinmask_on(plan: Plan) -> bool:
+    opt = plan.options
+    return opt.phasereg and opt.phasereg_veins == "auto" and bool(_tissue_files(opt))
+
+
+def _stage_phasereg(plan: Plan) -> str:
+    """Phase regression on the final data, into phasereg/ (post-preprocessing, so
+    a folder of its own rather than another stageNN prefix)."""
+    opt = plan.options
+    if not opt.phasereg:
+        return ""
+    tasks = _phasereg_runs(plan)
+    d = PHASEREG_DIR
+    out = [
+        "",
+        "# ============================ phasereg: phase regression ====================",
+        "# The phase-explained (macrovascular) part of each GE run's magnitude, removed",
+        f"# on the stage10 data (voxel-matched magnitude + phase) into {d}/. stage10 is",
+        "# left as it is, so the GLM below fits both and they compare like for like.",
+        "echo '== phasereg =='",
+        f"mkdir -p {d}",
+    ]
+    spr: list[str] = []
+    qc = []
+    if _veinmask_on(plan):
+        means = " ".join(f'"{_final_mean(_frag(pr))}"' for prs in tasks.values() for pr in prs)
+        tissue = " ".join(shlex.quote(t) for t in _tissue_files(opt))
+        out += [
+            "# Vein candidates for -spr: cortex and pial CSF darker in the EPI than the",
+            "# anat's tissue fractions predict (ffs_veinmask). Only there may a voxel",
+            "# borrow a neighbour's phase; elsewhere its own phase is used.",
+            f'[ -f "{d}/veinmask_mask.nii.gz" ] || \\',
+            _ffs(
+                "ffs_veinmask",
+                [
+                    f"-epi {means}",
+                    f"-tissue {tissue}",
+                    f'-mask "{_mask_brain()}"',
+                    f'-prefix "{d}/veinmask"',
+                    '-device "$DEVICE"',
+                ],
+            ),
+        ]
+        spr = ["-spr", f'-spr_mask "{d}/veinmask_mask.nii.gz"']
+        first = next(iter(tasks.values()))[0]
+        qc.append(
+            f'qc_tcat "{d}/QC.veinmask.nii.gz" "epi expected ratio region mask" '
+            f'"{_final_mean(_frag(first))}" "{d}/veinmask_expected.nii.gz" '
+            f'"{d}/veinmask_ratio.nii.gz" "{d}/veinmask_region.nii.gz" '
+            f'"{d}/veinmask_mask.nii.gz"'
+        )
+    elif opt.phasereg_veins == "auto":
+        out.append("# No anat tissue maps (-tissue / -presurf): plain phase regression, no -spr.")
+    extra = _split_flags(opt.phasereg_opts) if opt.phasereg_opts else []
+    for task, prs in tasks.items():
+        mags = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
+        phs = " ".join(f'"stage10.final.{_frag(pr)}.part-phase.nii$FINAL_FMT"' for pr in prs)
+        out.append(f"# task-{task}: runs {', '.join(_frag(pr) for pr in prs)} -> run-01..")
+        out.append(f'[ -f "{_phasereg_corrected(task, len(prs))}" ] || \\')
+        out.append(
+            _ffs(
+                "ffs_phasereg",
+                [
+                    f"-magnitude {mags}",
+                    f"-phase {phs}",
+                    f'-prefix "{d}/task-{task}"',
+                    "-keep_drift",
+                    *spr,
+                    *extra,
+                    '-device "$DEVICE"',
+                ],
+            )
+        )
+        qc.append(
+            f'qc_tcat "{d}/QC.task-{task}.nii.gz" "before after r2" '
+            f'"stage10.final.{_frag(prs[0])}.nii$FINAL_FMT[0]" '
+            f'"{_phasereg_corrected(task, 1)}[0]" "{d}/task-{task}_r2.nii$FINAL_FMT"'
+        )
+    if _qc_on(plan):
+        out.append(_qc_block("phasereg", qc))
+    return "\n".join(out) + "\n"
+
+
 def _stage_stats(plan: Plan, bids_root: str | None) -> str:
     """One GLM per task.
 
@@ -3860,26 +3985,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
         # the preamble -- it just had nothing to switch. Editing the design TOML
         # and re-running the script is the common case, so say what to flip.
         out.append(f'if [ "$skip_stats" -ne 1 ] || [ ! -f "{rbuck}" ]; then')
-        common = [
-            f'-Obuck "{stem}stats-ols.task-{task}.nii$GLM_FMT"',
-            f'-Rbuck "{rbuck}"',
-            *(['-mask "$GLM_MASK"'] if _glm_mask(plan) else []),
-            *([f"-do_blur {blur:g}"] if blur else []),
-            *_target_blur_flags(
-                to=opt.glm_blur_to,
-                tsnr=opt.glm_blur_tsnr,
-                local=opt.glm_blur_local,
-                max_fwhm=opt.glm_blur_max_fwhm,
-                nbhd=opt.glm_blur_nbhd,
-                fwhm_map=f"{stem}blurfwhm.task-{task}.nii.gz",
-            ),
-            # The ACF comes from the residuals this fit already has in memory,
-            # so this needs no -Rerrts and no second pass over the data.
-            *(["-clustsim"] if opt.clustsim else []),
-            *(["-clustsim_null resid"] if opt.clustsim and opt.clustsim_null == "resid" else []),
-            *([f'-adjust_dof "{_task_dofloss(task)}"'] if _dof_adjust_on(opt) else []),
-            *_reml_shared(opt, task),
-        ]
+        common = _glm_common(plan, task, stem, blur)
         if _censoring_on(opt):
             out.append(_concat_censor(task, prs))
         if resolved:
@@ -3893,8 +3999,8 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
                 )
             out.append(_ffs("ffs_reml", [f"-input {finals}", f"-spec {spec}", *common], indent=""))
             out.append(_stats_guard_close(task))
+            out += _phasereg_glm(plan, task, prs, spec, tag, blur)
             continue
-
         out.append(
             f"# TODO task-{task}: no events TSV found when this script was written, so no"
             "\n#      design spec could be built. The -events value below is a PLACEHOLDER"
@@ -3933,6 +4039,59 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
         out.append(_stats_guard_close(task))
     out.append("fi")
     return "\n".join(out) + "\n"
+
+
+def _glm_common(plan: Plan, task: str, stem: str, blur: float | None) -> list[str]:
+    """stage12's ffs_reml flags for one task's buckets under ``stem`` (``stage12.``,
+    ``stage12.blur6.``, ``phasereg/``): outputs, mask, smoothing, cluster and dof."""
+    opt = plan.options
+    return [
+        f'-Obuck "{stem}stats-ols.task-{task}.nii$GLM_FMT"',
+        f'-Rbuck "{stem}stats-reml.task-{task}.nii$GLM_FMT"',
+        *(['-mask "$GLM_MASK"'] if _glm_mask(plan) else []),
+        *([f"-do_blur {blur:g}"] if blur else []),
+        *_target_blur_flags(
+            to=opt.glm_blur_to,
+            tsnr=opt.glm_blur_tsnr,
+            local=opt.glm_blur_local,
+            max_fwhm=opt.glm_blur_max_fwhm,
+            nbhd=opt.glm_blur_nbhd,
+            fwhm_map=f"{stem}blurfwhm.task-{task}.nii.gz",
+        ),
+        # The ACF comes from the residuals this fit already has in memory,
+        # so this needs no -Rerrts and no second pass over the data.
+        *(["-clustsim"] if opt.clustsim else []),
+        *(["-clustsim_null resid"] if opt.clustsim and opt.clustsim_null == "resid" else []),
+        *([f'-adjust_dof "{_task_dofloss(task)}"'] if _dof_adjust_on(opt) else []),
+        *_reml_shared(opt, task),
+    ]
+
+
+def _phasereg_glm(
+    plan: Plan, task: str, prs: list[PlanRun], spec: str, tag: str, blur: float | None
+) -> list[str]:
+    """The same model fit on phasereg's corrected runs, buckets in phasereg/."""
+    corrected = _phasereg_runs(plan).get(task) if plan.options.phasereg else None
+    if not corrected:
+        return []
+    if len(corrected) != len(prs):
+        return [
+            f"# task-{task}: no phasereg GLM -- only {len(corrected)} of {len(prs)} runs "
+            "carry phase, and the design spec models them all."
+        ]
+    stem = f"{PHASEREG_DIR}/{tag}." if tag else f"{PHASEREG_DIR}/"
+    finals = " ".join(f'"{_phasereg_corrected(task, i)}"' for i in range(1, len(prs) + 1))
+    rbuck = f"{stem}stats-reml.task-{task}.nii$GLM_FMT"
+    return [
+        f"# task-{task} after phase regression: same spec, buckets in {PHASEREG_DIR}/.",
+        f'if [ "$skip_stats" -ne 1 ] || [ ! -f "{rbuck}" ]; then',
+        _ffs(
+            "ffs_reml",
+            [f"-input {finals}", f"-spec {spec}", *_glm_common(plan, task, stem, blur)],
+            indent="",
+        ),
+        _stats_guard_close(task),
+    ]
 
 
 def _reml_shared(opt, task: str) -> list[str]:
@@ -4239,6 +4398,7 @@ def write_script(
         _stage_final(plan, script_stem),
         _stage_surface(plan, script_stem),
         _stage_masks(plan),
+        _stage_phasereg(plan),
         _stage_stats(plan, bids_root),
         _stage_surface_stats(plan, bids_root),
     ]

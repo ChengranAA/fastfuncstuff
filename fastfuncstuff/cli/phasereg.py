@@ -323,6 +323,14 @@ def create_parser() -> argparse.ArgumentParser:
         "Default: all runs, in-sample, which biases toward over-suppression.",
     )
     sprg.add_argument(
+        "-spr_mask",
+        metavar="FILE",
+        default=None,
+        help="Voxels allowed to borrow a neighbour's phase (an independent vein mask, "
+        "e.g. from GRE R2* or SWI, on the magnitude's grid). Elsewhere a voxel keeps "
+        "its own phase. Default: every voxel may borrow.",
+    )
+    sprg.add_argument(
         "-spr_select_on",
         choices=("data", "residual"),
         default="data",
@@ -607,6 +615,18 @@ def main(argv: list[str] | None = None) -> int:
     mask_flat = None if mask_np is None else torch.from_numpy(mask_np)
 
     phas, _ = load_and_concatenate_runs(args.phase, keep_on_cpu=True, mask_flat=mask_np)
+
+    spr_allow = None
+    if args.spr_mask:
+        allow = load_afni_mask(args.spr_mask)
+        if allow.shape != (nx, ny, nz):
+            print(
+                f"ERROR: -spr_mask shape {allow.shape} != data shape {(nx, ny, nz)}",
+                file=sys.stderr,
+            )
+            return 1
+        allow = allow.flatten().astype(bool)
+        spr_allow = torch.from_numpy(allow[mask_np] if mask_np is not None else allow)
     mag_list = list(mags.split(n_tp_per_run, dim=1))
     pha_list = list(phas.split(n_tp_per_run, dim=1))
 
@@ -788,6 +808,7 @@ def main(argv: list[str] | None = None) -> int:
         spr_connectivity=args.spr_neighborhood,
         spr_select_run=args.spr_select_run,
         spr_select_on=args.spr_select_on,
+        spr_allow=spr_allow,
         volume_shape=(nx, ny, nz),
         mask_flat=mask_flat,
         device=str(device),

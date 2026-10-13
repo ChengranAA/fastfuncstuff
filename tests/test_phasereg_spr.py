@@ -202,3 +202,36 @@ def test_vein_mask_flags_vessel_not_grey_matter():
         device=torch.device("cpu"),
     )
     assert torch.allclose(res.magnitude_corrected, res_no.magnitude_corrected)
+
+
+def test_spr_allow_limits_borrowing_to_the_mask():
+    """-spr_mask: a voxel outside the allowed set keeps its own phase even when a
+    neighbour's would win; inside it, borrowing is unchanged."""
+    torch.manual_seed(1)
+    n_tp = 150
+    shape = (2, 1, 1)
+    task = torch.sin(torch.linspace(0, 10 * torch.pi, n_tp))
+    mag = 1000.0 + torch.randn(n_tp, 2) * 2.0
+    pha = torch.randn(n_tp, 2) * 0.01
+    mag[:, 0] += 50.0 * task
+    pha[:, 1] += 0.5 * task
+    common = dict(
+        tr=2.0,
+        task_removal="none",
+        max_poly_degree=1,
+        signal_thresh=0.0,
+        regression="ols",
+        shrink_mode="none",
+        spr=True,
+        volume_shape=shape,
+        device=torch.device("cpu"),
+    )
+    allowed = phase_regress(
+        mag.T.contiguous(), pha.T.contiguous(), spr_allow=torch.tensor([True, False]), **common
+    )
+    barred = phase_regress(
+        mag.T.contiguous(), pha.T.contiguous(), spr_allow=torch.tensor([False, True]), **common
+    )
+    assert allowed.spr_donor is not None and barred.spr_donor is not None
+    assert allowed.spr_donor[0].item() == 1
+    assert barred.spr_donor[0].item() == 0

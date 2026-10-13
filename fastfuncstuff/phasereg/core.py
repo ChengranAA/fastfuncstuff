@@ -345,6 +345,7 @@ def phase_regress(
     spr_connectivity: int = 6,
     spr_select_run: int | None = None,
     spr_select_on: str = "data",
+    spr_allow: torch.Tensor | None = None,
     volume_shape: tuple[int, int, int] | None = None,
     mask_flat: torch.Tensor | None = None,
     device: str | torch.device = "cpu",
@@ -469,6 +470,11 @@ def phase_regress(
         sharing the voxel's spontaneous and physiological coupling rather than
         merely carrying the task, which on task-locked data makes the argmax
         pick task-responsive phase anywhere and suppress tissue response.
+    spr_allow : Tensor (n_voxels,) bool or None
+        Voxels allowed to borrow a neighbour's phase, e.g. an independent vein
+        mask (GRE R2* or SWI). Elsewhere the voxel keeps its own phase (plain PR).
+        On ds003427 the coupling statistic could not tell a vein from the tissue
+        it drains, so where to borrow has to come from outside the coupling.
     volume_shape : (nx, ny, nz) or None
         Shape of the 3-D grid the voxel axis was flattened from.  Required for
         ``spr``; ignored otherwise.
@@ -776,6 +782,14 @@ def phase_regress(
             device=device,
             chunk_size=chunk_size,
         )
+
+        if spr_allow is not None:
+            if spr_allow.shape[0] != n_voxels:
+                raise ValueError(
+                    f"spr_allow has {spr_allow.shape[0]} voxels but data has {n_voxels}"
+                )
+            self_idx = torch.arange(n_voxels)
+            spr_donor = torch.where(spr_allow.cpu().bool(), spr_donor, self_idx)
 
         # Substituting the donor series here means phi, the slope fit, and the
         # applied correction all use the donor phase with no further changes.

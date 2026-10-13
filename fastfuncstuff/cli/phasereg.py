@@ -48,7 +48,10 @@ RECIPES
   GLM input (the usual case):
     ffs_phasereg -magnitude run*_mag.nii.zst -phase run*_phase.nii.zst \\
                  -prefix pr -keep_drift
-  Veins survive, sub-mm 7T: add -spr -spr_select_run 0 (see -spr).
+  Veins survive, sub-mm 7T: add -spr -spr_mask VEINS (see -spr), VEINS from
+    ffs_veinmask (EPI darker than the anat's tissue predicts) or a GRE/SWI vein
+    mask. Unrestricted -spr also removes about a third of tissue response
+    (ds003427, GE vs SE). ffs_autoproc -phasereg does this.
   Drop vein voxels instead of correcting them: add -vein_mask.
   phaseprep / Stanley 2021 parity:  -polort 1 -shrink odr -no_phase_unwrap \
                                     -max_slope_ratio 0

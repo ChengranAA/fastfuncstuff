@@ -1338,17 +1338,17 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 "sidecar. Pass -TR SECONDS (volume TR) or -slicetiming_method none."
             )
     if opt.phase_proc:
-        # Phase is carried per run, so a single run without one would silently
-        # produce a script that dies at stage00 — catch it here instead.
+        # Phase is carried per run, wherever a run has one: a session can mix
+        # gradient-echo runs (with phase) and spin-echo runs (without).
+        runs = [r for s in subject.sessions for r in s.bold_runs]
         missing = [
-            f"{r.session or '-'}/{r.task}/{r.run or '-'}"
-            for s in subject.sessions
-            for r in s.bold_runs
-            if r.phase_path is None
+            f"{r.session or '-'}/{r.task}/{r.run or '-'}" for r in runs if r.phase_path is None
         ]
-        if missing:
-            errors.append(
-                "-phase_proc needs a part-phase bold for every run; these have none: "
+        if len(missing) == len(runs):
+            errors.append("-phase_proc: no run has a phase timeseries (part-phase bold)")
+        elif missing:
+            warnings.append(
+                "-phase_proc: these runs have no phase and are processed magnitude-only: "
                 + ", ".join(missing)
             )
         if shutil.which("romeo") is None:
@@ -1558,6 +1558,40 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             _cols, warn = resolve_event_cols(task, paths, opt)
             if warn:
                 warnings.append(warn)
+
+    # BIDS lets an events file omit trial_type; every row is then one condition.
+    # That is right for a single-condition block design and wrong if the condition
+    # sits in a column under another name, so say which happened.
+    if opt.run_glm:
+        import csv
+
+        from fastfuncstuff.autoproc.glm import requested_event_cols
+        from fastfuncstuff.design.bids_events import SINGLE_TRIAL_TYPE
+
+        for task in sorted(all_tasks):
+            if requested_event_cols(task, opt) is not None:
+                continue
+            if opt.events:
+                paths = [Path(e) for e in opt.events]
+            else:
+                paths = [ev for _, ev in _events_by_run(args.bids_dir, task, subject) if ev]
+            lacking = []
+            for path in dict.fromkeys(paths):
+                try:
+                    with open(path, newline="") as fh:
+                        header = next(csv.reader(fh, delimiter="\t"), [])
+                except OSError:
+                    continue
+                if "trial_type" not in header:
+                    lacking.append((Path(path).name, header))
+            if lacking:
+                name, header = lacking[0]
+                warnings.append(
+                    f"task-{task}: {name} has no trial_type column (columns: "
+                    f"{', '.join(header)}), so every row is modelled as ONE condition "
+                    f"'{SINGLE_TRIAL_TYPE}'. If a column names the conditions, pass "
+                    "-spec_event_cols ONSET DURATION TRIAL_TYPE."
+                )
 
     # A filter on a column the TSVs lack would build the wrong model an hour from now.
     if opt.run_glm and opt.event_filters:

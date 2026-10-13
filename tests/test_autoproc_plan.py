@@ -768,6 +768,40 @@ def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc,
     assert "part-phase" not in body
 
 
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+@pytest.mark.parametrize("stc", ["integrate", "first"])
+def test_phase_proc_skips_runs_without_phase(tmp_path, stc):
+    """A session mixing gradient-echo runs (phase) and spin-echo runs (none):
+    every phase step is gated per run, so the SE run gets no unwrap, no phase
+    tshift, and no -phase arguments at the final resample."""
+    se = _run("SM", "primary", "2")
+    subj = Subject("X", [Session("SM", [_phase_run("SM", "primary", "1"), se])])
+    opt = Options(phase_proc=True, slicetiming_method=stc, go_to_anat=False, distortion=False)
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True
+        ).returncode
+        == 0
+    )
+    assert '[ -n "${PHASE[$k]:-}" ] || continue' in s
+    assert '[ -n "${PHASE[$k]:-}" ] && pa=" -phase' in s
+    assert '-prefix \\"$outf\\"$pa"' in s
+    if stc == "first":
+        assert '[ -z "${PHASE[$k]:-}" ] || [ -f "$phout" ]' in s
+
+    # Run the stage10 argument builder for both runs: only the GE line has phase.
+    for k, ph in (("ge", "x_phase.nii.gz"), ("se", "")):
+        frag = f'declare -A PHASE FRAG; PHASE[{k}]="{ph}"; FRAG[{k}]={k}; k={k}; FINAL_FMT=.gz; PHASE_FMT=.gz\n'
+        lines = [ln for ln in s.splitlines() if "phoutf=" in ln or 'pa=" -phase' in ln]
+        out = subprocess.run(  # noqa: S603
+            ["bash", "-c", frag + "\n".join(lines) + '\necho "[$pa]"'],
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        assert ("-phase_prefix" in out) == bool(ph), out
+
+
 def _write(path, text):
     path.write_text(text)
     return path

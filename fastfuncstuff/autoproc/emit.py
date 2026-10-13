@@ -1492,7 +1492,10 @@ def _stage_tshift(plan: Plan) -> str:
                 '-device "$DEVICE"',
             ],
         )
-        phase_cmd = f'  phout="{_unwrapped("tshift")}"\n  [ -f "$phout" ] || {{\n{pc}\n  }}\n'
+        phase_cmd = (
+            f'  phout="{_unwrapped("tshift")}"\n'
+            f'  [ -z "${{PHASE[$k]:-}}" ] || [ -f "$phout" ] || {{\n{pc}\n  }}\n'
+        )
     return f"""
 # ============================ stage01: slice timing (first) =================
 # STC applied up front (before moco); the final resample does NOT re-integrate
@@ -3188,16 +3191,20 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
     phase_args = ""
     phase_note = ""
     if _phase_on(plan):
-        phase_args = (
-            f' -phase \\"{_phase_source(plan)}\\" -phase_units rad -phase_warp direct'
-            f' -phase_prefix \\"$phoutf\\"'
-        )
+        phase_args = "$pa"
         phase_note = (
             "# The unwrapped phase rides the same chain in the same pass\n"
             "# (-phase_warp direct, radians) → stage10.final.<frag>.part-phase.*\n"
         )
+    # A run without phase (a spin-echo run beside gradient-echo ones) gets no
+    # phase arguments: pa stays empty.
     phase_out = (
-        '  phoutf="stage10.final.${FRAG[$k]}.part-phase.nii$FINAL_FMT"\n' if _phase_on(plan) else ""
+        '  phoutf="stage10.final.${FRAG[$k]}.part-phase.nii$FINAL_FMT"; pa=""\n'
+        '  [ -n "${PHASE[$k]:-}" ] && pa=" -phase \\"'
+        + _phase_source(plan)
+        + '\\" -phase_units rad -phase_warp direct -phase_prefix \\"$phoutf\\""\n'
+        if _phase_on(plan)
+        else ""
     )
     meanf = _final_mean("${FRAG[$k]}")
     surf_args, surf_note = _surface_args(plan), ""
@@ -3473,6 +3480,7 @@ def _stage_unwrap(plan: Plan) -> str:
 {note}{drift_note}
 echo '== stage00: phase unwrap (ROMEO) =='
 for k in "${{RUN_KEYS[@]}}"; do
+  [ -n "${{PHASE[$k]:-}}" ] || continue  # no phase for this run (e.g. spin echo)
   uw="{uw}"{drift_vars}
   [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ]{drift_done} && continue
 {src}

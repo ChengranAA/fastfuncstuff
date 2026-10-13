@@ -303,3 +303,54 @@ class TestPhaseScaling:
         assert np.allclose(narrow_mate, wide_mate, atol=1e-5)
         assert narrow_mate.min() == pytest.approx(-np.pi, abs=1e-5)
         assert narrow_mate.max() == pytest.approx(np.pi, abs=1e-5)
+
+
+def test_phasediff_with_two_magnitudes_uses_the_first(tmp_path, monkeypatch):
+    """Bug of record (ds003427): a Siemens phasediff ships magnitude1 AND
+    magnitude2; both went to ROMEO beside the one phase image and it refused."""
+    import nibabel as nib
+    import numpy as np
+
+    from fastfuncstuff.cli import util_b0fmap
+    from fastfuncstuff.processing import b0fmap as B
+
+    def img(name, value):
+        p = tmp_path / name
+        nib.save(nib.Nifti1Image(np.full((4, 4, 4), value, np.float32), np.eye(4)), p)
+        return str(p)
+
+    pd, m1, m2 = img("pd.nii.gz", 0.5), img("m1.nii.gz", 100.0), img("m2.nii.gz", 50.0)
+    seen = {}
+
+    class StopError(Exception):
+        pass
+
+    def fake_romeo(phase, magnitude, tes_ms, affine, **kw):
+        seen["mag"] = magnitude
+        raise StopError
+
+    monkeypatch.setattr(B, "run_romeo", fake_romeo)
+    argv = [
+        "-phasediff",
+        pd,
+        "-magnitude",
+        m1,
+        m2,
+        "-te",
+        "4.08",
+        "5.1",
+        "-pe_dir",
+        "j-",
+        "-readout",
+        "0.06",
+        "-no_match",
+        "-prefix",
+        str(tmp_path / "out"),
+        "-device",
+        "cpu",
+        "-verb",
+        "0",
+    ]
+    with pytest.raises(StopError):
+        util_b0fmap.main(argv)
+    assert seen["mag"].shape[-1] == 1 and float(seen["mag"].max()) == 100.0

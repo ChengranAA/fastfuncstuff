@@ -379,7 +379,13 @@ def main(argv: list[str] | None = None) -> int:
         phase_np = np.stack([_load(p)[0] for p in ph_paths], axis=-1)
         if affine is None:
             _, affine, header = _load(ph_paths[0])
-        mags = [_load(p)[0] for p in (args.magnitude or ph_paths)]
+        mag_paths = list(args.magnitude or ph_paths)
+        if is_pd and len(mag_paths) > 1:
+            # A Siemens phasediff comes with magnitude1 AND magnitude2, but its one
+            # phase image needs one magnitude: the first echo's (higher SNR; FSL's
+            # fsl_prepare_fieldmap takes magnitude1 too).
+            mag_paths = mag_paths[:1]
+        mags = [_load(p)[0] for p in mag_paths]
         mag4d = np.stack(mags, axis=-1)
         if verb >= 1:
             kind = "phasediff (dTE)" if is_pd else "multi-echo phase"

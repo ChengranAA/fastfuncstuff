@@ -215,6 +215,17 @@ def create_parser() -> argparse.ArgumentParser:
 
     match = parser.add_argument_group("EPI matching")
     match.add_argument(
+        "-sign",
+        choices=("auto", "1", "-1"),
+        default="auto",
+        help="Which way the field displaces the EPI. How a scanner's phase sign relates "
+        "to the PE polarity is a vendor and sequence convention (FSL and SPM make you "
+        "supply it and check by eye), so auto places the undistorted magnitude on the "
+        "EPI once, forward-distorts it both ways, and keeps the sign whose image "
+        "correlates better (local Pearson) with the EPI. 1 / -1 force it. auto needs "
+        "the match step; with -no_match or -1Dmatrix_apply the sign is 1.",
+    )
+    match.add_argument(
         "-no_match",
         action="store_true",
         help="Skip the affine match; write everything on the fieldmap's own grid. Use when "
@@ -455,11 +466,16 @@ def main(argv: list[str] | None = None) -> int:
         _, epi_affine_probe, _ = _load(args.epi, collapse=args.collapse)
         epi_pe_mm = _voxel_sizes_zyx(epi_affine_probe)[{0: 2, 1: 1, 2: 0}[pe_axis]]
 
-    _, inv_f, pe_tdim = B.field_to_pe_warp(field, readout * (epi_pe_mm / fmap_pe_mm), pe_dir)
+    def forward_distort(f: torch.Tensor) -> torch.Tensor:
+        assert mag_arr is not None
+        _, inv_f, tdim = B.field_to_pe_warp(f, readout * (epi_pe_mm / fmap_pe_mm), pe_dir)
+        return B.synthesize_distorted(_to_tensor(mag_arr, device), inv_f, tdim)
 
+    if args.sign != "auto":
+        field = field * float(args.sign)
     wfmag = None
     if mag_arr is not None:
-        wfmag = B.synthesize_distorted(_to_tensor(mag_arr, device), inv_f, pe_tdim)
+        wfmag = forward_distort(field)
         _save_zyx(f"{stem}_wfmag{ext}", wfmag, affine)
         if verb >= 1:
             print(f"  wrote {stem}_wfmag{ext}  (magnitude forward-warped to look like the EPI)")
@@ -497,6 +513,53 @@ def main(argv: list[str] | None = None) -> int:
                 device=str(device),
                 verb=max(0, verb - 1),
             )
+            if args.sign == "auto":
+                # Bug of record: ds003427's Siemens phasediff displaces the EPI the
+                # other way from ds001600's, and a fixed sign made that 7T data's
+                # distortion worse instead of removing it. Both signs are scored
+                # under ONE placement (from the undistorted magnitude): matched
+                # separately, each sign gets its own best rigid fit, and that
+                # absorbs most of the difference the test is looking for.
+                from fastfuncstuff.processing.cost import lpa_correlation
+                from fastfuncstuff.processing.mask import automask
+
+                common, _ = allineate(
+                    epi,
+                    _to_tensor(mag_arr, device),
+                    cfg,
+                    base_header={"affine": epi_affine, "header": epi_header},
+                    source_header={"affine": affine, "header": header},
+                )
+                placed = epi_affine @ np.linalg.inv(
+                    common.detach().cpu().numpy().astype(np.float64)
+                )
+                brain = automask(epi, device=device).float()
+                scores = {
+                    s: float(
+                        lpa_correlation(
+                            epi,
+                            resample_to_grid(
+                                forward_distort(field * s),
+                                placed,
+                                tuple(epi.shape),
+                                epi_affine,
+                                interp="linear",
+                            ),
+                            weight=brain,
+                        )
+                    )
+                    for s in (1.0, -1.0)
+                }
+                sign = max(scores, key=lambda s: scores[s])
+                if verb >= 1:
+                    print(
+                        f"  sign: local correlation with the EPI {scores[1.0]:.4f} (+1) vs "
+                        f"{scores[-1.0]:.4f} (-1) -> {sign:+.0f}"
+                    )
+                if sign < 0:
+                    field = -field
+                    wfmag = forward_distort(field)
+                    _save_zyx(f"{stem}_wfmag{ext}", wfmag, affine)
             matrix, _ = allineate(
                 epi,
                 wfmag,

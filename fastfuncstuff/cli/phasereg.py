@@ -209,9 +209,10 @@ def create_parser() -> argparse.ArgumentParser:
     task.add_argument(
         "-tent_window",
         type=float,
-        default=20.0,
+        default=None,
         metavar="SECONDS",
-        help="TENT window for -task_removal tent.",
+        help="TENT window for -task_removal tent (default: long enough for the "
+        "longest event's response, from -events or -durations; else 20 s).",
     )
     task.add_argument(
         "-durations",
@@ -612,6 +613,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── Parse onsets ─────────────────────────────────────────────────────
     onsets_per_condition = None
+    condition_durations: list[float] | None = None
     if args.onsets:
         from fastfuncstuff.design.builder import parse_afni_timing_file
 
@@ -658,18 +660,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         onsets_per_condition = bids_onsets
+        condition_durations = list(bids_durations)
         if args.verb >= 1:
             print(f"  BIDS events: {len(bids_labels)} conditions ({', '.join(bids_labels)})")
 
     # ── Auto tent window from durations ──────────────────────────────────
-    tent_window = args.tent_window
-    if args.task_removal == "tent" and args.durations and onsets_per_condition is not None:
+    # The durations size the TENT window and shape the canonical regressor; they
+    # come from the TSV with -events, or from -durations (which wins).
+    tent_window = args.tent_window if args.tent_window is not None else 20.0
+    if args.durations and onsets_per_condition is not None:
         from fastfuncstuff.design.builder import parse_durations
-        from fastfuncstuff.design.hrf import compute_windows_from_durations
 
         n_conds = len(onsets_per_condition)
         cond_labels = [f"cond{i}" for i in range(n_conds)]
         condition_durations = parse_durations(args.durations, n_conds, cond_labels)
+    if args.task_removal == "tent" and condition_durations is not None and args.tent_window is None:
+        from fastfuncstuff.design.hrf import compute_windows_from_durations
+
         windows = compute_windows_from_durations(condition_durations, tr)
         tent_window = max(top for _, top in windows)
         if args.verb >= 1:
@@ -745,6 +752,7 @@ def main(argv: list[str] | None = None) -> int:
         tr=tr,
         task_removal=args.task_removal,
         onsets_per_condition=onsets_per_condition,
+        durations_per_condition=condition_durations,
         nuisance_per_run=nuisance_per_run,
         max_poly_degree=polort,
         phi=args.phi,

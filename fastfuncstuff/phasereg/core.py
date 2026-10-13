@@ -185,26 +185,29 @@ def _build_task_design_canonical(
     tr: float,
     n_timepoints_per_run: list[int],
     device: torch.device,
+    durations: list[float] | None = None,
 ) -> list[torch.Tensor]:
-    """Build per-run canonical HRF design matrices for task removal."""
+    """Per-run SPMG1 designs, each event a duration boxcar convolved at 0.1 s.
+
+    Bug of record: this used to place an impulse at each onset, so a 15 s block
+    was modelled as a 0 s event and the task residual (hence phi) kept most of
+    the block response."""
     from fastfuncstuff.design.hrf import get_spmg1_hrf
-    from fastfuncstuff.design.matrices import convolve_hrf
-    from fastfuncstuff.io.afni import onsets_to_tr_matrix
+    from fastfuncstuff.design.matrices import build_event_design_microtime
 
     n_conditions = len(onsets_per_condition)
-    hrf = get_spmg1_hrf(tr)
-    designs = []
-    for run_idx, n_tp in enumerate(n_timepoints_per_run):
-        run_onsets = [onsets_per_condition[c][run_idx] for c in range(n_conditions)]
-        onset_matrix = onsets_to_tr_matrix(
-            [[o] for o in run_onsets],
-            n_timepoints=n_tp,
-            tr=tr,
-        )
-        onset_tensor = torch.tensor(onset_matrix, dtype=torch.float32, device=device)
-        convolved = convolve_hrf(onset_tensor, hrf, n_tp, device=device)
-        designs.append(convolved)
-    return designs
+    durs = list(durations) if durations is not None else [0.0] * n_conditions
+    design = build_event_design_microtime(
+        [[np.asarray(o, dtype=np.float64) for o in runs] for runs in onsets_per_condition],
+        durs,
+        get_spmg1_hrf(0.1, device=device),
+        list(n_timepoints_per_run),
+        tr=tr,
+        microtime_dt=0.1,
+        device=device,
+    )
+    assert isinstance(design, torch.Tensor)
+    return list(design.to(torch.float32).split(list(n_timepoints_per_run), dim=0))
 
 
 def _apply_sgf(
@@ -317,6 +320,7 @@ def phase_regress(
     onsets_per_condition: list[list] | None = None,
     nuisance_per_run: list[torch.Tensor] | None = None,
     max_poly_degree: int = 3,
+    durations_per_condition: list[float] | None = None,
     phi: float | torch.Tensor | None = None,
     phi_method: str = "fft",
     phi_freq_range: tuple[float, float | None] = (0.15, None),
@@ -364,6 +368,9 @@ def phase_regress(
         only with ``slope_on="residual"``, the slope fit.
     onsets_per_condition : list of list of ndarray, optional
         Onset times structured as [condition][run] -> ndarray.
+    durations_per_condition : list of float, optional
+        Event duration (s) per condition for ``task_removal="canonical"``;
+        None models every event as an impulse.
     nuisance_per_run : list of Tensor, optional
         Additional per-run nuisance regressors (e.g. motion parameters),
         each (n_timepoints, n_regressors).
@@ -583,6 +590,7 @@ def phase_regress(
             tr,
             n_tp_per_run,
             device,
+            durations_per_condition,
         )
     elif task_removal != "none":
         raise ValueError(

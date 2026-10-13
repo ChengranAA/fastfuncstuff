@@ -220,7 +220,11 @@ def scan_trial_types(
     gets no [[events]] block, since compile would find nothing to model."""
     import csv
 
-    from fastfuncstuff.design.bids_events import check_filter_columns, event_row_passes
+    from fastfuncstuff.design.bids_events import (
+        check_filter_columns,
+        event_row_passes,
+        implicit_trial_type,
+    )
 
     drop = drop or set()
     _, dur_col, tt_col = cols
@@ -228,9 +232,11 @@ def scan_trial_types(
     for path in events_files:
         with open(path, newline="") as fh:
             reader = csv.DictReader(fh, delimiter="\t")
-            check_filter_columns(list(reader.fieldnames or []), event_filters, path)
+            fieldnames = list(reader.fieldnames or [])
+            check_filter_columns(fieldnames, event_filters, path)
+            implicit = implicit_trial_type(fieldnames, tt_col)
             for row in reader:
-                tt = str(row.get(tt_col, "")).strip()
+                tt = implicit or str(row.get(tt_col, "")).strip()
                 if not tt or tt.lower() == "n/a" or tt in drop:
                     continue
                 if not event_row_passes(row, event_filters):

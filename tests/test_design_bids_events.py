@@ -731,3 +731,20 @@ class TestEventFilters:
         f = self._tsv(tmp_path)
         rows, _ = read_run_event_rows([f], event_filters=[EventFilter("hemifield", ["left"], "in")])
         assert [r["_trial_type"] for r in rows[0]] == ["loc06", "loc08"]
+
+
+def test_events_without_trial_type_are_one_condition(tmp_path):
+    """BIDS makes trial_type optional (ds003427 ships onset/duration only)."""
+    from fastfuncstuff.design.bids_events import SINGLE_TRIAL_TYPE, read_tsv_rows
+    from fastfuncstuff.design.spec import scan_trial_types
+
+    ev = tmp_path / "task-cb_events.tsv"
+    ev.write_text("onset\tduration\n15\t15\n45\t15\n")
+    rows, _ = read_tsv_rows(ev)
+    assert [r["_trial_type"] for r in rows] == [SINGLE_TRIAL_TYPE] * 2
+    assert scan_trial_types([ev])[0] == [SINGLE_TRIAL_TYPE]
+    # A custom column that is missing is still an error, not a silent fallback.
+    import pytest
+
+    with pytest.raises(ValueError, match="not found"):
+        read_tsv_rows(ev, trial_type_col="condition")

@@ -36,6 +36,7 @@ from fastfuncstuff.design.bids_events import (
     check_events_pairing,
     check_filter_columns,
     event_row_passes,
+    implicit_trial_type,
     warn_unmatched_filters,
 )
 from fastfuncstuff.design.builder import (
@@ -309,9 +310,11 @@ def _read_events_for_condition(
     out: list[tuple[float, float]] = []
     with open(events_path, newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
-        check_filter_columns(list(reader.fieldnames or []), event_filters, events_path)
+        fieldnames = list(reader.fieldnames or [])
+        check_filter_columns(fieldnames, event_filters, events_path)
+        implicit = implicit_trial_type(fieldnames, tt_col)
         for row in reader:
-            if str(row.get(tt_col, "")).strip() != trial_type:
+            if (implicit or str(row.get(tt_col, "")).strip()) != trial_type:
                 continue
             if not event_row_passes(row, event_filters):
                 continue

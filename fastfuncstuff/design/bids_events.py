@@ -477,6 +477,19 @@ def warn_unmatched_filters(
             )
 
 
+# BIDS makes ``trial_type`` optional: an events file without it describes one
+# condition. Its rows are modelled under this label.
+SINGLE_TRIAL_TYPE = "event"
+
+
+def implicit_trial_type(fieldnames: list[str], trial_type_col: str) -> str | None:
+    """The label every row takes when the file has no trial_type column (and the
+    caller asked for the BIDS default name, not a custom column that is missing)."""
+    if trial_type_col == "trial_type" and trial_type_col not in fieldnames:
+        return SINGLE_TRIAL_TYPE
+    return None
+
+
 def read_tsv_rows(
     path: Path | str,
     onset_col: str = "onset",
@@ -502,13 +515,14 @@ def read_tsv_rows(
     with open(path, newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         fieldnames = list(reader.fieldnames or [])
+        implicit = implicit_trial_type(fieldnames, trial_type_col)
 
         for col, role in (
             (onset_col, "onset"),
             (duration_col, "duration"),
             (trial_type_col, "trial_type"),
         ):
-            if col not in fieldnames:
+            if col not in fieldnames and not (role == "trial_type" and implicit):
                 raise ValueError(
                     f"Column '{col}' (mapped as '{role}') not found in {path}.\n"
                     f"  Available columns: {fieldnames}\n"
@@ -518,7 +532,7 @@ def read_tsv_rows(
 
         rows: list[dict[str, Any]] = []
         for row_num, row in enumerate(reader, start=2):  # row 1 is header
-            trial_type = str(row[trial_type_col]).strip()
+            trial_type = implicit or str(row[trial_type_col]).strip()
             if not trial_type or trial_type.lower() == "n/a":
                 continue
             if not event_row_passes(row, event_filters):

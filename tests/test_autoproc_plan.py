@@ -3033,3 +3033,16 @@ def test_resolve_acq_3d_evidence_order(capsys):
     assert "assuming 3D" in capsys.readouterr().err
     assert _resolve_acq_3d(SimpleNamespace(acq="auto", slicetiming="st.txt"), subj(run())) is False
     assert _resolve_acq_3d(SimpleNamespace(acq="2d", slicetiming=None), subj(run("3D"))) is False
+
+
+def test_invocation_note_requotes_values_with_spaces():
+    """Bug of record: -anat_opts "-rigid -cost lpa" came back unquoted, split
+    over lines as if each word were a flag, so the regenerate line broke."""
+    import shlex
+
+    from fastfuncstuff.autoproc.emit import _invocation_note
+
+    argv = ["ffs_autoproc", "-subject", "03", "-anat_opts", "-rigid -cost lpa -fast", "-exec"]
+    note = _invocation_note(shlex.join(argv))
+    cmd = " ".join(ln.lstrip("#").strip().rstrip("\\").strip() for ln in note.splitlines()[2:])
+    assert shlex.split(cmd) == argv

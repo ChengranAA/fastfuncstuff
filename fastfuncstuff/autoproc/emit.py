@@ -1137,7 +1137,10 @@ def _invocation_note(invocation: str | None) -> str:
     readable width with continuations so it can be pasted as-is."""
     if not invocation:
         return ""
-    words = shlex.split(invocation)
+    # Re-quoted, so a value with spaces (-anat_opts "-rigid -cost lpa") pastes
+    # back as one word; a quoted value also never starts with "-", so it is
+    # never mistaken for the next flag below.
+    words = [shlex.quote(w) for w in shlex.split(invocation)]
     lines: list[str] = []
     cur = "# " + words[0]
     for w in words[1:]:

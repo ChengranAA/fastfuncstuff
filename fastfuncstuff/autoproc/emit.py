@@ -3317,7 +3317,7 @@ for k in "${{RUN_KEYS[@]}}"; do
   meanf="{meanf}"
 {phase_out}{st}
 {_raw_source(plan)}
-  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean \\"$meanf\\" -prefix \\"$outf\\"{phase_args}{surf_args}" >> "$nwarpbatch"
+  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -chain_base \\"$MASTER\\" -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean \\"$meanf\\" -prefix \\"$outf\\"{phase_args}{surf_args}" >> "$nwarpbatch"
 done
 {_numcomps_final_jobs(plan)}{_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
@@ -3443,7 +3443,7 @@ for k in "${{RUN_KEYS[@]}}"; do
       -prefix "$dofoutf" -device "$DEVICE"
     continue
   fi
-  printf '%s\\n' "-source \\"{_numcomps_native(plan)}\\" -nwarp \\"${{AVGCHAIN[$k]}}\\" -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" -interp linear -no_neg -prefix \\"$dofoutf\\"" >> "$nwarpbatch"
+  printf '%s\\n' "-source \\"{_numcomps_native(plan)}\\" -nwarp \\"${{AVGCHAIN[$k]}}\\" -master stage10.warpmaster.nii$FMT -chain_base \\"$MASTER\\" -dxyz \\"$FINAL_DXYZ\\" -interp linear -no_neg -prefix \\"$dofoutf\\"" >> "$nwarpbatch"
 done
 """
 
@@ -3478,7 +3478,7 @@ def _sbref_final_jobs(plan: Plan) -> str:
         "  fi\n"
         '  printf \'%s\\n\' "-source \\"${SBREF[$k]}\\" -nwarp \\"${AVGCHAIN[$k]}\\"'
         '${JAC[$k]:+ -jac \\"${JAC[$k]}\\"} '
-        '-master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" '
+        '-master stage10.warpmaster.nii$FMT -chain_base \\"$MASTER\\" -dxyz \\"$FINAL_DXYZ\\" '
         f'{nwarp_flags} -prefix \\"$sboutf\\"" >> "$nwarpbatch"\n'
         "done\n"
     )

@@ -141,6 +141,26 @@ def compute_cardinal_affine(oblique_aff: np.ndarray) -> np.ndarray:
     return cardinal_affine(oblique_aff)
 
 
+def base_frame_correction(
+    base_affine: np.ndarray, out_real: np.ndarray, out_cardinal: np.ndarray
+) -> np.ndarray:
+    """RAS 4x4 taking an output voxel's cardinal position to the base's cardinal frame.
+
+    Chains are applied in the output grid's cardinal frame (AFNI's ijk_to_dicom) but
+    were fitted in their base's. When both grids are oblique with the same rotation R
+    and different origins, the two frames disagree by (R^-1 - I)(origin offset) --
+    1.2-1.7 mm on a 42-degree 7T slab -- so data land that far from where the output
+    header puts them. Identity when output and base share a grid, or are cardinal.
+    """
+    base_affine = np.asarray(base_affine, dtype=np.float64)
+    return (
+        compute_cardinal_affine(base_affine)
+        @ np.linalg.inv(base_affine)
+        @ np.asarray(out_real, dtype=np.float64)
+        @ np.linalg.inv(np.asarray(out_cardinal, dtype=np.float64))
+    )
+
+
 @dataclass
 class AffineTransform:
     """Time-dependent affine matrix (analogous to AFNI's mat44_vec)."""
@@ -1781,6 +1801,7 @@ def nwarpforge(
     points: np.ndarray | None = None,
     point_reducer: Callable[[Tensor], Tensor] | None = None,
     source_image: tuple[Tensor, Any] | None = None,
+    chain_base: str | None = None,
 ) -> Tensor | None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1889,6 +1910,11 @@ def nwarpforge(
         source_image: ``load_image(source_path, device=None)``'s result, already in
             memory: a volume and a surface pass from one read of a big series (ffs_nwarp
             -surf_prefix). Read only, never modified.
+        chain_base: The dataset the chain's first transform was fitted against (its
+            base grid). Prepends :func:`base_frame_correction`, so data land where the
+            output header says in true (sform) space even when the output grid and
+            that base are oblique with different origins. None keeps AFNI's cardinal
+            mapping (3dNwarpApply parity).
 
     Returns:
         The sampled points when ``points`` is given, else None (the volume is saved).
@@ -2174,6 +2200,18 @@ def nwarpforge(
                 print(f"    xd: [{xform.xd.min().item():.3f}, {xform.xd.max().item():.3f}]")
                 print(f"    yd: [{xform.yd.min().item():.3f}, {xform.yd.max().item():.3f}]")
                 print(f"    zd: [{xform.zd.min().item():.3f}, {xform.zd.max().item():.3f}]")
+
+    if chain_base is not None:
+        from fastfuncstuff.io.afni import load_nifti
+
+        base_aff = np.asarray(load_nifti(chain_base).affine, dtype=np.float64)
+        corr = base_frame_correction(base_aff, obliquity @ output_affine, output_affine)
+        if verb >= 1:
+            print(f"nwarpforge: -chain_base frame correction {np.round(corr[:3, 3], 3)} mm")
+        vox = np.linalg.inv(output_affine) @ corr @ output_affine
+        transforms.insert(
+            0, AffineTransform(matrices=torch.from_numpy(vox.astype(np.float32))[None].to(device))
+        )
 
     # If master didn't provide space info, try the first NIfTI warp in chain
     if master_hdr_obj is None:

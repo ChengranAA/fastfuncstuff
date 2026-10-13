@@ -476,8 +476,11 @@ def test_warpmaster_defines_grid_mask_and_stats():
     assert '-base "stage09.anat_autobox.nii.gz"' in s
     assert '-prefix "stage09.grandmean_al_anat.nii$FMT"' in s
 
-    # stage10 lands runs on the warpmaster (not the raw anat master).
+    # stage10 lands runs on the warpmaster (not the raw anat master), correcting
+    # the cardinal-frame slip against the grid the warpmaster was cut from: without
+    # it an oblique slab's final data sat 1.2-1.7 mm off their header (ds003427).
     assert "-master stage10.warpmaster.nii$FMT" in s
+    assert '-chain_base \\"$MASTER\\"' in s
 
     # GLM: OLS by default + REML, masked, scaled.
     assert '-Obuck "stage12.stats-ols.task-foo.nii$GLM_FMT"' in s

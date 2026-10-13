@@ -123,6 +123,17 @@ Examples:
         "[required unless -batch]",
     )
     io_group.add_argument(
+        "-chain_base",
+        default=None,
+        metavar="DSET",
+        help="The dataset the chain's first transform was fitted against (its base). "
+        "Like AFNI, the chain is applied in the output grid's cardinal frame; when "
+        "the output grid and this base are oblique with different origins, that puts "
+        "the data mm away from where the output header says. Giving the base corrects "
+        "it, so the output lines up with the base in true (sform) space. Default: "
+        "off (3dNwarpApply parity).",
+    )
+    io_group.add_argument(
         "-prefix",
         default=None,
         help="Output path for magnitude (or only output) [required unless -batch]",
@@ -721,6 +732,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         jac_match=jac_match,
         progress=lambda message: spinner(message, enabled=verb >= 1),
         source_image=source_image,
+        chain_base=args.chain_base,
     )
     if source_image is not None:
         if verb >= 1:

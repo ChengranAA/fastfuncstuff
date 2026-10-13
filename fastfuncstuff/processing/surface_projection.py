@@ -494,5 +494,6 @@ def project_to_surface(
             interp=nwarp_kwargs.get("interp", "wsinc5"),
             ainterp=nwarp_kwargs.get("ainterp", "cubic"),
             device=nwarp_kwargs.get("device"), verb=verb, geom_prefix=geom_prefix,
+            chain_base=nwarp_kwargs.get("chain_base"),
         )  # fmt: skip
     return written

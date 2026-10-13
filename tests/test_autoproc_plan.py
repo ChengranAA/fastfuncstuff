@@ -2304,6 +2304,10 @@ def test_surface_target_samples_each_run_through_its_chain_up_to_the_anat():
     line = next(x for x in s.splitlines() if "-surf " in x and "printf" in x)
     assert '-surf_master \\"$ANAT\\"' in line
     assert '-surf_nwarp \\"${SURFCHAIN[$k]}\\"' in line
+    # Each pass corrects the cardinal-frame slip against its own chain's base: the
+    # volume's (MNI) chain was fitted on $MASTER, SURFCHAIN's on the anat box.
+    assert '-chain_base \\"$MASTER\\"' in line
+    assert '-surf_chain_base \\"stage09.anat_autobox.nii.gz\\"' in line
     assert '-surf_prefix \\"stage10s.surf.${FRAG[$k]}\\"' in line
     assert "-surf /fs/sub-X -surf_mesh native onavg-ico64" in line
     # the volume half keeps its own (MNI) chain and warpmaster

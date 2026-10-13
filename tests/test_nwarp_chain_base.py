@@ -73,3 +73,30 @@ def test_without_chain_base_the_cardinal_frame_slips(tmp_path):
     # is not a no-op on this geometry.
     got, want = _run(tmp_path, chain_base=False)
     assert np.abs(got - want).max() > 0.3
+
+
+def test_surface_points_get_the_same_correction(tmp_path):
+    # The surface route samples true-mm points on its own master (the raw anat)
+    # through a chain fitted on the cropped anat box: the same slip, the same fix.
+    _run(tmp_path, chain_base=True)  # writes src.nii and mast.nii
+    src, mast = tmp_path / "src.nii", tmp_path / "mast.nii"
+    ident = tmp_path / "ident.aff12.1D"
+    m = nib.load(str(mast)).affine
+    rng = np.random.default_rng(1)
+    pts = (m @ np.c_[rng.uniform(1, 8, size=(100, 3)), np.ones(100)].T)[:3].T
+    want = pts @ COEF + 50.0
+    for base, ok in ((str(src), True), (None, False)):
+        got = nwarpforge(
+            source_path=str(src),
+            nwarp_specs=[str(ident)],
+            prefix="",
+            master_path=str(mast),
+            interp="linear",
+            device=DEV,
+            verb=0,
+            points=pts,
+            chain_base=base,
+        )
+        assert got is not None
+        err = np.abs(got.numpy() - want).max()
+        assert (err < 2e-3) if ok else (err > 0.3)

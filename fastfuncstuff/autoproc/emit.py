@@ -3337,12 +3337,28 @@ def _surface_args(plan: Plan) -> str:
         return ""
     assert opt.fs_subject is not None
     meshes = " ".join(shlex.quote(m) for m in opt.surface_target)
+    base = _surf_chain_base(opt)
     return (
         f" -surf {shlex.quote(opt.fs_subject)} -surf_mesh {meshes}"
         ' -surf_prefix \\"stage10s.surf.${FRAG[$k]}\\" -surf_master \\"$ANAT\\"'
         ' -surf_nwarp \\"${SURFCHAIN[$k]}\\" -surf_geom_prefix stage10s.surf'
+        + (f' -surf_chain_base \\"{base}\\"' if base else "")
         + (" -surf_qc" if opt.surface_qc else "")
     )
+
+
+def _surf_chain_base(opt) -> str | None:
+    """The grid SURFCHAIN's head (the anat matrix) was fitted on, for -surf_chain_base.
+
+    The surface master is the raw $ANAT but the matrix's base is its autobox crop:
+    on an oblique anat the two share a rotation, not an origin, and the cardinal
+    frame the chain runs in would put the points mm off. None for -ref_file, whose
+    transforms' base this script cannot know."""
+    if opt.ref_file is not None:
+        return None
+    if opt.grand_reference:
+        return f"{opt.grand_reference.rstrip('/')}/{_anat_box()}"
+    return _anat_box()
 
 
 def _stage_surface(plan: Plan, script_stem: str) -> str:

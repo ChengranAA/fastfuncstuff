@@ -110,6 +110,7 @@ def surface_qc(
     seed: int = 0,
     verb: int = 1,
     geom_prefix: str | None = None,
+    chain_base: str | None = None,
 ) -> list[Path]:
     """Write the QC maps for ``targets`` (:func:`surface_targets` output) at ``prefix``.
 
@@ -129,7 +130,7 @@ def surface_qc(
     zooms = np.asarray(header["header"].get_zooms()[:3], np.float64)
     nominal = float(np.prod(zooms))
     h3 = _header_3d(header, shape)
-    kw = dict(interp="linear", ainterp=ainterp, device=device, verb=0)
+    kw = dict(interp="linear", ainterp=ainterp, device=device, verb=0, chain_base=chain_base)
 
     # --- exact coordinates: where each point reads the native grid -------------------
     centres = [

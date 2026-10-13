@@ -322,6 +322,14 @@ Examples:
         "another grid (an EPI-resolution warpmaster). Default: -master.",
     )
     surf_group.add_argument(
+        "-surf_chain_base",
+        default=None,
+        metavar="DSET",
+        help="-chain_base for the surface pass: the dataset -surf_nwarp's first "
+        "transform was fitted against. Default: -chain_base when the surface pass uses "
+        "the volume's chain (no -surf_nwarp), else off.",
+    )
+    surf_group.add_argument(
         "-surf_nwarp",
         default=None,
         metavar="CHAIN",
@@ -761,8 +769,11 @@ def _dispatch_surface(
     """-surf: the same chain, read at surface points, written as GIfTI."""
     from fastfuncstuff.processing.surface_projection import project_to_surface
 
+    chain_base = args.surf_chain_base
     if args.surf_nwarp is not None:
         nwarp_specs = parse_nwarp_string(args.surf_nwarp)
+    elif chain_base is None:
+        chain_base = args.chain_base
 
     master = args.surf_master or args.master
     wrong = [
@@ -815,6 +826,7 @@ def _dispatch_surface(
         jac_match=jac_match,
         progress=lambda message: spinner(message, enabled=args.verb >= 1),
         source_image=source_image,
+        chain_base=chain_base,
     )
     if args.verb >= 1:
         for path in written:

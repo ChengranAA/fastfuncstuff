@@ -3121,7 +3121,9 @@ def test_phasereg_stage_writes_into_its_folder_with_vein_mask_and_glm(tmp_path: 
     assert '-prefix "phasereg/veinmask"' in stage
     assert '-prefix "phasereg/task-floc"' in stage and "-keep_drift" in stage
     assert '-spr_mask "phasereg/veinmask_mask.nii$FINAL_FMT"' in stage
-    assert "-verb 1" in stage and "phasereg: sPR inside the vein mask" in stage
+    assert "-verb 1" in stage and "phasereg: sPR inside the local vein mask" in stage
+    # donors on task-residual coupling, with every run's events
+    assert "-spr_select_on residual -task_removal fit:2" in stage and "-events " in stage
     assert "phasereg/QC.veinmask.nii.gz" in stage
     import re
 

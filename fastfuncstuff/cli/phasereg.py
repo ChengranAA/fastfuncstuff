@@ -368,6 +368,17 @@ def create_parser() -> argparse.ArgumentParser:
         "its own phase. Default: every voxel may borrow.",
     )
     sprg.add_argument(
+        "-spr_regression",
+        choices=["ols", "deming", "same"],
+        default="ols",
+        help="Slope rule inside -spr_mask (the plausible veins). 'ols': least squares "
+        "on the own or borrowed phase, no ODR damping (Vu & Gallant's choice); on "
+        "ds003427 it was the one literature rule that cut the pial GE/SE excess "
+        "without the 2x cap, at little tissue cost. Outside the mask -regression and "
+        "-shrink apply, so the correction stays conservative without vein evidence. "
+        "'same': the global rule everywhere",
+    )
+    sprg.add_argument(
         "-spr_select_on",
         choices=("data", "residual"),
         default="data",
@@ -861,6 +872,7 @@ def main(argv: list[str] | None = None) -> int:
         spr_select_run=args.spr_select_run,
         spr_select_on=args.spr_select_on,
         spr_allow=spr_allow,
+        spr_regression=None if args.spr_regression == "same" else args.spr_regression,
         phi_calib=phi_calib,
         volume_shape=(nx, ny, nz),
         mask_flat=mask_flat,

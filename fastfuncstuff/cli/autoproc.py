@@ -470,14 +470,16 @@ def build_parser() -> argparse.ArgumentParser:
         "-phasereg_veins",
         choices=["off", "auto"],
         default="off",
-        help="off (default): plain phase regression, each voxel its own phase. auto "
-        "(EXPERIMENTAL, unvalidated): when anat tissue maps exist (-tissue, -presurf's "
-        "own, or -suma's aseg when the anat is SUMA's brain), let phase regression "
-        "borrow a neighbour's phase (-spr) inside ffs_veinmask's vein candidates "
-        "(cortex and pial CSF darker in the EPI than the tissue predicts). Its earlier "
-        "ds003427 support used tissue maps 2-7 mm off the EPI; a first rescoring on "
-        "aligned maps (2 of 4 subjects) kept ~45%% of the GE+SE shared response, "
-        "against ~70%% for plain PR.",
+        help="off (default): plain phase regression, each voxel its own phase, Deming "
+        "damped by ODR's factor (-shrink slope): stable, an even ~10%% suppression. auto: "
+        "when anat tissue maps exist (-tissue, -presurf's own, or -suma's aseg when the "
+        "anat is SUMA's brain), ffs_veinmask's local vein map (dark ridges: sulcal "
+        "plates, vessels, the pial edge) is where a voxel may borrow a neighbour's "
+        "phase (-spr), with an OLS slope there (-spr_regression ols) and donors chosen "
+        "on task-residual coupling when every run has events. Conservative outside "
+        "plausible veins, firmer inside. On ds003427 (2026-10-14) it was the one "
+        "literature rule that reduced the pial GE/SE excess, modestly, at little "
+        "tissue cost; still to be checked on event designs.",
     )
     g.add_argument(
         "-tissue",

@@ -3878,7 +3878,7 @@ def _veinmask_on(plan: Plan) -> bool:
     return opt.phasereg and opt.phasereg_veins == "auto" and bool(_tissue_files(opt))
 
 
-def _stage_phasereg(plan: Plan) -> str:
+def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
     """Phase regression on the final data, into phasereg/ (post-preprocessing, so
     a folder of its own rather than another stageNN prefix)."""
     opt = plan.options
@@ -3930,18 +3930,39 @@ def _stage_phasereg(plan: Plan) -> str:
         out.append("# No anat tissue maps (-tissue / -presurf): plain phase regression, no -spr.")
     extra = _split_flags(opt.phasereg_opts) if opt.phasereg_opts else []
     if spr:
-        how = "sPR inside the vein mask (dark-vs-tissue), own phase elsewhere"
+        how = (
+            "sPR inside the local vein mask (OLS on the borrowed phase), "
+            "own phase and ODR-damped Deming elsewhere"
+        )
     elif opt.phasereg_veins == "auto":
         how = "own phase only, no sPR: no anat tissue maps for a vein mask (-tissue)"
     else:
         how = "own phase only, no sPR (-phasereg_veins off)"
-    out.append(f"echo 'phasereg: {how}; Deming slope damped by ODR (-shrink slope), phi from FFT noise, no cap'")
+    out.append(
+        f"echo 'phasereg: {how}; Deming slope damped by ODR (-shrink slope), phi from FFT noise, no cap'"
+    )
     if extra:
         out.append(f"echo 'phasereg: extra options {shlex.quote(opt.phasereg_opts)[1:-1]}'")
     for task, prs in tasks.items():
         mags = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
         phs = " ".join(f'"stage10.final.{_frag(pr)}.part-phase.nii$FINAL_FMT"' for pr in prs)
         out.append(f"# task-{task}: runs {', '.join(_frag(pr) for pr in prs)} -> run-01..")
+        select: list[str] = []
+        if spr:
+            # Donors chosen on task-residual (spontaneous) coupling: chosen on the
+            # task-included series, a neighbour wins by carrying the task and sPR then
+            # removes tissue response (ds003427, 2026-10-14). Needs every run's events.
+            evs = [events_for_run(pr, bids_root, opt) for pr in prs]
+            if all(evs):
+                select = [
+                    "-spr_select_on residual -task_removal fit:2",
+                    "-events " + " ".join(shlex.quote(str(e)) for e in evs),
+                ]
+            else:
+                out.append(
+                    f"echo 'phasereg task-{task}: no events for every run, so sPR donors "
+                    "are chosen on the task-included series (can remove tissue response)'"
+                )
         out.append(f'[ -f "{_phasereg_corrected(task, len(prs))}" ] || \\')
         out.append(
             _ffs(
@@ -3952,6 +3973,7 @@ def _stage_phasereg(plan: Plan) -> str:
                     f'-prefix "{d}/task-{task}"',
                     "-keep_drift",
                     *spr,
+                    *select,
                     "-verb 1",
                     *extra,
                     '-device "$DEVICE"',
@@ -4448,7 +4470,7 @@ def write_script(
         _stage_final(plan, script_stem),
         _stage_surface(plan, script_stem),
         _stage_masks(plan),
-        _stage_phasereg(plan),
+        _stage_phasereg(plan, bids_root),
         _stage_stats(plan, bids_root),
         _stage_surface_stats(plan, bids_root),
     ]

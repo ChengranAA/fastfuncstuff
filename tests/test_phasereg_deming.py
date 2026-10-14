@@ -141,3 +141,25 @@ def test_shrink_slope_damps_unreliable_slopes_and_odr_is_phaseprep():
     r = m0 - odr.slope[:, None] * p0
     want = mag.mean(1, keepdim=True) + s[:, None] * r
     assert torch.allclose(odr.magnitude_corrected, want, rtol=1e-4, atol=1e-2)
+
+
+def test_spr_regression_ols_inside_the_vein_mask_only():
+    """-spr_regression ols: inside spr_allow the slope is the plain least-squares one
+    (a correction that can never add variance); outside, the global Deming + shrink."""
+    from fastfuncstuff.phasereg.core import phase_regress
+
+    g = torch.Generator().manual_seed(5)
+    n_vox, n_tp = 300, 150
+    pha = 0.01 * torch.randn(n_vox, n_tp, generator=g)
+    mag = 1000 - 300 * pha + 10 * torch.randn(n_vox, n_tp, generator=g)
+    allow = torch.zeros(n_vox, dtype=torch.bool)
+    allow[:150] = True
+    kw = dict(keep_drift=True, max_poly_degree=0, device="cpu")
+    split = phase_regress(mag, pha, 2.0, spr_allow=allow, spr_regression="ols", **kw)
+    glob = phase_regress(mag, pha, 2.0, spr_allow=allow, spr_regression=None, **kw)
+    m0, p0 = mag - mag.mean(1, keepdim=True), pha - pha.mean(1, keepdim=True)
+    ols = (m0 * p0).sum(1) / (p0 * p0).sum(1)
+    assert torch.allclose(split.slope[:150], ols[:150], rtol=1e-4)
+    assert torch.equal(split.magnitude_corrected[150:], glob.magnitude_corrected[150:])
+    ratio = split.magnitude_corrected[:150].std(1) / mag[:150].std(1)
+    assert float(ratio.max()) <= 1.0 + 1e-5  # OLS removes, never adds

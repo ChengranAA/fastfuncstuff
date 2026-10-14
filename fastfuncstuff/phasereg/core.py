@@ -345,6 +345,7 @@ def phase_regress(
     spr_select_run: int | None = None,
     spr_select_on: str = "data",
     spr_allow: torch.Tensor | None = None,
+    spr_regression: str | None = "ols",
     phi_calib: torch.Tensor | None = None,
     volume_shape: tuple[int, int, int] | None = None,
     mask_flat: torch.Tensor | None = None,
@@ -490,6 +491,14 @@ def phase_regress(
         mask (GRE R2* or SWI). Elsewhere the voxel keeps its own phase (plain PR).
         On ds003427 the coupling statistic could not tell a vein from the tissue
         it drains, so where to borrow has to come from outside the coupling.
+    spr_regression : {"ols", "deming"} or None
+        Slope rule inside ``spr_allow`` (the plausible veins). "ols" (default):
+        least squares on the voxel's own or borrowed phase, no ODR damping --
+        Vu & Gallant's choice for sPR, and on ds003427 the only literature rule
+        that reduced the pial GE/SE excess without the invented 2x cap (2026-10-14).
+        Outside the mask ``regression`` and ``shrink_mode`` apply as usual, so the
+        correction is conservative where there is no vein evidence. None: the
+        global rule everywhere.
     volume_shape : (nx, ny, nz) or None
         Shape of the 3-D grid the voxel axis was flattened from.  Required for
         ``spr``; ignored otherwise.
@@ -552,6 +561,8 @@ def phase_regress(
         raise ValueError(f"Unknown regression: {regression!r}")
     if slope_on not in ("data", "residual"):
         raise ValueError(f"Unknown slope_on: {slope_on!r}. Use 'data' or 'residual'.")
+    if spr_regression not in (None, "ols", "deming"):
+        raise ValueError(f"Unknown spr_regression: {spr_regression!r}. Use 'ols' or 'deming'.")
     if shrink_mode not in ("slope", "odr", "none"):
         raise ValueError(f"Unknown shrink_mode: {shrink_mode!r}. Use 'slope', 'odr' or 'none'.")
 
@@ -952,6 +963,15 @@ def phase_regress(
                 b = fit_mag.mean(dim=0) - s * fit_pha.mean(dim=0)
         else:
             s, b = ols_regression(fit_pha, fit_mag)
+        in_veins = None
+        if spr_allow is not None and spr_regression is not None and spr_regression != regression:
+            in_veins = spr_allow[lo:hi].to(device).bool()
+            if spr_regression == "ols":
+                s_alt, b_alt = ols_regression(fit_pha, fit_mag)
+            else:
+                s_alt, b_alt = deming_regression(fit_pha, fit_mag, phi_c)
+            s = torch.where(in_veins, s_alt, s)
+            b = torch.where(in_veins, b_alt, b)
         bad = ~good | flat
         s = torch.where(bad, torch.zeros_like(s), s)
         b = torch.where(bad, torch.zeros_like(b), b)
@@ -980,6 +1000,9 @@ def phase_regress(
         pha_centered = pha_filt - pha_filt.mean(dim=0)
         inflation = 1.0 + (s * s) / phi_c.clamp(min=1e-12)
         shrink = 1.0 / inflation if shrink_mode != "none" else torch.ones_like(inflation)
+        if in_veins is not None and spr_regression == "ols":
+            # ODR's factor belongs to the Deming fit; an OLS slope is used as fit
+            shrink = torch.where(in_veins, torch.ones_like(shrink), shrink)
 
         ss_total = ((mag_dt - mag_dt.mean(dim=0)) ** 2).sum(dim=0)
         r_obs = mag_dt - (b.unsqueeze(0) + s.unsqueeze(0) * pha_centered)

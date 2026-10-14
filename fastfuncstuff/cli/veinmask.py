@@ -21,14 +21,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = FfsArgumentParser(
         prog="ffs_veinmask",
         description=(
-            "Vein candidates for ffs_phasereg -spr_mask, from the data you already have. "
-            "The anat's GM/WM/CSF fractions times a smooth bias field predict the EPI "
-            "mean; voxels in cortex (or in CSF touching it) that come out much darker "
-            "than predicted are vein candidates. A vein darkens at the EPI's echo time; "
-            "white matter and tissue boundaries, which a plain darkness map also flags, "
-            "are predicted by the tissue model and so are not. Outputs (PREFIX_): mask "
-            "(the -spr_mask), ratio (EPI / expected; 1 = as the tissue predicts), "
-            "expected (the predicted EPI image), region (where veins are looked for)."
+            "Vein map from the GE-EPI mean and the anat's GM/WM/CSF fractions, for "
+            "ffs_phasereg -spr_mask and as a QC map, when there is no GRE/SWI. The tissue "
+            "mix predicts each EPI voxel; voxels in cortex (or in CSF touching it) much "
+            "darker than predicted are veins: a vein darkens at the EPI's echo time, "
+            "while white matter and tissue boundaries are predicted. With -model local "
+            "(default) the tissue levels are fitted per neighbourhood, and the mask "
+            "follows continuous dark ridges (plates: sulci and the brain edge; tubes: "
+            "vessels through slices; blobs: punctate) without dilating. Outputs "
+            "(PREFIX_): mask, ratio (EPI / expected; 1 = as predicted), expected, region "
+            "(where veins are looked for); local also thin (dark-ridge strength) and "
+            "shape (1 plate, 2 tube, 3 blob, inside the mask). PROTOTYPE, judged by eye "
+            "on ds003427 (2026-10-14); the GRE label it was checked against is noisy."
         ),
     )
     p.add_argument(
@@ -53,12 +57,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="brain mask on the EPI grid (default: EPI above 20%% of its 98th percentile)",
     )
     p.add_argument(
+        "-model",
+        choices=["local", "global"],
+        default="local",
+        help="'local': GM/WM/CSF levels fitted per voxel over -local_fwhm, so shading "
+        "and drifting tissue contrast do not read as darkness, plus the shape-aware "
+        "ridge-following mask. 'global': one level per tissue times a -bias_fwhm "
+        "shading field and a plain cut (the 2026-10-12 model; its baseline drifts "
+        "across the slab)",
+    )
+    p.add_argument(
+        "-local_fwhm",
+        type=float,
+        default=4.0,
+        help="-model local: FWHM (mm) of the neighbourhood the tissue levels are fitted "
+        "over. Smaller absorbs wide dark plates into the reference; larger lets "
+        "shading back in",
+    )
+    p.add_argument(
+        "-grow",
+        type=float,
+        default=0.15,
+        help="-model local: how much darker than predicted a continuation of a vein "
+        "must be (0.15 = 15%%) to join it: only along the ridge centre line and on a "
+        "real ridge, so it follows a dark structure rather than dilating it. 0 = no "
+        "growth (plain -darker cut)",
+    )
+    p.add_argument(
         "-darker",
         type=float,
         default=0.3,
-        help="flag voxels this much darker than predicted (0.3 = 30%% darker). "
-        "UNVALIDATED: the evidence for 0.3 used tissue maps that were 2-7 mm off "
-        "the EPI; on aligned ds003427 maps it marks 12-21%% of cortex+pial CSF",
+        help="seed voxels this much darker than predicted (0.3 = 30%% darker). Judged "
+        "by eye on ds003427: with -model local it seeds 8-12%% of cortex+pial CSF",
     )
     p.add_argument(
         "-dilate",
@@ -72,7 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-bias_fwhm",
         type=float,
         default=24.0,
-        help="FWHM (mm) of the bias field. Smaller follows coil shading more closely "
+        help="-model global: FWHM (mm) of the bias field. Smaller follows coil shading more closely "
         "but starts to absorb clusters of veins into the bias",
     )
     p.add_argument(
@@ -122,7 +152,15 @@ def main(argv: list[str] | None = None) -> None:
     device = setup_device(args.device)
     t0 = time.time()
     from fastfuncstuff.processing.io import load_image, save_image
-    from fastfuncstuff.processing.veinmask import tissue_darkness, vein_mask, vein_region
+    from fastfuncstuff.processing.veinmask import (
+        _dilate6,
+        dark_shapes,
+        local_tissue_darkness,
+        ridge_follow_mask,
+        tissue_darkness,
+        vein_mask,
+        vein_region,
+    )
 
     with spinner("Reading the EPI", enabled=args.verb >= 1):
         means, header = [], None
@@ -143,31 +181,57 @@ def main(argv: list[str] | None = None) -> None:
     brain &= tissue.sum(0) > 0.5
 
     zooms = header["header"].get_zooms()[:3]  # x, y, z; the volume is (z, y, x)
-    sig = tuple(args.bias_fwhm / 2.3548 / float(z) for z in reversed(zooms))
-    ratio, expected, levels = tissue_darkness(mean, tissue, brain, sig)
+    zyx = tuple(float(z) for z in reversed(zooms))
     region = vein_region(tissue, brain, gm_min=args.gm_min)
+    extra: dict[str, torch.Tensor] = {}
+    if args.model == "global":
+        sig = tuple(args.bias_fwhm / 2.3548 / z for z in zyx)
+        ratio, expected, levels = tissue_darkness(mean, tissue, brain, sig)
+        mask = vein_mask(ratio, region, args.darker, args.dilate)
+    else:
+        sig = tuple(args.local_fwhm / 2.3548 / z for z in zyx)
+        with spinner("Local tissue fit", enabled=args.verb >= 1):
+            ratio, expected = local_tissue_darkness(mean, tissue, brain, sig)
+        with spinner("Ridge shapes", enabled=args.verb >= 1):
+            thin, shape, ridge = dark_shapes(ratio, brain, zyx)
+        mask = ridge_follow_mask(
+            ratio, region, thin, ridge, seed=1.0 - args.darker, grow=1.0 - args.grow
+        )
+        for _ in range(args.dilate):
+            mask = _dilate6(mask)
+        extra = {"thin": thin, "shape": torch.where(mask, shape, torch.zeros_like(shape))}
     core = region & (ratio < 1.0 - args.darker)
-    mask = vein_mask(ratio, region, args.darker, args.dilate)
 
     if args.verb >= 1:
-        lv = levels.tolist()
-        print(f"  tissue levels before bias: GM {lv[0]:.0f}, WM {lv[1]:.0f}, CSF {lv[2]:.0f}")
+        if args.model == "global":
+            lv = levels.tolist()
+            print(f"  tissue levels before bias: GM {lv[0]:.0f}, WM {lv[1]:.0f}, CSF {lv[2]:.0f}")
+        nreg = max(int(region.sum()), 1)
         print(
-            f"  region {int(region.sum())} voxels; {int(core.sum())} "
-            f"({float(core.sum()) / max(int(region.sum()), 1):.1%}) > {args.darker:g} darker "
-            f"than predicted; mask after dilation {int(mask.sum())}"
+            f"  region {nreg} voxels; {int(core.sum())} ({float(core.sum()) / nreg:.1%}) > "
+            f"{args.darker:g} darker than predicted; mask {int(mask.sum())} "
+            f"({float(mask.sum()) / nreg:.1%})"
         )
-    for name, vol in (
-        ("mask", mask.to(torch.uint8)),
-        ("ratio", ratio),
-        ("expected", expected),
-        ("region", region.to(torch.uint8)),
-    ):
+        if extra:
+            sh = extra["shape"][mask]
+            print(
+                "  mask shapes: "
+                + ", ".join(
+                    f"{n} {float((sh == v).float().mean()):.0%}"
+                    for v, n in ((1, "plate"), (2, "tube"), (3, "blob"))
+                )
+            )
+    outs = {
+        "mask": mask.to(torch.uint8),
+        "ratio": ratio,
+        "expected": expected,
+        "region": region.to(torch.uint8),
+        **extra,
+    }
+    for name, vol in outs.items():
         save_image(vol, f"{args.prefix}_{name}.nii.gz", header_info=header)
     if args.verb >= 1:
-        print(
-            f"  wrote {args.prefix}_{{mask,ratio,expected,region}}.nii.gz ({time.time() - t0:.1f}s)"
-        )
+        print(f"  wrote {args.prefix}_{{{','.join(outs)}}}.nii.gz ({time.time() - t0:.1f}s)")
 
 
 if __name__ == "__main__":

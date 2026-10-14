@@ -77,3 +77,75 @@ def test_cli_writes_the_mask_from_tissue_files(tmp_path):
     v = vein.numpy()
     assert got[v].mean() > 0.9
     assert got.sum() < 2 * v.sum()
+
+
+def test_local_levels_survive_contrast_that_drifts_across_the_slab():
+    """The global model's failure on ds003427: GM/WM contrast that changes across the
+    slab reads as darkness in a whole region. Fitted locally, the levels follow it and
+    only the veins stay dark."""
+    from fastfuncstuff.processing.veinmask import local_tissue_darkness
+
+    img, tissue, vein = _phantom()
+    n = img.shape[0]
+    # GM brightness halves from the top slice to the bottom one, WM and CSF do not
+    drift = torch.linspace(0.5, 1.0, n)[:, None, None]
+    gm, wm, csf = tissue
+    flat = 1000 * gm + 650 * wm + 1300 * csf
+    img = img * (1000 * gm * drift + 650 * wm + 1300 * csf) / flat
+    brain = torch.ones_like(vein)
+    region = vein_region(tissue, brain)
+    g_ratio, _, _ = tissue_darkness(img, tissue, brain, (6.0, 6.0, 6.0))
+    l_ratio, _ = local_tissue_darkness(img, tissue, brain, (2.0, 2.0, 2.0))
+    gm_ok = (gm > 0.5) & ~vein
+    false_global = float((region & gm_ok & (g_ratio < 0.8)).float().mean() / gm_ok.float().mean())
+    false_local = float((region & gm_ok & (l_ratio < 0.8)).float().mean() / gm_ok.float().mean())
+    assert false_global > 0.05  # the bottom slices read dark
+    assert false_local < 0.005
+    assert float((l_ratio[vein] < 0.7).float().mean()) > 0.95
+
+
+def _line_volume():
+    """Darkness-ratio volume: a sheet, a tube through the slices and a dot, in flat 1."""
+    n = 32
+    r = torch.ones(n, n, n)
+    r[:, 6, 4:28] = 0.5  # sheet: thin in y only
+    r[2:30, 20, 20] = 0.5  # tube: thin in y and x, long in z
+    r[16, 26, 8] = 0.4  # blob
+    return r
+
+
+def test_dark_shapes_names_plate_tube_and_blob():
+    from fastfuncstuff.processing.veinmask import dark_shapes
+
+    r = _line_volume()
+    brain = torch.ones_like(r, dtype=torch.bool)
+    thin, shape, ridge = dark_shapes(r, brain, (0.8, 0.8, 0.8))
+    assert int(shape[16, 6, 16]) == 1
+    assert int(shape[16, 20, 20]) == 2
+    assert int(shape[16, 26, 8]) == 3
+    # the centre line is a ridge, its neighbour across the thin direction is not
+    assert bool(ridge[16, 20, 20]) and not bool(ridge[16, 21, 20])
+    assert float(thin[16, 20, 20]) > 10 * float(thin[16, 20, 26])
+
+
+def test_ridge_following_fills_a_faint_middle_but_not_the_halo():
+    """A vessel through slices, dark at one end and only faintly dark along the rest
+    (partial volume), with the smooth radial halo a real vessel has, in noise. The
+    whole centre line joins the dark end; the halo voxels beside the faint part, which
+    are dark enough for plain hysteresis, do not."""
+    from fastfuncstuff.processing.veinmask import dark_shapes, ridge_follow_mask
+
+    g = torch.Generator().manual_seed(0)
+    n = 32
+    z, y, x = torch.meshgrid(*(torch.arange(n, dtype=torch.float32),) * 3, indexing="ij")
+    depth = torch.where(z < 8, 0.5, 0.22) * ((z >= 2) & (z < 30))
+    r = 1 - depth * torch.exp(-((y - 16) ** 2 + (x - 16) ** 2) / (2 * 0.7**2))
+    r = r + 0.03 * torch.randn(n, n, n, generator=g)
+    brain = torch.ones_like(r, dtype=torch.bool)
+    thin, _, ridge = dark_shapes(r, brain, (0.8, 0.8, 0.8))
+    m = ridge_follow_mask(r, brain, thin, ridge, seed=0.7, grow=0.85)
+    assert bool(m[2:30, 16, 16].all())  # the whole centre line
+    halo = torch.stack(
+        [m[10:28, 16 + dy, 16 + dx] for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1))]
+    )
+    assert int(halo.sum()) == 0

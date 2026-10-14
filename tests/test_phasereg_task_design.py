@@ -45,3 +45,45 @@ def test_empty_condition_changes_nothing():
     base = run(onsets)
     padded = run([*onsets, [np.array([])]])
     assert float((base - padded).abs().max()) < 1e-3
+
+
+def test_fit_task_model_runs_and_ignores_empty_conditions():
+    """-task_removal fit:N (canonical + N time derivatives, locomoco's -detask fit
+    model) feeds the residual phi. An all-zero condition must change nothing."""
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.phasereg.core import phase_regress
+
+    rng = np.random.default_rng(1)
+    n_tp, n_vox, tr = 120, 40, 2.0
+    task = np.sin(np.arange(n_tp) * tr * 2 * np.pi / 40.0)
+    pha = 0.05 * task[:, None] + 0.02 * rng.standard_normal((n_tp, n_vox))
+    mag = 1000 + 600 * pha + 3 * rng.standard_normal((n_tp, n_vox))
+    m, p = (torch.tensor(a, dtype=torch.float32) for a in (mag, pha))
+    ons = [[np.arange(10.0, 230.0, 40.0)]]
+
+    def run(o, mode):
+        return phase_regress(
+            m, p, tr, task_removal=mode, onsets_per_condition=o,
+            durations_per_condition=[20.0] * len(o), phi_method="residual",
+            max_slope_ratio=None, device=torch.device("cpu"),
+        )  # fmt: skip
+
+    r2 = run(ons, "fit:2")
+    assert torch.isfinite(r2.phi[r2.voxel_mask]).all()
+    padded = run([*ons, [np.array([])]], "fit:2")
+    assert float((r2.magnitude_corrected - padded.magnitude_corrected).abs().max()) < 1e-3
+
+
+def test_task_removal_arg_rejects_garbage():
+    import argparse
+
+    import pytest
+
+    from fastfuncstuff.cli.phasereg import _task_removal_arg
+
+    assert _task_removal_arg("fit:2") == "fit:2"
+    assert _task_removal_arg("FIT") == "fit"
+    with pytest.raises(argparse.ArgumentTypeError):
+        _task_removal_arg("fit:x")

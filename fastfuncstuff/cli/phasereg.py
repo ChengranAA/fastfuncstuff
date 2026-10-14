@@ -93,6 +93,17 @@ IF VEINS SURVIVE, read prefix_slope at the vein:
 """
 
 
+def _task_removal_arg(value: str) -> str:
+    v = value.strip().lower()
+    if v in ("none", "tent", "canonical", "fit"):
+        return v
+    if v.startswith("fit:") and v[4:].isdigit():
+        return v
+    raise argparse.ArgumentTypeError(
+        f"-task_removal: expected none, tent, canonical or fit[:N], got {value!r}"
+    )
+
+
 def create_parser() -> argparse.ArgumentParser:
     parser = FfsArgumentParser(
         description=_DESCRIPTION,
@@ -197,9 +208,14 @@ def create_parser() -> argparse.ArgumentParser:
     )
     task.add_argument(
         "-task_removal",
-        choices=["none", "tent", "canonical"],
+        type=_task_removal_arg,
         default="none",
-        help="'tent': FIR basis, model-free. 'canonical': SPM HRF.",
+        metavar="{none,tent,canonical,fit[:N]}",
+        help="'tent': FIR basis, model-free. 'canonical': SPM HRF. 'fit:N': canonical "
+        "plus N time derivatives per condition (1 absorbs a few hundred ms of latency, "
+        "2 adds width), one DoF each: locomoco's -detask fit:N model. For phi, which "
+        "is a per-voxel ratio of residual variances from one design, a compact model "
+        "is enough; TENT spends many regressors.",
     )
     task.add_argument(
         "-onsets",

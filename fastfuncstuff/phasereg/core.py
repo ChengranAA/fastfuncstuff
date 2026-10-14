@@ -364,8 +364,8 @@ def phase_regress(
         Phase time series (radians, unwrapped), same shapes as magnitude.
     tr : float
         Repetition time in seconds.
-    task_removal : {"none", "tent", "canonical"}
-        Task model. Feeds the phi estimate (``phi_method="residual"``) and,
+    task_removal : {"none", "tent", "canonical", "fit[:N]"}
+        Task model. "fit:N" = canonical plus N time derivatives per condition. Feeds the phi estimate (``phi_method="residual"``) and,
         only with ``slope_on="residual"``, the slope fit.
     onsets_per_condition : list of list of ndarray, optional
         Onset times structured as [condition][run] -> ndarray.
@@ -615,9 +615,30 @@ def phase_regress(
             device,
             durations_per_condition,
         )
+    elif task_removal == "fit" or task_removal.startswith("fit:"):
+        # locomoco's -detask fit:N model: the canonical design plus N time
+        # derivatives per condition (one DoF each), via the shared builder. phi is a
+        # ratio of two residual variances from the SAME design, per voxel, so its
+        # degrees of freedom cancel; a FIR/TENT model would spend many more.
+        if onsets_per_condition is None:
+            raise ValueError(f"task_removal={task_removal!r} requires onsets_per_condition")
+        from fastfuncstuff.stats.task_coupling import design_fit_basis
+
+        n_deriv = int(task_removal.split(":", 1)[1]) if ":" in task_removal else 0
+        canon = _build_task_design_canonical(
+            onsets_per_condition, tr, n_tp_per_run, device, durations_per_condition
+        )
+        task_per_run = [
+            None
+            if t is None
+            else design_fit_basis(t, max(max_poly_degree, 0), n_deriv=n_deriv, device=device).to(
+                torch.float32
+            )
+            for t in canon
+        ]
     elif task_removal != "none":
         raise ValueError(
-            f"Unknown task_removal: {task_removal!r}. Use 'none', 'tent', or 'canonical'."
+            f"Unknown task_removal: {task_removal!r}. Use 'none', 'tent', 'canonical' or 'fit[:N]'."
         )
     has_task = any(t is not None for t in task_per_run)
 

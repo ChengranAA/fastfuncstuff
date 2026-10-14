@@ -479,6 +479,15 @@ Examples:
         "-nocmass", action="store_true", help="Disable center-of-mass pre-alignment"
     )
     search_group.add_argument(
+        "-use_headers",
+        action="store_true",
+        help="Trust the headers' placement, rotation (obliquity) included: start "
+        "there, no cmass, and search a small range around it (= -nocmass "
+        "-smallrange). For images from the same session, or the same scanner "
+        "with a shared landmark, where the headers are already within a few mm. "
+        "Without it the headers' placement is still always one of the candidates.",
+    )
+    search_group.add_argument(
         "-cmass_direct",
         "-cmass-direct",
         type=float,
@@ -944,7 +953,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             0.25
             if args.verysmallrange
             else 0.5
-            if args.smallrange
+            if args.smallrange or args.use_headers
             else 1.5
             if args.hugerange
             else 1.0
@@ -954,7 +963,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         adam_iters_2x=adam_iters_2x,
         adam_iters_1x=adam_iters_1x,
         powell_maxfev=powell_maxfev,
-        cmass=not args.nocmass and init_matrix is None,
+        cmass=not (args.nocmass or args.use_headers) and init_matrix is None,
         cmass_direct=(tuple(args.cmass_direct) if args.cmass_direct is not None else None),
         interp=args.interp,
         final_interp=args.final_interp,
@@ -977,7 +986,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         if init_path is not None:
             print(f"  Start: {init_path} (center of mass off)")
         else:
-            print(f"  Center of mass: {'off' if args.nocmass else 'on'}")
+            print(f"  Center of mass: {'off' if args.nocmass or args.use_headers else 'on'}")
         print(f"  Estimation interpolation: {args.interp}")
         print(f"  Final interpolation: {args.final_interp}")
         print(f"  Device: {device}")

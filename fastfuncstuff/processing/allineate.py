@@ -3399,6 +3399,65 @@ def _align_device(base: Tensor, config: AffineAlignConfig) -> torch.device:
     return torch.device(config.device) if config.device is not None else base.device
 
 
+def _header_or_cmass_start(
+    setup: _GridSetup,
+    base: Tensor,
+    base_header: dict | None,
+    source_native: Tensor,
+    source_header: dict | None,
+    config: AffineAlignConfig,
+    device: torch.device,
+    verb: int,
+    *,
+    force_cross_grid: bool = False,
+) -> tuple[_GridSetup, AffineAlignConfig]:
+    """Start where the headers put the source, unless the cmass shift scores better.
+
+    The cmass shift is a guess from two centroids. With partial slabs they do not
+    correspond: on ds003427 a posterior MP2RAGE slab against an oblique EPI slab
+    from the same session, headers within 4 mm, cmass moved the source by several
+    cm and the search settled 45 degrees off. Same-session (and same-landmark)
+    headers already carry the rotation and the position, so they get their own
+    start. The two cannot share one setup: the source is resampled, and its
+    validity mask built, at the start, so a header candidate scored inside the
+    cmass setup is judged against a field of view already cut away. Hence two
+    preparations and one cost each, at the identity residual."""
+    if not np.any(setup.cmass_shift != 0.0) or config.cmass_direct is not None:
+        return setup, config
+    hdr_config = replace(config, cmass=False)
+    hdr = _prepare_grid(
+        base, base_header, source_native, source_header, hdr_config, device, 0,
+        force_cross_grid=force_cross_grid,
+    )  # fmt: skip
+
+    def _start_cost(stp: _GridSetup) -> float:
+        # On a 2-voxel blur, like the coarse pass: far from the answer the sharp
+        # local costs are near zero for both starts, and the blur widens the basin.
+        sigma = 2.0
+        vmean = sum(stp.voxdims) / 3.0
+        rad = stp.ctx.blokrad_mm
+        with torch.no_grad():
+            return float(
+                _compute_cost(
+                    _separable_smooth_3d(stp.base_opt, sigma),
+                    _separable_smooth_3d(stp.source_opt, sigma),
+                    stp.weight_opt,
+                    stp.ctx,
+                    stp.voxdims,
+                    blokrad_mm=math.sqrt(rad**2 + (sigma * vmean) ** 2) if rad else None,
+                )
+            )
+
+    c_cmass, c_hdr = _start_cost(setup), _start_cost(hdr)
+    use_hdr = c_hdr >= c_cmass
+    if verb >= 1:
+        print(
+            f"  Start: headers cost {c_hdr:.4f}, headers + cmass {c_cmass:.4f} "
+            f"-> {'headers' if use_hdr else 'cmass'}"
+        )
+    return (hdr, hdr_config) if use_hdr else (setup, config)
+
+
 def _align(
     base: Tensor,
     source: Tensor,
@@ -3438,6 +3497,10 @@ def _align(
         save_weight_path=None if full_to_work is not None else save_weight_path,
         force_cross_grid=full_to_work is not None,
     )
+    setup, config = _header_or_cmass_start(
+        setup, base, base_header, source_native, source_header, config, device, verb,
+        force_cross_grid=full_to_work is not None,
+    )  # fmt: skip
     base_opt, source_opt, weight_opt = setup.base_opt, setup.source_opt, setup.weight_opt
     weight = setup.weight
     ctx, voxdims, bounds, sample = setup.ctx, setup.voxdims, setup.bounds, setup.sample

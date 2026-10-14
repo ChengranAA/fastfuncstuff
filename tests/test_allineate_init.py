@@ -99,3 +99,39 @@ def test_without_a_start_the_header_error_is_not_recovered(tmp_path):
     base_aff, src_aff, true_aff = _pair(tmp_path, 24.0)
     out = _solve(tmp_path, "-nocmass")
     assert _error_mm(out, base_aff, src_aff, true_aff) > 10.0
+
+
+def _slab_pair(tmp_path):
+    """A base, and a partial slab of the same object on a padded grid whose header
+    is RIGHT: only the first half along y was acquired. Its centre of mass sits far
+    from the base's, so a cmass start moves it away from where the headers had it."""
+    rng = np.random.default_rng(0)
+    from scipy import ndimage as ndi
+
+    vol = ndi.gaussian_filter(rng.standard_normal((32, 32, 32)), 1.5).astype(np.float32)
+    vol = (vol - vol.min()) * (_phantom() > 0)
+    base_aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    base_aff[:3, 3] = -32.0
+    slab = np.pad(vol, 1)[:, 17:]  # (z, y, x): a field of view of one half in y
+    true_aff = base_aff.copy()
+    true_aff[:3, 3] -= 2.0
+    true_aff[1, 3] += 17 * 2.0
+    nib.save(nib.Nifti1Image(vol.transpose(2, 1, 0), base_aff), str(tmp_path / "base.nii"))
+    nib.save(nib.Nifti1Image(slab.transpose(2, 1, 0), true_aff), str(tmp_path / "src.nii"))
+    return base_aff, true_aff, true_aff
+
+
+def test_the_header_placement_is_always_a_candidate(tmp_path):
+    """Bug of record (ds003427): a posterior MP2RAGE slab against an oblique EPI
+    slab, same session, headers within 4 mm. cmass moved the source several cm and
+    the search settled 45 degrees off; the headers' own placement was never tried."""
+    base_aff, src_aff, true_aff = _slab_pair(tmp_path)
+    out = tmp_path / "out.aff12.1D"
+    main(
+        [
+            "-base", str(tmp_path / "base.nii"), "-source", str(tmp_path / "src.nii"),
+            "-prefix", str(tmp_path / "out.nii"), "-1Dmatrix_save", str(out),
+            "-rigid", "-cost", "ls", "-device", "cpu", "-final", "linear", "-verb", "1",
+        ]
+    )  # fmt: skip
+    assert _error_mm(out, base_aff, src_aff, true_aff) < 1.0

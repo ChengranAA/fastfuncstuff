@@ -29,11 +29,21 @@ from fastfuncstuff.processing.filters import (
 class TestSGFCoefficients:
     @pytest.mark.parametrize("window,order", [(5, 2), (7, 3), (11, 4), (21, 5)])
     def test_matches_scipy_smoothing_kernel(self, window, order):
-        # float32 pinv on a 21x6 Vandermonde drifts ~1e-4 from scipy's
-        # float64 reference; wider tolerance still pins the right values.
         ours = _sgf_coefficients(window, order, deriv=0).numpy()
         ref = savgol_coeffs(window, order, deriv=0)
-        np.testing.assert_allclose(ours, ref, atol=5e-4)
+        np.testing.assert_allclose(ours, ref, atol=1e-6)
+
+    @pytest.mark.parametrize("window,order", [(49, 8), (49, 12), (97, 12), (151, 37)])
+    def test_wide_kernels_stay_smoothers(self, window, order):
+        """-phase_filter explore reaches these. Raw float32 powers made the 49/8
+        kernel amplify white noise ~4000x (scipy itself fails past ~order 10), so
+        check the defining property instead: polynomials up to ``order`` pass
+        through exactly, and white noise is attenuated."""
+        k = _sgf_coefficients(window, order).double().numpy()
+        u = np.linspace(-1, 1, window)
+        for d in range(order + 1):
+            assert abs(k @ u**d - (1.0 if d == 0 else 0.0)) < 1e-5
+        assert (k**2).sum() < 0.5
 
     def test_kernel_sums_to_one(self):
         """A smoothing SGF kernel (deriv=0) preserves a constant signal,

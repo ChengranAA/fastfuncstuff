@@ -47,18 +47,20 @@ def _sgf_coefficients(
         raise ValueError("poly_order must be < window_length")
 
     half = window_length // 2
-    order_range = torch.arange(-half, half + 1, device=device, dtype=dtype)
-    n_terms = poly_order + 1
-
-    vander = order_range.unsqueeze(1).pow(
-        torch.arange(n_terms, device=device, dtype=dtype).unsqueeze(0)
-    )
-
-    try:
-        coeffs = torch.linalg.pinv(vander, atol=1e-7)[deriv]
-    except torch._C._LinAlgError:  # ty: ignore[unresolved-attribute]
-        coeffs = torch.zeros(window_length, device=device, dtype=dtype)
-        coeffs[half] = 1.0
+    # Float64 on a [-1, 1] grid in a Legendre basis: raw powers of the sample index
+    # in float32 reach 24**8 ~ 1e11 at window 49 / order 8, and the pinv then
+    # returned kernels amplifying white noise ~4000x instead of ~0.12x.
+    u = torch.arange(-half, half + 1, dtype=torch.float64) / max(half, 1)
+    if deriv == 0:
+        legendre = [torch.ones_like(u), u]
+        for n in range(1, poly_order):
+            legendre.append(((2 * n + 1) * u * legendre[n] - n * legendre[n - 1]) / (n + 1))
+        q = torch.linalg.qr(torch.stack(legendre[: poly_order + 1], dim=1))[0]
+        coeffs = q @ q[half]  # centre row of the local-fit hat matrix
+    else:
+        vander = u.unsqueeze(1) ** torch.arange(poly_order + 1, dtype=torch.float64)
+        coeffs = torch.linalg.pinv(vander)[deriv] / float(max(half, 1)) ** deriv
+    coeffs = coeffs.to(device=device, dtype=dtype)
     return coeffs
 
 

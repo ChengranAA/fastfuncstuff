@@ -345,6 +345,7 @@ def phase_regress(
     spr_select_run: int | None = None,
     spr_select_on: str = "data",
     spr_allow: torch.Tensor | None = None,
+    phi_calib: torch.Tensor | None = None,
     volume_shape: tuple[int, int, int] | None = None,
     mask_flat: torch.Tensor | None = None,
     device: str | torch.device = "cpu",
@@ -380,8 +381,17 @@ def phase_regress(
     phi : float, Tensor, or None
         Fixed variance ratio for Deming regression.  If None, estimated
         automatically.
-    phi_method : {"fft", "residual"}
-        How to estimate phi when phi=None.
+    phi_method : {"fft", "residual", "thermal"}
+        How to estimate phi when phi=None. "thermal": phi = c * mean(M)^2 per
+        voxel, the thermal-noise physics (magnitude SD sigma, phase SD sigma/M)
+        with one global factor c for the phase noise in excess of thermal,
+        measured as the median of var(mag res)/var(phase res)/M^2 over
+        ``phi_calib`` voxels. Not circular: c comes from voxels without vein
+        coupling, never from the voxel being fit.
+    phi_calib : Tensor (n_voxels,) bool or None
+        Calibration voxels for phi_method="thermal": ones where magnitude and
+        phase should not share a vein signal (deep white matter away from
+        veins). None: every fitted voxel, a weaker estimate.
     phi_freq_range : tuple (lo_hz, hi_hz)
         Frequency range for FFT-based noise estimation. Default 0.15 Hz to
         Nyquist, as ffs_phasereg -freq_range (Stanley 2021, phaseprep).
@@ -701,9 +711,13 @@ def phase_regress(
         )
     chunks = [(lo, min(lo + chunk_size, n_voxels)) for lo in range(0, n_voxels, chunk_size)]
 
-    def _rows(arrays: list[torch.Tensor], lo: int, hi: int) -> torch.Tensor:
-        """Voxel rows [lo, hi) of per-run (voxels, time) arrays → (time, voxels) on device."""
-        block = torch.cat([a[lo:hi].to(device, torch.float32) for a in arrays], dim=1)
+    def _rows(
+        arrays: list[torch.Tensor], lo: int, hi: int, idx: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Voxel rows [lo, hi) (or ``idx``) of per-run (voxels, time) arrays → (time,
+        voxels) on device."""
+        sel = slice(lo, hi) if idx is None else idx
+        block = torch.cat([a[sel].to(device, torch.float32) for a in arrays], dim=1)
         return block.T.contiguous()
 
     def _host(x: torch.Tensor) -> torch.Tensor:
@@ -716,17 +730,18 @@ def phase_regress(
     # ── 3–5. Unwrap, detrend (and task-residualise), SGF — per chunk ─────
     # The residual phase is filtered the same way as the detrended phase so
     # the slope is estimated and applied on consistently filtered series.
-    def _prepare(lo: int, hi: int) -> dict[str, torch.Tensor]:
-        pha = _rows(phase, lo, hi)
+    def _prepare(lo: int, hi: int, idx: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        pha = _rows(phase, lo, hi, idx)
         if unwrap_in_chunks:
             from fastfuncstuff.phasereg.conditioning import temporal_unwrap
 
             pha = temporal_unwrap(pha, n_tp_per_run)
-        mag_dt = _project_runs(_rows(magnitude, lo, hi), q_drift)
+        mag_raw = _rows(magnitude, lo, hi, idx)
+        mag_dt = _project_runs(mag_raw, q_drift)
         pha_dt = _project_runs(pha, q_drift)
         sgf_kw = dict(
             device=device,
-            chunk_size=hi - lo,
+            chunk_size=hi - lo if idx is None else int(idx.numel()),
             sgf_window_max=sgf_window_max,
             sgf_order_max=sgf_order_max,
             sgf_step=sgf_step,
@@ -735,13 +750,13 @@ def phase_regress(
         pha_filt, win, order = _apply_sgf(
             pha_dt, phase_filter, sgf_window, sgf_order, mag_detrended=mag_dt, **sgf_kw
         )
-        if sgf_window_map is not None and sgf_order_map is not None:
+        if idx is None and sgf_window_map is not None and sgf_order_map is not None:
             assert win is not None and order is not None  # explore mode returns both
             sgf_window_map[lo:hi] = win.cpu()
             sgf_order_map[lo:hi] = order.cpu()
         out = {"mag_dt": mag_dt, "pha_dt": pha_dt, "pha_filt": pha_filt}
         if has_task:
-            mag_res = _project_runs(_rows(magnitude, lo, hi), q_full)
+            mag_res = _project_runs(mag_raw, q_full)
             pha_res = _project_runs(pha, q_full)
             out["mag_res"] = mag_res
             out["pha_res_filt"] = _apply_sgf(
@@ -866,6 +881,32 @@ def phase_regress(
     # change, catches dead voxels.
     pha_var_floor = 1e-6
 
+    phi_thermal_c: float | None = None
+    if phi is None and phi_method == "thermal":
+        cal = vox_mask if phi_calib is None else (phi_calib.to(vox_mask.device) & vox_mask)
+        idx = torch.nonzero(cal).squeeze(1)
+        if idx.numel() < 100:
+            raise ValueError(f"phi_method='thermal': only {int(idx.numel())} calibration voxels")
+        if idx.numel() > 20000:  # a median needs no more; keep the pre-pass cheap
+            g = torch.Generator().manual_seed(0)
+            idx = idx[torch.randperm(idx.numel(), generator=g)[:20000]].sort().values
+        pc = _prepare(0, 0, idx)
+        m_res = pc.get("mag_res", pc["mag_dt"])
+        p_res = pc.get("pha_res_filt", pc["pha_filt"])
+        m_bar = _rows(magnitude, 0, 0, idx).mean(dim=0)
+        ratio = (
+            m_res.var(dim=0) / p_res.var(dim=0).clamp_min(1e-12) / (m_bar * m_bar).clamp_min(1e-12)
+        )
+        phi_thermal_c = float(ratio[torch.isfinite(ratio)].median())
+        if verbose:
+            src = "every fitted voxel" if phi_calib is None else "-phi_calib voxels"
+            print(
+                f"  Phi (thermal): c = {phi_thermal_c:.4g} (median over {int(idx.numel()):,} "
+                f"{src}). Pure thermal noise gives c = 1; c < 1 means the phase noise "
+                f"is {1 / max(phi_thermal_c, 1e-12) ** 0.5:.2f}x thermal, relative to the magnitude noise"
+            )
+        del pc, m_res, p_res
+
     for lo, hi in tqdm(chunks, desc="Phase regression", disable=not verbose or len(chunks) < 2):
         if stored:
             s_ = {k: v[lo:hi].to(device).T for k, v in stored.items()}
@@ -877,7 +918,10 @@ def phase_regress(
         mag = _rows(magnitude, lo, hi)
         good = vox_mask[lo:hi].to(device)
 
-        if phi is None:
+        if phi_thermal_c is not None:
+            m_bar = mag.mean(dim=0)
+            phi_c = (phi_thermal_c * m_bar * m_bar).clamp_min(1e-6)
+        elif phi is None:
             phi_c = estimate_variance_ratio(
                 mag_res, pha_res_filt, tr, method=phi_method, freq_range=phi_freq_range
             )

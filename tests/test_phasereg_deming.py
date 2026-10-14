@@ -62,3 +62,39 @@ def test_default_slope_cap_never_leaves_a_voxel_noisier():
     assert free.slope.abs().max() > 1e5
     ratio = capped.magnitude_corrected.std(dim=1) / mag.std(dim=1)
     assert ratio.max() <= 1.0 + 1e-4
+
+
+def test_thermal_phi_recovers_c_one_and_the_vein_slope():
+    """-phi_method thermal: complex data with pure thermal noise (SD sigma per
+    channel), so magnitude SD = sigma and phase SD = sigma/M, phi = M^2 and c = 1.
+    c is calibrated on non-vein voxels only; the vein voxels' Deming slope must
+    then come out unbiased, where OLS is attenuated by the phase noise."""
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.phasereg.core import phase_regress
+
+    rng = np.random.default_rng(3)
+    n_tp, n_vein, n_cal, m0, sigma, slope = 400, 200, 600, 1000.0, 10.0, 2000.0
+    drive = np.convolve(rng.standard_normal(n_tp + 20), np.ones(8) / 8, "same")[:n_tp]
+    pha_true = np.zeros((n_tp, n_vein + n_cal))
+    pha_true[:, :n_vein] = 0.01 * drive[:, None]
+    mag_true = m0 + slope * pha_true
+    z = mag_true * np.exp(1j * pha_true)
+    z = z + sigma * (rng.standard_normal(z.shape) + 1j * rng.standard_normal(z.shape))
+    mag = torch.tensor(np.abs(z).T, dtype=torch.float32)  # (voxels, time)
+    pha = torch.tensor(np.angle(z).T, dtype=torch.float32)
+    calib = torch.zeros(n_vein + n_cal, dtype=torch.bool)
+    calib[n_vein:] = True
+    res = phase_regress(
+        mag, pha, 2.0, phi_method="thermal", phi_calib=calib, max_slope_ratio=None,
+        phase_unwrap=False, device=torch.device("cpu"),
+    )  # fmt: skip
+    c = float((res.phi[n_vein:] / mag[n_vein:].mean(1) ** 2).median())
+    assert abs(c - 1.0) < 0.1
+    vein_slope = float(res.slope[:n_vein].median())
+    ols = phase_regress(
+        mag, pha, 2.0, regression="ols", phase_unwrap=False, device=torch.device("cpu")
+    )
+    assert abs(vein_slope / slope - 1.0) < 0.1
+    assert float(ols.slope[:n_vein].median()) < 0.9 * slope  # attenuated: what Deming fixes

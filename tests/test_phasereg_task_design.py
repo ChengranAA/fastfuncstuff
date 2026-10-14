@@ -20,7 +20,7 @@ def test_canonical_task_design_uses_event_durations():
 def test_empty_condition_changes_nothing():
     """Bug of record: a condition with no events in a run is an all-zero design
     column, and QR kept an arbitrary direction for it, so projecting the task out
-    removed real signal (up to 0.79 scanner units here before the fix)."""
+    removed real signal (up to 0.23 scanner units here before the fix)."""
     import numpy as np
     import torch
 
@@ -31,8 +31,8 @@ def test_empty_condition_changes_nothing():
     task = np.sin(np.arange(n_tp) * tr * 2 * np.pi / 40.0)
     pha = 0.05 * task[:, None] + 0.02 * rng.standard_normal((n_tp, n_vox))
     mag = 1000 + 30 * pha / 0.05 + 3 * rng.standard_normal((n_tp, n_vox))
-    mag_t = torch.tensor(mag, dtype=torch.float32)
-    pha_t = torch.tensor(pha, dtype=torch.float32)
+    mag_t = torch.tensor(mag.T, dtype=torch.float32)  # (voxels, time)
+    pha_t = torch.tensor(pha.T, dtype=torch.float32)
     onsets = [[np.arange(10.0, 230.0, 40.0)]]
 
     def run(ons):
@@ -60,7 +60,7 @@ def test_fit_task_model_runs_and_ignores_empty_conditions():
     task = np.sin(np.arange(n_tp) * tr * 2 * np.pi / 40.0)
     pha = 0.05 * task[:, None] + 0.02 * rng.standard_normal((n_tp, n_vox))
     mag = 1000 + 600 * pha + 3 * rng.standard_normal((n_tp, n_vox))
-    m, p = (torch.tensor(a, dtype=torch.float32) for a in (mag, pha))
+    m, p = (torch.tensor(a.T, dtype=torch.float32) for a in (mag, pha))  # (voxels, time)
     ons = [[np.arange(10.0, 230.0, 40.0)]]
 
     def run(o, mode):

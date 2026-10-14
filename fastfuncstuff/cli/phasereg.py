@@ -178,12 +178,25 @@ def create_parser() -> argparse.ArgumentParser:
     )
     reg.add_argument(
         "-phi_method",
-        choices=["fft", "residual"],
+        choices=["fft", "residual", "thermal"],
         default="fft",
-        help="'fft': noise power above -freq_range (Curtis 2014, phaseprep); safe for "
-        "task and rest. 'residual': variance after detrend, nuisance and task "
-        "removal (Knudsen 2023); on task data it needs -task_removal, or the task "
-        "counts as noise.",
+        help="'fft': noise power above -freq_range (Curtis 2014, phaseprep); at TR >= "
+        "2.5 s that band is a sliver (0.15-0.20 Hz) of aliased physiology. 'residual': "
+        "variance after detrend, nuisance and task removal (Knudsen 2023); needs "
+        "-task_removal on task data, and keeps the vein's own non-task fluctuation "
+        "(breathing, cardiac), which belongs in neither error. 'thermal': phi = c * "
+        "mean(M)^2, the thermal-noise physics (magnitude SD sigma, phase SD sigma/M) "
+        "with one global c for the excess phase noise, measured on -phi_calib voxels "
+        "(deep white matter away from veins), so the voxel being fit never sets its "
+        "own phi.",
+    )
+    reg.add_argument(
+        "-phi_calib",
+        default=None,
+        metavar="MASK",
+        help="[thermal] Calibration voxels on the magnitude's grid: where magnitude and "
+        "phase should share no vein signal, e.g. white matter fraction > 0.9 minus a "
+        "vein mask. Default: every fitted voxel (weaker: veins pull c).",
     )
     reg.add_argument(
         "-freq_range",
@@ -648,6 +661,17 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         allow = allow.flatten().astype(bool)
         spr_allow = torch.from_numpy(allow[mask_np] if mask_np is not None else allow)
+    phi_calib = None
+    if args.phi_calib:
+        cal = load_afni_mask(args.phi_calib)
+        if cal.shape != (nx, ny, nz):
+            print(
+                f"ERROR: -phi_calib shape {cal.shape} != data shape {(nx, ny, nz)}",
+                file=sys.stderr,
+            )
+            return 1
+        cal = cal.flatten().astype(bool)
+        phi_calib = torch.from_numpy(cal[mask_np] if mask_np is not None else cal)
     mag_list = list(mags.split(n_tp_per_run, dim=1))
     pha_list = list(phas.split(n_tp_per_run, dim=1))
 
@@ -830,6 +854,7 @@ def main(argv: list[str] | None = None) -> int:
         spr_select_run=args.spr_select_run,
         spr_select_on=args.spr_select_on,
         spr_allow=spr_allow,
+        phi_calib=phi_calib,
         volume_shape=(nx, ny, nz),
         mask_flat=mask_flat,
         device=str(device),

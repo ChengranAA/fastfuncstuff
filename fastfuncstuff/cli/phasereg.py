@@ -140,7 +140,8 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="R",
         help="Cap the Deming |A| at R times the voxel's OLS slope; 0 = no cap. "
         "Residual variance is lowest at the OLS slope and back to the input's at "
-        "2x, so R=2 never leaves a voxel noisier than it was. Uncapped, Deming "
+        "2x, so R=2 cannot raise the variance of the series it was fit on (a "
+        "bound on explosions, not on other runs or on tissue signal). Uncapped, Deming "
         "goes to ~1e9 where magnitude and phase are uncorrelated (5.8%% of "
         "MindsEye voxels had a >10 sd removal). MindsEye split-half, share of the "
         "task effect kept: veins 0.84 OLS / 0.71 R=2 / 0.65 R=3 / 0.59 R=10; "

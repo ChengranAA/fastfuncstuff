@@ -390,8 +390,10 @@ def phase_regress(
     max_slope_ratio : float or None
         Cap |slope| at this multiple of the voxel's OLS slope (Deming only).
         The residual variance of ``mag - A*phase`` is smallest at the OLS slope
-        and is back to the input's at twice it, so the default 2 can never
-        leave a voxel noisier than it found it. Uncapped, the Deming slope
+        and is back to the input's at twice it, so the default 2 cannot raise
+        the variance of the series the slope was fit on. That is all it
+        guarantees: another run, or task-preserved data when the slope came
+        from task residuals, can still get noisier. Uncapped, the Deming slope
         diverges (diff/SXY as SXY -> 0) wherever magnitude and phase are
         uncorrelated but SYY > phi*SXX. None: no cap.
     slope_on : {"data", "residual"}

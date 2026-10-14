@@ -3399,6 +3399,9 @@ def _align_device(base: Tensor, config: AffineAlignConfig) -> torch.device:
     return torch.device(config.device) if config.device is not None else base.device
 
 
+_CMASS_START_MARGIN = 1.25
+
+
 def _header_or_cmass_start(
     setup: _GridSetup,
     base: Tensor,
@@ -3449,7 +3452,10 @@ def _header_or_cmass_start(
             )
 
     c_cmass, c_hdr = _start_cost(setup), _start_cost(hdr)
-    use_hdr = c_hdr >= c_cmass
+    # The headers are the prior; cmass is a guess from two centroids. On ds003427
+    # sub-05 a 2.5% start-cost edge sent cmass 29 mm off, while correct header
+    # starts won by 1.4-9x, so cmass has to win clearly.
+    use_hdr = c_cmass < _CMASS_START_MARGIN * c_hdr
     if verb >= 1:
         print(
             f"  Start: headers cost {c_hdr:.4f}, headers + cmass {c_cmass:.4f} "

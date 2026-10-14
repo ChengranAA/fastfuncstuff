@@ -3906,7 +3906,7 @@ def _stage_phasereg(plan: Plan) -> str:
             "# Vein candidates for -spr: cortex and pial CSF darker in the EPI than the",
             "# anat's tissue fractions predict (ffs_veinmask). Only there may a voxel",
             "# borrow a neighbour's phase; elsewhere its own phase is used.",
-            f'[ -f "{d}/veinmask_mask.nii.gz" ] || \\',
+            f'[ -f "{d}/veinmask_mask.nii$FINAL_FMT" ] || \\',
             _ffs(
                 "ffs_veinmask",
                 [
@@ -3918,13 +3918,13 @@ def _stage_phasereg(plan: Plan) -> str:
                 ],
             ),
         ]
-        spr = ["-spr", f'-spr_mask "{d}/veinmask_mask.nii.gz"']
+        spr = ["-spr", f'-spr_mask "{d}/veinmask_mask.nii$FINAL_FMT"']
         first = next(iter(tasks.values()))[0]
         qc.append(
             f'qc_tcat "{d}/QC.veinmask.nii.gz" "epi expected ratio region mask" '
-            f'"{_final_mean(_frag(first))}" "{d}/veinmask_expected.nii.gz" '
-            f'"{d}/veinmask_ratio.nii.gz" "{d}/veinmask_region.nii.gz" '
-            f'"{d}/veinmask_mask.nii.gz"'
+            f'"{_final_mean(_frag(first))}" "{d}/veinmask_expected.nii$FINAL_FMT" '
+            f'"{d}/veinmask_ratio.nii$FINAL_FMT" "{d}/veinmask_region.nii$FINAL_FMT" '
+            f'"{d}/veinmask_mask.nii$FINAL_FMT"'
         )
     elif opt.phasereg_veins == "auto":
         out.append("# No anat tissue maps (-tissue / -presurf): plain phase regression, no -spr.")
@@ -3935,7 +3935,7 @@ def _stage_phasereg(plan: Plan) -> str:
         how = "own phase only, no sPR: no anat tissue maps for a vein mask (-tissue)"
     else:
         how = "own phase only, no sPR (-phasereg_veins off)"
-    out.append(f"echo 'phasereg: {how}; Deming slope capped at 2x OLS, phi from FFT noise'")
+    out.append(f"echo 'phasereg: {how}; Deming slope, phi from FFT noise, no slope cap'")
     if extra:
         out.append(f"echo 'phasereg: extra options {shlex.quote(opt.phasereg_opts)[1:-1]}'")
     for task, prs in tasks.items():

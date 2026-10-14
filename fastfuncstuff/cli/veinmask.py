@@ -14,7 +14,14 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser
-from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    input_nifti_ext,
+    parse_prefix,
+    setup_device,
+    spinner,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -51,7 +58,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "grid: resampled onto the EPI's through the headers (smoothed to the EPI voxel "
         "size first when finer, so the fractions stay partial-volume fractions)",
     )
-    p.add_argument("-prefix", required=True, help="output prefix")
+    p.add_argument(
+        "-prefix",
+        required=True,
+        help="output prefix; an extension (.nii, .nii.gz, .nii.zst) sets the format, "
+        "else the first -epi's format is kept",
+    )
     p.add_argument(
         "-mask",
         help="brain mask on the EPI grid (default: EPI above 20%% of its 98th percentile)",
@@ -228,10 +240,11 @@ def main(argv: list[str] | None = None) -> None:
         "region": region.to(torch.uint8),
         **extra,
     }
+    pfx = parse_prefix(args.prefix, default_ext=input_nifti_ext(args.epi[0]))
     for name, vol in outs.items():
-        save_image(vol, f"{args.prefix}_{name}.nii.gz", header_info=header)
+        save_image(vol, f"{pfx.stem}_{name}{pfx.nifti_ext}", header_info=header)
     if args.verb >= 1:
-        print(f"  wrote {args.prefix}_{{{','.join(outs)}}}.nii.gz ({time.time() - t0:.1f}s)")
+        print(f"  wrote {pfx.stem}_{{{','.join(outs)}}}{pfx.nifti_ext} ({time.time() - t0:.1f}s)")
 
 
 if __name__ == "__main__":

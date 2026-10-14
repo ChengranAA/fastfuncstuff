@@ -149,3 +149,23 @@ def test_ridge_following_fills_a_faint_middle_but_not_the_halo():
         [m[10:28, 16 + dy, 16 + dx] for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1))]
     )
     assert int(halo.sum()) == 0
+
+
+def test_cli_outputs_inherit_the_epi_format(tmp_path):
+    """autoproc -final_format zst hands ffs_veinmask .nii.zst means and a bare prefix;
+    the outputs must come back as .nii.zst, which is the name autoproc then reads."""
+    from fastfuncstuff.cli.veinmask import main
+    from fastfuncstuff.processing.io import save_image
+
+    img, tissue, _ = _phantom()
+    hdr = {"affine": np.diag([0.8, 0.8, 0.8, 1.0])}
+    epi = tmp_path / "epi.nii.zst"
+    save_image(img, str(epi), header_info=hdr)
+    paths = []
+    for k in range(3):
+        p = tmp_path / f"c{k + 1}.nii.zst"
+        save_image(tissue[k], str(p), header_info=hdr)
+        paths.append(str(p))
+    main(["-epi", str(epi), "-tissue", *paths, "-prefix", str(tmp_path / "vm"),
+          "-device", "cpu", "-verb", "0"])  # fmt: skip
+    assert (tmp_path / "vm_mask.nii.zst").exists() and not (tmp_path / "vm_mask.nii.gz").exists()

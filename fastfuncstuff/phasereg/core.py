@@ -324,7 +324,7 @@ def phase_regress(
     phi_method: str = "fft",
     phi_freq_range: tuple[float, float | None] = (0.15, None),
     regression: str = "deming",
-    max_slope_ratio: float | None = 2.0,
+    max_slope_ratio: float | None = None,
     slope_on: str = "data",
     tent_window: float = 20.0,
     phase_filter: str = "none",
@@ -399,13 +399,12 @@ def phase_regress(
         Regression method.
     max_slope_ratio : float or None
         Cap |slope| at this multiple of the voxel's OLS slope (Deming only).
-        The residual variance of ``mag - A*phase`` is smallest at the OLS slope
-        and is back to the input's at twice it, so the default 2 cannot raise
-        the variance of the series the slope was fit on. That is all it
-        guarantees: another run, or task-preserved data when the slope came
-        from task residuals, can still get noisier. Uncapped, the Deming slope
-        diverges (diff/SXY as SXY -> 0) wherever magnitude and phase are
-        uncorrelated but SYY > phi*SXX. None: no cap.
+        Default None: no cap, as in the literature and phaseprep; the cap is
+        ours and kept for comparison. At 2x OLS the residual variance of
+        ``mag - A*phase`` is back to the input's, so a binding cap means no net
+        correction. Uncapped, the Deming slope diverges (diff/SXY as SXY -> 0)
+        wherever magnitude and phase are uncorrelated but SYY > phi*SXX: the
+        cure is a phi that is right, not a bound on A.
     slope_on : {"data", "residual"}
         Series the slope is fit on. "data" (default; Menon 2002, Stanley
         2021, Knudsen 2023): detrended, task preserved, because a vein's

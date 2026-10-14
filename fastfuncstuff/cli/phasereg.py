@@ -54,8 +54,7 @@ RECIPES
     the GE+SE shared response against ~70% for plain PR, and unrestricted -spr removes about a third of tissue
     response. ffs_autoproc -phasereg does plain PR unless -phasereg_veins auto.
   Drop vein voxels instead of correcting them: add -vein_mask.
-  phaseprep / Stanley 2021 parity:  -polort 1 -shrink odr -no_phase_unwrap \
-                                    -max_slope_ratio 0
+  phaseprep / Stanley 2021 parity:  -polort 1 -shrink odr -no_phase_unwrap
 """
 
 # Printed at the end of -h: what each output is for and how to read it. Flag
@@ -148,16 +147,15 @@ def create_parser() -> argparse.ArgumentParser:
     reg.add_argument(
         "-max_slope_ratio",
         type=float,
-        default=2.0,
+        default=0.0,
         metavar="R",
-        help="Cap the Deming |A| at R times the voxel's OLS slope; 0 = no cap. "
-        "Residual variance is lowest at the OLS slope and back to the input's at "
-        "2x, so R=2 cannot raise the variance of the series it was fit on (a "
-        "bound on explosions, not on other runs or on tissue signal). Uncapped, Deming "
-        "goes to ~1e9 where magnitude and phase are uncorrelated (5.8%% of "
-        "MindsEye voxels had a >10 sd removal). MindsEye split-half, share of the "
-        "task effect kept: veins 0.84 OLS / 0.71 R=2 / 0.65 R=3 / 0.59 R=10; "
-        "controls 0.98 / 0.97 / 0.96 / 0.94.",
+        help="Cap the Deming |A| at R times the voxel's OLS slope; 0 (default) = no "
+        "cap, as in every published method and in phaseprep. The cap is our own "
+        "invention (2026-10-12), not from the literature. At R=2 the residual "
+        "variance is back to the input's, so the fit removes exactly what it adds: "
+        "where it binds, the voxel is not corrected in net. It hides an "
+        "unidentified slope (magnitude and phase near-uncorrelated); it does not "
+        "fix one. Kept for comparison only.",
     )
     reg.add_argument(
         "-shrink",

@@ -48,7 +48,7 @@ class Options:
     # chain at the final resample. Nothing between those two points touches it.
     phase_proc: bool = False
     phase_drift: bool = True  # -phase_proc: ffs_phasedrift after ROMEO
-    # Phase regression after stage10, into phasereg/ (and a GLM on its output).
+    # Phase regression after stage10, into phasereg_NN/ (and a GLM on its output).
     phasereg: bool = False
     phasereg_opts: str = ""
     # "auto": sPR restricted to ffs_veinmask's candidates when tissue maps exist.

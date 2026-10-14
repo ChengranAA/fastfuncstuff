@@ -46,16 +46,22 @@ UPSTREAM, in order (phase in radians, voxel-matched to the magnitude):
   phase noise several times thermal and weakens every slope.
 
 RECIPES
-  GLM input (the usual case):
+  GLM input (the usual case): stable, an even suppression (~10% on 0.8 mm 7T):
     ffs_phasereg -magnitude run*_mag.nii.zst -phase run*_phase.nii.zst \\
                  -prefix pr -keep_drift
-  Veins survive, sub-mm 7T (EXPERIMENTAL): -spr -spr_mask VEINS (see -spr),
-    VEINS from a GRE/SWI vein mask or ffs_veinmask. Neither is validated yet:
-    in a first ds003427 rescoring (2 of 4 subjects) vein-masked sPR kept ~45% of
-    the GE+SE shared response against ~70% for plain PR, and unrestricted -spr removes about a third of tissue
-    response. ffs_autoproc -phasereg does plain PR unless -phasereg_veins auto.
+  Firmer inside plausible veins, conservative elsewhere (what ffs_autoproc
+    -phasereg_veins auto runs): VEINS from ffs_veinmask (or a GRE/SWI mask); the
+    voxels in it may borrow a neighbour's phase, fit by OLS (-spr_regression):
+    ... -spr -spr_mask VEINS -spr_select_on residual -task_removal fit:2 \\
+        -events run*_events.tsv
+    Donors chosen on task residuals so a neighbour cannot win by carrying the task.
+    On ds003427 (0.8 mm 7T, TR 2.5 s) this cut the pial GE/SE excess modestly,
+    mostly after NORDIC (veins kept 0.64-0.90, tissue 0.79-0.91).
   Drop vein voxels instead of correcting them: add -vein_mask.
   phaseprep / Stanley 2021 parity:  -polort 1 -shrink odr -no_phase_unwrap
+  Expect little per voxel at sub-mm, slow TR: magnitude-phase correlation is
+    near chance in most voxels, so no phi makes a per-voxel slope reliable; the
+    defaults damp what the data cannot support rather than cap it.
 """
 
 # Printed at the end of -h: what each output is for and how to read it. Flag
@@ -65,7 +71,7 @@ _EPILOG = """\
 OUTPUTS  (4D files are written per run as prefix_<name>_run-NN when several
 runs go in; -concat_output gives one file. 3D maps are one per fit.)
 
-  prefix_corrected (4D)  The deliverable: magnitude minus A*phase. Drift is
+  prefix_corrected (4D)  The deliverable: magnitude minus s*A*phase. Drift is
       dropped and the series re-centred on its mean, unless -keep_drift.
   prefix_macro_std (3D)  Temporal std of what was subtracted: THE QC overlay.
       It should trace pial veins and sinuses, not a diffuse haze; a haze means

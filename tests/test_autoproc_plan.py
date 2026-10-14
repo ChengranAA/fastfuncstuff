@@ -3116,22 +3116,22 @@ def test_phasereg_stage_writes_into_its_folder_with_vein_mask_and_glm(tmp_path: 
     )
 
     stage = s.split("phasereg: phase regression")[1].split("stage12: GLM")[0]
-    assert "mkdir -p phasereg" in stage
+    assert "select_phasereg_dir" in stage and "phasereg_[0-9][0-9]" in stage
     assert "ffs_veinmask" in stage and "-tissue /t/c1.nii.gz /t/c2.nii.gz /t/c3.nii.gz" in stage
-    assert '-prefix "phasereg/veinmask"' in stage
-    assert '-prefix "phasereg/task-floc"' in stage and "-keep_drift" in stage
-    assert '-spr_mask "phasereg/veinmask_mask.nii$FINAL_FMT"' in stage
+    assert '-prefix "$PHASEREG_DIR/veinmask"' in stage
+    assert '-prefix "$PHASEREG_DIR/task-floc"' in stage and "-keep_drift" in stage
+    assert '-spr_mask "$PHASEREG_DIR/veinmask_mask.nii$FINAL_FMT"' in stage
     assert "-verb 1" in stage and "phasereg: sPR inside the local vein mask" in stage
     # donors on task-residual coupling, with every run's events
     assert "-spr_select_on residual -task_removal fit:2" in stage and "-events " in stage
-    assert "phasereg/QC.veinmask.nii.gz" in stage
+    assert "$PHASEREG_DIR/QC.veinmask.nii.gz" in stage
     import re
 
     written = re.findall(r'-prefix "([^"]+)"', stage) + re.findall(r'qc_tcat "([^"]+)"', stage)
-    assert written and all(w.startswith("phasereg/") for w in written)  # no new stageNN files
+    assert written and all(w.startswith("$PHASEREG_DIR/") for w in written)  # no new stageNN files
     glm = s.split("stage12: GLM")[1]
-    assert '-input "phasereg/task-floc_corrected_run-01.nii$FINAL_FMT"' in glm
-    assert '-Rbuck "phasereg/stats-reml.task-floc.nii$GLM_FMT"' in glm
+    assert '-input "$PHASEREG_DIR/task-floc_corrected_run-01.nii$FINAL_FMT"' in glm
+    assert '-Rbuck "$PHASEREG_DIR/stats-reml.task-floc.nii$GLM_FMT"' in glm
     assert '-Rbuck "stage12.stats-reml.task-floc.nii$GLM_FMT"' in glm  # stage10 fit kept
 
     plain = write_script(
@@ -3185,8 +3185,8 @@ def test_phasereg_vein_mask_takes_the_suma_aseg_when_the_anat_is_sumas():
     s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
     stage = s.split("phasereg: phase regression")[1]
     assert "/fs/SUMA/aseg.auto.nii.gz'<4,14,43,24>'" in stage  # CSF incl. label 24
-    assert '-prefix "phasereg/tissue_aseg_gm.nii.gz"' in stage
-    assert "-tissue phasereg/tissue_aseg_gm.nii.gz" in stage and "-spr_mask" in stage
+    assert '-prefix "phasereg_tissue/tissue_aseg_gm.nii.gz"' in stage
+    assert "-tissue phasereg_tissue/tissue_aseg_gm.nii.gz" in stage and "-spr_mask" in stage
     # A user -anat that is not SUMA's: the aseg does not sit on it.
     opt.anat_path = "/elsewhere/t1.nii.gz"
     assert "tissue_aseg" not in write_script(build_plan(subj, opt), "wd", bids_root="/bids")
@@ -3205,3 +3205,30 @@ def test_phasereg_default_is_plain_pr_even_with_tissue():
         and "-spr" not in stage.split("ffs_phasereg")[1].split("echo")[0]
     )
     assert "-phasereg_veins off" in stage
+
+
+def test_phasereg_folders_are_numbered_per_setting_and_reused_on_rerun(tmp_path: Path):
+    """Each phase-regression setting gets its own phasereg_NN with a settings.txt saying
+    what was run: an identical rerun resumes in its folder, other -phasereg_* options
+    make the next number. Runs the generated bash block itself."""
+    from fastfuncstuff.autoproc.emit import _phasereg_dir_block
+
+    def run(settings: str) -> str:
+        block = "\n".join(_phasereg_dir_block(settings)) + '\necho "DIR=$PHASEREG_DIR"\n'
+        r = subprocess.run(  # noqa: S603
+            ["bash", "-c", "ffs_phasereg() { :; }\n" + block],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip().splitlines()[-1].removeprefix("DIR=")
+
+    a = "ffs_autoproc phase regression settings\n-phasereg_veins off\n\nffs_phasereg \\\n  -keep_drift"
+    b = a.replace("off", "auto")
+    assert run(a) == "phasereg_01"
+    assert run(a) == "phasereg_01"  # same settings: resume, no new folder
+    assert run(b) == "phasereg_02"
+    assert run(a) == "phasereg_01"
+    assert (tmp_path / "phasereg_02" / "settings.txt").read_text().strip() == b
+    assert len((tmp_path / "phasereg_01" / "history.txt").read_text().splitlines()) == 3

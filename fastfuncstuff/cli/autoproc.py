@@ -455,16 +455,22 @@ def build_parser() -> argparse.ArgumentParser:
         "-phasereg",
         action="store_true",
         help="with -phase_proc, run ffs_phasereg on each task's runs that have phase, "
-        "after stage10, into phasereg/ (task-X_corrected_run-NN, one per run in run "
-        "order; -keep_drift, so the GLM models drift as usual). With a GLM, each task's "
-        "model is also fit on the corrected runs: phasereg/stats-*.task-X. stage10 is "
-        "untouched, so the two fits compare like for like.",
+        "after stage10, into phasereg_NN/ (task-X_corrected_run-NN, one per run in run "
+        "order; -keep_drift, so the GLM models drift as usual). Each setting "
+        "(-phasereg_veins, -phasereg_opts, -tissue, the commands) gets its own numbered "
+        "folder with a settings.txt saying what was run and a history.txt of when; an "
+        "identical rerun resumes in its folder, other settings add the next number. "
+        "With a GLM, each task's model is also fit on the corrected runs: "
+        "phasereg_NN/stats-*.task-X. stage10 is untouched, so the fits compare like "
+        "for like. Default fit: Deming damped by ODR's factor (-shrink slope), no cap: "
+        "stable, an even ~10%% suppression.",
     )
     g.add_argument(
         "-phasereg_opts",
         default="",
         metavar="'FLAGS'",
-        help='extra ffs_phasereg flags (quoted), e.g. "-shrink odr"',
+        help='extra ffs_phasereg flags (quoted), e.g. "-shrink odr" (phaseprep\'s '
+        'published output) or "-phase_filter sgf"; part of the folder\'s settings',
     )
     g.add_argument(
         "-phasereg_veins",

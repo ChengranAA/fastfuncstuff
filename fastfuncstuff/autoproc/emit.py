@@ -3804,7 +3804,13 @@ def _dofloss_sums(plan: Plan, tasks) -> list[str]:
     return out
 
 
-PHASEREG_DIR = "phasereg"
+# Each distinct phase-regression setting gets its own numbered folder, chosen when the
+# script runs (see _phasereg_dir_block): rerunning autoproc with other -phasereg_*
+# options adds phasereg_02 instead of mixing outputs, and an identical rerun resumes in
+# the folder it already made. Everything inside double quotes, so the variable expands.
+PHASEREG_DIR = "$PHASEREG_DIR"
+# Settings-independent inputs shared by every phasereg_NN (the aseg tissue maps).
+PHASEREG_SHARED = "phasereg_tissue"
 
 
 def _tissue_files(opt) -> list[str]:
@@ -3815,7 +3821,7 @@ def _tissue_files(opt) -> list[str]:
     if opt.presurf and _own_anat(opt):
         return [f"presurf_work/anat1_uni_c{k}.nii.gz" for k in (1, 2, 3)]
     if _aseg_tissue(opt):
-        return [f"{PHASEREG_DIR}/tissue_aseg_{c}.nii.gz" for c in ("gm", "wm", "csf")]
+        return [f"{PHASEREG_SHARED}/tissue_aseg_{c}.nii.gz" for c in ("gm", "wm", "csf")]
     return []
 
 
@@ -3832,7 +3838,7 @@ def _aseg_tissue(opt) -> bool:
 
 
 def _aseg_tissue_block(opt) -> list[str]:
-    """Binary GM/WM/CSF from aseg.auto into phasereg/; ffs_veinmask blurs them to
+    """Binary GM/WM/CSF from aseg.auto into phasereg_tissue/; ffs_veinmask blurs them to
     the EPI voxel, which turns the hard labels into partial-volume fractions."""
     aseg = shlex.quote(str(Path(opt.suma_dir) / "aseg.auto.nii.gz"))
     sets = dict(ASEG_TPM_LABELS)
@@ -3841,10 +3847,13 @@ def _aseg_tissue_block(opt) -> list[str]:
         "wm": ("tpm3_cortwm", "tpm4_cerebelwm"),
         "csf": ("tpm6_vents", "tpm7_outercsf"),
     }
-    out = ["# Tissue maps from FreeSurfer's aseg (the anat is -suma's brain)."]
+    out = [
+        "# Tissue maps from FreeSurfer's aseg (the anat is -suma's brain).",
+        f"mkdir -p {PHASEREG_SHARED}",
+    ]
     for cls, names in groups.items():
         sel = ",".join(sets[n] for n in names)
-        f = f"{PHASEREG_DIR}/tissue_aseg_{cls}.nii.gz"
+        f = f"{PHASEREG_SHARED}/tissue_aseg_{cls}.nii.gz"
         out.append(
             f"[ -f \"{f}\" ] || 3dcalc -overwrite -a {aseg}'<{sel}>' -expr 'step(a)' -prefix \"{f}\""
         )
@@ -3878,9 +3887,55 @@ def _veinmask_on(plan: Plan) -> bool:
     return opt.phasereg and opt.phasereg_veins == "auto" and bool(_tissue_files(opt))
 
 
+def _phasereg_dir_block(settings: str) -> list[str]:
+    """Bash that sets $PHASEREG_DIR: the phasereg_NN whose settings.txt holds exactly
+    ``settings``, else the next free number. settings.txt is written once, when the
+    folder is made; history.txt gets a line every time a run uses the folder."""
+    return [
+        "# Which phasereg_NN: the one made with exactly these settings (resume), else a",
+        "# new number. settings.txt says what was run; history.txt when.",
+        "read -r -d '' PHASEREG_SETTINGS <<'FFS_PHASEREG_SETTINGS' || true",
+        settings.rstrip("\n"),
+        "FFS_PHASEREG_SETTINGS",
+        "select_phasereg_dir() {",
+        "  local d n=1",
+        "  PHASEREG_DIR=",
+        "  for d in phasereg_[0-9][0-9]; do",
+        '    [ -f "$d/settings.txt" ] || continue',
+        '    if [ "$(cat "$d/settings.txt")" = "$PHASEREG_SETTINGS" ]; then PHASEREG_DIR=$d; break; fi',
+        "  done",
+        '  if [ -z "$PHASEREG_DIR" ]; then',
+        '    while [ -e "$(printf \'phasereg_%02d\' "$n")" ]; do n=$((n + 1)); done',
+        "    PHASEREG_DIR=$(printf 'phasereg_%02d' \"$n\")",
+        '    mkdir -p "$PHASEREG_DIR"',
+        '    printf \'%s\\n\' "$PHASEREG_SETTINGS" > "$PHASEREG_DIR/settings.txt"',
+        "  fi",
+        '  echo "$(date \'+%F %T\') $(command -v ffs_phasereg)" >> "$PHASEREG_DIR/history.txt"',
+        '  echo "phasereg: outputs in $PHASEREG_DIR/ (settings: $PHASEREG_DIR/settings.txt)"',
+        "}",
+        '[ -n "${PHASEREG_DIR:-}" ] || select_phasereg_dir',
+    ]
+
+
+def _phasereg_settings(opt, tasks, commands: list[str]) -> str:
+    """What settings.txt records: the options that shape phase regression, then the
+    exact commands (paths under $PHASEREG_DIR left literal, so identical settings give
+    identical text wherever the folder ends up)."""
+    lines = [
+        "ffs_autoproc phase regression settings",
+        f"-phasereg_veins {opt.phasereg_veins}",
+        f"-phasereg_opts {opt.phasereg_opts or '(none)'}",
+        f"-tissue {' '.join(opt.tissue) if opt.tissue else '(none)'}",
+        "tasks: " + ", ".join(f"{t} ({len(p)} runs)" for t, p in tasks.items()),
+        "",
+        *commands,
+    ]
+    return "\n".join(lines)
+
+
 def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
-    """Phase regression on the final data, into phasereg/ (post-preprocessing, so
-    a folder of its own rather than another stageNN prefix)."""
+    """Phase regression on the final data, into phasereg_NN/ (post-preprocessing, so
+    a folder of its own rather than another stageNN prefix; one folder per setting)."""
     opt = plan.options
     if not opt.phasereg:
         return ""
@@ -3890,11 +3945,12 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
         "",
         "# ============================ phasereg: phase regression ====================",
         "# The phase-explained (macrovascular) part of each GE run's magnitude, removed",
-        f"# on the stage10 data (voxel-matched magnitude + phase) into {d}/. stage10 is",
-        "# left as it is, so the GLM below fits both and they compare like for like.",
+        "# on the stage10 data (voxel-matched magnitude + phase) into phasereg_NN/. stage10",
+        "# is left as it is, so the GLM below fits both and they compare like for like.",
         "echo '== phasereg =='",
-        f"mkdir -p {d}",
     ]
+    body: list[str] = []
+    commands: list[str] = []
     spr: list[str] = []
     qc = []
     if _veinmask_on(plan):
@@ -3902,21 +3958,23 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
         tissue = " ".join(shlex.quote(t) for t in _tissue_files(opt))
         if _aseg_tissue(opt) and not opt.tissue and not opt.presurf:
             out += _aseg_tissue_block(opt)
-        out += [
+        vm_cmd = _ffs(
+            "ffs_veinmask",
+            [
+                f"-epi {means}",
+                f"-tissue {tissue}",
+                f'-mask "{_mask_brain()}"',
+                f'-prefix "{d}/veinmask"',
+                '-device "$DEVICE"',
+            ],
+        )
+        commands.append(vm_cmd)
+        body += [
             "# Vein candidates for -spr: cortex and pial CSF darker in the EPI than the",
             "# anat's tissue fractions predict (ffs_veinmask). Only there may a voxel",
             "# borrow a neighbour's phase; elsewhere its own phase is used.",
             f'[ -f "{d}/veinmask_mask.nii$FINAL_FMT" ] || \\',
-            _ffs(
-                "ffs_veinmask",
-                [
-                    f"-epi {means}",
-                    f"-tissue {tissue}",
-                    f'-mask "{_mask_brain()}"',
-                    f'-prefix "{d}/veinmask"',
-                    '-device "$DEVICE"',
-                ],
-            ),
+            vm_cmd,
         ]
         spr = ["-spr", f'-spr_mask "{d}/veinmask_mask.nii$FINAL_FMT"']
         first = next(iter(tasks.values()))[0]
@@ -3927,7 +3985,7 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
             f'"{d}/veinmask_mask.nii$FINAL_FMT"'
         )
     elif opt.phasereg_veins == "auto":
-        out.append("# No anat tissue maps (-tissue / -presurf): plain phase regression, no -spr.")
+        body.append("# No anat tissue maps (-tissue / -presurf): plain phase regression, no -spr.")
     extra = _split_flags(opt.phasereg_opts) if opt.phasereg_opts else []
     if spr:
         how = (
@@ -3938,15 +3996,15 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
         how = "own phase only, no sPR: no anat tissue maps for a vein mask (-tissue)"
     else:
         how = "own phase only, no sPR (-phasereg_veins off)"
-    out.append(
+    body.append(
         f"echo 'phasereg: {how}; Deming slope damped by ODR (-shrink slope), phi from FFT noise, no cap'"
     )
     if extra:
-        out.append(f"echo 'phasereg: extra options {shlex.quote(opt.phasereg_opts)[1:-1]}'")
+        body.append(f"echo 'phasereg: extra options {shlex.quote(opt.phasereg_opts)[1:-1]}'")
     for task, prs in tasks.items():
         mags = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
         phs = " ".join(f'"stage10.final.{_frag(pr)}.part-phase.nii$FINAL_FMT"' for pr in prs)
-        out.append(f"# task-{task}: runs {', '.join(_frag(pr) for pr in prs)} -> run-01..")
+        body.append(f"# task-{task}: runs {', '.join(_frag(pr) for pr in prs)} -> run-01..")
         select: list[str] = []
         if spr:
             # Donors chosen on task-residual (spontaneous) coupling: chosen on the
@@ -3959,32 +4017,34 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
                     "-events " + " ".join(shlex.quote(str(e)) for e in evs),
                 ]
             else:
-                out.append(
+                body.append(
                     f"echo 'phasereg task-{task}: no events for every run, so sPR donors "
                     "are chosen on the task-included series (can remove tissue response)'"
                 )
-        out.append(f'[ -f "{_phasereg_corrected(task, len(prs))}" ] || \\')
-        out.append(
-            _ffs(
-                "ffs_phasereg",
-                [
-                    f"-magnitude {mags}",
-                    f"-phase {phs}",
-                    f'-prefix "{d}/task-{task}"',
-                    "-keep_drift",
-                    *spr,
-                    *select,
-                    "-verb 1",
-                    *extra,
-                    '-device "$DEVICE"',
-                ],
-            )
+        body.append(f'[ -f "{_phasereg_corrected(task, len(prs))}" ] || \\')
+        pr_cmd = _ffs(
+            "ffs_phasereg",
+            [
+                f"-magnitude {mags}",
+                f"-phase {phs}",
+                f'-prefix "{d}/task-{task}"',
+                "-keep_drift",
+                *spr,
+                *select,
+                "-verb 1",
+                *extra,
+                '-device "$DEVICE"',
+            ],
         )
+        commands.append(pr_cmd)
+        body.append(pr_cmd)
         qc.append(
             f'qc_tcat "{d}/QC.task-{task}.nii.gz" "before after r2" '
             f'"stage10.final.{_frag(prs[0])}.nii$FINAL_FMT[0]" '
             f'"{_phasereg_corrected(task, 1)}[0]" "{d}/task-{task}_r2.nii$FINAL_FMT"'
         )
+    out += _phasereg_dir_block(_phasereg_settings(opt, tasks, commands))
+    out += body
     if _qc_on(plan):
         out.append(_qc_block("phasereg", qc))
     return "\n".join(out) + "\n"
@@ -4115,7 +4175,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
 
 def _glm_common(plan: Plan, task: str, stem: str, blur: float | None) -> list[str]:
     """stage12's ffs_reml flags for one task's buckets under ``stem`` (``stage12.``,
-    ``stage12.blur6.``, ``phasereg/``): outputs, mask, smoothing, cluster and dof."""
+    ``stage12.blur6.``, ``$PHASEREG_DIR/``): outputs, mask, smoothing, cluster and dof."""
     opt = plan.options
     return [
         f'-Obuck "{stem}stats-ols.task-{task}.nii$GLM_FMT"',
@@ -4142,7 +4202,7 @@ def _glm_common(plan: Plan, task: str, stem: str, blur: float | None) -> list[st
 def _phasereg_glm(
     plan: Plan, task: str, prs: list[PlanRun], spec: str, tag: str, blur: float | None
 ) -> list[str]:
-    """The same model fit on phasereg's corrected runs, buckets in phasereg/."""
+    """The same model fit on phasereg's corrected runs, buckets in the same phasereg_NN/."""
     corrected = _phasereg_runs(plan).get(task) if plan.options.phasereg else None
     if not corrected:
         return []
@@ -4156,6 +4216,7 @@ def _phasereg_glm(
     rbuck = f"{stem}stats-reml.task-{task}.nii$GLM_FMT"
     return [
         f"# task-{task} after phase regression: same spec, buckets in {PHASEREG_DIR}/.",
+        '[ -n "${PHASEREG_DIR:-}" ] || select_phasereg_dir',
         f'if [ "$skip_stats" -ne 1 ] || [ ! -f "{rbuck}" ]; then',
         _ffs(
             "ffs_reml",

@@ -3104,7 +3104,9 @@ def test_phasereg_stage_writes_into_its_folder_with_vein_mask_and_glm(tmp_path: 
     subj = scan_subject(tmp_path, "ME1")
     assert all(r.phase_path for s in subj.sessions for r in s.bold_runs)
     tissue = ["/t/c1.nii.gz", "/t/c2.nii.gz", "/t/c3.nii.gz"]
-    opt = Options(run_glm=True, phase_proc=True, phasereg=True, tissue=tissue)
+    opt = Options(
+        run_glm=True, phase_proc=True, phasereg=True, tissue=tissue, phasereg_veins="auto"
+    )
     s = write_script(build_plan(subj, opt), str(tmp_path / "wd"), bids_root=str(tmp_path))
     assert (
         subprocess.run(  # noqa: S603
@@ -3151,6 +3153,7 @@ def test_phasereg_vein_mask_takes_presurfs_classes_and_keeps_them_written():
         go_to_anat=True,
         phase_proc=True,
         phasereg=True,
+        phasereg_veins="auto",
         presurf=[("/a/uni.nii.gz", "/a/inv2.nii.gz", None)],
         presurf_tpm="/t/TPM.nii",
     )
@@ -3173,6 +3176,7 @@ def test_phasereg_vein_mask_takes_the_suma_aseg_when_the_anat_is_sumas():
         go_to_anat=True,
         phase_proc=True,
         phasereg=True,
+        phasereg_veins="auto",
         suma_dir="/fs/SUMA",
         anat_path="/fs/SUMA/brain.nii.gz",
     )
@@ -3184,3 +3188,18 @@ def test_phasereg_vein_mask_takes_the_suma_aseg_when_the_anat_is_sumas():
     # A user -anat that is not SUMA's: the aseg does not sit on it.
     opt.anat_path = "/elsewhere/t1.nii.gz"
     assert "tissue_aseg" not in write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+
+
+def test_phasereg_default_is_plain_pr_even_with_tissue():
+    """The vein-masked sPR default rested on tissue maps 2-7 mm off the EPI and on a
+    padded mask; rescored, it removed tissue response. Until it is re-earned,
+    -phasereg means plain phase regression and the vein mask is opt-in."""
+    subj = Subject("X", [Session("01", [_phase_run("01", "foo", "1")], anat=None)])
+    opt = Options(go_to_anat=True, phase_proc=True, phasereg=True, tissue=["/t/c.nii.gz"])
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    stage = s.split("phasereg: phase regression")[1]
+    assert (
+        "ffs_veinmask" not in stage
+        and "-spr" not in stage.split("ffs_phasereg")[1].split("echo")[0]
+    )
+    assert "-phasereg_veins off" in stage

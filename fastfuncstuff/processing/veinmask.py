@@ -7,9 +7,9 @@ the EPI mean, divided by a smooth bias field, should then look like
 and comes out darker than that prediction; a local-mean comparison alone cannot
 tell it from white matter or a tissue boundary, which the tissue model can.
 
-On ds003427 (7T GE vs SE, 4 subjects) sPR inside this mask flattened the GE/SE depth
-profile from 1.10-1.65 (default PR) to 0.99-1.28 pial/deep at default-PR tissue cost,
-close to a GRE R2* vein mask (0.89-1.23). See the fmri_wiki ffs_phasereg note.
+Unvalidated: the first ds003427 results for this mask used tissue maps 2-7 mm off the
+EPI and are void. Rescored with aligned maps, sPR inside it removed tissue response
+too (2026-10-14). See the fmri_wiki ffs_veinmask and ffs_phasereg notes.
 """
 
 from __future__ import annotations

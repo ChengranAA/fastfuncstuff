@@ -52,7 +52,7 @@ class Options:
     phasereg: bool = False
     phasereg_opts: str = ""
     # "auto": sPR restricted to ffs_veinmask's candidates when tissue maps exist.
-    phasereg_veins: str = "auto"
+    phasereg_veins: str = "off"
     tissue: list[str] | None = None  # GM/WM/CSF fractions in anat space
     # 3-D (slab/partition-encoded) vs 2-D multi-slice EPI. Decides whether
     # anything per-slice (ffs_phasedrift) has acquired slices to work on.

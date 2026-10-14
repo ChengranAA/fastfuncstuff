@@ -56,16 +56,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-darker",
         type=float,
         default=0.3,
-        help="flag voxels this much darker than predicted (0.3 = 30%% darker). On "
-        "ds003427 (7T, 0.8 mm, TE 23 ms) 0.3 marked 7-10%% of cortex+pial CSF, the share "
-        "the GRE vein masks it was validated against marked",
+        help="flag voxels this much darker than predicted (0.3 = 30%% darker). "
+        "UNVALIDATED: the evidence for 0.3 used tissue maps that were 2-7 mm off "
+        "the EPI; on aligned ds003427 maps it marks 12-21%% of cortex+pial CSF",
     )
     p.add_argument(
         "-dilate",
         type=int,
-        default=1,
-        help="grow the mask this many voxels (6-connected): residual EPI-anat "
-        "misregistration, and the vein's field reaching its neighbours",
+        default=0,
+        help="grow the mask this many voxels (6-connected). Default 0: once the anat "
+        "is registered to the EPI, growing only smears the mask (a 3x3x3 growth "
+        "took ds003427's GRE vein mask from 7-12%% of the brain to 40-54%%)",
     )
     p.add_argument(
         "-bias_fwhm",

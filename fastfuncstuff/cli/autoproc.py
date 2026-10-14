@@ -468,15 +468,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument(
         "-phasereg_veins",
-        choices=["auto", "off"],
-        default="auto",
-        help="auto (default): when anat tissue maps exist (-tissue, -presurf's own, or "
-        "-suma's aseg when the anat is SUMA's brain), "
-        "let phase regression borrow a neighbour's phase (-spr) only inside "
-        "ffs_veinmask's vein candidates: cortex and pial CSF darker in the EPI than the "
-        "tissue predicts. On ds003427 (7T GE vs SE) that flattened the GE depth profile "
-        "toward SE at the tissue cost of plain phase regression; unrestricted -spr "
-        "removed a third of everything. off: plain phase regression.",
+        choices=["off", "auto"],
+        default="off",
+        help="off (default): plain phase regression, each voxel its own phase. auto "
+        "(EXPERIMENTAL, unvalidated): when anat tissue maps exist (-tissue, -presurf's "
+        "own, or -suma's aseg when the anat is SUMA's brain), let phase regression "
+        "borrow a neighbour's phase (-spr) inside ffs_veinmask's vein candidates "
+        "(cortex and pial CSF darker in the EPI than the tissue predicts). Its earlier "
+        "ds003427 support used tissue maps 2-7 mm off the EPI; a first rescoring on "
+        "aligned maps (2 of 4 subjects) kept ~45%% of the GE+SE shared response, "
+        "against ~70%% for plain PR.",
     )
     g.add_argument(
         "-tissue",

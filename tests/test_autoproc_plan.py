@@ -3162,3 +3162,25 @@ def test_phasereg_vein_mask_takes_presurfs_classes_and_keeps_them_written():
     # Without -phasereg nothing reads the classes: presurf keeps -no_classes.
     opt.phasereg = False
     assert "-no_classes" in write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+
+
+def test_phasereg_vein_mask_takes_the_suma_aseg_when_the_anat_is_sumas():
+    """MindsEye bug of record: with -suma the anat is FreeSurfer's brain, presurfer
+    is skipped, and -phasereg fell back to plain PR with no word in the log. The aseg
+    labels sit on that anat, so they are the tissue maps (sulcal CSF included)."""
+    subj = Subject("X", [Session("01", [_phase_run("01", "foo", "1")], anat=None)])
+    opt = Options(
+        go_to_anat=True,
+        phase_proc=True,
+        phasereg=True,
+        suma_dir="/fs/SUMA",
+        anat_path="/fs/SUMA/brain.nii.gz",
+    )
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    stage = s.split("phasereg: phase regression")[1]
+    assert "/fs/SUMA/aseg.auto.nii.gz'<4,14,43,24>'" in stage  # CSF incl. label 24
+    assert '-prefix "phasereg/tissue_aseg_gm.nii.gz"' in stage
+    assert "-tissue phasereg/tissue_aseg_gm.nii.gz" in stage and "-spr_mask" in stage
+    # A user -anat that is not SUMA's: the aseg does not sit on it.
+    opt.anat_path = "/elsewhere/t1.nii.gz"
+    assert "tissue_aseg" not in write_script(build_plan(subj, opt), "wd", bids_root="/bids")

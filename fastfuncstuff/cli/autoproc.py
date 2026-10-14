@@ -470,7 +470,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-phasereg_veins",
         choices=["auto", "off"],
         default="auto",
-        help="auto (default): when anat tissue maps exist (-tissue, or -presurf's own), "
+        help="auto (default): when anat tissue maps exist (-tissue, -presurf's own, or "
+        "-suma's aseg when the anat is SUMA's brain), "
         "let phase regression borrow a neighbour's phase (-spr) only inside "
         "ffs_veinmask's vein candidates: cortex and pial CSF darker in the EPI than the "
         "tissue predicts. On ds003427 (7T GE vs SE) that flattened the GE depth profile "
@@ -484,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="GM, WM, CSF fractions of the anat (one 4-D file in SPM c1/c2/c3 order, or "
         "three files), in the anat's scanner space, for -phasereg_veins. Default with "
-        "-presurf: presurfer's own UNI classes.",
+        "-presurf: presurfer's own UNI classes; with -suma: GM/WM/CSF from aseg.auto.",
     )
     g.add_argument(
         "-nordic_save_resid",
@@ -1417,10 +1418,17 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             errors.append("-tissue takes one 4-D file (GM, WM, CSF) or three files.")
         errors += [f"-tissue not found: {t}" for t in opt.tissue if not Path(t).is_file()]
     if opt.phasereg and opt.phasereg_veins == "auto" and not (opt.tissue or opt.presurf):
-        warnings.append(
-            "-phasereg: no anat tissue maps (-tissue, or -presurf), so no vein mask: "
-            "plain phase regression. Give -tissue to restrict -spr to vein candidates."
-        )
+        from fastfuncstuff.autoproc.emit import _aseg_tissue
+
+        if _aseg_tissue(opt):
+            aseg = Path(opt.suma_dir) / "aseg.auto.nii.gz"
+            if not aseg.is_file():
+                errors.append(f"-phasereg: -suma has no aseg.auto.nii.gz for tissue maps: {aseg}")
+        else:
+            warnings.append(
+                "-phasereg: no anat tissue maps (-tissue, -presurf or -suma), so no vein mask: "
+                "plain phase regression. Give -tissue to restrict -spr to vein candidates."
+            )
     if opt.fs_tpm:  # in-script TPM build needs the FS label volume
         aseg = Path(opt.suma_dir) / "aseg.auto.nii.gz"
         if not aseg.is_file():

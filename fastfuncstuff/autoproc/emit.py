@@ -2958,24 +2958,28 @@ if [ ! -f "{brain}" ]; then
 fi"""
 
 
+# aseg.auto label sets per TPM class. aseg.auto's label 24 covers the sulcal CSF
+# too, so the CSF classes reach the pial veins the vein mask looks for.
+ASEG_TPM_LABELS = [
+    ("tpm1_cortex", "3,42"),
+    ("tpm2_cerebelgm", "8,47"),
+    ("tpm3_cortwm", "2,41,28,60,16,252,251,253,254,255"),
+    ("tpm4_cerebelwm", "7,46"),
+    ("tpm5_subcortexgm", "5,10,11,12,13,17,18,49,50,51,52,53,54,44,58,26"),
+    ("tpm6_vents", "4,14,43"),
+    ("tpm7_outercsf", "24"),
+]
+
+
 def _fs_tpm_block(opt) -> str:
     """Build a subject-specific 8-class TPM from FreeSurfer (SUMA) outputs using
     AFNI (aseg.auto label sets + a skull class from SurfVol). Hard-edge tissue
     priors in FS space — no ahead-of-time SPM TPM needed. Runs in a subshell so
     the ``cd`` doesn't leak. Output: tpm_work/sub_specific_fsTPM.nii.gz."""
     suma = shlex.quote(opt.suma_dir.rstrip("/")) if opt.suma_dir else "${SUMA_DIR:?set -suma}"
-    labels = [
-        ("tpm1_cortex", "3,42"),
-        ("tpm2_cerebelgm", "8,47"),
-        ("tpm3_cortwm", "2,41,28,60,16,252,251,253,254,255"),
-        ("tpm4_cerebelwm", "7,46"),
-        ("tpm5_subcortexgm", "5,10,11,12,13,17,18,49,50,51,52,53,54,44,58,26"),
-        ("tpm6_vents", "4,14,43"),
-        ("tpm7_outercsf", "24"),
-    ]
     calc = "\n".join(
         f"  3dcalc -overwrite -a {suma}/aseg.auto.nii.gz'<{sel}>' -expr 'step(a)' -prefix {name}.nii.gz"
-        for name, sel in labels
+        for name, sel in ASEG_TPM_LABELS
     )
     return f"""# --- build subject TPM from FreeSurfer (SUMA) ---
 if [ ! -f "tpm_work/sub_specific_fsTPM.nii.gz" ]; then
@@ -3810,7 +3814,41 @@ def _tissue_files(opt) -> list[str]:
         return list(opt.tissue)
     if opt.presurf and _own_anat(opt):
         return [f"presurf_work/anat1_uni_c{k}.nii.gz" for k in (1, 2, 3)]
+    if _aseg_tissue(opt):
+        return [f"{PHASEREG_DIR}/tissue_aseg_{c}.nii.gz" for c in ("gm", "wm", "csf")]
     return []
+
+
+def _aseg_tissue(opt) -> bool:
+    """The anat is -suma's brain.nii.gz, so FreeSurfer's aseg.auto sits on it and its
+    labels are the tissue maps (the same anat-derived classes as the -suma TPM)."""
+    return bool(
+        opt.suma_dir
+        and opt.anat_path
+        and not opt.anat_extra
+        and Path(opt.anat_path).parent == Path(opt.suma_dir)
+        and _own_anat(opt)
+    )
+
+
+def _aseg_tissue_block(opt) -> list[str]:
+    """Binary GM/WM/CSF from aseg.auto into phasereg/; ffs_veinmask blurs them to
+    the EPI voxel, which turns the hard labels into partial-volume fractions."""
+    aseg = shlex.quote(str(Path(opt.suma_dir) / "aseg.auto.nii.gz"))
+    sets = dict(ASEG_TPM_LABELS)
+    groups = {
+        "gm": ("tpm1_cortex", "tpm2_cerebelgm", "tpm5_subcortexgm"),
+        "wm": ("tpm3_cortwm", "tpm4_cerebelwm"),
+        "csf": ("tpm6_vents", "tpm7_outercsf"),
+    }
+    out = ["# Tissue maps from FreeSurfer's aseg (the anat is -suma's brain)."]
+    for cls, names in groups.items():
+        sel = ",".join(sets[n] for n in names)
+        f = f"{PHASEREG_DIR}/tissue_aseg_{cls}.nii.gz"
+        out.append(
+            f"[ -f \"{f}\" ] || 3dcalc -overwrite -a {aseg}'<{sel}>' -expr 'step(a)' -prefix \"{f}\""
+        )
+    return out
 
 
 def _presurf_classes_needed(opt) -> bool:
@@ -3862,6 +3900,8 @@ def _stage_phasereg(plan: Plan) -> str:
     if _veinmask_on(plan):
         means = " ".join(f'"{_final_mean(_frag(pr))}"' for prs in tasks.values() for pr in prs)
         tissue = " ".join(shlex.quote(t) for t in _tissue_files(opt))
+        if _aseg_tissue(opt) and not opt.tissue and not opt.presurf:
+            out += _aseg_tissue_block(opt)
         out += [
             "# Vein candidates for -spr: cortex and pial CSF darker in the EPI than the",
             "# anat's tissue fractions predict (ffs_veinmask). Only there may a voxel",

@@ -1131,6 +1131,19 @@ def test_design_fit_basis_removes_the_task_and_keeps_the_drift():
     assert float(out.std()) > 0.1 * float(drift.std())
 
 
+@pytest.mark.gpu
+def test_design_fit_basis_takes_an_on_device_design():
+    """phasereg builds its design on the fitting device; np.asarray on a CUDA tensor
+    raises, which broke ``ffs_phasereg -task_removal fit:N`` on every GPU run."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    dev = torch.device("cuda")
+    design = _block_design(120)
+    on_dev = design_fit_basis(torch.as_tensor(design).to(dev), polort=3, n_deriv=1, device=dev)
+    assert on_dev.device.type == "cuda"
+    assert torch.allclose(on_dev.cpu(), design_fit_basis(design, polort=3, n_deriv=1), atol=1e-10)
+
+
 def test_design_fit_basis_derivatives_cost_one_dof_each_and_absorb_latency():
     """``n_deriv`` widens the subspace by one column per regressor per derivative, and
     the extra columns are what let a latency-shifted response be removed at all."""

@@ -93,6 +93,17 @@ __all__ = [
 ]
 
 
+def _design_tensor(
+    design: torch.Tensor | np.ndarray, device: torch.device | None = None
+) -> torch.Tensor:
+    """float64 copy of a design matrix on ``device``. A tensor is moved, never routed
+    through numpy: np.asarray raises on a CUDA tensor, and callers build designs on
+    the fitting device."""
+    if isinstance(design, torch.Tensor):
+        return design.to(device=device, dtype=torch.float64)
+    return torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
+
+
 def default_polort(n_timepoints: int, tr: float) -> int:
     """AFNI's drift rule: ``1 + floor(run_seconds / 150)``.
 
@@ -297,7 +308,7 @@ def task_coupling(
     src_device = f.device
     if device is None:
         device = f.device
-    x = torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
+    x = _design_tensor(design, device)
     if x.ndim == 1:
         x = x[:, None]
     n_t, n_k = f.shape[3], x.shape[1]
@@ -545,7 +556,7 @@ def project_task_out(
     if device is None:
         device = f.device
     n_t = f.shape[3]
-    x = torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
+    x = _design_tensor(design, device)
     if x.ndim == 1:
         x = x[:, None]
 
@@ -608,7 +619,7 @@ def design_notch_bins(
     """
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
-    x = torch.as_tensor(np.asarray(design), dtype=torch.float64)
+    x = _design_tensor(design)
     if x.ndim == 1:
         x = x[:, None]
     n_t = x.shape[0]
@@ -745,7 +756,7 @@ def design_fit_basis(
     """
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
-    x = torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
+    x = _design_tensor(design, device)
     if x.ndim == 1:
         x = x[:, None]
     n_t = x.shape[0]
@@ -908,7 +919,7 @@ def component_variance_in_data(
 
     q_x = None
     if design is not None:
-        x = torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
+        x = _design_tensor(design, device)
         if x.ndim == 1:
             x = x[:, None]
         if x.shape[0] != n_t:
@@ -1028,7 +1039,7 @@ def component_task_fit(
     if m.ndim != 2:
         raise ValueError(f"mixing must be (T, k), got {tuple(m.shape)}")
     n_t, k = m.shape
-    x = torch.as_tensor(np.asarray(design), dtype=torch.float64)
+    x = _design_tensor(design)
     if x.ndim == 1:
         x = x[:, None]
     if x.shape[0] != n_t:

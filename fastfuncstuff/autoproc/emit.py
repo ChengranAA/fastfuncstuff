@@ -3889,6 +3889,15 @@ def _stage_phasereg(plan: Plan) -> str:
     elif opt.phasereg_veins == "auto":
         out.append("# No anat tissue maps (-tissue / -presurf): plain phase regression, no -spr.")
     extra = _split_flags(opt.phasereg_opts) if opt.phasereg_opts else []
+    if spr:
+        how = "sPR inside the vein mask (dark-vs-tissue), own phase elsewhere"
+    elif opt.phasereg_veins == "auto":
+        how = "own phase only, no sPR: no anat tissue maps for a vein mask (-tissue)"
+    else:
+        how = "own phase only, no sPR (-phasereg_veins off)"
+    out.append(f"echo 'phasereg: {how}; Deming slope capped at 2x OLS, phi from FFT noise'")
+    if extra:
+        out.append(f"echo 'phasereg: extra options {shlex.quote(opt.phasereg_opts)[1:-1]}'")
     for task, prs in tasks.items():
         mags = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
         phs = " ".join(f'"stage10.final.{_frag(pr)}.part-phase.nii$FINAL_FMT"' for pr in prs)
@@ -3903,6 +3912,7 @@ def _stage_phasereg(plan: Plan) -> str:
                     f'-prefix "{d}/task-{task}"',
                     "-keep_drift",
                     *spr,
+                    "-verb 1",
                     *extra,
                     '-device "$DEVICE"',
                 ],

@@ -515,9 +515,17 @@ def phase_regress(
     if verbose:
         print(f"Phase regression: {n_runs} run(s), {n_voxels:,} voxels, {n_tp} total timepoints")
         print(f"  Task removal: {task_removal}")
-        print(f"  Regression: {regression}")
+        cap = f", |A| capped at {max_slope_ratio:g}x OLS" if max_slope_ratio else ""
+        print(f"  Regression: {regression}{cap if regression == 'deming' else ''}")
         print(f"  Phi method: {phi_method}")
         print(f"  Phase filter: {phase_filter}")
+        print(f"  Slope fit on: {slope_on}; residual shrink: {shrink_mode}")
+        print(f"  Drift: {'kept in the output' if keep_drift else 'removed from the output'}")
+        if spr:
+            where = "inside -spr_mask" if spr_allow is not None else "everywhere (no mask)"
+            print(f"  sPR: borrow a neighbour's phase {where}")
+        else:
+            print("  sPR: off (each voxel uses its own phase)")
 
         sample = magnitude[0][0]
         print(f"  Magnitude scale: mean={sample.mean().item():.1f}, std={sample.std().item():.1f}")
@@ -824,6 +832,7 @@ def phase_regress(
     inflation_all = torch.zeros(n_voxels)
     coupling_r = torch.zeros(n_voxels) if vein_mask else None
     n_unstable = 0
+    n_capped = 0
     mag_corrected = torch.empty((n_voxels, n_tp), dtype=torch.float32)
     macro_out = torch.empty((n_voxels, n_tp), dtype=torch.float32)
 
@@ -866,6 +875,8 @@ def phase_regress(
             s, b = deming_regression(fit_pha, fit_mag, phi_c)
             if max_slope_ratio is not None:
                 s_ols, _ = ols_regression(fit_pha, fit_mag)
+                capped = s.abs() > max_slope_ratio * s_ols.abs()
+                n_capped += int((capped & good).sum().item())
                 s = torch.sign(s) * torch.minimum(s.abs(), max_slope_ratio * s_ols.abs())
                 b = fit_mag.mean(dim=0) - s * fit_pha.mean(dim=0)
         else:
@@ -948,6 +959,12 @@ def phase_regress(
             print(
                 f"  Phase variance floor: {n_unstable:,} voxels with "
                 f"Var(phase) < {pha_var_floor:.0e} (slopes zeroed)"
+            )
+        if n_capped:
+            print(
+                f"  Slope cap: {n_capped:,} / {int(vox_mask.sum()):,} voxels "
+                f"({100.0 * n_capped / max(int(vox_mask.sum()), 1):.1f}%) hit "
+                f"{max_slope_ratio:g}x OLS (Deming wanted more; usually weak coupling)"
             )
         n_sig = (slope_all[vox_mask].abs() > 0.01).sum().item()
         print(

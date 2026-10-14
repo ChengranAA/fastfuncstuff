@@ -595,7 +595,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         mask_np = mask_np.flatten().astype(bool)
-    mags, _ = load_and_concatenate_runs(args.magnitude, keep_on_cpu=True, mask_flat=mask_np)
+    # Loaded whole and masked in memory: the corrected output carries every voxel outside
+    # the mask over from the input, and re-reading (re-decompressing) every run for that
+    # cost as much as the fit (2026-10-14 profile: ~8 s of a 70 s sPR run).
+    mags_full, _ = load_and_concatenate_runs(args.magnitude, keep_on_cpu=True, mask_flat=None)
+    mags = mags_full if mask_np is None else mags_full[torch.from_numpy(mask_np)]
 
     if args.tr is None:
         if len(set(tr_values)) > 1:
@@ -885,10 +889,8 @@ def main(argv: list[str] | None = None) -> int:
         with no signal and silently drop it from any GLM run on the output."""
         if mask_np is None:
             return _to_volume(data_flat, is_4d=True)
-        full, _ = load_and_concatenate_runs(
-            [args.magnitude[i] for i in runs], keep_on_cpu=True, mask_flat=None
-        )
-        full = full.numpy()
+        lo, hi = run_edges[runs[0]], run_edges[runs[-1] + 1]
+        full = mags_full[:, lo:hi].numpy().copy()
         full[mask_np] = data_flat
         return from_voxel_major(full, (nx, ny, nz), None)
 

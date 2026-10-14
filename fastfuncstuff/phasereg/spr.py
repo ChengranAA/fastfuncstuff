@@ -173,6 +173,15 @@ def select_phase_donor(
     # can lie outside the chunk being processed.
     pha_c = phase - phase.mean(dim=0, keepdim=True)
     pha_n = pha_c / pha_c.norm(dim=0, keepdim=True).clamp(min=1e-12)
+    del pha_c
+    # Gathering donors from a host copy cost a CPU gather plus a host->device copy per
+    # neighbour per chunk (2026-10-14 profile: ~10 s of a 70 s run, the GPU idle).
+    # Keep it on the device when the whole normalised phase fits.
+    if device.type != "cpu":
+        from fastfuncstuff.memory import get_available_memory
+
+        if pha_n.numel() * pha_n.element_size() < get_available_memory(device):
+            pha_n = pha_n.to(device)
 
     donor = torch.zeros(n_vox, dtype=torch.int64)
     donor_corr = torch.zeros(n_vox)
@@ -191,7 +200,7 @@ def select_phase_donor(
 
         for k in range(neigh_chunk.shape[1]):
             idx = neigh_chunk[:, k]
-            donor_pha = pha_n[:, idx.cpu()].to(device)  # (n_tp, c)
+            donor_pha = pha_n[:, idx.to(pha_n.device)].to(device)  # (n_tp, c)
             corr = (mag_n * donor_pha).sum(dim=0)
             better = corr.abs() > best_abs
             best_abs = torch.where(better, corr.abs(), best_abs)
@@ -201,5 +210,5 @@ def select_phase_donor(
         donor[start:end] = best_idx.cpu()
         donor_corr[start:end] = best_val.cpu()
 
-    del pha_n, pha_c
+    del pha_n
     return donor, donor_corr

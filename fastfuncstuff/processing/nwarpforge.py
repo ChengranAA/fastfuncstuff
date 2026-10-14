@@ -2212,6 +2212,12 @@ def nwarpforge(
         transforms.insert(
             0, AffineTransform(matrices=torch.from_numpy(vox.astype(np.float32))[None].to(device))
         )
+        # Keep the names index-aligned with `transforms`: -jac AXIS:FIELDMAP finds its
+        # fieldmap BY NAME and then indexes `transforms`. Without this the lookup was
+        # one off and took the Jacobian of the transform before the fieldmap -- on
+        # autoproc chains the PE-only anat nonlinear warp, whose derivative stippled
+        # every stage10 image (2026-10-13..14). The placeholder can match no pattern.
+        nwarp_specs = ["\x00-chain_base", *nwarp_specs]
 
     # If master didn't provide space info, try the first NIfTI warp in chain
     if master_hdr_obj is None:

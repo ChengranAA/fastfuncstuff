@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import nibabel as nib
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.processing.nwarpforge import nwarpforge
@@ -100,3 +101,40 @@ def test_surface_points_get_the_same_correction(tmp_path):
         assert got is not None
         err = np.abs(got.numpy() - want).max()
         assert (err < 2e-3) if ok else (err > 0.3)
+
+
+def test_chain_base_keeps_jac_on_the_named_fieldmap(tmp_path):
+    """Bug of record (2026-10-14): -chain_base inserted its correction at the front of
+    the transforms but not of the names, so -jac AXIS:FIELDMAP (found by name, then
+    indexed into the transforms) took the Jacobian of the transform BEFORE the
+    fieldmap: on autoproc chains the PE-only anat nonlinear warp, which stippled every
+    stage10 image. Chain = [other PE warp, fieldmap PE warp] on cardinal grids, where
+    the correction is the identity, so -chain_base must change nothing; a constant
+    source makes the output the applied Jacobian itself."""
+    n = 16
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    src = tmp_path / "const.nii"
+    nib.Nifti1Image(np.full((n, n, n), 100.0, np.float32), aff).to_filename(str(src))
+
+    def pe_ramp(name, slope_mm):
+        jj = np.arange(n, dtype=np.float32)[None, :, None]
+        d = np.zeros((n, n, n, 3), np.float32)
+        d[..., 1] = np.broadcast_to(slope_mm * (jj - n / 2), (n, n, n))
+        p = tmp_path / name
+        nib.Nifti1Image(d, aff).to_filename(str(p))
+        return str(p)
+
+    other = pe_ramp("anat_nl_warp.nii", 0.6)  # Jacobian 1 -/+ 0.3
+    fmap = pe_ramp("fmap_warp.nii", 0.2)  # Jacobian 1 -/+ 0.1
+    outs = {}
+    for cb in (False, True):
+        out = tmp_path / f"out_{cb}.nii"
+        nwarpforge(
+            source_path=str(src), nwarp_specs=[other, fmap], prefix=str(out),
+            master_path=str(src), interp="linear", device=DEV, verb=0,
+            jac_axis=1, jac_match="fmap_warp", auto_pad=False,
+            chain_base=str(src) if cb else None,
+        )  # fmt: skip
+        outs[cb] = np.asarray(nib.load(str(out)).dataobj, np.float32)[3:-3, 3:-3, 3:-3]
+    assert abs(float(np.median(outs[False])) - 100.0) == pytest.approx(10.0, abs=0.5)
+    np.testing.assert_allclose(outs[True], outs[False], atol=1e-3)

@@ -3935,7 +3935,7 @@ def _stage_phasereg(plan: Plan) -> str:
         how = "own phase only, no sPR: no anat tissue maps for a vein mask (-tissue)"
     else:
         how = "own phase only, no sPR (-phasereg_veins off)"
-    out.append(f"echo 'phasereg: {how}; Deming slope, phi from FFT noise, no slope cap'")
+    out.append(f"echo 'phasereg: {how}; Deming slope damped by ODR (-shrink slope), phi from FFT noise, no cap'")
     if extra:
         out.append(f"echo 'phasereg: extra options {shlex.quote(opt.phasereg_opts)[1:-1]}'")
     for task, prs in tasks.items():

@@ -99,3 +99,45 @@ def test_thermal_phi_recovers_c_one_and_the_vein_slope():
     )
     assert abs(vein_slope / slope - 1.0) < 0.1
     assert float(ols.slope[:n_vein].median()) < 0.9 * slope  # attenuated: what Deming fixes
+
+
+def test_shrink_slope_damps_unreliable_slopes_and_odr_is_phaseprep():
+    """-shrink slope (default): s = 1/(1 + A^2/phi) is ~1 in a well-coupled voxel, so
+    the full A*phase comes out, and ~0 where Deming fits phase noise, so at most a
+    bounded bit of noise is added where -shrink none explodes. -shrink odr is phaseprep's output: the voxel
+    mean plus the residual scaled by s."""
+    from fastfuncstuff.phasereg.core import phase_regress
+
+    g = torch.Generator().manual_seed(3)
+    n_tp = 200
+    # 50 coupled voxels (magnitude = -400 * true phase + noise), 400 uncoupled. The
+    # coupled signal is slow (< 0.08 Hz at TR 2 s), as vein fluctuations are, so the
+    # FFT noise band (> 0.15 Hz) sees only noise.
+    t = torch.arange(n_tp, dtype=torch.float32) * 2.0
+    f = 0.005 + 0.075 * torch.rand(50, 6, 1, generator=g)
+    ph0 = 6.283 * torch.rand(50, 6, 1, generator=g)
+    truth = 0.02 * torch.sin(6.283 * f * t + ph0).sum(1)
+    pha_c = truth + 0.001 * torch.randn(50, n_tp, generator=g)
+    mag_c = 1000 - 400 * truth + 2 * torch.randn(50, n_tp, generator=g)
+    pha_u = 0.01 * torch.randn(400, n_tp, generator=g)
+    mag_u = 1000 + 50 * torch.randn(400, n_tp, generator=g)
+    mag, pha = torch.cat([mag_c, mag_u]), torch.cat([pha_c, pha_u])
+    kw = dict(keep_drift=True, max_poly_degree=0, device="cpu")
+    slope = phase_regress(mag, pha, 2.0, shrink_mode="slope", **kw)
+    full = phase_regress(mag, pha, 2.0, shrink_mode="none", **kw)
+    removed = (mag - slope.magnitude_corrected).std(dim=1) / mag.std(dim=1)
+    assert float(removed[:50].median()) > 0.9  # the coupled signal comes out
+    # Uncoupled: s*A = A*phi/(phi + A^2) peaks at sqrt(phi)/2, so at most a quarter of
+    # the noise variance is added (SD x sqrt(1.25)) -- bounded, never an explosion.
+    noisier = slope.magnitude_corrected[50:].std(dim=1) / mag[50:].std(dim=1)
+    assert float(noisier.max()) < 1.25**0.5 + 0.01 and float(noisier.median()) < 1.03
+    assert float((full.magnitude_corrected[50:].std(dim=1) / mag[50:].std(dim=1)).max()) > 10
+
+    odr = phase_regress(
+        mag, pha, 2.0, shrink_mode="odr", keep_drift=False, max_poly_degree=0, device="cpu"
+    )
+    s = 1.0 / (1.0 + odr.slope**2 / odr.phi)
+    m0, p0 = mag - mag.mean(1, keepdim=True), pha - pha.mean(1, keepdim=True)
+    r = m0 - odr.slope[:, None] * p0
+    want = mag.mean(1, keepdim=True) + s[:, None] * r
+    assert torch.allclose(odr.magnitude_corrected, want, rtol=1e-4, atol=1e-2)

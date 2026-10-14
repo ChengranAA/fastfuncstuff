@@ -337,7 +337,7 @@ def phase_regress(
     phase_unwrap: bool = True,
     phase_global_order: int = -1,
     keep_drift: bool = False,
-    shrink_mode: str = "none",
+    shrink_mode: str = "slope",
     vein_mask: bool = False,
     vein_fdr_q: float = 0.05,
     spr: bool = False,
@@ -445,12 +445,17 @@ def phase_regress(
         False (default, phaseprep): the corrected magnitude is re-centred on
         its mean with the ``max_poly_degree`` drift dropped. True: corrected
         = input - macro, drift kept for a downstream GLM.
-    shrink_mode : {"none", "odr"}
-        "none" (default) subtracts A·phase and leaves the residual intact.
-        "odr" (phaseprep/Stanley parity) applies s = 1/(1 + A²/φ): without
-        ``keep_drift`` the residual, micro BOLD included, is scaled by s (t
-        unchanged, betas shrunk most near veins); with ``keep_drift`` only
-        s·A·phase is removed, leaving (1 − s) of the macro in.
+    shrink_mode : {"slope", "odr", "none"}
+        ODR's factor s = 1/(1 + A²/φ) is ~1 where the slope is believable and
+        ~0 where it is an ill-conditioned fit to phase noise (A² ≫ φ).
+        "slope" (default): subtract s·A·phase and leave the residual intact,
+        so an unreliable slope is damped toward zero (s·A → φ/A) instead of
+        exploding; no cap, no deletion. On ds003427 (2026-10-14): 0 explosions,
+        an even 7–15% suppression. "odr" (phaseprep/Stanley parity): the
+        published output, the residual scaled by s, which flattens every voxel
+        whose slope is unreliable, task response included (~73% of the
+        response removed, veins and tissue alike, on ds003427). "none": subtract
+        A·phase in full; with weakly coupled voxels the slope explodes.
     vein_mask : bool
         Also emit a vein *exclusion* mask: voxels whose magnitude covaries with
         phase beyond chance (oriented vessels). For layer workflows that drop
@@ -547,8 +552,8 @@ def phase_regress(
         raise ValueError(f"Unknown regression: {regression!r}")
     if slope_on not in ("data", "residual"):
         raise ValueError(f"Unknown slope_on: {slope_on!r}. Use 'data' or 'residual'.")
-    if shrink_mode not in ("none", "odr"):
-        raise ValueError(f"Unknown shrink_mode: {shrink_mode!r}. Use 'odr' or 'none'.")
+    if shrink_mode not in ("slope", "odr", "none"):
+        raise ValueError(f"Unknown shrink_mode: {shrink_mode!r}. Use 'slope', 'odr' or 'none'.")
 
     # ── 1. Keep magnitude in raw scanner units ───────────────────────────
     # phaseprep and Stanley fit ODR on raw-unit magnitude. With raw mag and
@@ -974,11 +979,12 @@ def phase_regress(
         # voxelwise with phaseprep.
         pha_centered = pha_filt - pha_filt.mean(dim=0)
         inflation = 1.0 + (s * s) / phi_c.clamp(min=1e-12)
-        shrink = 1.0 / inflation if shrink_mode == "odr" else torch.ones_like(inflation)
+        shrink = 1.0 / inflation if shrink_mode != "none" else torch.ones_like(inflation)
 
         ss_total = ((mag_dt - mag_dt.mean(dim=0)) ** 2).sum(dim=0)
         r_obs = mag_dt - (b.unsqueeze(0) + s.unsqueeze(0) * pha_centered)
-        eps = r_obs * shrink.unsqueeze(0)
+        # "slope" keeps the residual whole: only the damped slope acts.
+        eps = r_obs * shrink.unsqueeze(0) if shrink_mode == "odr" else r_obs
         zero = torch.zeros_like(ss_total)
         has_var = ss_total > 1e-30
         r2[lo:hi] = torch.where(has_var, 1.0 - (eps**2).sum(dim=0) / ss_total, zero).cpu()
@@ -990,20 +996,21 @@ def phase_regress(
             ).cpu()
 
         # ── Apply the correction ──
-        # keep_drift=False (phaseprep parity): corrected = mean(mag) + eps, the
-        # shrunk residual re-centred on the voxel mean, drift dropped; voxels
-        # with an ill-conditioned huge slope collapse to ≈ mean.
-        # keep_drift=True (GLM-friendly): corrected = mag − A_eff·(phase − mean),
-        # A_eff = A·shrink, drift kept for the downstream GLM. With shrink_mode
-        # "odr", A_eff ≤ √φ/2 bounds the subtraction in ill-conditioned voxels.
-        # The saved macro is whatever was actually subtracted, so
-        # mag − corrected ≡ macro in both modes.
-        if keep_drift:
-            macro = (s * shrink).unsqueeze(0) * pha_centered
-            corrected = mag - macro
+        # ``removed`` is what comes out of the detrended series: s·A·phase for
+        # "slope" (and A·phase for "none"), plus (1 − s) of the residual for
+        # "odr". keep_drift=True subtracts it from the input (drift kept for a
+        # GLM); False re-centres the detrended series on the voxel mean, which for
+        # "odr" is phaseprep's mean + eps. mag − corrected ≡ macro in every mode.
+        if shrink_mode == "odr":
+            # phaseprep: the detrended series minus A·phase, residual scaled by s
+            removed = s.unsqueeze(0) * pha_centered + r_obs - eps
         else:
-            corrected = mag.mean(dim=0, keepdim=True) + eps
-            macro = mag - corrected
+            removed = (s * shrink).unsqueeze(0) * pha_centered
+        if keep_drift:
+            corrected = mag - removed
+        else:
+            corrected = mag.mean(dim=0, keepdim=True) + (mag_dt - b.unsqueeze(0)) - removed
+        macro = mag - corrected
         mag_corrected[lo:hi] = _host(corrected)
         macro_out[lo:hi] = _host(macro)
 
@@ -1096,13 +1103,12 @@ def phase_regress(
             )
         else:
             frac = (1.0 / infl_good).median().item()
-            # The two output modes put the same factor in different places.
             what = (
-                "of the fitted macro component is left IN the output"
-                if keep_drift
+                "of the fitted macro component is left IN the output (slope damped)"
+                if shrink_mode == "slope"
                 else "of the residual (micro signal + noise) is removed WITH the macro"
             )
-            print(f"    shrink_mode='odr': median {100.0 * (1 - frac):.0f}% {what}.")
+            print(f"    shrink_mode={shrink_mode!r}: median {100.0 * (1 - frac):.0f}% {what}.")
         print(f"  R2 distribution over {n_good:,} masked voxels:")
         for thresh in (0.01, 0.05, 0.10, 0.20, 0.30, 0.50):
             n_above = int((r2_good > thresh).sum().item())

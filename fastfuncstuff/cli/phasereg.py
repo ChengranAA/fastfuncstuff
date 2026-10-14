@@ -35,7 +35,8 @@ _DESCRIPTION = """\
 Remove the phase-explained (macrovascular) part of magnitude BOLD.
 
 Each voxel's magnitude is regressed on its phase with a Deming (errors-in-
-variables) fit, capped at twice the OLS slope, and A*phase is subtracted. Runs passed together share one slope
+variables) fit, and s*A*phase is subtracted, where ODR's factor s = 1/(1+A^2/phi)
+damps slopes the data cannot support (-shrink slope). Runs passed together share one slope
 per voxel (drift removed per run) and are written back one file per run.
 
 UPSTREAM, in order (phase in radians, voxel-matched to the magnitude):
@@ -83,10 +84,10 @@ runs go in; -concat_output gives one file. 3D maps are one per fit.)
 IF VEINS SURVIVE, read prefix_slope at the vein:
   * Slope ~0: the voxel's own phase carries nothing (phase cancels within a
     voxel-sized vein, or the vessel is near the magic angle). Use -spr.
-  * Slope huge (1e3-1e5): an ill-conditioned fit to phase noise. Under -shrink
-    odr the voxel collapses to its mean, which looks like suppression but is
-    not; with the default -shrink none it shows as added noise. -spr gives it
-    a real regressor.
+  * Slope huge (1e3-1e5): an ill-conditioned fit to phase noise. The default
+    -shrink slope damps it to ~0 (no correction); -shrink odr collapses the
+    voxel to its mean, which looks like suppression but is not; -shrink none
+    adds it as noise. -spr gives it a real regressor.
   * Slopes small everywhere: phase noise dominates the regressor. Run
     ffs_phasedrift upstream.
 """
@@ -159,13 +160,17 @@ def create_parser() -> argparse.ArgumentParser:
     )
     reg.add_argument(
         "-shrink",
-        choices=["odr", "none"],
-        default="none",
-        help="'none': subtract A*phase, leave the residual intact. 'odr': phaseprep "
-        "parity. It also applies ODR's factor s = 1/(1+A^2/phi): by default the "
-        "residual (micro BOLD included) is scaled by s, so betas shrink most near "
-        "veins; with -keep_drift only s*A*phase is removed, leaving (1-s) of the "
-        "macro in.",
+        choices=["slope", "odr", "none"],
+        default="slope",
+        help="ODR's factor s = 1/(1+A^2/phi): ~1 for a believable slope, ~0 for an "
+        "ill-conditioned fit to phase noise. 'slope' (default): subtract s*A*phase, "
+        "residual intact, so unreliable slopes are damped toward zero instead of "
+        "exploding (no cap; s*A <= sqrt(phi)/2, so an uncoupled voxel gains at most "
+        "12%% in SD; ds003427: 0 explosions, an even 7-15%% suppression). "
+        "'odr': phaseprep/Stanley's output, the residual scaled by s, which "
+        "flattens every voxel with an unreliable slope (~73%% of the response "
+        "removed, veins and tissue alike, on ds003427). 'none': the full A*phase; "
+        "explodes where magnitude and phase barely couple.",
     )
     reg.add_argument(
         "-phi",

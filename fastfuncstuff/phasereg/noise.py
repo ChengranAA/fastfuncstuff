@@ -18,6 +18,8 @@ This module provides two estimation strategies:
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 
 
@@ -62,6 +64,14 @@ def _psd_noise_variance(
     n_bins = mask.sum().item()
 
     if n_bins < 2:
+        # Long TR / short run: no noise band above freq_lo. Total variance includes
+        # the task, which changes what Deming estimates -- say so.
+        warnings.warn(
+            f"phi (fft): fewer than 2 frequency bins in [{freq_lo:g}, {freq_hi:g}] Hz "
+            f"(TR {tr:g} s, {n_tp} volumes); using total variance instead. Lower "
+            "-freq_range or use -phi_method residual with a task model.",
+            stacklevel=2,
+        )
         return data.var(dim=0)
 
     filtered = torch.zeros_like(spectrum)
@@ -120,7 +130,9 @@ def estimate_variance_ratio(
 
     elif method == "residual":
         if design is not None:
-            Q, _ = torch.linalg.qr(design)
+            from fastfuncstuff.stats.task_coupling import _orthonormal_basis
+
+            Q = _orthonormal_basis(design)
             mag_resid = magnitude - Q @ (Q.T @ magnitude)
             pha_resid = phase - Q @ (Q.T @ phase)
         else:

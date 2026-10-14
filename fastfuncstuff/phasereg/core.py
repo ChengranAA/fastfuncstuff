@@ -31,6 +31,7 @@ from tqdm.auto import tqdm
 from fastfuncstuff.phasereg.deming import deming_regression, ols_regression
 from fastfuncstuff.phasereg.noise import estimate_variance_ratio
 from fastfuncstuff.processing.filters import savgol_filter_1d, savgol_filter_explore
+from fastfuncstuff.stats.task_coupling import _orthonormal_basis
 
 
 @dataclass
@@ -138,10 +139,8 @@ def _project_out(data: torch.Tensor, design: torch.Tensor) -> torch.Tensor:
     -------
     residual : (n_timepoints, n_voxels)
     """
-    if design.shape[1] == 0:
-        return data
-    Q, _ = torch.linalg.qr(design)
-    return data - Q @ (Q.T @ data)
+    Q = _orthonormal_basis(design)
+    return data - Q @ (Q.T @ data) if Q.shape[1] else data
 
 
 def _voxel_coords(
@@ -613,7 +612,11 @@ def phase_regress(
     has_task = any(t is not None for t in task_per_run)
 
     def _basis(design: torch.Tensor) -> torch.Tensor | None:
-        return torch.linalg.qr(design)[0] if design.shape[1] > 0 else None
+        # Rank-revealing: QR keeps an arbitrary orthonormal direction for an
+        # all-zero column (a condition with no events in this run) or a
+        # duplicate, and projecting that out removed real signal.
+        q = _orthonormal_basis(design)
+        return q if q.shape[1] else None
 
     q_drift = [_basis(p) for p in poly_per_run]
     q_full = [

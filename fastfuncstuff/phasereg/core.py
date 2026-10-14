@@ -797,7 +797,7 @@ def phase_regress(
             del prepared
 
     # ── 5b. sPR: swap in each voxel's best neighbouring phase regressor ───
-    # Donor selection runs on the DETRENDED series, not the task-residualised
+    # By default (spr_select_on="data") donor selection runs on the DETRENDED series, not the task-residualised
     # one: the signal that identifies a vein is precisely the task-related
     # phase change, so residualising the task out first would erase the thing
     # being searched for. The slope is still fit on whatever series
@@ -934,7 +934,12 @@ def phase_regress(
         good = vox_mask[lo:hi].to(device)
 
         if phi_thermal_c is not None:
-            m_bar = mag.mean(dim=0)
+            # The regressor's noise is the phase's: sigma/M of the voxel the phase came
+            # from. Under sPR that is the donor, and a dark vein borrowing from brighter
+            # tissue would otherwise get the vein's M^2 (thermal sigma taken as locally
+            # smooth, so the magnitude's own noise is unchanged).
+            src = mag if spr_donor is None else _rows(magnitude, 0, 0, spr_donor[lo:hi])
+            m_bar = src.mean(dim=0)
             phi_c = (phi_thermal_c * m_bar * m_bar).clamp_min(1e-6)
         elif phi is None:
             phi_c = estimate_variance_ratio(

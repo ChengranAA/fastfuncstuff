@@ -163,3 +163,28 @@ def test_spr_regression_ols_inside_the_vein_mask_only():
     assert torch.equal(split.magnitude_corrected[150:], glob.magnitude_corrected[150:])
     ratio = split.magnitude_corrected[:150].std(1) / mag[:150].std(1)
     assert float(ratio.max()) <= 1.0 + 1e-5  # OLS removes, never adds
+
+
+def test_thermal_phi_uses_the_donor_brightness_under_spr():
+    """phi = c * M^2 describes the REGRESSOR's noise (sigma / M of the voxel the phase
+    came from). Under sPR that is the donor: a dark vein borrowing from brighter
+    tissue must get the donor's M^2, not its own."""
+    from fastfuncstuff.phasereg.core import phase_regress
+
+    g = torch.Generator().manual_seed(7)
+    shape, n_tp = (6, 6, 6), 120
+    n = 6 * 6 * 6
+    level = 500 + 1500 * torch.rand(n, 1, generator=g)  # brightness varies by voxel
+    pha = 0.02 * torch.randn(n, n_tp, generator=g)
+    mag = level - 200 * pha.roll(1, 0) + 5 * torch.randn(n, n_tp, generator=g)
+    res = phase_regress(
+        mag, pha, 2.0, keep_drift=True, max_poly_degree=0, device="cpu", spr=True,
+        volume_shape=shape, phi_method="thermal", spr_regression=None,
+    )  # fmt: skip
+    donor = res.spr_donor
+    borrowed = donor != torch.arange(n)
+    assert int(borrowed.sum()) > 20
+    m_bar = mag.mean(1)
+    c = res.phi[~borrowed] / m_bar[~borrowed] ** 2
+    want = c.median() * m_bar[donor[borrowed]] ** 2
+    assert torch.allclose(res.phi[borrowed], want, rtol=1e-3)

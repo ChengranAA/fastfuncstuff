@@ -34,7 +34,7 @@ import torch
 from tqdm.auto import tqdm
 
 from fastfuncstuff.memory import bytes_per_voxel_arma, make_vram_debugger
-from fastfuncstuff.utils import get_device, to_tensor, warn_mps_float32_precision
+from fastfuncstuff.utils import full_fp32_matmul, get_device, to_tensor, warn_mps_float32_precision
 
 from .whiten import (
     RunWhitener,
@@ -1590,6 +1590,26 @@ def precompute_reml_grid(
 
 
 @torch.inference_mode()
+def _residualize_reml_search_data(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
+    """Remove fitted signal before low-precision REML energy differences.
+
+    REML is invariant to subtracting Xc. Float64 reductions alone cannot repair
+    float32 products in ||Yw||² - ||Q'Yw||² when a large baseline nearly cancels.
+    Only the small design factorization uses float64; voxel GEMMs stay on-device.
+    """
+    if Y.dtype == torch.float64 or X.shape[1] == 0:
+        return Y
+    from .core import design_pinv
+
+    design = X.to(device=Y.device, dtype=Y.dtype)
+    pinv, _, _ = design_pinv(design)
+    # TF32 would quantize Xc before the subtraction meant to remove it.
+    with full_fp32_matmul():
+        fitted = (Y @ pinv.T) @ design.T
+    return fitted.neg_().add_(Y)
+
+
+@torch.inference_mode()
 def batch_reml_grid_search(
     X: torch.Tensor,
     Y_batch: torch.Tensor,
@@ -1663,6 +1683,7 @@ def batch_reml_grid_search(
 
     X = X.to(device)
     Y_batch = Y_batch.to(device)
+    Y_batch = _residualize_reml_search_data(X, Y_batch.T).T
 
     n_timepoints, n_voxels_batch = Y_batch.shape
     n_regressors = X.shape[1]
@@ -1968,6 +1989,7 @@ def search_voxels_precomputed_grid(
     # Move Y_batch to device if needed
     if Y_batch.device != device:
         Y_batch = Y_batch.to(device)
+    Y_batch = _residualize_reml_search_data(X, Y_batch)
 
     # Allocate full surface array if requested: (n_voxels, n_valid_pairs)
     if return_profile:
@@ -2059,8 +2081,8 @@ def search_voxels_precomputed_grid_hierarchical(
     Parameters
     ----------
     X : torch.Tensor, shape (n_timepoints, n_regressors)
-        Design matrix (used only for shape — actual prewhitening uses
-        precomputed L_inv).
+        Design matrix for fixed-effect conditioning. Prewhitening uses the
+        factors in precomputed_grid.
     Y_batch : torch.Tensor, shape (n_voxels_batch, n_timepoints)
         Voxel timeseries data, voxels-major (matches
         search_voxels_precomputed_grid's convention).
@@ -2086,6 +2108,7 @@ def search_voxels_precomputed_grid_hierarchical(
 
     if Y_batch.device != device:
         Y_batch = Y_batch.to(device)
+    Y_batch = _residualize_reml_search_data(X, Y_batch)
 
     # Build sorted (a, b) axes from the precomputed dict.
     param_list = list(precomputed_grid.keys())
@@ -3869,8 +3892,8 @@ def fit_glm_arma11(
         dsort = _dsort_constant_guard(dsort)
 
     # Per-voxel normalization for float32 numerical conditioning.
-    # Dividing Y by its std before REML and GLS eliminates catastrophic cancellation
-    # (residuals are O(1) instead of O(signal/noise_ratio)).
+    # Dividing Y by its std keeps GLS residuals O(1). Fixed-effect subtraction
+    # conditions the REML search separately; scaling alone cannot repair cancellation.
     # REML argmin, R², t-stats, and F-stats are all scale-invariant.
     # Betas, sigma2, residuals, and predicted are unscaled in post-processing.
     _y_norm_scale: torch.Tensor | None = None

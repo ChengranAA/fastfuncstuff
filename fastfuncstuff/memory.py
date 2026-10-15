@@ -644,14 +644,16 @@ def bytes_per_voxel_arma_search(
     shared across voxels (per grid point) — they live in the
     precomputed grid, not in the per-voxel chunk.
 
-    Memory model: ``(3 * n_timepoints + n_regressors + 4) * 4 bytes``
+    Memory model: ``(5 * n_timepoints + 2 * n_regressors + 4) * 4 bytes``
     - Y row on device                : n_timepoints * 4
+    - conditioned search row         : n_timepoints * 4
+    - hierarchical active subset     : n_timepoints * 4
     - Y_w transient (L_inv @ Y)      : n_timepoints * 4
     - resid-scratch (Q' Y_w etc.)    : n_timepoints * 4 (upper bound)
-    - Q'Y_w + likelihood scratch     : n_regressors * 4
+    - conditioning betas + Q'Y_w     : 2 * n_regressors * 4
     - best_params / best_likelihoods : 4 floats
     """
-    return (3 * n_timepoints + n_regressors + 4) * 4
+    return (5 * n_timepoints + 2 * n_regressors + 4) * 4
 
 
 def bytes_per_voxel_lss(

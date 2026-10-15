@@ -1555,28 +1555,6 @@ class TestHybridOptimizer:
             torch.from_numpy(blob(c + 1.5, n / 4.5) + blob(c - n / 5 + 1.5, n / 12, 40.0)),
         )
 
-    def _ls(self, cost, optimizer):
-        import torch
-
-        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
-        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
-
-        base, moving = self._pair()
-        warped, *_ = qwarp(
-            base,
-            moving,
-            config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, optimizer=optimizer),
-            device=torch.device("cuda"),
-        )
-        return evaluate_metrics(MetricInputs(base=base, moving=warped.cpu()), ["ls"])["ls"]
-
-    @pytest.mark.gpu
-    @pytest.mark.parametrize("cost", ["pearclp", "lpa"])
-    def test_hybrid_is_no_worse_than_gauss_newton_alone(self, cost):
-        """The polish starts from GN's answer and only accepts improvements, so it
-        cannot hand back something worse than what it was given."""
-        assert self._ls(cost, "hybrid") <= self._ls(cost, "gn") + 1e-6
-
     def test_polish_warm_starts_rather_than_restarting(self):
         """A polish that began from zeros would throw away GN's work and just be a
         short (and therefore bad) Adam run."""

@@ -18,6 +18,7 @@ __all__ = [
     "FfsHelpFormatter",
     "ScannableHelpFormatter",
     "canonical_option_strings",
+    "normalize_group_title",
     "spelling_variants",
     "suggest",
 ]
@@ -52,6 +53,38 @@ def canonical_option_strings(option_strings: list[str]) -> list[str]:
         seen.add(key)
         out.append(opt)
     return out
+
+
+_REQUIRED_TITLE = re.compile(r"(?i)^required(?:\s+(?:arguments?|inputs?))?(?=\s*(?:\(|$))")
+_TITLE_WORD = re.compile(r"(?<=[\s/\-])[A-Z][a-z]+\b")
+
+
+def normalize_group_title(title: str) -> str:
+    """Sentence-case an argument-group title so every tool's ``-help`` reads alike.
+
+    Group titles had drifted into three casings ("Required Arguments",
+    "required", "inputs & scope") and seven spellings of the required group.
+    Fixing it here, where every parser already passes, means the 70-odd call
+    sites keep their words and only the shape is decided in one place.
+
+    Only a leading run before any parenthetical is touched, because that is
+    where proper nouns and flag names live ("(Patriat et al. 2017)",
+    "(only used with -model FLOBS)").  Acronyms (all-caps) never match, and a
+    "STEP n -- ..." title is a numbered outline, left as authored.
+    """
+    if title.startswith("STEP "):
+        return title
+    head, sep, tail = title.partition(" (")
+    required = _REQUIRED_TITLE.match(head)
+    if required:
+        head = "Required arguments" + head[required.end() :]
+    else:
+        head = re.sub(r"(?i)^input\s*/\s*output", "Input/Output", head)
+        head = _TITLE_WORD.sub(lambda m: m.group(0).lower(), head)
+        first = head.split(" ", 1)[0]
+        if first[:1].islower() and first.isalpha():
+            head = head[:1].upper() + head[1:]
+    return head + sep + tail
 
 
 class FfsHelpFormatter(
@@ -216,6 +249,11 @@ class FfsArgumentParser(argparse.ArgumentParser):
         super().__init__(*args, **kwargs)
         self._ffs_alias_strings: set[str] = set()
         self._ffs_aliases_applied = False
+
+    def add_argument_group(self, title=None, *args, **kwargs):
+        if isinstance(title, str):
+            title = normalize_group_title(title)
+        return super().add_argument_group(title, *args, **kwargs)
 
     def _ffs_apply_spelling_aliases(self) -> None:
         """Make every registered flag's other spelling parse. Idempotent."""

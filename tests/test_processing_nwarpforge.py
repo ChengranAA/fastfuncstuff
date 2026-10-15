@@ -907,3 +907,35 @@ def test_static_warp_after_per_volume_affine_keeps_its_own_grid(tmp_path):
                    auto_pad=False)  # fmt: skip
         ref = np.asarray(nib.load(ref_p).dataobj).squeeze()
         np.testing.assert_allclose(got[..., t][inner], ref[inner], atol=1e-2)
+
+
+def test_nwarpforge_composes_at_full_fp32_even_after_a_solver_enabled_tf32(tmp_path, monkeypatch):
+    """Solvers leave float32 matmul at 'high' (TF32) process-wide; a transform applied
+    later in the same process (the -allineate rebuild, a batch) inherited it and lost
+    ~0.1 voxel of coordinate precision. nwarpforge must run at 'highest' and hand
+    the caller's setting back."""
+    nib = pytest.importorskip("nibabel")
+    import fastfuncstuff.processing.nwarpforge as nf
+
+    seen = []
+    real = nf.compose_chain
+
+    def spy(*a, **k):
+        seen.append(torch.get_float32_matmul_precision())
+        return real(*a, **k)
+
+    monkeypatch.setattr(nf, "compose_chain", spy)
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    sp = tmp_path / "s.nii.gz"
+    nib.save(nib.Nifti1Image(np.random.rand(8, 8, 8).astype(np.float32), aff), sp)
+    wp = tmp_path / "w_WARP.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8, 1, 3), np.float32), aff), wp)
+    before = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        nf.nwarpforge(str(sp), [str(wp)], str(tmp_path / "o.nii.gz"),
+                      device=torch.device("cpu"), verb=0)  # fmt: skip
+        assert seen and set(seen) == {"highest"}
+        assert torch.get_float32_matmul_precision() == "high"
+    finally:
+        torch.set_float32_matmul_precision(before)

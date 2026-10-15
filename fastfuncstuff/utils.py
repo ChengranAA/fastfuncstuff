@@ -10,7 +10,7 @@ import functools
 import os
 import threading
 import warnings
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -626,6 +626,30 @@ constant and let those CLIs take the default ``tf32=True``.
 Does not affect the GLM-side CLIs, which already call
 :func:`configure_torch_backends` with the default and want TF32.
 """
+
+
+@contextlib.contextmanager
+def full_fp32_matmul() -> Generator[None]:
+    """Run the block with TF32 off, restoring the caller's matmul precision after.
+
+    For geometry: a voxel coordinate in the hundreds keeps ~0.1 voxel through a
+    TF32 (10-bit mantissa) matmul. Several solvers still switch TF32 on process-
+    wide, so a transform applied later in the same process -- the -allineate
+    rebuild, a batch -- inherited it: measured 0.7 median / 70 max intensity
+    difference against the CPU on a T1->MNI chain. Also usable as a decorator.
+    """
+    prev = torch.get_float32_matmul_precision()
+    prev_mm = torch.backends.cuda.matmul.allow_tf32
+    prev_cudnn = torch.backends.cudnn.allow_tf32
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(prev)
+        torch.backends.cuda.matmul.allow_tf32 = prev_mm
+        torch.backends.cudnn.allow_tf32 = prev_cudnn
 
 
 def configure_torch_backends(

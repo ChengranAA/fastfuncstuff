@@ -29,6 +29,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from ..utils import full_fp32_matmul
 from .interp import (
     _separable_resample_3d,
     normalize_interp_mode,
@@ -1804,6 +1805,7 @@ def _phase_spacetime_channels(
     return channels, no_neg, recombine
 
 
+@full_fp32_matmul()
 def nwarpforge(
     source_path: str,
     nwarp_specs: list[str],

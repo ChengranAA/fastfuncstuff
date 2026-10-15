@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 
 __all__ = [
     "FfsArgumentParser",
@@ -171,6 +172,20 @@ def suggest(action: argparse.Action, values) -> argparse.Action:
     return action
 
 
+def option_string_value(action: argparse.Action) -> argparse.Action:
+    """Mark a flag whose value is itself a string of flags (``-allineate_opts '-rigid'``).
+
+    argparse only takes a ``-``-leading value when it contains a space, so a
+    single-flag string dies with "expected one argument" while a multi-flag one
+    parses. :class:`FfsArgumentParser` glues a marked flag to its value
+    (``-x_opts=-rigid``), the one form argparse never second-guesses.
+
+    Returns the action, so it can wrap an ``add_argument`` call in place.
+    """
+    setattr(action, "ffs_option_string_value", True)  # noqa: B010
+    return action
+
+
 class FfsArgumentParser(argparse.ArgumentParser):
     """``ArgumentParser`` that accepts both spellings of every flag it is given.
 
@@ -230,6 +245,27 @@ class FfsArgumentParser(argparse.ArgumentParser):
             out.append(tup)
         return out
 
+    def _ffs_glue_option_string_values(self, args: list[str]) -> list[str]:
+        """``-x_opts VALUE`` -> ``-x_opts=VALUE`` for flags marked by option_string_value."""
+        glued = {
+            opt
+            for opt, action in self._option_string_actions.items()
+            if getattr(action, "ffs_option_string_value", False)
+        }
+        if not glued:
+            return args
+        out: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] in glued and i + 1 < len(args):
+                out.append(f"{args[i]}={args[i + 1]}")
+                i += 2
+            else:
+                out.append(args[i])
+                i += 1
+        return out
+
     def parse_known_args(self, args=None, namespace=None):
         self._ffs_apply_spelling_aliases()
-        return super().parse_known_args(args, namespace)
+        argv = sys.argv[1:] if args is None else list(args)
+        return super().parse_known_args(self._ffs_glue_option_string_values(argv), namespace)

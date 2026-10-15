@@ -19,6 +19,7 @@ from fastfuncstuff.cli_help import (
     FfsArgumentParser,
     FfsHelpFormatter,
     canonical_option_strings,
+    option_string_value,
     spelling_variants,
     suggest,
 )
@@ -164,6 +165,20 @@ def test_suggest_returns_the_action_so_it_can_wrap_add_argument():
     assert action.dest == "device"
     # A hint is not a constraint: anything still parses.
     assert parser.parse_args(["-device", "cuda,0"]).device == "cuda,0"
+
+
+def test_option_string_value_takes_a_single_dash_led_flag():
+    """argparse rejects ``-x_opts '-rigid'`` ("expected one argument") but takes
+    ``-x_opts '-rigid -cost ls'`` -- the space is what lets it through. A marked
+    flag must take both, under either spelling, and leave other flags alone."""
+    parser = FfsArgumentParser(prog="demo")
+    option_string_value(parser.add_argument("-al_opts", default=None))
+    parser.add_argument("-rigid", action="store_true")
+    assert parser.parse_args(["-al_opts", "-rigid"]).al_opts == "-rigid"
+    assert parser.parse_args(["-al-opts", "-rigid"]).al_opts == "-rigid"
+    assert parser.parse_args(["-al_opts", "-rigid -cost ls"]).al_opts == "-rigid -cost ls"
+    args = parser.parse_args(["-rigid", "-al_opts", "-superfast"])
+    assert args.rigid and args.al_opts == "-superfast"
 
 
 def test_the_default_formatter_is_the_shared_one():

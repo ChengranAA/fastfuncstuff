@@ -147,6 +147,25 @@ def test_tables_survive_the_round_trip_through_a_file(tmp_path, suffix):
     assert set(found) == {(1, "2-sided")}
 
 
+def test_tables_are_read_from_an_afni_head(tmp_path):
+    """3dClustSim's 3drefit and 3dttest++ -Clustsim leave the tables as .HEAD
+    string attributes. nibabel's parser folds their newlines into spaces, which
+    the old line-per-row parse could not survive. The layout below is AFNI's own
+    (checked against a 3drefit-patched dataset): a quote, the NIML, a tilde."""
+    from fastfuncstuff.stats.clustsim import read_clustsim_tables_from
+
+    niml = _written(tmp_path, nn=2, sidedness="bi-sided").read_text().rstrip()
+    head = tmp_path / "stat+tlrc.HEAD"
+    head.write_text(
+        "\ntype = string-attribute\nname = AFNI_CLUSTSIM_NN2_bisided\n"
+        f"count = {len(niml) + 1}\n'{niml}~\n"
+    )
+    for spelling in (head, tmp_path / "stat+tlrc", f"{head}[0]"):
+        found = read_clustsim_tables_from(spelling)
+        assert set(found) == {(2, "bi-sided")}
+        np.testing.assert_allclose(found[(2, "bi-sided")].sizes, _table())
+
+
 def test_the_size_for_an_alpha_is_afni_find_cluster_thresh():
     """afni_cluster.c:find_cluster_thresh: the tabulated alpha at or below the one
     asked for, a power law between the bracketing p rows, nothing past the loose end."""

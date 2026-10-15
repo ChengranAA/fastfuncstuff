@@ -1016,14 +1016,15 @@ def parse_clustsim_niml(text: str) -> ClustSimTable | None:
         athr = tuple(float(v) for v in attrs["athr"].split(","))
     except (KeyError, ValueError):
         return None
-    rows = [
-        [float(v) for v in line.split()]
-        for line in m.group("body").strip().splitlines()
-        if line.strip()
-    ]
-    sizes = np.asarray(rows, dtype=np.float64)
-    if sizes.shape != (len(pthr), len(athr)):
+    # Every number, then the declared shape: nibabel's .HEAD reader folds the
+    # table's newlines into spaces, so rows cannot come from line breaks.
+    try:
+        values = np.asarray([float(v) for v in m.group("body").split()], dtype=np.float64)
+    except ValueError:
         return None
+    if values.size != len(pthr) * len(athr):
+        return None
+    sizes = values.reshape(len(pthr), len(athr))
     nn_match = re.search(r"<3dClustSim_NN([123])", m.group(0))
     return ClustSimTable(
         nn=int(nn_match.group(1)) if nn_match else 1,
@@ -1052,6 +1053,34 @@ def read_clustsim_tables(img) -> dict[tuple[int, str], ClustSimTable]:
         re.S,
     ):
         table = parse_clustsim_niml(m.group(3))
+        if table is not None:
+            out[(int(m.group(1)), SIDED_FROM_ATTR[m.group(2)])] = table
+    return out
+
+
+def read_clustsim_tables_from(path) -> dict[tuple[int, str], ClustSimTable]:
+    """:func:`read_clustsim_tables` for a file on disk, NIfTI or AFNI ``.HEAD``.
+
+    Header only either way: a NIfTI is read up to ``vox_offset`` (the tables are
+    in its AFNI extension), a ``.HEAD`` is parsed for its ``AFNI_CLUSTSIM_*``
+    string attributes -- where 3dClustSim's ``3drefit`` and 3dttest++
+    ``-Clustsim`` put them -- without touching the BRIK.
+    """
+    from fastfuncstuff.io.afni import _afni_head_path
+    from fastfuncstuff.io.headers import parse_subbrick_selector, read_nifti_header
+
+    clean = _afni_head_path(parse_subbrick_selector(str(path))[0])
+    if not clean.endswith(".HEAD"):
+        return read_clustsim_tables(read_nifti_header(clean, extensions=True))
+
+    from nibabel.brikhead import parse_AFNI_header
+
+    out: dict[tuple[int, str], ClustSimTable] = {}
+    for name, value in parse_AFNI_header(clean).items():
+        m = re.fullmatch(r"AFNI_CLUSTSIM_NN([123])_(1sided|2sided|bisided)", name)
+        if m is None or not isinstance(value, str):
+            continue
+        table = parse_clustsim_niml(value)
         if table is not None:
             out[(int(m.group(1)), SIDED_FROM_ATTR[m.group(2)])] = table
     return out

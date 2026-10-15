@@ -57,6 +57,10 @@ uv pip install -e .
 
 Add `".[dev]"` instead of `.` for tests + linters.
 
+`ffs_autoproc` generates scripts that require Bash 4 or newer. macOS ships Bash 3.2;
+install Bash with `brew install bash` and run the script with the installed Bash
+(for example, `/opt/homebrew/bin/bash pipeline.sh` on Apple Silicon).
+
 
 ### File formats
 

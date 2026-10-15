@@ -1202,6 +1202,12 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 # ============================================================================={
         _invocation_note(invocation)
     }
+# ---- Bash version -----------------------------------------------------------
+if [ -z "${{BASH_VERSION:-}}" ] || [ "${{BASH_VERSINFO[0]}}" -lt 4 ]; then
+    echo "ERROR: ffs_autoproc pipelines require Bash >= 4 (associative arrays)." >&2
+    echo "On macOS: brew install bash; run this script with the installed Bash." >&2
+    exit 1
+fi
 set -euo pipefail
 
 OUT={shlex.quote(out_dir)}

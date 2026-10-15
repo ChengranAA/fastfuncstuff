@@ -36,7 +36,7 @@ from torch import Tensor
 
 from .._compile import safe_compile
 from ..memory import gn_normal_eqs_voxel_chunk, plan_nonlinear_memory
-from ..utils import _prefers_cuda_batching, mps_is_good_for
+from ..utils import _prefers_cuda_batching, linalg_device, mps_is_good_for
 
 try:
     from tqdm import tqdm as _tqdm
@@ -936,7 +936,12 @@ def _box_sums(vol: Tensor, bounds: Tensor) -> Tensor:
     float64 for a real one. A prefix sum reassociates the additions, and these sums
     are compared against thresholds; at float32 a box near a threshold could land on
     the other side of it and silently change which patches get optimised.
+    Floating-point sums return on linalg_device(vol.device), preserving float64
+    precision on devices that cannot store it.
     """
+    work = linalg_device(vol.device) if vol.is_floating_point() else vol.device
+    vol = vol.to(device=work)
+    bounds = bounds.to(device=work)
     acc = torch.int64 if not vol.is_floating_point() else torch.float64
     pref = torch.zeros(
         (vol.shape[0] + 1, vol.shape[1] + 1, vol.shape[2] + 1), dtype=acc, device=vol.device
@@ -986,6 +991,9 @@ def _filter_patches(
     if not keep:
         return []
 
+    # Coverage thresholds need float64 prefix sums, including on Metal.
+    weight = weight.to(device=linalg_device(weight.device))
+    mask = mask.to(device=weight.device)
     w_avg = float(weight[mask > 0].mean().item()) if (mask > 0).any() else 1.0
     bounds = torch.tensor(
         [(p.kbot, p.ktop, p.jbot, p.jtop, p.ibot, p.itop) for p in keep],
@@ -2308,7 +2316,9 @@ def _improve_warp_batched(
                 ],
                 dim=1,
             )
-            patch_energies = _box_sums(energy_global, _pen_bounds).to(energy_global.dtype)
+            patch_energies = _box_sums(energy_global, _pen_bounds).to(
+                device=energy_global.device, dtype=energy_global.dtype
+            )
             external_pen = global_energy_sum - patch_energies
 
     # Axis weight scales

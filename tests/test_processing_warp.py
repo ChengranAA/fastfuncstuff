@@ -16,6 +16,7 @@ from fastfuncstuff.processing.warp import (
     WarpState,
     _autobox,
     _blur_for_patch,
+    _box_sums,
     _checkerboard_phases,
     _compute_hfactor,
     _compute_support_padding,
@@ -610,6 +611,71 @@ class TestCheckerboardPhases:
 
 
 class TestFilterPatches:
+    def test_box_sums_preserve_small_values_after_a_large_prefix(self):
+        vol = torch.ones(12, 12, 12)
+        vol[:6] = 1e8
+        bounds = torch.tensor([[6, 11, 6, 11, 6, 11], [0, 11, 0, 11, 0, 11]])
+        sums = _box_sums(vol, bounds)
+        expected = torch.stack([vol[6:, 6:, 6:].double().sum(), vol.double().sum()])
+        assert sums.dtype == torch.float64
+        torch.testing.assert_close(sums, expected, rtol=0, atol=0)
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+    def test_mps_filter_and_box_sums_match_cpu(self):
+        weight = torch.rand(20, 20, 20)
+        mask = (weight > 0.2).to(torch.uint8)
+        mask[:5, :5, :5] = 0
+        patches = [
+            PatchSpec(0, 4, 0, 4, 0, 4, 0, 0, 0),
+            PatchSpec(6, 14, 6, 14, 6, 14, 1, 1, 1),
+        ]
+        expected = _filter_patches(patches, weight, mask, 20, 20, 20)
+        actual = _filter_patches(patches, weight.to("mps"), mask.to("mps"), 20, 20, 20)
+        assert actual == expected
+        bounds = torch.tensor([[6, 14, 6, 14, 6, 14]])
+        sums = _box_sums(weight.to("mps"), bounds.to("mps"))
+        assert sums.device.type == "cpu"
+        assert sums.dtype == torch.float64
+        torch.testing.assert_close(sums, _box_sums(weight, bounds), rtol=0, atol=0)
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+    def test_mps_refinement_with_penalty(self, monkeypatch):
+        import fastfuncstuff.processing.warp as warp_module
+        from fastfuncstuff.processing.warp import qwarp
+
+        penalty_sum_devices = []
+        original_box_sums = warp_module._box_sums
+
+        def record_box_sums(vol, bounds):
+            if vol.is_floating_point():
+                penalty_sum_devices.append(vol.device.type)
+            return original_box_sums(vol, bounds)
+
+        monkeypatch.setattr(warp_module, "_box_sums", record_box_sums)
+        base = torch.rand(16, 16, 16)
+        config = QwarpConfig(
+            minpatch=7,
+            max_level=1,
+            penalty_first_level=1,
+            gn_iters=1,
+            gn_iters_coarse=1,
+            final_interp="linear",
+            verb=0,
+        )
+        warped, *fields = qwarp(
+            base,
+            base.roll(1, dims=2),
+            weight=torch.ones_like(base),
+            mask=torch.ones_like(base, dtype=torch.uint8),
+            config=config,
+            device=torch.device("mps"),
+            pad=False,
+        )
+        assert all(t.device.type == "mps" and torch.isfinite(t).all() for t in [warped, *fields])
+        assert "mps" in penalty_sum_devices
+
     def test_all_valid(self):
         """Patches with full weight/mask should pass."""
         nx, ny, nz = 20, 20, 20

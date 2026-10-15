@@ -1253,10 +1253,11 @@ def create_parser() -> argparse.ArgumentParser:
     acc.add_argument(
         "-jacobian",
         action="store_true",
-        help="[plain path only] Modulate the corrected series by the PE Jacobian to conserve "
+        help="[not rotation-aware] Modulate the corrected series by the PE Jacobian to conserve "
         "signal: where distortion stacked voxels (compression) the correction stretches "
         "them and dims accordingly, and vice-versa. Off by default (pure geometric "
-        "correction); affects the corrected image, not the saved warp geometry.",
+        "correction); affects the corrected image, not the saved warp geometry. Multi-echo: "
+        "each echo from its own TE-scaled field, so later echoes are modulated more.",
     )
     acc.add_argument(
         "-workhard",
@@ -4152,6 +4153,8 @@ def _run_multiecho(
         f"{len(datas)} echoes, shape={datas[0].shape}, device={device}"
     )
     print(f"   data resampling kernel: {_warp_kernel_label(args.warp_interp, args.warp_radius)}")
+    if args.jacobian:
+        print("   jacobian: on, per echo from its own TE-scaled field")
     if args.me_interecho:
         mode, scaling = "inter-echo (align stack per TR)", "linear-in-TE (anchor=echo1)"
         if args.me_interecho_refine:
@@ -4521,6 +4524,13 @@ def _run_multiecho(
             or args.want_pcs is not None
         )
         corrected_series = res.corrected_series() if want_corrected else None
+        if corrected_series is not None and args.jacobian:
+            from fastfuncstuff.processing.locomoco import apply_pe_jacobian
+
+            # Each echo from its OWN field, alpha_e*w: a later echo is displaced further,
+            # so its Jacobian departs further from 1. Before the echo mean, so the
+            # task-fit "after" and the PC table see the series that is written.
+            apply_pe_jacobian(res, corrected_series)
         if corrected_series is not None and (
             getattr(args, "_task_after", None) is not None or args.want_pcs is not None
         ):

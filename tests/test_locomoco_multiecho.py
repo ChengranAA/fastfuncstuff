@@ -8,6 +8,7 @@ common grid so its temporal variance collapses.
 """
 
 import inspect
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -1109,3 +1110,56 @@ def test_qwarp_registers_source_datas_and_resamples_raw_once_with_warp_interp():
         )
         got = torch.as_tensor(split.per_echo[j].corrected_series()).float()
         assert torch.allclose(got, expect, atol=1e-5), j
+
+
+def test_cli_jacobian_modulates_each_echo_by_its_own_field(tmp_path):
+    """-jacobian reached only the single-echo runner; multi-echo ignored it silently.
+
+    Each echo must be modulated by the Jacobian of ITS OWN field (alpha_e*w), so the
+    written series is the plain one times that echo's J, and a later echo -- displaced
+    further -- departs further from J = 1. A bulk shift has J = 1 everywhere and could
+    not tell modulation from none, hence the stretch along the partition axis here.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+    from fastfuncstuff.processing.locomoco import _shift3d_axes, apply_pe_jacobian
+
+    tes = [12.0, 30.0]
+    base = torch.from_numpy(_phantom())
+    z = torch.arange(base.shape[PE], dtype=torch.float32)
+    stretch = (0.08 * (z - z.mean()))[None, None, :]  # d/dz = 0.08 per unit amplitude
+    amps = [0.0, 1.0, -0.8, 0.6, -1.0, 0.7]
+    paths = []
+    for e, te in enumerate(tes):
+        a = te / tes[0]
+        frames = [
+            _shift3d_axes(base[None], [(a * s * stretch).expand_as(base)[None]], [PE])[0]
+            for s in amps
+        ]
+        p = tmp_path / f"e{e + 1}.nii.gz"
+        nib.save(nib.Nifti1Image(torch.stack(frames, -1).numpy(), np.eye(4)), str(p))
+        paths.append(str(p))
+
+    def run(stem, *extra):
+        argv = [
+            "-input", *paths, "-prefix", str(tmp_path / stem), "-pe_dir2", "IS",
+            "-me_3depi", "-is_3dacq", "-echo_times", *[str(t) for t in tes],
+            "-me_fixed_scaling", "-device", "cpu", "-no_warp", "-no_movie",
+            "-allow_neg", "-refine", "1", *extra,
+        ]  # fmt: skip
+        assert main(argv) == 0
+
+    run("plain")
+    run("jac", "-jacobian")
+    departure = []
+    for e in (1, 2):
+        load = lambda f: torch.from_numpy(nib.load(tmp_path / f).get_fdata(dtype=np.float32))  # noqa: E731
+        plain, jac = load(f"plain_e{e}_locomoco.nii.gz"), load(f"jac_e{e}_locomoco.nii.gz")
+        flow = load(f"plain_e{e}_flow.nii.gz")
+        res = SimpleNamespace(pe_displacements=lambda flow=flow: [("pe", PE, flow)])
+        j = apply_pe_jacobian(res, torch.ones_like(plain))
+        assert torch.allclose(jac, plain * j, rtol=1e-4, atol=1e-4), e
+        departure.append(float((j - 1).abs().mean()))
+    assert departure[0] > 0.01, departure  # it modulated at all
+    assert departure[1] > 1.5 * departure[0], departure  # echo 2 sees alpha=2.5x the field

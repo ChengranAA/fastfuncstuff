@@ -8,7 +8,13 @@ import sys
 import time
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    print_cli_header,
+    setup_device,
+)
 from fastfuncstuff.denoise.sauna import SaunaConfig, run_sauna
 
 
@@ -143,11 +149,7 @@ Examples:
     )
 
     perf_group = parser.add_argument_group("Performance")
-    perf_group.add_argument(
-        "-device",
-        default=None,
-        help="Device override (cuda, mps, cpu). Default: auto",
-    )
+    add_device_arg(perf_group)
     perf_group.add_argument(
         "-svd-batch-size",
         type=int,

@@ -15,7 +15,13 @@ import time
 import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    print_cli_header,
+    setup_device,
+)
 from fastfuncstuff.denoise.pcpatch import PCPatchConfig, run_pcpatch
 
 
@@ -143,7 +149,7 @@ Examples:
     )
 
     perf = p.add_argument_group("Performance")
-    perf.add_argument("-device", default=None, help="cuda | cpu | mps (default: auto)")
+    add_device_arg(perf)
     perf.add_argument("-svd-batch-size", "-svd_batch_size", type=int, default=512)
     add_verbose_arg(p)
     return p.parse_args(argv)

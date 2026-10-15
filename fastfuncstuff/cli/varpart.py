@@ -23,7 +23,7 @@ import torch
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
-    from fastfuncstuff.cli_utils import parse_prefix, setup_device
+    from fastfuncstuff.cli_utils import add_device_arg, parse_prefix, setup_device
     from fastfuncstuff.design.trial_table import (
         canonicalize_label,
         level_identifier,
@@ -725,7 +725,7 @@ mapping back to the original labels is written to {prefix}_varpart.json).
         ),
     )
     opt.add_argument("-seed", type=int, default=0, help="RNG seed for permutations")
-    opt.add_argument("-device", default=None, help="cuda | cpu | mps (default: auto)")
+    add_device_arg(opt)
     opt.add_argument("-quiet", action="store_true", help="Suppress progress bars")
     return p
 

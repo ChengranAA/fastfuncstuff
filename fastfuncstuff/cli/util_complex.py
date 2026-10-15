@@ -11,7 +11,13 @@ import torch
 from tqdm import tqdm
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, parse_prefix, spinner
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    setup_device,
+    spinner,
+)
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.processing.complex import (
     magnitude_phase_to_real_imag,
@@ -19,7 +25,7 @@ from fastfuncstuff.processing.complex import (
     scale_phase_to_radians,
 )
 from fastfuncstuff.processing.io import load_image, save_image
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -65,12 +71,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Input phase units for -mag/-phase: 'rad' (default) preserves radians; "
         "'scale' maps the loaded data range to [-pi, pi].",
     )
-    options.add_argument(
-        "-device",
-        default=None,
-        metavar="DEVICE",
-        help="Compute device: cpu, cuda, cuda,N, or mps (default: auto).",
-    )
+    add_device_arg(options)
     add_verbose_arg(options, default=1)
     return parser
 
@@ -166,11 +167,10 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     try:
-        device, _, _ = parse_device_arg(args.device)
+        device = setup_device(args.device, tf32=REGISTRATION_TF32)
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     # This is a memory-bandwidth-bound elementwise pass; a GPU only adds PCIe
     # transfers for a trivial cos/sin, so it runs on the host regardless of -device.

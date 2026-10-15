@@ -56,8 +56,8 @@ from datetime import datetime
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, add_device_arg
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -271,7 +271,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     misc = parser.add_argument_group("Misc")
-    misc.add_argument("-device", default="cuda", help="Compute device (cuda/cpu/mps).")
+    add_device_arg(misc, default="cuda")
     misc.add_argument("-verb", type=int, default=1, help="Verbosity (0/1/2).")
     return parser
 
@@ -306,14 +306,13 @@ def _voxel_sizes_zyx(affine: np.ndarray) -> tuple[float, float, float]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix
+    from fastfuncstuff.cli_utils import parse_prefix, setup_device
     from fastfuncstuff.processing import b0fmap as B
     from fastfuncstuff.processing.io import save_warp_field
     from fastfuncstuff.processing.medic import PE_AXIS_MAP
 
     args = create_parser().parse_args(argv)
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
     pinfo = parse_prefix(args.prefix)
     stem, ext = pinfo.stem, pinfo.nifti_ext
     verb = args.verb

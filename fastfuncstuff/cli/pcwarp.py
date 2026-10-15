@@ -35,7 +35,7 @@ import sys
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, setup_device
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -132,13 +132,7 @@ def create_parser() -> argparse.ArgumentParser:
         "By default, axes are auto-detected from the warp files by "
         "checking which displacement components are non-zero.",
     )
-    opt.add_argument(
-        "-device",
-        default=None,
-        metavar="DEV",
-        help="Torch device for PCA computation: cuda / mps / cpu "
-        "[default: auto-detect — cuda if available, else cpu].",
-    )
+    add_device_arg(opt, extra="Used for the PCA computation.")
     add_verbose_arg(opt, default=1)
 
     return parser

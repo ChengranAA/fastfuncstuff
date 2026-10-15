@@ -43,8 +43,8 @@ from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, add_device_arg
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -105,11 +105,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Negate the displacement (escape hatch if the warp doubles "
         "distortion instead of removing it). Mainly for -displacement_map.",
     )
-    opt.add_argument(
-        "-device",
-        default=None,
-        help="PyTorch device (default: auto).",
-    )
+    add_device_arg(opt)
     opt.add_argument(
         "-verb",
         "-verbose",
@@ -127,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import torch
 
-        from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix, spinner
+        from fastfuncstuff.cli_utils import parse_prefix, setup_device, spinner
         from fastfuncstuff.io.afni import load_nifti
         from fastfuncstuff.processing.medic import (
             PE_AXIS_MAP,
@@ -153,8 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: file not found: {in_path}", file=sys.stderr)
         return 1
 
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
     pfx = parse_prefix(args.prefix)
     prefix_stem, nii_ext = pfx.stem, pfx.nifti_ext
     pe_axis = PE_AXIS_MAP[args.pe_dir]

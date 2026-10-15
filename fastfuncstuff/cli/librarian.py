@@ -58,6 +58,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 try:
     from fastfuncstuff.cli_utils import (
         add_bids_events_args,
+        add_device_arg,
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_ortvec_arguments,
@@ -68,13 +69,13 @@ try:
         check_bids_event_args,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
-        parse_device_arg,
         parse_input_files,
         parse_prefix,
         preflight_check,
         resolve_event_filters,
         resolve_microtime_offset,
         run_lengths_from_starts,
+        setup_device,
         spinner,
         trim_spec_from_args,
     )
@@ -101,7 +102,6 @@ try:
     )
     from fastfuncstuff.glm.core import fit_glm
     from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.utils import configure_torch_backends
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -611,11 +611,7 @@ Notes:
 
     # Processing
     proc_grp = parser.add_argument_group("Processing")
-    proc_grp.add_argument(
-        "-device",
-        default="auto",
-        help="Compute device: 'auto', 'cpu', 'cuda', 'cuda:0', 'mps'.",
-    )
+    add_device_arg(proc_grp, default="auto")
     proc_grp.add_argument(
         "-max-poly-degree",
         type=int,
@@ -2005,8 +2001,7 @@ def main() -> None:
     )
 
     # --- Load data ------------------------------------------------------------
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device)
+    device = setup_device(args.device)
     # Two "Device:" lines may follow — they mean different things:
     # the one here is the *compute* device (where GLM chunks are
     # processed), the one printed by load_and_preprocess_runs below

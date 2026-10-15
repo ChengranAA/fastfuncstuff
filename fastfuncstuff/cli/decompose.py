@@ -77,7 +77,13 @@ from pathlib import Path
 import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    setup_device,
+    spinner,
+)
 from fastfuncstuff.decomposition.ica import (
     FastICA,
     ica_stability_analysis,
@@ -211,11 +217,7 @@ def parse_args():
     )
 
     dev_group = parser.add_argument_group("Device")
-    dev_group.add_argument(
-        "-device",
-        default=None,
-        help="PyTorch device: cuda, mps, cpu (auto-detected by default)",
-    )
+    add_device_arg(dev_group)
     dev_group.add_argument(
         "-cpu",
         action="store_true",

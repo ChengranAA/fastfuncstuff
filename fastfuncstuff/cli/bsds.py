@@ -42,6 +42,7 @@ from tqdm.auto import tqdm
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_bids_events_args,
+    add_device_arg,
     bids_event_kwargs,
     check_bids_event_args,
     parse_input_files,
@@ -329,7 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-tr", type=float, default=1.0, help="TR in seconds (for lifetimes).")
     p.add_argument("-seed", type=int, default=0, help="Random seed.")
-    p.add_argument("-device", default=None, help="cpu / cuda / mps (default: auto).")
+    add_device_arg(p)
     p.add_argument(
         "-parcellation",
         choices=["none", "atlas", "ward", "voronoi"],

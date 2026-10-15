@@ -34,6 +34,7 @@ import torch
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
+    add_device_arg,
     collect_batch_jobs,
     run_batch_jobs,
     setup_device,
@@ -114,7 +115,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "suffixed #0, #1, ...).",
     )
     p.add_argument("-mask", metavar="FILE", help="Only compute inside mask>0; zero elsewhere.")
-    p.add_argument("-device", default="cpu", help="torch device (cpu/cuda).")
+    add_device_arg(p, default="cpu")
     p.add_argument("-overwrite", action="store_true")
     add_batch_args(
         p,

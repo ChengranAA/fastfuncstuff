@@ -40,7 +40,7 @@ import torch
 from fastfuncstuff.cli.design_spec import _do_compile as _design_spec_compile
 from fastfuncstuff.cli.design_spec import _resolve_spec_path
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import setup_device, spinner
+from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
 from fastfuncstuff.design.spec import load_spec, resolve_contrast
 from fastfuncstuff.glm.arma import build_arma11_covariance
 from fastfuncstuff.io.afni import carry_afni_atrs, load_nifti, read_afni_design_matrix
@@ -126,7 +126,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "labels don't match the bucket. Recomputing a contrast that already "
         "exists never needs -force.",
     )
-    p.add_argument("-device", default=None, help="torch device override (cpu / cuda / mps).")
+    add_device_arg(p)
     p.add_argument(
         "-verb", type=int, default=1, help="0 = quiet, 1 = summary, 2 = per-bin progress."
     )

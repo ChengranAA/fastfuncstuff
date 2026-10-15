@@ -18,7 +18,13 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    setup_device,
+    spinner,
+)
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.locomoco import resolve_pe_axis
 from fastfuncstuff.processing.shiftcorr import (
@@ -216,7 +222,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Stem for the shift/QC tables (see the output list above).",
     )
-    p.add_argument("-device", default=None, help="Compute device (cuda/cpu/mps).")
+    add_device_arg(p)
     add_verbose_arg(p)
     return p.parse_args(argv)
 

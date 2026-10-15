@@ -47,7 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, add_device_arg
 
 
 def _normalize_negative_option_values(argv: list[str] | None) -> list[str]:
@@ -233,11 +233,7 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="CPU workers for warpkit's per-frame unwrap.",
     )
-    hw.add_argument(
-        "-device",
-        default=None,
-        help="PyTorch device for the GPU warp/apply: cpu, cuda (default: auto).",
-    )
+    add_device_arg(hw, extra="Used for the GPU warp/apply.")
 
     out = parser.add_argument_group("Output Options")
     out.add_argument(
@@ -462,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import torch
 
-        from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix, spinner
+        from fastfuncstuff.cli_utils import parse_prefix, setup_device, spinner
         from fastfuncstuff.io.afni import save_nifti
         from fastfuncstuff.processing.medic import (
             PE_AXIS_MAP,
@@ -477,7 +473,6 @@ def main(argv: list[str] | None = None) -> int:
             undistort_series,
             warpkit_available,
         )
-        from fastfuncstuff.utils import configure_torch_backends
     except ImportError as e:
         print(f"ERROR: Could not import fastfuncstuff: {e}", file=sys.stderr)
         return 1
@@ -527,8 +522,7 @@ def main(argv: list[str] | None = None) -> int:
 
     pfx = parse_prefix(args.prefix)
     prefix_stem, nii_ext = pfx.stem, pfx.nifti_ext
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device)
+    device = setup_device(args.device)
 
     if args.verb >= 1:
         print("=" * 70)

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -158,12 +158,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Preview -import-cache or -remove-cache without writing changes.",
     )
-    parser.add_argument(
-        "-device",
-        type=str,
-        default=None,
-        help="PyTorch device passed to FFS tools: cpu, cuda, mps (default: auto-detect).",
-    )
+    add_device_arg(parser, extra="Passed through to every FFS tool the benchmark runs.")
     add_verbose_arg(parser, default=0)
 
     if len(sys.argv) == 1:

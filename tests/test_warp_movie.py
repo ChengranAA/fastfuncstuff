@@ -347,6 +347,11 @@ def test_qwarp_captures_phases_and_levels():
 
 
 def test_blipflip_rows_follow_opposite_blips():
+    import sys
+    from pathlib import Path
+
+    # Tests are not a package, and importlib import mode does not put tests/ on the path.
+    sys.path.insert(0, str(Path(__file__).parent))
     from test_topup import _make_synthetic
 
     from fastfuncstuff.processing import topup as T
@@ -356,7 +361,7 @@ def test_blipflip_rows_follow_opposite_blips():
     planes = build_slice_planes(shape, np.eye(4), "ax")
     rec = WarpMovieRecorder([s.data for s in scans], planes, max_frames=10, device=CPU)
     cfg = T.TopupConfig(
-        warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[4, 4], subsamp=[2, 1]
+        warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[4, 4], subsamp=[1, 1]
     )
     res = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, recorder=rec)
     pinned = [f for f in rec._frames if f.pinned]

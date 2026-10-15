@@ -1163,3 +1163,41 @@ def test_cli_jacobian_modulates_each_echo_by_its_own_field(tmp_path):
         departure.append(float((j - 1).abs().mean()))
     assert departure[0] > 0.01, departure  # it modulated at all
     assert departure[1] > 1.5 * departure[0], departure  # echo 2 sees alpha=2.5x the field
+
+
+def test_cli_save_echo_corr_writes_one_labelled_bucket(tmp_path):
+    """-save_echo_corr: one file, per pair the input r, the output r and their change.
+
+    No direction is asserted, deliberately. Echoes move together, so motion is SHARED
+    variance between them: on this motion-only synthetic the correction takes the
+    inter-echo r from ~0.9 to ~0, which is the right answer, not damage.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    tes = [12.0, 30.0, 48.0]
+    rng = np.random.default_rng(3)
+    datas, _ = _make_multiecho(tes, list(rng.uniform(-0.6, 0.6, 12)))
+    paths = []
+    for e, series in enumerate(datas):
+        noisy = series + rng.normal(0, 0.01, series.shape).astype(np.float32)
+        img = nib.Nifti1Image(noisy, np.eye(4))
+        img.header.set_zooms((1.0, 1.0, 1.0, 2.0))
+        p = tmp_path / f"e{e + 1}.nii.gz"
+        nib.save(img, str(p))
+        paths.append(str(p))
+    argv = [
+        "-input", *paths, "-prefix", str(tmp_path / "o"), "-pe_dir2", "IS", "-me_3depi",
+        "-is_3dacq", "-echo_times", *[str(t) for t in tes], "-me_fixed_scaling",
+        "-device", "cpu", "-no_warp", "-no_movie", "-refine", "1", "-save_echo_corr",
+    ]  # fmt: skip
+    assert main(argv) == 0
+    img = nib.load(tmp_path / "o_echocorr.nii.gz")
+    pairs = ["e1-e2", "e1-e3", "e2-e3"]
+    assert read_brick_labels(img) == [f"{p}{t}" for p in pairs for t in ("_orig", "", "_delta")]
+    v = img.get_fdata()
+    for k in range(3):
+        np.testing.assert_allclose(v[..., 3 * k + 2], v[..., 3 * k + 1] - v[..., 3 * k], atol=1e-6)
+    assert np.abs(v[..., 0]).max() > 0.5  # it actually correlated something

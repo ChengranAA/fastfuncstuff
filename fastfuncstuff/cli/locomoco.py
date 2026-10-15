@@ -1747,6 +1747,16 @@ def create_parser() -> argparse.ArgumentParser:
         "correction left clean signal.",
     )
     out.add_argument(
+        "-save_echo_corr",
+        "-save-echo-corr",
+        dest="save_echo_corr",
+        action="store_true",
+        help="[multi-echo, QC] Write {prefix}_echocorr: per echo pair, the voxelwise\n"
+        "inter-echo r over time on the input (_orig), on the output, and the change\n"
+        "(_delta). For eyeballing. Motion is shared across echoes, so removing it can\n"
+        "LOWER this r -- a drop is not by itself damage. Standalone: ffs_util_tcorr.",
+    )
+    out.add_argument(
         "-save_initial",
         "-save-initial",
         dest="save_initial",
@@ -3775,6 +3785,45 @@ def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
     return arr if allow_neg else np.clip(arr, 0.0, None)
 
 
+def _save_echo_corr(datas, corrected, stem, ext, affine, args, tr, device) -> None:
+    """``-save_echo_corr``: one bucket of inter-echo r, input / output / change, per pair."""
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.processing.locomoco import _brain_mask_from
+    from fastfuncstuff.stats.paired_correlation import pair_list, paired_voxel_correlation
+    from fastfuncstuff.stats.task_coupling import default_polort
+
+    n_t = datas[0].shape[3]
+    tr = args.tr if args.tr is not None else tr
+    # Same detrend on both sides, so the change stays fair without a usable TR.
+    polort = default_polort(n_t, tr) if tr is not None and 0.1 <= tr <= 20.0 else 2
+    pairs = pair_list(len(datas), "all")
+    brain = _brain_mask_from(torch.from_numpy(np.abs(datas[0]).mean(axis=3)))
+
+    def corr(series):
+        return paired_voxel_correlation(
+            series, pairs, polort=polort, mask=brain, device=device, verbose=False
+        )
+
+    before, after = corr(datas), corr(corrected)
+    maps, labels, stataux = [], [], {}
+    for k, (a, b) in enumerate(pairs):
+        for tag, m in (("_orig", before), ("", after), ("_delta", after - before)):
+            if tag != "_delta":
+                stataux[len(maps)] = (2, (n_t, 1, polort + 1))
+            maps.append(m[..., k])
+            labels.append(f"e{a + 1}-e{b + 1}{tag}")
+    path = f"{stem}_echocorr{ext}"
+    with spinner(f"Writing {Path(path).name}"):
+        save_nifti(
+            torch.stack(maps, -1).numpy(),
+            path,
+            affine=affine,
+            brick_labels=labels,
+            brick_stataux=stataux,
+        )
+
+
 def _want_qc(args) -> bool:
     """True if any QC-output flag (first/last, diff, tSNR, initial) was requested."""
     return bool(
@@ -4493,6 +4542,7 @@ def _run_multiecho(
     # materializes each echo's corrected series rather than a second pass over all of
     # them.
     corr_sum = None
+    echo_corrected: list[torch.Tensor] = []
     for j, res in enumerate(result.per_echo):
         estem = f"{stem}_e{j + 1}"
         if not args.no_warp:
@@ -4522,6 +4572,7 @@ def _run_multiecho(
             # the "before" was) and the per-PC data-variance table.
             or getattr(args, "_task_after", None) is not None
             or args.want_pcs is not None
+            or args.save_echo_corr
         )
         corrected_series = res.corrected_series() if want_corrected else None
         if corrected_series is not None and args.jacobian:
@@ -4564,7 +4615,14 @@ def _run_multiecho(
             _write_qc_diag(
                 args, corrected, datas[j], f"{estem}_locomoco", f"{estem}_orig", ext, affine
             )
+        if args.save_echo_corr:
+            # Held after the Jacobian, so the QC measures the series that was written.
+            echo_corrected.append(corrected_series)
         del corrected_series
+
+    if args.save_echo_corr:
+        _save_echo_corr(datas, echo_corrected, stem, ext, affine, args, out_tr, device)
+    del echo_corrected
 
     echo_mean_corr = None if corr_sum is None else corr_sum / len(result.per_echo)
     del corr_sum
@@ -4906,6 +4964,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.save_echo_corr and not me_mode:
+        print("   ⚠️  -save_echo_corr needs several echoes; skipped on a single-echo run.")
     if me_mode:
         return _run_multiecho(
             args,

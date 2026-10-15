@@ -31,6 +31,7 @@ from fastfuncstuff.cli_help import (  # noqa: F401
     FfsArgumentParser,
     FfsHelpFormatter,
     ScannableHelpFormatter,
+    add_device_arg,
     canonical_option_strings,
     option_string_value,
     suggest,
@@ -2825,33 +2826,6 @@ def validate_paired_surface_args(parser, args, n_runs: int) -> None:
         parser.error("-surface_input needs one surface run for each -input volume run")
     if args.surface_input and getattr(args, "dry_run", False):
         parser.error("paired -surface_input does not support -dry_run")
-
-
-def add_device_arg(
-    parser_or_group,
-    *,
-    default: str | None = None,
-    extra: str = "",
-) -> None:
-    """Register ``-device`` with the spec the canonical parser actually accepts.
-
-    The help text advertises ``cuda,N`` and ``cpu,N`` deliberately: pinning a
-    card matters on a shared GPU, and users only find the form if the tool
-    names it. Pair with :func:`setup_device`, never with ``torch.device(...)``
-    directly — bare torch rejects every comma form.
-    """
-    suggest(
-        parser_or_group.add_argument(
-            "-device",
-            default=default,
-            metavar="SPEC",
-            help="Compute device: auto, cpu, cuda, mps. Append ',N' to pin a CUDA "
-            "device (cuda,0) or cap CPU threads (cpu,8)." + (f" {extra}" if extra else ""),
-        ),
-        # Not choices=: the comma forms are open-ended, which is exactly the
-        # case suggest() exists for.
-        ("auto", "cpu", "cuda", "mps"),
-    )
 
 
 def resolve_microtime_dt(tr: float, requested_dt: float, verbose: bool = True) -> float:

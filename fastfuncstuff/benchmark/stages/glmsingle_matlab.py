@@ -49,6 +49,21 @@ _TIMING_PATTERNS: dict[str, re.Pattern[str]] = {
 
 TIMINGS_FILENAME = "glmsingle_timings.json"
 
+_EXPECTED_OUTPUTS = [
+    "glmsingle_hrf_index.nii.gz",
+    "glmsingle_r2_B.nii.gz",
+    "glmsingle_betas_B.nii.gz",
+    "glmsingle_noisepool.nii.gz",
+    "glmsingle_r2_C.nii.gz",
+    "glmsingle_betas_C.nii.gz",
+    "glmsingle_pcnum.txt",
+    "glmsingle_xvaltrend.txt",
+    "glmsingle_fracvalue.nii.gz",
+    "glmsingle_r2_D.nii.gz",
+    "glmsingle_betas_D.nii.gz",
+    "glmsingle_mask.nii.gz",
+]
+
 
 def _glm_params(ctx: BenchmarkContext) -> dict:
     return ctx.get_stage_params("glm")
@@ -119,25 +134,27 @@ def _run_matlab_with_log(cmd: str, log_file: Path, cwd: Path) -> float:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     start = time.monotonic()
 
+    # Output goes straight to the log file, not through a pipe we read to EOF:
+    # MATLAB starts a detached MathWorksServiceHost that inherits stdout, and a
+    # pipe reader then waits on the daemon instead of on MATLAB.
     with open(log_file, "w") as logf:
         proc = subprocess.Popen(
             cmd,
             shell=True,
             cwd=str(cwd),
-            stdout=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
             env=env,
         )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            logf.write(line)
-            logf.flush()
-            if _show_output:
-                sys.stdout.write(line)
-                sys.stdout.flush()
         proc.wait()
+
+    if _show_output:
+        try:
+            sys.stdout.write(log_file.read_text(errors="replace"))
+            sys.stdout.flush()
+        except OSError:
+            pass
 
     elapsed = time.monotonic() - start
 
@@ -197,8 +214,17 @@ def load_timings(ctx: BenchmarkContext) -> dict[str, float]:
 
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run MATLAB GLMsingle (treated as the 'reference' tool)."""
-    script = _matlab_script(ctx)
     gs = ctx.glmsingle_dir
+    # Reference stages obey -force-ref only.  Without this guard every benchmark
+    # launched MATLAB just to have the .m script discover its outputs existed,
+    # which -force-ffs then dragged along, and a fresh MathWorksServiceHost
+    # spawned by that no-op once held the stdout pipe open and hung the run.
+    if not ctx.force_ref and all((gs / f).exists() for f in _EXPECTED_OUTPUTS):
+        print("  Skipping MATLAB GLMsingle (outputs exist, use -force-ref to re-run)")
+        ctx.note_items("ref", 0, 1)
+        return 0.0
+
+    script = _matlab_script(ctx)
     gs.mkdir(parents=True, exist_ok=True)
 
     # Build MATLAB command
@@ -238,20 +264,7 @@ def validate(ctx: BenchmarkContext) -> dict:
     """Check that GLMsingle outputs exist and are valid."""
     gs = ctx.glmsingle_dir
 
-    expected = [
-        "glmsingle_hrf_index.nii.gz",
-        "glmsingle_r2_B.nii.gz",
-        "glmsingle_betas_B.nii.gz",
-        "glmsingle_noisepool.nii.gz",
-        "glmsingle_r2_C.nii.gz",
-        "glmsingle_betas_C.nii.gz",
-        "glmsingle_pcnum.txt",
-        "glmsingle_xvaltrend.txt",
-        "glmsingle_fracvalue.nii.gz",
-        "glmsingle_r2_D.nii.gz",
-        "glmsingle_betas_D.nii.gz",
-        "glmsingle_mask.nii.gz",
-    ]
+    expected = _EXPECTED_OUTPUTS
 
     present = []
     missing = []

@@ -11,9 +11,8 @@ two runs of the same task, or a series before vs after a correction. With
 change ``r(input) - r(before)`` is written -- where a correction made agreement
 worse is then just ``delta < 0``.
 
-READ A RISE IN r WITH CARE: thermal noise is independent across echoes and runs, and
-any resampling averages it down while keeping the shared signal, so blur alone
-raises these correlations. Check sharpness (or tSNR against the raw) alongside.
+Blur raises these correlations (it averages down independent noise), and between
+echoes motion is shared, so removing it can lower r. Eyeball, don't score.
 
 Examples
 --------
@@ -133,7 +132,6 @@ def _resolve_polort(spec: str, n_t: int, tr: float | None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    import torch
 
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.stats.paired_correlation import pair_list, paired_voxel_correlation
@@ -187,8 +185,6 @@ def main(argv: list[str] | None = None) -> int:
     after = correlate(data)
     del data
     write(f"{stem}{ext}", after, stataux)
-    inside = torch.from_numpy(mask) if mask is not None else after[..., 0] != 0
-    report = [("r" if not args.fisher else "z", after)]
     if args.before is not None:
         try:
             prior, _ = _load(args.before, "-before")
@@ -202,19 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         del prior
         write(f"{stem}_before{ext}", before, stataux)
         write(f"{stem}_delta{ext}", after - before, None)
-        report = [("before", before), ("after", after), ("delta", after - before)]
 
-    if verbose:
-        for k, (label, (a, b)) in enumerate(zip(labels, pairs, strict=True)):
-            line = ", ".join(
-                f"{name} {float(m[..., k][inside].median()):+.3f}" for name, m in report
-            )
-            print(
-                f"   {label} ({Path(args.input[a]).name} ~ {Path(args.input[b]).name}): median {line}"
-            )
-            if args.before is not None:
-                d = (after - before)[..., k][inside]
-                print(f"      {float((d < -0.05).float().mean()) * 100:.1f}% of voxels lost > 0.05")
     return 0
 
 

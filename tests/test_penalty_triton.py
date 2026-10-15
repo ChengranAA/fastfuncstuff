@@ -1,5 +1,10 @@
 """The fused deformation penalty must match the tensor implementation exactly.
 
+The reference is the hexahedron energy qwarp actually dispatches to, not the
+central-difference ``compute_jacobian_energy`` that formwarp's fold guard keeps:
+after the AFNI hexahedral rewrite this test kept the legacy reference and failed
+by ~1e6 on every shape while the kernel itself agreed to <1e-5 relative.
+
 It replaces nine central-difference fields and some forty elementwise
 expressions with one register-resident pass, so only a comparison against the
 code it replaces can show it kept AFNI's semantics -- the one-sided differences
@@ -11,7 +16,7 @@ import torch
 
 from fastfuncstuff.processing.penalty import (
     HPEN_CUT,
-    compute_jacobian_energy,
+    compute_hexahedron_energy,
     compute_penalty_batched,
     penalty_energy,
 )
@@ -21,7 +26,7 @@ penalty_sums_triton = triton_mod.penalty_sums_triton
 
 
 def _reference_sums(xd, yd, zd):
-    je, se = compute_jacobian_energy(xd, yd, zd)
+    je, se = compute_hexahedron_energy(xd, yd, zd)
     return penalty_energy(je, se).sum(dim=(-3, -2, -1))
 
 
@@ -52,6 +57,7 @@ def test_fused_penalty_matches_reference(b, nz, ny, nx, amp):
     actual = penalty_sums_triton(xd, yd, zd, HPEN_CUT)
 
     assert actual.shape == (b,)
+    # Sums run to ~1e15 on the large shapes, so only the relative term bites.
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 

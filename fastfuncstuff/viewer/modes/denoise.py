@@ -175,13 +175,24 @@ class DenoiseMode(Mode):
         """
         assert self.session is not None
         from fastfuncstuff.viewer.modes.ica import ICAMode
+        from fastfuncstuff.viewer.modes.instaica import InstaICAMode
 
-        found = self.session.mode_named("ica")
-        mix = found.mixing_matrix() if isinstance(found, ICAMode) else None
-        noise = found.noise_components() if isinstance(found, ICAMode) else []
+        # Either ICA review this tab has: one computed here (InstaICA) or a
+        # folder made elsewhere (the ICA button). The one with noise labels
+        # wins; InstaICA first when both have them, as the fresher of the two.
+        reviews = [
+            m
+            for m in (self.session.mode_named("instaica"), self.session.mode_named("ica"))
+            if isinstance(m, (InstaICAMode, ICAMode)) and m.mixing_matrix() is not None
+        ]
+        labelled = [m for m in reviews if m.noise_components()]
+        found = (labelled or reviews or [None])[0]
+        mix = found.mixing_matrix() if found is not None else None
+        noise = found.noise_components() if found is not None else []
         if mix is None:
             raise ValueError(
-                "ICA noise is on, but this tab has no decomposition loaded in ICA mode"
+                "ICA noise is on, but this tab has no ICA: run InstaICA, or open a "
+                "folder with the ICA button"
             )
         if not noise:
             raise ValueError("ICA noise is on, but no component is labelled noise yet")

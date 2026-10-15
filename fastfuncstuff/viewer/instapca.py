@@ -53,6 +53,16 @@ class Decomposition:
     polort: int
     #: ``"automask"`` or the mask file's name, for the ortvec header.
     mask_source: str
+    #: ``(V,)`` percent of each voxel's mean per unit correlation: amplitude is
+    #: ``correlation * scale``, for any time course -- which is what lets a
+    #: rotation of these components (InstaICA) have amplitude maps too.
+    scale: np.ndarray | None = None
+    #: ``(V, K)`` z-scored spatial maps, when the components have them (ICA).
+    zmap: np.ndarray | None = None
+    #: What the components are, for labels: "PC" or "IC".
+    kind: str = "PC"
+    #: Anything the decomposition wants said, for the status line.
+    note: str = ""
 
     @property
     def n_components(self) -> int:
@@ -65,7 +75,9 @@ class Decomposition:
         draws "outside the brain" and "uncorrelated" alike is the bug the
         ffs_denoise PC figures had.
         """
-        values = self.amplitude if kind == "amplitude" else self.correlation
+        values = {"amplitude": self.amplitude, "z": self.zmap}.get(kind)
+        if values is None:
+            values = self.correlation
         out = np.full(self.mask.shape, np.nan, dtype=np.float32)
         out[self.mask] = values[:, k]
         return out
@@ -202,6 +214,7 @@ def decompose(
         tr=float(tr),
         polort=polort,
         mask_source=mask_source,
+        scale=scale.astype(np.float32),
     )
 
 

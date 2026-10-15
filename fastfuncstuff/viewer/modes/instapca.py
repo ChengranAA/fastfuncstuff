@@ -47,7 +47,7 @@ MAX_COMPONENTS = 200
 _IMAGE_SUFFIXES = (".nii.gz", ".nii.zst", ".nii", "+orig.HEAD", "+tlrc.HEAD", ".HEAD")
 
 
-def default_ortvec_path(run_path: str) -> Path:
+def default_ortvec_path(run_path: str, tail: str = "pca_noise") -> Path:
     """``sub-01_bold.nii.gz`` to ``sub-01_bold_pca_noise.1D`` beside it."""
     path = Path(run_path)
     name = path.name
@@ -55,7 +55,7 @@ def default_ortvec_path(run_path: str) -> Path:
         if name.endswith(suffix):
             name = name[: -len(suffix)]
             break
-    return path.with_name(f"{name}_pca_noise.1D")
+    return path.with_name(f"{name}_{tail}.1D")
 
 
 @mode
@@ -64,11 +64,20 @@ class InstaPCAMode(Mode):
     label = "InstaPCA"
     tag = "IPCA"
     overlay_kind = OverlayKind.CORRELATION
+    #: What one component is called on screen, and the ortvec's suffix --
+    #: the hooks InstaICA (a rotation of this decomposition) overrides.
+    component_word = "PC"
+    ortvec_suffix = "pca_noise"
+    map_choices: tuple[str, ...] = ("correlation", "amplitude")
 
     def __init__(self) -> None:
         self._result: engine.Decomposition | None = None
         #: ``(run key, mask, polort)`` the labels and the result belong to.
-        self._identity: tuple[str, str, int] | None = None
+        self._identity: tuple | None = None
+        #: The decomposition before a subclass's step (InstaICA's rotation),
+        #: and what it was made from: a new seed reuses it.
+        self._raw: engine.Decomposition | None = None
+        self._raw_key: tuple | None = None
         self._n_requested = 0
         self._source_key: str | None = None
         self._source_name = ""
@@ -125,7 +134,7 @@ class InstaPCAMode(Mode):
             ChoiceControl(
                 name="map",
                 label="map",
-                choices=("correlation", "amplitude"),
+                choices=self.map_choices,
                 default="correlation",
                 style="radio",
                 span=HALF,
@@ -138,7 +147,8 @@ class InstaPCAMode(Mode):
                 label="save to",
                 filter="1D (*.1D);;All (*)",
                 newline=True,
-                help="Where SAVE NOISE writes. Empty means <run>_pca_noise.1D beside the run.",
+                help=f"Where SAVE NOISE writes. Empty means <run>_{self.ortvec_suffix}.1D "
+                "beside the run.",
             ),
         )
 
@@ -188,36 +198,45 @@ class InstaPCAMode(Mode):
         # A layer used as the mask can be painted after the fact: its data
         # version is part of what the decomposition was made from.
         mask_version = self.session.store.get(mask_layer.key).generation if mask_layer else 0
-        identity = (layer.key, f"{mask_text}@{mask_version}", polort)
+        identity = (layer.key, f"{mask_text}@{mask_version}", polort, *self._identity_extra())
         # Coming back into the mode re-marks it dirty; the decomposition it
         # left is still the right one unless what it was made from changed.
         if self._result is not None and identity == self._identity and n_comp == self._n_requested:
             self._dirty = False
             return True
-        data = self.session.store.ensure_ram(layer.key)
-        tr = float(self.session.store.get(layer.key).info.tr or 0.0)
+        # The decomposition itself, before a subclass's step: a new ICA seed
+        # rotates the same PCA again (milliseconds) rather than redoing it.
+        raw_key = (*identity[: len(identity) - len(self._identity_extra())], n_comp)
+        raw = self._raw if self._raw_key == raw_key else None
         try:
-            if mask_layer is not None:
-                mask = self.session.mask_from_layer(mask_layer.key, layer)
+            if raw is None:
+                data = self.session.store.ensure_ram(layer.key)
+                tr = float(self.session.store.get(layer.key).info.tr or 0.0)
+                if mask_layer is not None:
+                    mask = self.session.mask_from_layer(mask_layer.key, layer)
+                else:
+                    mask = engine.read_mask(mask_text, data.shape[:3]) if mask_text else None
+                result = engine.decompose(
+                    data,
+                    affine=np.asarray(layer.affine, dtype=float),
+                    tr=tr,
+                    mask=mask,
+                    mask_source=(
+                        mask_layer.name
+                        if mask_layer
+                        else Path(mask_text).name
+                        if mask_text
+                        else "automask"
+                    ),
+                    polort=polort,
+                    n_components=n_comp,
+                    device=self.session.store.device,
+                    progress=progress,
+                )
+                self._raw, self._raw_key = result, raw_key
             else:
-                mask = engine.read_mask(mask_text, data.shape[:3]) if mask_text else None
-            result = engine.decompose(
-                data,
-                affine=np.asarray(layer.affine, dtype=float),
-                tr=tr,
-                mask=mask,
-                mask_source=(
-                    mask_layer.name
-                    if mask_layer
-                    else Path(mask_text).name
-                    if mask_text
-                    else "automask"
-                ),
-                polort=polort,
-                n_components=n_comp,
-                device=self.session.store.device,
-                progress=progress,
-            )
+                result = raw
+            result = self._post(result, progress)
         except (OSError, ValueError) as exc:
             self._message = str(exc)
             self._dirty = False
@@ -237,9 +256,24 @@ class InstaPCAMode(Mode):
         self._message = (
             f"{result.n_components} components of {layer.name}, {total:.0f}% of the variance, "
             f"{int(result.mask.sum())} voxels"
+            + (f"  ·  \u26a0 {result.note}" if result.note else "")
         )
         self._dirty = False
         return True
+
+    def _identity_extra(self) -> tuple:
+        """What else the decomposition was made from, for a subclass."""
+        return ()
+
+    def _post(
+        self, result: engine.Decomposition, progress: ProgressFn | None
+    ) -> engine.Decomposition:
+        """What a subclass does to the decomposition. PCA: nothing."""
+        return result
+
+    def mixing_matrix(self) -> np.ndarray | None:
+        """``(T, K)`` component time courses -- what Denoise regresses."""
+        return None if self._result is None else np.asarray(self._result.timecourses)
 
     # -- production ----------------------------------------------------
     @property
@@ -266,12 +300,12 @@ class InstaPCAMode(Mode):
         return ComputedOverlay(
             values=values,
             affine=self._result.affine,
-            name=self.output_name(f"PC {k} {self._label_text(k)}".strip()),
+            name=self.output_name(f"{self.component_word} {k} {self._label_text(k)}".strip()),
             kind=OverlayKind.CORRELATION if kind == "correlation" else OverlayKind.VALUE,
             colormap="redblue",
             display_range=(-top, top) if top > 0 else None,
             threshold=top * 0.4 if top > 0 else 0.0,
-            volume_labels=(f"PC {k} {kind} ({pct:.1f}%)",),
+            volume_labels=(f"{self.component_word} {k} {kind} ({pct:.1f}%)",),
             rescale=rescale,
         )
 
@@ -312,7 +346,7 @@ class InstaPCAMode(Mode):
             return Path(chosen).expanduser()
         if not self._source_path:
             raise ValueError("the run has no file to save beside; choose where to save")
-        return default_ortvec_path(self._source_path)
+        return default_ortvec_path(self._source_path, self.ortvec_suffix)
 
     def _save(self) -> Path:
         if self._result is None:
@@ -332,11 +366,11 @@ class InstaPCAMode(Mode):
         if self._result is None:
             return None
         return Trace(
-            label=f"PC {k} time course {self._label_text(k)}".strip(),
+            label=f"{self.component_word} {k} time course {self._label_text(k)}".strip(),
             values=np.asarray(self._result.timecourses[:, k], dtype=np.float32),
             x_label="TR",
             key="timecourse",
-            short="PC time course",
+            short=f"{self.component_word} time course",
         )
 
     def _spectrum(self, k: int) -> Trace | None:
@@ -352,12 +386,12 @@ class InstaPCAMode(Mode):
             x = np.linspace(nyquist / values.size, nyquist, values.size)
             x_label = "Hz"
         return Trace(
-            label=f"PC {k} power spectrum",
+            label=f"{self.component_word} {k} power spectrum",
             values=values,
             x=x,
             x_label=x_label,
             key="spectrum",
-            short="PC spectrum",
+            short=f"{self.component_word} spectrum",
         )
 
     def _scree(self) -> Trace | None:
@@ -389,16 +423,16 @@ class InstaPCAMode(Mode):
 
     def status(self) -> str:
         if self._preparing:
-            return "instapca: decomposing…"
+            return f"{self.name}: decomposing…"
         if self._result is None:
-            return f"instapca: {self._message or 'pick a 4-D run'}"
+            return f"{self.name}: {self._message or 'pick a 4-D run'}"
         n = self._result.n_components
         n_noise = len(self.noise_components())
         n_sig = sum(1 for v in self.labels.values() if v == "signal")
         here = self.labels.get(self._index, "unlabelled")
         pct = self._result.explained[self._index] * 100
         return (
-            f"instapca: PC {self._index}/{n - 1} {here} ({pct:.1f}%)  ·  "
+            f"{self.name}: {self.component_word} {self._index}/{n - 1} {here} ({pct:.1f}%)  ·  "
             f"{n_noise} noise, {n_sig} signal, {n - n_noise - n_sig} left  ·  {self._message}"
         )
 

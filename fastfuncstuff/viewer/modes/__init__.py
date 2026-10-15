@@ -21,6 +21,7 @@ from fastfuncstuff.viewer.modes.denoise import DenoiseMode  # noqa: E402
 from fastfuncstuff.viewer.modes.ica import ICAMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instacorr import InstaCorrMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instaglm import InstaGLMMode  # noqa: E402
+from fastfuncstuff.viewer.modes.instaica import InstaICAMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instapca import InstaPCAMode  # noqa: E402
 from fastfuncstuff.viewer.modes.paint import PaintMode  # noqa: E402
 
@@ -43,6 +44,7 @@ __all__ = [
     "ICAMode",
     "InstaCorrMode",
     "InstaGLMMode",
+    "InstaICAMode",
     "InstaPCAMode",
     "IntControl",
     "Mark",

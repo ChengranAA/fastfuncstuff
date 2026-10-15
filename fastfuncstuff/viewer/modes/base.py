@@ -371,6 +371,10 @@ class Mode(ABC):
     #: Short upper-case stem for what this mode makes: ``A_ICORR``, ``B_ICA``.
     tag: ClassVar[str] = ""
     overlay_kind: ClassVar[OverlayKind] = OverlayKind.VALUE
+    #: Whether the MODE dropdown lists it. A mode reached by a button instead
+    #: -- the ICA folder reviewer, opened by choosing a folder -- is still a
+    #: mode, with its panel and its overlay, just not one you pick from a list.
+    in_selector: ClassVar[bool] = True
     #: Whether this mode owns an overlay layer at all. Plain mode does not --
     #: its overlay is whatever the user picked.
     produces_overlay: ClassVar[bool] = True

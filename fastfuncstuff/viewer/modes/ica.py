@@ -71,8 +71,10 @@ def _first(directory: Path, names: tuple[str, ...]) -> Path | None:
 @mode
 class ICAMode(Mode):
     name = "ica"
-    label = "ICA"
+    label = "ICA folder"
     tag = "ICA"
+    # Opened by the ICA button in the window bar, which asks for the folder.
+    in_selector = False
     overlay_kind = OverlayKind.COMPONENT
     # The decomposition comes from a folder, not from the stack.
     input_kind = "none"

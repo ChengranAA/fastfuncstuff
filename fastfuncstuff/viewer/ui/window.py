@@ -501,6 +501,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         self.surf_button.clicked.connect(self._surfaces_dialog)
         bar.addWidget(self.surf_button)
+        self.ica_button = QtWidgets.QPushButton("ICA")
+        self.ica_button.setToolTip(
+            "Review an ICA made elsewhere -- a MELODIC or ffs_ica folder: step through\n"
+            "components, label signal/noise, save the labels. To decompose the run\n"
+            "you are looking at, use the InstaICA mode."
+        )
+        self.ica_button.clicked.connect(self._ica_folder_dialog)
+        bar.addWidget(self.ica_button)
         # The surface windows, as buttons as well as keys: a window nobody can
         # find is a window that does not exist.
         for text, tip, slot in (
@@ -655,7 +663,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.mode_box = QtWidgets.QComboBox()
         labels = registry.labels()
         for name in registry.names():
-            self.mode_box.addItem(labels[name], userData=name)
+            if registry.get(name).in_selector:
+                self.mode_box.addItem(labels[name], userData=name)
         self.mode_box.setCurrentIndex(self.mode_box.findData(self.session.mode.name))
         self.mode_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.mode_box.activated.connect(lambda _: self._switch_mode(self.mode_box.currentData()))
@@ -855,6 +864,23 @@ class ViewerWindow(QtWidgets.QMainWindow):
         directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Read directory", start)
         if directory:
             self.read_directory(directory)
+
+    def _ica_folder_dialog(self) -> None:
+        previous = self.session.mode_named("ica")
+        start = str(previous.params.get("folder") or "") if previous is not None else ""
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "ICA folder (melodic_IC + melodic_mix)", start or str(Path.cwd())
+        )
+        if folder:
+            self.open_ica_folder(folder)
+
+    def open_ica_folder(self, folder: str | Path) -> None:
+        """The ICA folder reviewer, on ``folder``."""
+        from fastfuncstuff.viewer.vocab import SetModeParam
+
+        self._switch_mode("ica")
+        self._dispatch(SetModeParam("folder", str(folder)))
+        self._prepare_then_refresh()
 
     def _surfaces_dialog(self) -> None:
         start = self.session.state.surface_subject or os.environ.get(
@@ -2440,6 +2466,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._fitted_mode = mode.name
         if self.isVisible():
             QtCore.QTimer.singleShot(0, lambda: self.fit_to_content(shrink=changed))
+        # A mode reached by a button is shown while it is active, so the box
+        # never claims a mode that is not running, and dropped when it is not.
+        self.mode_box.blockSignals(True)
+        for i in reversed(range(self.mode_box.count())):
+            name = self.mode_box.itemData(i)
+            if not registry.get(name).in_selector and name != mode.name:
+                self.mode_box.removeItem(i)
+        if self.mode_box.findData(mode.name) < 0:
+            self.mode_box.addItem(mode.label or mode.name, userData=mode.name)
+        self.mode_box.blockSignals(False)
         idx = self.mode_box.findData(mode.name)
         if idx >= 0 and idx != self.mode_box.currentIndex():
             self.mode_box.blockSignals(True)

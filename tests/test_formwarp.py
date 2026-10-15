@@ -384,6 +384,59 @@ def test_cli_matrix_estimates_on_the_source_grid(tmp_path):
     assert nib.load(str(tmp_path / "out_WARP.nii.gz")).shape == (snx, sny, snz, 3)
 
 
+def test_cli_allineate_runs_affine_then_warp_and_lands_in_base(tmp_path):
+    """-allineate = ffs_allineate + -matrix + ffs_nwarp 'matrix WARP' -master base.
+
+    The source is displaced 3 voxels from the base on a different grid. The warp
+    outputs stay on the SOURCE grid (the -matrix contract); _al and _in_base are on
+    the BASE grid, and _in_base must line up with the base -- a matrix taken the
+    wrong way round in the chain doubles the shift instead of undoing it.
+    """
+    import numpy as np
+
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.cli.formwarp import main as fmain
+    from fastfuncstuff.processing.affine import apply_affine_interp
+
+    nz, ny, nx = 24, 28, 26
+    snz, sny, snx = 22, 26, 24
+    base = _blobs(nz, ny, nx) + 0.2
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+    m_b2s = torch.eye(4)
+    m_b2s[2, 3] = 3.0
+    source = apply_affine_interp(
+        base, torch.linalg.inv(m_b2s.double()).float(), output_shape=(snz, sny, snx)
+    )
+    bp, sp = tmp_path / "b.nii.gz", tmp_path / "s.nii.gz"
+    nib.save(nib.Nifti1Image(base.permute(2, 1, 0).numpy(), affine), bp)
+    nib.save(nib.Nifti1Image(source.permute(2, 1, 0).numpy(), affine), sp)
+
+    out = tmp_path / "out.nii.gz"
+    rc = fmain(
+        [
+            *("-base", str(bp), "-source", str(sp), "-prefix", str(out)),
+            *("-allineate", "-allineate_opts", "-rigid -cost ls -superfast"),
+            *("-shrink", "2x1", "-smooth", "1x0", "-iters", "4x3"),
+            *("-device", "cpu", "-verb", "0"),
+        ]
+    )
+    assert rc == 0
+    assert (tmp_path / "out_al.aff12.1D").exists()
+    assert nib.load(str(out)).shape == (snx, sny, snz)
+    assert nib.load(str(tmp_path / "out_WARP.nii.gz")).shape == (snx, sny, snz, 3)
+    assert nib.load(str(tmp_path / "out_al.nii.gz")).shape == (nx, ny, nz)
+    in_base = nib.load(str(tmp_path / "out_in_base.nii.gz"))
+    assert in_base.shape == (nx, ny, nz)
+
+    # Interior only: the source grid is smaller, so the base-grid edge is zero-filled.
+    # Unaligned the interior correlates ~0.77; the affine recovers most of the shift
+    # (the phantom is clipped by the smaller source FoV, so not all of it), and a
+    # matrix inverted in the chain would land ~2x the shift away, far below that.
+    got = np.asarray(in_base.get_fdata()).transpose(2, 1, 0)[3:-3, 3:-3, 3:-3]
+    ref = base.numpy()[3:-3, 3:-3, 3:-3]
+    assert np.corrcoef(got.ravel(), ref.ravel())[0, 1] > 0.92
+
+
 def test_cli_warp_prefix_names_the_warp_independently(tmp_path):
     """-warp_prefix renames only the warp family, not the warped image.
 

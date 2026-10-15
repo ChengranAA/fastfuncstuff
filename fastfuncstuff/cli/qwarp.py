@@ -35,6 +35,7 @@ from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_deterministic_arg,
     add_device_arg,
+    add_preallineate_args,
     add_recipe_arg,
     add_verbose_arg,
     add_warp_movie_args,
@@ -43,9 +44,11 @@ from fastfuncstuff.cli_utils import (
     collect_batch_jobs,
     enable_determinism,
     parse_prefix,
+    preallineate_outputs,
     render_warp_movie,
     resolve_movie_path,
     run_batch_jobs,
+    run_with_preallineate,
     setup_device,
     spinner,
 )
@@ -249,6 +252,7 @@ def parse_args(
         "the warp applied first: ffs_nwarp -source src.nii -nwarp 'matrix.aff12.1D "
         "out_WARP.nii' -master base.nii. Not available in timeseries mode.",
     )
+    add_preallineate_args(g_io, "ffs_qwarp")
     add_batch_args(
         g_io,
         tool="ffs_qwarp",
@@ -1562,9 +1566,11 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     skipped -- safe, and the pipeline's nonlinear stages are all 3D anyway."""
     pfx = parse_prefix(args.prefix)
     outs = [pfx.as_file()]
-    if not args.no_save_warp:
+    if not args.no_save_warp or args.allineate:
         # The warp is written .nii.gz regardless of the prefix's own extension.
         outs.append(f"{_warp_stem(args, pfx)}_WARP.nii.gz")
+    if args.allineate:
+        outs += preallineate_outputs(pfx.stem, pfx.nifti_ext, _warp_stem(args, pfx))
     movie = resolve_movie_path(args)
     if movie is not None:
         outs.append(movie)
@@ -1650,6 +1656,19 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     Both the standalone path and every batch job go through here, so a manifest
     line reproduces a solo invocation bit-for-bit."""
+    if args.allineate:
+        pfx = parse_prefix(args.prefix)
+        ws = _warp_stem(args, pfx)
+        return run_with_preallineate(
+            args,
+            device,
+            _dispatch_run,
+            image_stem=pfx.stem,
+            ext=pfx.nifti_ext,
+            warp_stem=ws,
+            warp_path=f"{ws}_WARP.nii.gz",
+            final_interp=args.final,
+        )
     if args.verb >= 1:
         print(
             f"ffs_qwarp\n  device: {device}\n"

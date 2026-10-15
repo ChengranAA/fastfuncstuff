@@ -32,6 +32,7 @@ from fastfuncstuff.cli_help import (  # noqa: F401
     FfsHelpFormatter,
     ScannableHelpFormatter,
     canonical_option_strings,
+    option_string_value,
     suggest,
 )
 from fastfuncstuff.design.trim import TrimSpec, TrimTimingReport, shift_onsets_for_trim
@@ -1766,6 +1767,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
 
     def note() -> str:
         return next(notes, f"\nLABEL modifiers and FILE selectors: as {first}.")
+
     if include_legacy:
         parser_or_group.add_argument(
             f"-{p}ortvec",
@@ -1775,8 +1777,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
             metavar=("FILE", "LABEL"),
             help=(
                 "Full-length nuisance regressors (pre-concatenated across all runs). "
-                f"Repeatable: -{p}ortvec motion.1D motion -{p}ortvec physio.1D physio"
-                + note()
+                f"Repeatable: -{p}ortvec motion.1D motion -{p}ortvec physio.1D physio" + note()
             ),
         )
     parser_or_group.add_argument(
@@ -5353,3 +5354,123 @@ def render_warp_movie(recorder, args, verb: int = 1) -> str | None:
     if verb >= 1 and path is not None:
         print(f"Saved movie: {path}")
     return path
+
+
+def add_preallineate_args(group, tool: str) -> None:
+    """Register ``-allineate`` / ``-allineate_opts`` on a nonlinear warp CLI.
+
+    One flag set for qwarp, optiwarp and formwarp, so "affine first, then warp" is
+    asked for the same way in each. :func:`run_with_preallineate` does the work.
+    """
+    group.add_argument(
+        "-allineate",
+        action="store_true",
+        help="Affine-align the source to the base first (ffs_allineate, in-process), "
+        "then warp. Replaces running ffs_allineate and passing its matrix as -matrix: "
+        "the matrix is saved as {warp prefix}_al.aff12.1D and used exactly as -matrix "
+        "would be (warp solved on the SOURCE grid, source interpolated once). Also "
+        "writes {prefix}_al (affine only, base grid: the before-warp baseline) and "
+        "{prefix}_in_base (affine + warp, base grid, one interpolation via the "
+        "'aff12 + WARP' chain). The warp is always saved. 3D source only.",
+    )
+    option_string_value(
+        group.add_argument(
+            "-allineate_opts",
+            "-allineate-opts",
+            default=None,
+            metavar="'OPTS'",
+            help="Extra ffs_allineate flags for the -allineate step, as one quoted "
+            "string (e.g. '-cost lpc -rigid' for a cross-modal or same-subject pair). "
+            f"Not -base/-source/-prefix/-1Dmatrix_save; {tool} sets those.",
+        )
+    )
+
+
+def preallineate_outputs(image_stem: str, ext: str, warp_stem: str) -> tuple[str, str, str]:
+    """``(matrix, affine-only image, base-space image)`` paths an -allineate run writes.
+
+    The matrix belongs to the warp family (``-warp_prefix``), the images to ``-prefix``.
+    """
+    return (
+        f"{warp_stem}_al.aff12.1D",
+        f"{image_stem}_al{ext}",
+        f"{image_stem}_in_base{ext}",
+    )
+
+
+def run_with_preallineate(
+    args: argparse.Namespace,
+    device: torch.device,
+    dispatch,
+    *,
+    image_stem: str,
+    ext: str,
+    warp_stem: str,
+    warp_path: str,
+    final_interp: str,
+) -> int:
+    """Run ``dispatch`` (a warp CLI's per-pair body) after an in-process ffs_allineate.
+
+    The affine goes in through the tool's own ``-matrix`` path rather than by
+    resampling the source onto the base: that keeps the source interpolated once
+    and the saved WARP composable with the saved matrix, so the base-space copy at
+    the end is ``ffs_nwarp -nwarp 'matrix WARP' -master base`` and nothing new.
+    """
+    import copy
+    import shlex
+
+    from fastfuncstuff.cli.allineate import _dispatch_run as allineate_dispatch
+    from fastfuncstuff.cli.allineate import parse_args as allineate_parse
+    from fastfuncstuff.processing.io import load_image
+    from fastfuncstuff.processing.nwarpforge import nwarpforge
+
+    if args.matrix is not None:
+        print("ERROR: -allineate computes the matrix; do not also pass -matrix.")
+        return 1
+    if getattr(args, "source", None) is None:
+        print("ERROR: -allineate needs -source.")
+        return 1
+    # Checked before the affine search, not after it: a warp series has no single
+    # source frame for the matrix, and qwarp would refuse it only once that ran.
+    with spinner(f"Checking {Path(args.source).name}", enabled=args.verb >= 1):
+        src, _ = load_image(args.source, device=torch.device("cpu"))
+    if src.ndim != 3:
+        print(f"ERROR: -allineate needs a 3D -source; {args.source} is {src.ndim}D.")
+        return 1
+    del src
+
+    matrix_path, al_image, in_base = preallineate_outputs(image_stem, ext, warp_stem)
+    al_argv = [
+        *("-base", args.base, "-source", args.source),
+        *("-prefix", al_image, "-1Dmatrix_save", matrix_path),
+        *("-verb", str(args.verb)),
+        *shlex.split(args.allineate_opts or ""),
+    ]
+    allineate_dispatch(allineate_parse(al_argv), device)
+
+    run = copy.copy(args)
+    run.allineate = False
+    run.matrix = matrix_path
+    # The base-space copy needs the warp on disk; the flag differs per tool.
+    run.save_warp = True
+    run.no_save_warp = False
+    rc = dispatch(run, device)
+    if rc != 0:
+        return rc
+
+    if args.verb >= 1:
+        print(f"\nApplying {Path(matrix_path).name} + {Path(warp_path).name} -> base grid")
+    nwarpforge(
+        source_path=args.source,
+        nwarp_specs=[matrix_path, warp_path],
+        prefix=in_base,
+        master_path=args.base,
+        interp=final_interp,
+        device=device,
+        verb=args.verb,
+        auto_pad=False,
+        progress=lambda message: spinner(message, enabled=args.verb >= 1),
+    )
+    if args.verb >= 1:
+        print(f"Saved base-space image: {in_base}")
+    return 0

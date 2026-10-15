@@ -46,6 +46,7 @@ from fastfuncstuff.cli_utils import (
     add_coverage_args,
     add_deterministic_arg,
     add_device_arg,
+    add_preallineate_args,
     add_recipe_arg,
     add_verbose_arg,
     add_warp_movie_args,
@@ -56,9 +57,11 @@ from fastfuncstuff.cli_utils import (
     enable_determinism,
     image_support,
     parse_prefix,
+    preallineate_outputs,
     render_warp_movie,
     resolve_movie_path,
     run_batch_jobs,
+    run_with_preallineate,
     sanitize_volume,
     setup_device,
     spinner,
@@ -322,6 +325,7 @@ def parse_args(
         "NOTE: this does not recover a clipped FoV, it relocates it -- the base is what "
         "falls out of frame now, and the fixed image is the one interpolated.",
     )
+    add_preallineate_args(p, "ffs_optiwarp")
     p.add_argument(
         "-save_warp",
         "-save-warp",
@@ -734,8 +738,10 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     pfx = parse_prefix(args.prefix)
     prefix, ext = _warp_stem(args, pfx), pfx.nifti_ext
     outs: list[str] = [pfx.as_file()]
-    if args.save_warp:
+    if args.save_warp or args.allineate:
         outs.append(f"{prefix}_WARP{ext}")
+    if args.allineate:
+        outs += preallineate_outputs(pfx.stem, ext, prefix)
     if args.save_inverse:
         outs.append(f"{prefix}_WARPINV{ext}")
     if args.save_jacobian:
@@ -800,6 +806,19 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     Both the standalone path and every batch job go through here, so a manifest
     line reproduces a solo invocation bit-for-bit."""
+    if args.allineate:
+        pfx = parse_prefix(args.prefix)
+        ws = _warp_stem(args, pfx)
+        return run_with_preallineate(
+            args,
+            device,
+            _dispatch_run,
+            image_stem=pfx.stem,
+            ext=pfx.nifti_ext,
+            warp_stem=ws,
+            warp_path=f"{ws}_WARP{pfx.nifti_ext}",
+            final_interp=args.final_interp,
+        )
     if args.verb >= 1:
         print(
             f"ffs_optiwarp\n  device: {device}\n"

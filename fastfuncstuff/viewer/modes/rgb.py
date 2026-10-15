@@ -55,6 +55,7 @@ from fastfuncstuff.viewer.modes.base import (
     Control,
     FloatControl,
     IntControl,
+    Mark,
     Mode,
     OverlayKind,
     PathControl,
@@ -65,6 +66,10 @@ from fastfuncstuff.viewer.modes.base import (
     mode,
 )
 
+#: Region colours on the slices: A amber, B cyan -- apart from each other and
+#: from the crosshair.
+A_RGB = (1.0, 0.75, 0.15)
+B_RGB = (0.2, 0.85, 1.0)
 IMAGE_FILTER = "Images (*.nii *.nii.gz *.nii.zst *.HEAD);;All (*)"
 #: Parameters held until GO (unless ``live``): the ones that read files or
 #: refit. Adding a file and then another must not start a read in between.
@@ -76,6 +81,10 @@ GATED = frozenset(
 )
 STATS_FIXED = ("core", "brain", "slice", "crosshair")
 LIGHT_FIXED = ("basis", "channel 1")
+
+
+def _ijk(v) -> tuple[int, int, int]:
+    return (int(round(v[0])), int(round(v[1])), int(round(v[2])))
 
 
 def _layer_choice(layer) -> str:
@@ -97,6 +106,14 @@ class RGBMode(Mode):
         self._fit: ColourSource | None = None
         self._fit_key: tuple | None = None
         self._source: ColourSource | None = None
+        self._source_key: tuple | None = None
+        #: Crosshair traces per voxel, for the current source. The graph asks
+        #: for the same voxel several times per repaint.
+        self._series_cache: dict[tuple[int, int, int], list[Trace]] = {}
+        self._panels_cache: tuple[tuple, dict[str, list[Trace]]] | None = None
+        #: Region A's centre while B is being moved (the crosshair is B then).
+        self._a_saved: tuple[float, float, float] | None = None
+        self._contrast_note = ""
         self._message = ""
         super().__init__()
         #: What GO last applied of the gated parameters. ``params`` is what the
@@ -364,6 +381,68 @@ class RGBMode(Mode):
                 help="Frames averaged around the shown one. One frame of percent change is "
                 "mostly thermal noise; 5-15 frames shows a breath-hold or a block.",
             ),
+            # -- regions A and B: the optimiser's two sides ---------------
+            FloatControl(
+                name="radius_a",
+                label="A radius",
+                lo=1.0,
+                hi=30.0,
+                step=0.5,
+                default=5.0,
+                span=HALF,
+                newline=True,
+                unit="mm",
+                help="Region A: a sphere this size around the crosshair (amber on the slices).",
+            ),
+            BoolControl(
+                name="move_b",
+                label="move B",
+                default=False,
+                span=HALF,
+                help="While ticked, clicking moves region B (cyan) instead of the crosshair. "
+                "Untick to put the crosshair back where A was.",
+            ),
+            FloatControl(
+                name="radius_b",
+                label="B radius",
+                lo=1.0,
+                hi=30.0,
+                step=0.5,
+                default=5.0,
+                span=HALF,
+                newline=True,
+                unit="mm",
+                help="Region B: a sphere this size around B.",
+            ),
+            TextControl(
+                name="b_at",
+                label="B at",
+                placeholder="tick move B",
+                span=HALF,
+                help="B's centre in mm (x,y,z), set by clicking with move B ticked.",
+            ),
+            FloatControl(
+                name="context",
+                label="context",
+                lo=0.0,
+                hi=5.0,
+                step=0.1,
+                default=1.0,
+                span=HALF,
+                newline=True,
+                help="What A-vs-B contrast may cost the rest of the brain. 0: separate A "
+                "and B at any price, even if everything else clips flat. Higher keeps "
+                "the anatomy legible and gives up some separation.",
+            ),
+            ActionControl(
+                name="optimise",
+                label="A \u2260 B",
+                span=HALF,
+                help="Find weights, shifts and stretches that make A and B look as "
+                "different as possible (Oklab distance between their mean colours), "
+                "with each region uniform and the context kept. Writes the result "
+                "into the panel as a custom basis; tweak from there.",
+            ),
             # -- finding areas --------------------------------------------
             FloatControl(
                 name="tolerance",
@@ -447,7 +526,7 @@ class RGBMode(Mode):
         return frozenset({"files"})
 
     def panel_names(self) -> tuple[str, ...]:
-        return ("channels",)
+        return ("channels", "colour axes")
 
     # -- helpers ---------------------------------------------------------
     def _layer_choices(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -657,6 +736,7 @@ class RGBMode(Mode):
             raise ValueError(str(exc)) from exc
         self._loaded_for = entries
         self._fit = self._source = None
+        self._series_cache.clear()
         self._fit_key = None
         self._message = ""
         self._dirty = False
@@ -693,9 +773,18 @@ class RGBMode(Mode):
                     window=int(p["window"]),
                 )
                 self._fit_key = fit_key
-            self._source = self._fit.with_look(
-                look, masked=bool(p["masked"]), window=int(p["window"])
-            )
+            drawn = (look, bool(p["masked"]), int(p["window"]))
+            if (
+                self._source is None
+                or self._source.chans is not self._fit.chans
+                or (self._source_key != (self._fit.serial, *drawn))
+            ):
+                # Only a real change makes a new source: a repeated refresh
+                # (the window's after-the-fact one, a crosshair move) keeps
+                # the same object, so nothing downstream re-uploads.
+                self._source = self._fit.with_look(look, masked=drawn[1], window=drawn[2])
+                self._source_key = (self._fit.serial, *drawn)
+                self._series_cache.clear()
         except (ValueError, RuntimeError) as exc:
             self._message = f"\u26a0 {exc}"
             return None
@@ -711,6 +800,10 @@ class RGBMode(Mode):
         if self.params.get(name) == value:
             return Aspect.NOTHING
         self.params[name] = value
+        if name == "move_b":
+            return self._toggle_move_b(bool(value))
+        if name in ("radius_a", "radius_b", "b_at", "context"):
+            return Aspect.SLICES  # the circles; nothing to refit
         if name == "live":
             return self._apply() if value else Aspect.GRAPH
         if name in GATED and not self.params["live"]:
@@ -731,6 +824,12 @@ class RGBMode(Mode):
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:
         if not dirty & (Aspect.CROSSHAIR | Aspect.TIME):
             return Aspect.NOTHING
+        if dirty & Aspect.CROSSHAIR and self.params.get("move_b") and self.session is not None:
+            # While B is being placed, the crosshair is B.
+            mm = self.session.state.crosshair_mm
+            if mm is not None:
+                self.params["b_at"] = ",".join(f"{v:.1f}" for v in mm)
+            return Aspect.SLICES
         out = Aspect.GRAPH
         # A lens: stats read around the crosshair follow it.
         if dirty & Aspect.CROSSHAIR and str(self._p["stats"]) in ("slice", "crosshair"):
@@ -755,12 +854,127 @@ class RGBMode(Mode):
                 self.params[f"stretch{k}"] = 1.0
             self.params["hue"], self.params["gamma"] = 0.0, 1.0
             return self.refresh() | Aspect.LAYERS
+        if name == "optimise":
+            return self._optimise()
         if name == "select":
             return self._select()
         if name == "save":
             self._save()
             return Aspect.NOTHING
         return super().action(name, progress)
+
+    # -- regions A and B ------------------------------------------------
+    def _a_mm(self) -> tuple[float, float, float] | None:
+        """Region A's centre: the crosshair, or where it was when B started moving."""
+        if self.params.get("move_b") and self._a_saved is not None:
+            return self._a_saved
+        return None if self.session is None else self.session.state.crosshair_mm
+
+    def _b_mm(self) -> tuple[float, float, float] | None:
+        text = str(self.params.get("b_at") or "").strip()
+        if not text:
+            return None
+        try:
+            x, y, z = (float(v) for v in text.split(","))
+        except ValueError:
+            return None
+        return (x, y, z)
+
+    def marks(self) -> list[Mark]:
+        out = []
+        a = self._a_mm()
+        if a is not None:
+            out.append(Mark(tuple(a), float(self.params["radius_a"]), A_RGB, "A"))  # type: ignore[arg-type]
+        b = self._b_mm()
+        if b is not None:
+            out.append(Mark(b, float(self.params["radius_b"]), B_RGB, "B"))
+        return out
+
+    def _toggle_move_b(self, on: bool) -> Aspect:
+        st = self.session.state if self.session is not None else None
+        if st is None or st.grid is None:
+            return Aspect.NOTHING
+        if on:
+            self._a_saved = st.crosshair_mm
+            b = self._b_mm()
+            if b is not None:
+                st.crosshair = st.grid.clamp(_ijk(st.grid.mm_to_ijk(b)))
+            else:
+                self.params["b_at"] = ",".join(f"{v:.1f}" for v in st.crosshair_mm or (0, 0, 0))
+            return Aspect.CROSSHAIR | Aspect.SLICES | Aspect.GRAPH
+        # Back to A: the crosshair returns to where it was when B started moving.
+        if self._a_saved is not None:
+            st.crosshair = st.grid.clamp(_ijk(st.grid.mm_to_ijk(self._a_saved)))
+        self._a_saved = None
+        return Aspect.CROSSHAIR | Aspect.SLICES | Aspect.GRAPH
+
+    def _sphere(self, mm: tuple[float, float, float], radius: float) -> torch.Tensor:
+        """A ball on the channels' grid, inside the mask."""
+        chans, src = self._chans, self._source
+        assert chans is not None and src is not None
+        aff = torch.as_tensor(
+            np.asarray(chans.affine, float), dtype=torch.float32, device=chans.device
+        )
+        axes = [torch.arange(s, device=chans.device, dtype=torch.float32) for s in chans.shape]
+        ijk = torch.stack(torch.meshgrid(*axes, indexing="ij"), -1)
+        pos = ijk @ aff[:3, :3].T + aff[:3, 3]
+        centre = torch.tensor(mm, dtype=torch.float32, device=chans.device)
+        return ((pos - centre) ** 2).sum(-1).le(radius**2) & src.brain
+
+    def _optimise(self) -> Aspect:
+        from fastfuncstuff.viewer.contrast import optimise_contrast
+
+        src, chans = self._source, self._chans
+        a, b = self._a_mm(), self._b_mm()
+        if src is None or chans is None or self.session is None:
+            self._message = "\u26a0 nothing to optimise yet: press GO"
+            return Aspect.GRAPH
+        if a is None or b is None:
+            self._message = "\u26a0 place B first: tick move B and click"
+            return Aspect.GRAPH
+        live = self.session.state.layers.find_by_source(self.layer_source)
+        t = 0 if live is None else self.session.layer_time(live)
+        x = src.frame(t)[: chans.n]
+        in_a = self._sphere(a, float(self.params["radius_a"]))
+        in_b = self._sphere(b, float(self.params["radius_b"]))
+        if int(in_a.sum()) < 2 or int(in_b.sum()) < 2:
+            self._message = "\u26a0 A and B each need voxels inside the mask"
+            return Aspect.GRAPH
+        assert src.fit_mu is not None and src.fit_sd is not None and src.context is not None
+        mu, sd = src.fit_mu, src.fit_sd
+        za = ((x[:, in_a].T - mu) / sd).cpu()
+        zb = ((x[:, in_b].T - mu) / sd).cpu()
+        zc = ((src.context - mu) / sd).cpu()
+        # The current map in the optimiser's coordinates: y = W (x - m) / s is
+        # W diag(sd / s) z plus a constant, which the window's centre absorbs.
+        W0 = (src.map.W * (sd / src.map.sd)[None, :]).cpu()
+        look = src.look
+        light = None
+        if look.lightness == "anatomy":
+            flat = src.anatomy.reshape(-1)
+            assert src.context_where is not None
+            light = (
+                src.anatomy[in_a].cpu(),
+                src.anatomy[in_b].cpu(),
+                flat[src.context_where].cpu(),
+            )
+        result = optimise_contrast(
+            za, zb, zc, W0, look, light=light, context=float(self.params["context"])
+        )
+        # Into the panel, where it can be read and tweaked: a custom basis in
+        # the space it was optimised in, and the shifts and stretches found.
+        self.params["space"] = look.space
+        self.params["basis"] = "custom"
+        self.params["weights"] = result.weights_text()
+        for k in range(3):
+            self.params[f"shift{k}"] = round(result.shift[k], 3)
+            self.params[f"stretch{k}"] = round(result.stretch[k], 3)
+        dirty = self._apply()
+        self._contrast_note = (
+            f"A\u2260B: \u0394E {result.before:.3f} \u2192 {result.separation:.3f} (Oklab), "
+            f"context past the knee {result.clipped:.0%}"
+        )
+        return dirty | Aspect.GRAPH
 
     def _select(self) -> Aspect:
         if self.session is None or self._source is None:
@@ -801,7 +1015,26 @@ class RGBMode(Mode):
 
     # -- graph --------------------------------------------------------------
     def series(self, ijk: tuple[int, int, int]) -> list[Trace]:
-        """Each channel's time course at the voxel, and the three colour coordinates."""
+        """Each channel's time course at the voxel.
+
+        The three colour coordinates over time are a panel of their own (at
+        the crosshair) rather than lines in every graph cell: in a 3x3 grid
+        they tripled the traces drawn for something read at one voxel.
+        """
+        return [t for t in self._traces(ijk) if not t.key.startswith("rgb:axis")]
+
+    def _traces(self, ijk: tuple[int, int, int]) -> list[Trace]:
+        """Channel and coordinate time courses at a voxel, cached per source."""
+        hit = self._series_cache.get(ijk)
+        if hit is not None:
+            return hit
+        out = self._series(ijk)
+        if len(self._series_cache) > 256:
+            self._series_cache.clear()
+        self._series_cache[ijk] = out
+        return out
+
+    def _series(self, ijk: tuple[int, int, int]) -> list[Trace]:
         chans, source = self._chans, self._source
         if chans is None or source is None or chans.n_frames < 2 or self.session is None:
             return []
@@ -836,7 +1069,22 @@ class RGBMode(Mode):
         return out
 
     def panels(self) -> dict[str, list[Trace]]:
-        """The channels at the crosshair, against TE when there is one -- the decay curve."""
+        """The channels at the crosshair, against TE when there is one -- the decay curve.
+
+        Cached per crosshair, frame and source: a repaint asks once per panel
+        window and again for each refresh it takes part in.
+        """
+        if self.session is None or self._source is None:
+            return {}
+        st = self.session.state
+        key = (st.crosshair, st.time_index, self._source.serial)
+        if self._panels_cache is not None and self._panels_cache[0] == key:
+            return self._panels_cache[1]
+        out = self._panels()
+        self._panels_cache = (key, out)
+        return out
+
+    def _panels(self) -> dict[str, list[Trace]]:
         chans, source = self._chans, self._source
         if chans is None or source is None or self.session is None:
             return {}
@@ -868,7 +1116,12 @@ class RGBMode(Mode):
                     short="fit",
                 )
             )
-        return {"channels": lines}
+        panels = {"channels": lines}
+        cross = self.session.state.crosshair
+        axes = [t for t in self._traces(cross) if t.key.startswith("rgb:axis")]
+        if axes:
+            panels["colour axes"] = axes
+        return panels
 
     def status(self) -> str:
         if self._preparing:
@@ -879,7 +1132,17 @@ class RGBMode(Mode):
         if self._chans is None:
             return f"rgb: {self._message or f'{n} channels ticked; add files to the list'}"
         frames = f", {self._chans.n_frames} frames" if self._chans.n_frames > 1 else ""
-        return f"rgb: {self._chans.n} channels{frames}  ·  {self._message}"
+        placing = (
+            "  ·  placing B: click to move it, untick move B when done"
+            if self.params.get("move_b")
+            else ""
+        )
+        note = (
+            f"  ·  {self._contrast_note}"
+            if self._contrast_note and self._p["basis"] == "custom"
+            else ""
+        )
+        return f"rgb: {self._chans.n} channels{frames}  ·  {self._message}{note}{placing}"
 
 
 __all__ = ["RGBMode"]

@@ -926,6 +926,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.nudge_button.setChecked(state.surface_editing and state.surface_tool == "nudge")
         self.highlight_button.setChecked(state.surface_editing and state.surface_tool == "mark")
         self.pane.set_marks(self._selected_marks())
+        self.pane.set_regions(self._mode_regions())
         self.pane.set_highlight(self._highlight_points())
         self._sync_brush()
         self._redraw_strip(vp)
@@ -1364,6 +1365,39 @@ class ImageWindow(QtWidgets.QWidget):
                     out.append(np.asarray(view.points_to_image(ijk[near])).reshape(-1, 2))
         return np.concatenate(out) if out else np.zeros((0, 2))
 
+    def _mode_regions(self) -> list[tuple[float, float, float, float, tuple, str]]:
+        """The mode's marks cut by this slice: centre and circle radii in image pixels.
+
+        A sphere of radius r whose centre is d mm off this slice cuts it in a
+        circle of radius sqrt(r^2 - d^2); further off than r, it is not drawn.
+        """
+        state = self.session.state
+        vp = self._viewport()
+        view = None if vp is None else plane_view(state, vp)
+        pos = self.pane.position
+        marks = self.session.mode.marks()
+        if not marks or view is None or pos is None or state.grid is None:
+            return []
+        grid = self._grid()
+        assert grid is not None
+        inv = np.linalg.inv(grid.affine)
+        vox = np.sqrt((np.asarray(grid.affine)[:3, :3] ** 2).sum(0))
+        lay = view.layout
+        out = []
+        for m in marks:
+            ijk = inv[:3, :3] @ np.asarray(m.mm, float) + inv[:3, 3]
+            d = (ijk[lay.fixed] - pos) * vox[lay.fixed]
+            if abs(d) > m.radius_mm:
+                continue
+            r = float(np.sqrt(max(m.radius_mm**2 - d**2, 0.0)))
+            on = ijk.copy()
+            on[lay.fixed] = pos
+            row, col = view.points_to_image(on)
+            return_r = r / vox[lay.row]
+            return_c = r / vox[lay.col]
+            out.append((float(row), float(col), return_r, return_c, m.rgb, m.label))
+        return out
+
     def _selected_marks(self) -> list[tuple[float, float, str]]:
         """Where the selected vertex sits on this slice, per surface, if it is close."""
         state = self.session.state
@@ -1645,6 +1679,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
         self.pane.set_readout(self.session.overlay_readout())
         self.pane.set_handle(self._handle_position())
+        self.pane.set_regions(self._mode_regions())
 
     def _graph_coverage(self, plane: Plane, row: int, col: int) -> list[tuple[int, int, int, int]]:
         """Footprints of the graphs reading this plane, in image indices.

@@ -255,19 +255,8 @@ class ChromaMap:
 
     def unit(self, y: Tensor, look: Look) -> Tensor:
         """Coordinates in window units, the look's shift and stretch applied."""
-        shape = (3,) + (1,) * (y.ndim - 1)
-        u = (y - self.center.reshape(shape)) / (look.spread * self.width.reshape(shape))
-        shift = torch.tensor(look.shift, dtype=u.dtype, device=u.device).reshape(shape)
-        stretch = torch.tensor(look.stretch, dtype=u.dtype, device=u.device).reshape(shape)
-        return (u - shift) * stretch
-
-    def level(self, y0: Tensor, look: Look) -> Tensor:
-        """The first coordinate as a [0, 1] level, for lightness."""
-        lo, hi = self.l_lo, self.l_hi
-        mid, half = 0.5 * (lo + hi), 0.5 * max(hi - lo, 1e-12)
-        s0, k0 = look.shift[0], look.stretch[0]
-        t = ((y0 - mid) / half - s0) * k0
-        return (0.5 + 0.5 * t).clamp(0.0, 1.0)
+        shift, stretch = look_tensors(look, y)
+        return unit_coords(y, self.center, self.width, look.spread, shift, stretch)
 
     def colors(self, x: Tensor, look: Look, lightness: Tensor | None = None) -> Tensor:
         """(N, ...) transformed channels -> (..., 3) sRGB in [0, 1].
@@ -277,27 +266,86 @@ class ChromaMap:
         only nudges.
         """
         y = self.coords(x)
-        u = self.unit(y, look)
-        c, s = math.cos(math.radians(look.hue)), math.sin(math.radians(look.hue))
-        u1, u2 = c * u[1] - s * u[2], s * u[1] + c * u[2]
-        if look.space == "rgb":
-            rgb = (0.5 + 0.5 * torch.stack([u[0], u1, u2], -1)).clamp(0.0, 1.0)
-            if look.gamma != 1.0:
-                rgb = rgb ** (1.0 / look.gamma)
-            if lightness is not None:
-                rgb = rgb * lightness.unsqueeze(-1) ** look.gamma
-            return rgb
-        if lightness is None:
-            level = self.level(y[0], look)
-            L = L_FLOOR + (L_CEIL - L_FLOOR) * level**look.gamma
-        else:
-            L = L_FLOOR + (L_CEIL - L_FLOOR) * lightness**look.gamma
-            L = L + ANATOMY_NUDGE * torch.tanh(u[0])
-        # tanh rather than a clip: saturation rolls off instead of flattening,
-        # so the strongest voxels are still distinguishable from strong ones.
-        b = look.chroma * torch.tanh(1.25 * u1)
-        a = look.chroma * torch.tanh(1.25 * u2)
-        return oklab_to_srgb(L, a, b)
+        shift, stretch = look_tensors(look, y)
+        return paint(
+            y, self.center, self.width, self.l_lo, self.l_hi, look, shift, stretch, lightness
+        )
+
+
+def look_tensors(look: Look, like: Tensor) -> tuple[Tensor, Tensor]:
+    """The look's shift and stretch as tensors on ``like``'s device."""
+    shift = torch.tensor(look.shift, dtype=like.dtype, device=like.device)
+    stretch = torch.tensor(look.stretch, dtype=like.dtype, device=like.device)
+    return shift, stretch
+
+
+def unit_coords(
+    y: Tensor, center: Tensor, width: Tensor, spread: float, shift: Tensor, stretch: Tensor
+) -> Tensor:
+    """(3, ...) coordinates into window units: ``stretch * ((y - c) / (spread * w) - shift)``."""
+    shape = (3,) + (1,) * (y.ndim - 1)
+    u = (y - center.reshape(shape)) / (spread * width.reshape(shape))
+    return (u - shift.reshape(shape)) * stretch.reshape(shape)
+
+
+def paint(
+    y: Tensor,
+    center: Tensor,
+    width: Tensor,
+    l_lo: float | Tensor,
+    l_hi: float | Tensor,
+    look: Look,
+    shift: Tensor,
+    stretch: Tensor,
+    lightness: Tensor | None = None,
+) -> Tensor:
+    """(3, ...) coordinates -> (..., 3) sRGB in [0, 1]: the one colour pipeline.
+
+    Shift and stretch come in as tensors so the contrast optimiser can
+    differentiate through exactly what the screen draws, rather than a copy
+    of it that could drift.
+    """
+    u = unit_coords(y, center, width, look.spread, shift, stretch)
+    c, s = math.cos(math.radians(look.hue)), math.sin(math.radians(look.hue))
+    u1, u2 = c * u[1] - s * u[2], s * u[1] + c * u[2]
+    if look.space == "rgb":
+        rgb = (0.5 + 0.5 * torch.stack([u[0], u1, u2], -1)).clamp(0.0, 1.0)
+        if look.gamma != 1.0:
+            rgb = rgb.clamp(min=1e-6) ** (1.0 / look.gamma)
+        if lightness is not None:
+            rgb = rgb * lightness.unsqueeze(-1) ** look.gamma
+        return rgb
+    if lightness is None:
+        mid, half = 0.5 * (l_lo + l_hi), 0.5 * (l_hi - l_lo)
+        half = half.clamp(min=1e-12) if isinstance(half, Tensor) else max(half, 1e-12)
+        level = (0.5 + 0.5 * ((y[0] - mid) / half - shift[0]) * stretch[0]).clamp(0.0, 1.0)
+        L = L_FLOOR + (L_CEIL - L_FLOOR) * level.clamp(min=1e-6) ** look.gamma
+    else:
+        L = L_FLOOR + (L_CEIL - L_FLOOR) * lightness.clamp(min=1e-6) ** look.gamma
+        L = L + ANATOMY_NUDGE * torch.tanh(u[0])
+    # tanh rather than a clip: saturation rolls off instead of flattening, so
+    # the strongest voxels are still distinguishable from strong ones.
+    b = look.chroma * torch.tanh(1.25 * u1)
+    a = look.chroma * torch.tanh(1.25 * u2)
+    return oklab_to_srgb(L, a, b)
+
+
+def srgb_to_oklab(rgb: Tensor) -> Tensor:
+    """(..., 3) gamma-encoded sRGB in [0, 1] to Oklab, where distance is perceived difference."""
+    lin = torch.where(rgb <= 0.04045, rgb / 12.92, ((rgb.clamp(min=0.0) + 0.055) / 1.055) ** 2.4)
+    r, g, b = lin[..., 0], lin[..., 1], lin[..., 2]
+    l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
+    l_, m_, s_ = (v.clamp(min=1e-9) ** (1.0 / 3.0) for v in (l, m, s))
+    return torch.stack(
+        [
+            0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,
+        ],
+        -1,
+    )
 
 
 def oklab_to_srgb(L: Tensor, a: Tensor, b: Tensor) -> Tensor:

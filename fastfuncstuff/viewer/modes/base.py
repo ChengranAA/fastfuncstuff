@@ -318,6 +318,20 @@ class ComputedOverlay:
     colour: Any = None
 
 
+@dataclass(frozen=True)
+class Mark:
+    """A place a mode points at on the slices: a centre, a radius, a colour.
+
+    Drawn by every image window as a dot and the circle where a sphere of
+    ``radius_mm`` cuts the slice shown -- the RGB mode's regions A and B.
+    """
+
+    mm: tuple[float, float, float]
+    radius_mm: float
+    rgb: tuple[float, float, float]
+    label: str = ""
+
+
 @dataclass
 class Trace:
     """One line for a graph window."""
@@ -515,6 +529,10 @@ class Mode(ABC):
     def panel_names(self) -> tuple[str, ...]:
         """Named lines this mode shows in windows of their own, opened on entry."""
         return ()
+
+    def marks(self) -> list[Mark]:
+        """Points with a radius to draw on every slice. Default: none."""
+        return []
 
     def panels(self) -> dict[str, list[Trace]]:
         """The current lines for each of :meth:`panel_names`.

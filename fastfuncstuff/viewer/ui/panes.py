@@ -145,6 +145,8 @@ class ImagePane(QtWidgets.QWidget):
         self._stroke_pts: list[tuple[float, float]] = []
         #: The selected vertex on this slice, per surface: (row, col, surface).
         self._marks: list[tuple[float, float, str]] = []
+        #: ``(row, col, radius rows, radius cols, rgb, label)`` in image pixels.
+        self._regions: list[tuple[float, float, float, float, tuple, str]] = []
         self._highlight = np.zeros((0, 2))
         #: Replaces the plane/slice caption and drops the edge labels: for a
         #: small cell (a neighbour-strip slice) where those would cover the image.
@@ -244,6 +246,12 @@ class ImagePane(QtWidgets.QWidget):
         points = np.asarray(points, np.float64).reshape(-1, 2)
         if points.shape != self._highlight.shape or not np.array_equal(points, self._highlight):
             self._highlight = points
+            self.update()
+
+    def set_regions(self, regions: list[tuple[float, float, float, float, tuple, str]]) -> None:
+        """A mode's marked regions on this slice; empty clears them."""
+        if regions != self._regions:
+            self._regions = list(regions)
             self.update()
 
     def set_marks(self, marks: list[tuple[float, float, str]]) -> None:
@@ -362,6 +370,8 @@ class ImagePane(QtWidgets.QWidget):
             self._paint_highlight(p, rect)
         if self._marks:
             self._paint_marks(p, rect)
+        if self._regions:
+            self._paint_regions(p, rect)
         if self._handle is not None:
             self._paint_handle(p, rect)
 
@@ -501,6 +511,28 @@ class ImagePane(QtWidgets.QWidget):
             p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
             centre = QtCore.QPointF(rect.x() + (col + 0.5) * sx, rect.y() + (row + 0.5) * sy)
             p.drawEllipse(centre, 6.0, 6.0)
+        p.restore()
+
+    def _paint_regions(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
+        """Each region: its circle on this slice, a dot at the centre, its label."""
+        assert self._image is not None
+        sx = rect.width() / self._image.width()
+        sy = rect.height() / self._image.height()
+        p.save()
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        for row, col, rr, rc, rgb, label in self._regions:
+            colour = QtGui.QColor.fromRgbF(*rgb)
+            pen = QtGui.QPen(colour)
+            pen.setWidthF(1.6)
+            p.setPen(pen)
+            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            centre = QtCore.QPointF(rect.x() + (col + 0.5) * sx, rect.y() + (row + 0.5) * sy)
+            if rr > 0 and rc > 0:
+                p.drawEllipse(centre, rc * sx, rr * sy)
+            p.setBrush(colour)
+            p.drawEllipse(centre, 2.5, 2.5)
+            if label:
+                p.drawText(centre + QtCore.QPointF(rc * sx + 3, -3), label)
         p.restore()
 
     def _paint_stroke(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:

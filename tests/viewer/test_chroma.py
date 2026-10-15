@@ -396,7 +396,9 @@ def test_time_series_play_and_window_averages(tmp_path, session):
     assert lean > 10
     session.do(SetIndex(10))
     assert render_plane(session, Plane.CORONAL) is not None
-    assert len(session.mode.series((12, 12, 8))) == 6
+    # Channels in every graph cell; the colour axes over time in a panel of their own.
+    assert len(session.mode.series((12, 12, 8))) == 3
+    assert len(session.mode.panels()["colour axes"]) == 3
 
 
 def test_echoes_interleaved_in_one_file_by_selector(tmp_path, session):
@@ -464,3 +466,124 @@ def test_quantiles_have_no_size_ceiling():
     x = torch.arange(17_000_000, dtype=torch.float32)
     lo, mid = quantiles(x, (0.0, 0.5))
     assert lo == 0.0 and abs(mid - 8_500_000) < 2
+
+
+# ---------------------------------------------------------------------------
+# regions A and B, and the contrast optimiser
+# ---------------------------------------------------------------------------
+
+
+def _two_tissues(tmp_path):
+    """Two blobs that differ only in channel 1 minus channel 2 -- a direction
+    pick-3 shows as a barely different grey -- inside a head."""
+    xx, yy, zz = _grids()
+    c = np.array(SHAPE) / 2
+    head = (((xx - c[0]) / 10) ** 2 + ((yy - c[1]) / 10) ** 2 + ((zz - c[2]) / 7) ** 2) < 1
+    a = ((xx - 7) ** 2 + (yy - 12) ** 2 + (zz - 8) ** 2) < 9
+    b = ((xx - 17) ** 2 + (yy - 12) ** 2 + (zz - 8) ** 2) < 9
+    rng = np.random.default_rng(3)
+    tissue = rng.normal(0, 1, SHAPE)
+    vols = []
+    for ch, sign in enumerate((1.0, -1.0, 0.0)):
+        v = 1000 + 150 * tissue * (1 - 0.1 * ch) + rng.normal(0, 8, SHAPE)
+        v = v + 40 * sign * (a.astype(float) - b.astype(float))
+        vols.append(np.where(head, v, 5.0).astype(np.float32))
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    paths = []
+    for ch, v in enumerate(vols):
+        p = tmp_path / f"t{ch}.nii.gz"
+        nib.save(nib.Nifti1Image(v, aff), str(p))
+        paths.append(p)
+    return paths, a, b
+
+
+def _lab_gap(source, a, b) -> float:
+    from fastfuncstuff.viewer.chroma import srgb_to_oklab
+
+    rgb = torch.as_tensor(source.rgb_volume(0).astype(np.float32) / 255.0)
+    lab = srgb_to_oklab(rgb)
+    return float((lab[torch.as_tensor(a)].mean(0) - lab[torch.as_tensor(b)].mean(0)).norm())
+
+
+def test_move_b_places_b_and_gives_the_crosshair_back_to_a(tmp_path, session):
+    paths, _, _ = _two_tissues(tmp_path)
+    _enter(session, paths, basis="pick", signal="raw")
+    session.do(SetIJK(7, 12, 8))
+    a_mm = session.state.crosshair_mm
+    session.do(SetModeParam("move_b", "1"))
+    session.do(SetIJK(17, 12, 8))
+    b_mm = session.state.crosshair_mm
+    session.do(SetModeParam("move_b", "0"))
+    assert session.state.crosshair == (7, 12, 8)
+    marks = {m.label: m for m in session.mode.marks()}
+    assert np.allclose(marks["A"].mm, a_mm) and np.allclose(marks["B"].mm, b_mm, atol=0.06)
+
+
+def test_optimise_pulls_a_and_b_apart_and_lands_as_a_custom_basis(tmp_path, session):
+    paths, a, b = _two_tissues(tmp_path)
+    layer = _enter(session, paths, basis="pick", signal="raw", radius_a=4, radius_b=4)
+    session.do(SetIJK(7, 12, 8))
+    session.do(SetModeParam("move_b", "1"))
+    session.do(SetIJK(17, 12, 8))
+    session.do(SetModeParam("move_b", "0"))
+    before = _lab_gap(session.colour_sources[layer.key], a, b)
+    session.do(ModeAction("optimise"))
+    params = session.mode.params
+    assert params["basis"] == "custom" and len(params["weights"].split(";")) == 3
+    after = _lab_gap(session.colour_sources[layer.key], a, b)
+    assert after > 2 * before, (before, after)
+    assert "ΔE" in session.mode.status()
+
+
+def test_optimise_says_what_is_missing(tmp_path, session):
+    paths, _, _ = _two_tissues(tmp_path)
+    _enter(session, paths, basis="pick", signal="raw")
+    session.do(ModeAction("optimise"))
+    assert "B" in session.mode.status()
+
+
+def test_image_windows_draw_both_regions_where_the_slice_cuts_them(tmp_path):
+    """A at the crosshair, B elsewhere on the same slice; a sphere of radius r
+    whose centre is on the slice is a circle of radius r on it."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    paths, _, _ = _two_tissues(tmp_path)
+    s = ViewerSession(device=CPU)
+    win = ViewerWindow(s)
+    try:
+        from fastfuncstuff.viewer.vocab import SetUnderlay
+
+        win.refresh(s.do(SetUnderlay(str(paths[0]))))
+        win.show()
+        app.processEvents()
+        # With a window, preparation is the window worker's job; run it here.
+        s.do(SetMode("rgb"))
+        for k, v in (("live", "1"), ("files", _files(paths)), ("basis", "pick")):
+            s.do(SetModeParam(k, v))
+        for k, v in (("signal", "raw"), ("radius_a", "6"), ("radius_b", "4")):
+            s.do(SetModeParam(k, v))
+        s.mode.prepare()
+        s.refresh_mode()
+        s.do(SetIJK(7, 12, 8))
+        s.do(SetModeParam("move_b", "1"))
+        s.do(SetIJK(17, 12, 8))
+        s.do(SetModeParam("move_b", "0"))
+        app.processEvents()
+        from fastfuncstuff.viewer.state import Plane
+
+        vid = next(vp.id for vp in s.state.viewports.images if vp.plane is Plane.AXIAL)
+        axial = win.manager.windows[vid]
+        axial.redraw()
+        regions = {r[5]: r for r in axial._mode_regions()}
+        assert set(regions) == {"A", "B"}
+        # 2 mm voxels: a 6 mm sphere on its own slice is a 3-voxel circle.
+        assert regions["A"][2] == pytest.approx(3.0) and regions["B"][2] == pytest.approx(2.0)
+    finally:
+        win.close()
+        s.close()
+        app.processEvents()

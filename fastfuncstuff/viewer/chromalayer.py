@@ -48,6 +48,8 @@ PSC_FRAMES = 16
 #: Rows of the sample matrix a fit keeps. A covariance of a few channels is
 #: settled long before a million voxels.
 MAX_SAMPLES = 400_000
+#: Fit samples kept for the contrast optimiser's context term.
+CONTEXT_SAMPLES = 20_000
 #: The brain mask is eroded this many voxels for ``stats=core``.
 CORE_EROSION = 2
 #: Levels per channel when a colour layer is drawn as a palette index (the 3-D
@@ -390,6 +392,13 @@ class ColourSource:
     brain: Tensor
     te_ms: tuple[float, ...] | None
     te_source: str
+    #: Per-channel mean and SD of the fit samples: the standardisation a custom
+    #: basis fitted to the same region applies.
+    fit_mu: Tensor | None = None
+    fit_sd: Tensor | None = None
+    #: A subsample of the fit samples (M, N), and the flat voxel index of each.
+    context: Tensor | None = None
+    context_where: Tensor | None = None
     masked: bool = True
     window: int = 1
     _frames: dict[int, Tensor] = field(default_factory=dict, repr=False)
@@ -640,11 +649,21 @@ def fit_source(
             for t in frames
         ]
         samples = torch.cat(rows)
+        where = region.reshape(-1).nonzero()[:, 0].repeat(len(rows))
     else:
         samples = transform(chans.means, spec.signal, eps=chans.eps)[:, region].T
+        where = region.reshape(-1).nonzero()[:, 0]
     if samples.shape[0] > MAX_SAMPLES:
         gen = torch.Generator().manual_seed(0)
-        samples = samples[torch.randperm(samples.shape[0], generator=gen)[:MAX_SAMPLES].to(device)]
+        keep = torch.randperm(samples.shape[0], generator=gen)[:MAX_SAMPLES].to(device)
+        samples, where = samples[keep], where[keep]
+    # The fit's own standardisation, and a context subsample with its voxels:
+    # what the contrast optimiser needs to work in the space a custom basis
+    # will be fitted in, so its answer draws the same once written back.
+    gen = torch.Generator().manual_seed(1)
+    ctx = torch.randperm(samples.shape[0], generator=gen)[:CONTEXT_SAMPLES].to(device)
+    fit_mu = samples.mean(0)
+    fit_sd = samples.std(0).clamp(min=1e-12)
 
     te_ms, te_source = chans.echo_times(spec)
     cmap = fit_map(samples, spec, te_ms).to(device)
@@ -658,6 +677,10 @@ def fit_source(
         brain=brain,
         te_ms=None if te_ms is None else tuple(te_ms),
         te_source=te_source,
+        fit_mu=fit_mu,
+        fit_sd=fit_sd,
+        context=samples[ctx],
+        context_where=where[ctx],
         masked=masked,
         window=window,
     )

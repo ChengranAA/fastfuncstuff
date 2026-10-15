@@ -313,6 +313,9 @@ class ComputedOverlay:
     #: is not a rescale of the same picture, it is a different question, and
     #: keeping the old range renders the new one flat.
     rescale: bool = False
+    #: A colour view (viewer.chromalayer.ColourSource) instead of values: the
+    #: RGB mode's output. ``values`` is unused when this is set.
+    colour: Any = None
 
 
 @dataclass

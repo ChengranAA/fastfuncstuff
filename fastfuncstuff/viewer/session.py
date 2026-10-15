@@ -18,7 +18,6 @@ import torch
 from fastfuncstuff.io.dsetinfo import DatasetInfo
 from fastfuncstuff.viewer import catalog as catalog_mod
 from fastfuncstuff.viewer.catalog import CatalogEntry
-from fastfuncstuff.viewer.chromalayer import ChromaLayers
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
 from fastfuncstuff.viewer.design import Design, Provenance, RegressorTrace, run_of
 from fastfuncstuff.viewer.layers import Layer, SignMode
@@ -253,8 +252,9 @@ class ViewerSession:
         self.clock: Callable[[], float] = time.monotonic
         self._last_move = float("-inf")
         self.store = store or VolumeStore(device=device)
-        #: Colour layers' fits and frames (viewer.chromalayer).
-        self.chroma = ChromaLayers(self)
+        #: What each colour layer draws from, by layer key (viewer.chromalayer).
+        #: Kept copies share their source with the live layer they froze.
+        self.colour_sources: dict = {}
         self.bus = install(
             CommandBus(self.state, record=record), open_layer=self._open, session=self
         )
@@ -1067,18 +1067,20 @@ class ViewerSession:
         st = self.state
         if st.grid is None:
             return []
-        overlays = [ly for ly in list(st.layers)[1:] if ly.visible]
+        # A colour layer is read out even at the bottom of the stack: its
+        # numbers are the channels, which no other line shows.
+        overlays = [ly for i, ly in enumerate(st.layers) if ly.visible and (i > 0 or ly.colour)]
         lines: list[str] = []
         for layer in reversed(overlays):
             volume = self.display_volume(layer.key)
             if volume is None:
                 continue
             prefix = f"{_short(layer.name)}  " if len(overlays) > 1 else ""
-            if layer.chroma is not None:
-                try:
-                    lines.append(ValueLine(prefix, self.chroma.readout(layer, st.crosshair)))
-                except (KeyError, ValueError):
-                    pass
+            if layer.colour:
+                source = self.colour_sources.get(layer.key)
+                if source is not None:
+                    ijk = self.layer_voxel(layer.affine, st.crosshair)
+                    lines.append(ValueLine(prefix, source.readout(ijk, self.layer_time(layer))))
                 continue
             if layer.roi:
                 rois = self.roi_set(layer.key)
@@ -1485,6 +1487,8 @@ class ViewerSession:
         sense while an output died with its mode; now that it stays, a layer
         taken out of the stack would never come back.
         """
+        if overlay.colour is not None:
+            return self._install_colour(source, overlay)
         existing = self.state.layers.find_by_source(source)
         key = existing.key if existing is not None else self.state.layers.mint_key("M")
         array, shape_of = _overlay_array(overlay)
@@ -1545,6 +1549,52 @@ class ViewerSession:
             )
         return key
 
+    def layer_time(self, layer: Layer) -> int:
+        """The frame a layer shows: the global time index if it follows time."""
+        return self.state.time_index if layer.time_linked else layer.volume_index
+
+    def _install_colour(self, source: str, overlay: ComputedOverlay) -> str:
+        """Install (or update in place) a mode's colour layer.
+
+        Its store entry is lazy -- the first coordinate, made per frame on
+        request -- so the generic paths that ask the store for a volume (AUTO,
+        a montage, the 3-D window) see a sensible scalar and nothing holds a
+        4-D copy of colours.
+        """
+        colour = overlay.colour
+        n = int(colour.n_frames)
+        shape = tuple(int(v) for v in colour.chans.shape)
+        existing = self.state.layers.find_by_source(source)
+        key = existing.key if existing is not None else self.state.layers.mint_key("M")
+        self.colour_sources[key] = colour
+        self.store.adopt_lazy(key, shape, n, colour.lightness_volume, name=overlay.name)
+        self.invalidate(key)
+        fields = dict(
+            name=overlay.name,
+            shape=shape,
+            n_volumes=n,
+            affine=np.asarray(overlay.affine, dtype=float),
+            time_linked=n > 1,
+            labels=overlay.volume_labels,
+        )
+        if existing is not None:
+            self.state.layers.update(key, **fields)
+            return key
+        consumed = self.mode.input_layer_key() if self.mode.layer_source == source else None
+        self._add_on_top(
+            hide=[consumed] if consumed else [],
+            layer=Layer(
+                key=key,
+                path=f"<{overlay.name}>",
+                range_lo=0.0,
+                range_hi=1.0,
+                colour=True,
+                source=source,
+                **fields,  # type: ignore[arg-type]
+            ),
+        )
+        return key
+
     def remove_computed_overlay(self, source: str) -> None:
         """Drop a mode's output layer, if it has one."""
         existing = self.state.layers.find_by_source(source)
@@ -1564,7 +1614,6 @@ class ViewerSession:
         live = self.state.layers.find_by_source(mode.layer_source)
         if live is None:
             return Aspect.NOTHING
-        values = np.array(self.store.ensure_ram(live.key), dtype=np.float32, copy=True)
         stem = mode.output_name()
         taken = [ly for ly in self.state.layers if ly.source == f"kept:{mode.layer_source}"]
         number = 1 + max(
@@ -1574,7 +1623,17 @@ class ViewerSession:
         detail = live.name[len(stem) :].strip()
         name = f"{stem}_{number}" + (f" {detail}" if detail else "")
         key = self.state.layers.mint_key("K")
-        self.store.adopt(key, values, name=name)
+        if live.colour:
+            # A source is never changed after it is made -- a new look is a
+            # new source -- so the copy can share the live one's.
+            frozen = self.colour_sources[live.key]
+            self.colour_sources[key] = frozen
+            self.store.adopt_lazy(
+                key, live.shape, live.n_volumes, frozen.lightness_volume, name=name
+            )
+        else:
+            values = np.array(self.store.ensure_ram(live.key), dtype=np.float32, copy=True)
+            self.store.adopt(key, values, name=name)
         self.state.layers.add(
             live.with_(
                 key=key,
@@ -1601,7 +1660,7 @@ class ViewerSession:
         if key in held:
             return
         self.invalidate(key)
-        self.chroma.forget(key)
+        self.colour_sources.pop(key, None)
         for stale in [k for k in self._threshold_scales if k[0] == key]:
             del self._threshold_scales[stale]
         for stale in [k for k in self._source_masks if k[0] == key]:
@@ -2176,8 +2235,8 @@ class ViewerSession:
         from fastfuncstuff.io.afni import save_nifti
 
         layer = self.state.layers.get(key)
-        if layer.chroma is not None:
-            return self.chroma.save(key, path)
+        if layer.colour:
+            return self.colour_sources[key].save(path)
         data = np.asarray(self.store.ensure_ram(key), dtype=np.float32)
         if data.ndim == 4 and data.shape[3] == 1:
             data = data[..., 0]

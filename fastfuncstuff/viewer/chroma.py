@@ -1,7 +1,7 @@
 """Several values per voxel, drawn as one colour.
 
 Echoes, inversions, betas, component maps: anything with N >= 2 values at a
-voxel. A colour layer is a linear map from those N values to three colour
+voxel. A colour view is a linear map from those N values to three colour
 coordinates, fitted once and applied per plane, so it costs a matmul at draw
 time and plays as a movie when its channels are time series. Colour and time
 never compete for one display axis, which is the problem a 4-D RGB file runs
@@ -24,29 +24,33 @@ basis is a different answer to that:
               (R2*) and P2 the departure from a single exponential; on percent
               change, P0 is the TE-independent (S0) part and P1 the
               TE-proportional (BOLD) part. Hues mean the same in every subject.
+``custom``    weights typed by hand, one row per colour coordinate, on the
+              standardised channels -- for when you know the contrast you want.
+
+The fit is split from the :class:`Look`. A fit (which basis, from which
+statistics) is tens of milliseconds; a look -- each coordinate's shift and
+stretch, a hue rotation, a lightness gamma -- is applied per draw and costs
+nothing, which is what makes it a live contrast manipulator rather than a
+render setting.
 
 Two colour spaces. ``rgb`` maps the three coordinates to the three primaries.
 ``oklab`` puts the first coordinate in lightness and the other two on the
 opponent axes (b: blue-yellow, a: green-red), so a change of hue never reads
 as a change of brightness and anatomy stays legible under the tint.
-
-The statistics a fit reads -- channel means and covariance -- come from a
-region (``core``: the brain mask eroded, so the susceptibility fringe at the
-edge cannot claim the whole stretch; ``brain``; or any loaded layer as a mask),
-which is DStretch's "enhance this selection" in viewer terms.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
 from torch import Tensor
 
-BASES = ("pick", "dstretch", "pca", "te")
+BASES = ("pick", "dstretch", "pca", "te", "custom")
 SPACES = ("auto", "rgb", "oklab")
 SIGNALS = ("raw", "log", "psc")
 LIGHTNESS = ("basis", "anatomy")
@@ -63,166 +67,105 @@ ANATOMY_NUDGE = 0.15
 
 
 @dataclass(frozen=True)
-class Channel:
-    """One channel: a layer, and which of its sub-bricks to read at time ``t``.
-
-    The sub-brick is ``offset + t * stride``. Separate echo files are
-    ``offset=0, stride=1``; echoes stacked echo-major in one file of ``nt``
-    frames are ``offset=e*nt, stride=1``; interleaved, ``offset=e, stride=N``;
-    a static volume or one bucket sub-brick is ``stride=0``.
-    """
-
-    key: str
-    offset: int = 0
-    stride: int = 1
-
-    def brick(self, t: int, n_bricks: int) -> int:
-        return max(0, min(self.offset + t * self.stride, n_bricks - 1))
-
-    def n_frames(self, n_bricks: int) -> int:
-        if self.stride <= 0:
-            return 1
-        return max(1, (n_bricks - 1 - self.offset) // self.stride + 1)
-
-    def text(self) -> str:
-        if self.offset == 0 and self.stride == 1:
-            return self.key
-        return f"{self.key}:{self.offset}" + ("" if self.stride == 1 else f"+{self.stride}")
-
-
-_CHANNEL = re.compile(r"^([^:,+\s]+)(?::(\d+)(?:\+(\d+))?)?$")
-
-
-def parse_channels(text: str) -> tuple[Channel, ...]:
-    """``"E1,E2,E3"`` or ``"L1:0+3,L1:1+3,L1:2+3"`` -- ``KEY[:OFFSET[+STRIDE]]``.
-
-    An offset with no stride means one fixed sub-brick (stride 0): ``L4:2`` is
-    a bucket's third sub-brick, not a time series starting there.
-    """
-    out: list[Channel] = []
-    for part in str(text).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        m = _CHANNEL.match(part)
-        if m is None:
-            raise ValueError(f"bad channel {part!r}: expected KEY[:OFFSET[+STRIDE]]")
-        key, offset, stride = m.groups()
-        if offset is None:
-            out.append(Channel(key))
-        else:
-            out.append(Channel(key, int(offset), 0 if stride is None else int(stride)))
-    if len(out) < 2:
-        raise ValueError("a colour layer needs at least two channels")
-    return tuple(out)
-
-
-def format_channels(channels: Sequence[Channel]) -> str:
-    return ",".join(c.text() for c in channels)
-
-
-@dataclass(frozen=True)
 class ChromaSpec:
-    """How a colour layer is made. Everything a fit depends on, and nothing else."""
+    """How the 3 x N map is fitted. Changing any of it refits (tens of ms)."""
 
-    channels: tuple[Channel, ...]
     basis: str = "dstretch"
-    space: str = "auto"
     signal: str = "log"
-    #: Window half-width in standard deviations. Larger is calmer.
-    spread: float = 2.5
-    #: Oklab chroma at full swing. ~0.25 is near the edge of the sRGB gamut.
-    chroma: float = 0.25
     #: Eigenvalues below ``floor * largest`` are not whitened further. Without
     #: it the weakest component -- usually noise -- is amplified the most,
     #: which on three echoes shows up as speckle.
     floor: float = 0.05
-    stats: str = "core"
-    lightness: str = "basis"
-    #: Which three channels ``pick`` (and ``dstretch`` with N > 3) shows, as
-    #: comma-separated indices. Empty: first, middle, last.
-    pick: str = ""
-    #: Echo times in ms, comma-separated, for the ``te`` basis. Empty: read
-    #: from the channels' sidecars, or evenly spaced when they have none.
+    #: Channel indices shown as the three coordinates by ``pick`` and
+    #: ``dstretch``; -1 is first / middle / last.
+    pick: tuple[int, int, int] = (-1, -1, -1)
+    #: Echo times in ms for the ``te`` basis; empty reads sidecars.
     te: str = ""
-    #: Hide voxels outside the brain mask.
-    masked: bool = True
-    #: Frames averaged around the shown one (centred, odd). One frame of
-    #: percent change at fMRI resolution is mostly thermal noise; a few
-    #: seconds' average is where a breath-hold or a block shows.
-    window: int = 1
+    #: ``custom`` weights: three rows separated by ``;``, N numbers each.
+    weights: str = ""
 
     def __post_init__(self) -> None:
         if self.basis not in BASES:
             raise ValueError(f"basis must be one of {BASES}, not {self.basis!r}")
-        if self.space not in SPACES:
-            raise ValueError(f"space must be one of {SPACES}, not {self.space!r}")
         if self.signal not in SIGNALS:
             raise ValueError(f"signal must be one of {SIGNALS}, not {self.signal!r}")
-        if self.lightness not in LIGHTNESS:
-            raise ValueError(f"lightness must be one of {LIGHTNESS}, not {self.lightness!r}")
-        if len(self.channels) < 2:
-            raise ValueError("a colour layer needs at least two channels")
-        if self.window < 1:
-            raise ValueError("window must be at least one frame")
-        # Checked here rather than at fit time: a value that cannot be drawn
-        # must be refused by the command that sets it, not leave the layer
-        # silently blank on the next repaint.
-        self.picked()
-        self.te_ms()
 
-    def te_ms(self) -> list[float] | None:
+    def picked(self, n: int) -> tuple[int, int, int]:
+        auto = (0, 1, 1) if n == 2 else ((0, n // 2, n - 1) if n > 3 else (0, 1, 2))
+        r, g, b = (a if p < 0 else p for p, a in zip(self.pick, auto, strict=True))
+        if max(r, g, b) >= n:
+            raise ValueError(
+                f"R/G/B channel {max(r, g, b)} does not exist; there are {n} (0..{n - 1})"
+            )
+        return (r, g, b)
+
+    def te_ms(self, n: int) -> list[float] | None:
         """Typed echo times, or ``None`` when they are to be read from sidecars."""
         if not self.te.strip():
             return None
         try:
-            tes = [float(v) for v in self.te.split(",")]
+            tes = [float(v) for v in self.te.replace(";", ",").split(",") if v.strip()]
         except ValueError:
-            raise ValueError(f"te must be comma-separated numbers, got {self.te!r}") from None
-        if len(tes) != len(self.channels):
-            raise ValueError(f"te lists {len(tes)} echo times for {len(self.channels)} channels")
+            raise ValueError(f"TE must be comma-separated numbers, got {self.te!r}") from None
+        if len(tes) != n:
+            raise ValueError(f"TE lists {len(tes)} echo times for {n} channels")
         if len(set(tes)) < 2:
             raise ValueError("echo times must differ")
         return tes
 
-    @property
-    def resolved_space(self) -> str:
-        """``auto``: Oklab where the first coordinate is a level (te, pca), RGB otherwise."""
-        if self.space != "auto":
-            return self.space
-        return "oklab" if self.basis in ("te", "pca") else "rgb"
+    def custom_weights(self, n: int) -> np.ndarray:
+        rows = [r for r in self.weights.split(";") if r.strip()]
+        if len(rows) != 3:
+            raise ValueError("custom weights need three rows separated by ';'")
+        try:
+            W = np.array([[float(v) for v in r.split(",")] for r in rows])
+        except ValueError:
+            raise ValueError(f"custom weights must be numbers, got {self.weights!r}") from None
+        if W.shape != (3, n):
+            raise ValueError(f"custom weights need {n} numbers per row, one per channel")
+        return W
 
-    def picked(self) -> tuple[int, int, int]:
-        n = len(self.channels)
-        if self.pick.strip():
-            try:
-                idx = tuple(int(v) for v in self.pick.split(","))
-            except ValueError:
-                raise ValueError(f"pick must be three indices, got {self.pick!r}") from None
-            if len(idx) != 3 or min(idx) < 0 or max(idx) >= n:
-                raise ValueError(f"pick needs three indices in 0..{n - 1}, got {self.pick!r}")
-            return idx  # type: ignore[return-value]
-        if n == 2:
-            return (0, 1, 1)
-        return (0, n // 2, n - 1) if n > 3 else (0, 1, 2)
 
-    def with_param(self, name: str, value: str) -> ChromaSpec:
-        """A copy with one parameter set from its script text."""
-        if name == "channels":
-            return replace(self, channels=parse_channels(value))
-        known = {f.name: f for f in fields(self)}
-        if name not in known:
-            raise KeyError(f"colour layers have no parameter {name!r}")
-        current = getattr(self, name)
-        if isinstance(current, bool):
-            coerced: object = value not in ("0", "false", "False", "")
-        elif isinstance(current, float):
-            coerced = float(value)
-        elif isinstance(current, int):
-            coerced = int(float(value))
-        else:
-            coerced = "" if value == "-" else str(value)
-        return replace(self, **{name: coerced})
+@dataclass(frozen=True)
+class Look:
+    """How the fitted coordinates become colour. Applied per draw; no refit.
+
+    ``shift`` and ``stretch`` are per coordinate, in window units: the window
+    is the stats region's median +- ``spread`` standard deviations, so a shift
+    of 0.5 moves the centre half a window and a stretch of 2 doubles the
+    contrast. A negative stretch flips that coordinate's direction.
+    """
+
+    space: str = "oklab"
+    lightness: str = "basis"
+    #: Window half-width in standard deviations of the stats region. Larger
+    #: is calmer; smaller saturates and clips sooner.
+    spread: float = 2.5
+    chroma: float = 0.25
+    shift: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    stretch: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    #: Rotation of the two chroma coordinates, degrees: oklab hue, or the G-B
+    #: plane in rgb. Moves which tissue lands on which colour.
+    hue: float = 0.0
+    #: Lightness gamma: above 1 darkens the dim end, below 1 lifts it.
+    gamma: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.space not in ("rgb", "oklab"):
+            raise ValueError(f"space must be rgb or oklab, not {self.space!r}")
+        if self.lightness not in LIGHTNESS:
+            raise ValueError(f"lightness must be one of {LIGHTNESS}, not {self.lightness!r}")
+        if self.gamma <= 0:
+            raise ValueError("gamma must be positive")
+        if self.spread <= 0:
+            raise ValueError("spread must be positive")
+
+
+def resolve_space(space: str, basis: str) -> str:
+    """``auto``: Oklab where the first coordinate is a level (te, pca), RGB otherwise."""
+    if space != "auto":
+        return space
+    return "oklab" if basis in ("te", "pca") else "rgb"
 
 
 # ---------------------------------------------------------------------------
@@ -277,19 +220,18 @@ def echo_basis(te_ms: Sequence[float]) -> np.ndarray:
 
 @dataclass(frozen=True)
 class ChromaMap:
-    """Transformed channels in, colour out. Fitted by :func:`fit_map`."""
+    """Transformed channels in, coordinates out. Fitted by :func:`fit_map`."""
 
     #: (3, N), applied to ``(x - mu) / sd``.
     W: Tensor
     mu: Tensor
     sd: Tensor
-    #: Per coordinate: the window ``center +- width`` spans the colour range.
+    #: Per coordinate: median and standard deviation over the stats region.
+    #: The window is ``center +- look.spread * width``.
     center: Tensor
     width: Tensor
-    space: str
-    chroma: float
-    #: Oklab lightness window on the first coordinate (robust percentiles,
-    #: because it is a level and its distribution is skewed, not a deviation).
+    #: Lightness window on the first coordinate (robust percentiles, because
+    #: it is a level and its distribution is skewed, not a deviation).
     l_lo: float
     l_hi: float
 
@@ -306,16 +248,26 @@ class ChromaMap:
     def coords(self, x: Tensor) -> Tensor:
         """(N, ...) -> (3, ...): the basis coordinates, unwindowed."""
         n = x.shape[0]
-        flat = x.reshape(n, -1)
-        z = (flat - self.mu[:, None]) / self.sd[:, None]
+        z = (x.reshape(n, -1) - self.mu[:, None]) / self.sd[:, None]
         return (self.W @ z).reshape(3, *x.shape[1:])
 
-    def unit(self, y: Tensor) -> Tensor:
-        """Coordinates scaled so the window is [-1, 1]."""
+    def unit(self, y: Tensor, look: Look) -> Tensor:
+        """Coordinates in window units, the look's shift and stretch applied."""
         shape = (3,) + (1,) * (y.ndim - 1)
-        return (y - self.center.reshape(shape)) / self.width.reshape(shape)
+        u = (y - self.center.reshape(shape)) / (look.spread * self.width.reshape(shape))
+        shift = torch.tensor(look.shift, dtype=u.dtype, device=u.device).reshape(shape)
+        stretch = torch.tensor(look.stretch, dtype=u.dtype, device=u.device).reshape(shape)
+        return (u - shift) * stretch
 
-    def colors(self, x: Tensor, lightness: Tensor | None = None) -> Tensor:
+    def level(self, y0: Tensor, look: Look) -> Tensor:
+        """The first coordinate as a [0, 1] level, for lightness."""
+        lo, hi = self.l_lo, self.l_hi
+        mid, half = 0.5 * (lo + hi), 0.5 * max(hi - lo, 1e-12)
+        s0, k0 = look.shift[0], look.stretch[0]
+        t = ((y0 - mid) / half - s0) * k0
+        return (0.5 + 0.5 * t).clamp(0.0, 1.0)
+
+    def colors(self, x: Tensor, look: Look, lightness: Tensor | None = None) -> Tensor:
         """(N, ...) transformed channels -> (..., 3) sRGB in [0, 1].
 
         ``lightness`` (in [0, 1], same spatial shape) replaces the first
@@ -323,22 +275,26 @@ class ChromaMap:
         only nudges.
         """
         y = self.coords(x)
-        u = self.unit(y)
-        if self.space == "rgb":
-            rgb = (0.5 + 0.5 * u).clamp(0.0, 1.0)
-            rgb = rgb.movedim(0, -1)
+        u = self.unit(y, look)
+        c, s = math.cos(math.radians(look.hue)), math.sin(math.radians(look.hue))
+        u1, u2 = c * u[1] - s * u[2], s * u[1] + c * u[2]
+        if look.space == "rgb":
+            rgb = (0.5 + 0.5 * torch.stack([u[0], u1, u2], -1)).clamp(0.0, 1.0)
+            if look.gamma != 1.0:
+                rgb = rgb ** (1.0 / look.gamma)
             if lightness is not None:
-                rgb = rgb * lightness.unsqueeze(-1)
+                rgb = rgb * lightness.unsqueeze(-1) ** look.gamma
             return rgb
         if lightness is None:
-            level = ((y[0] - self.l_lo) / max(self.l_hi - self.l_lo, 1e-12)).clamp(0.0, 1.0)
-            L = L_FLOOR + (L_CEIL - L_FLOOR) * level
+            level = self.level(y[0], look)
+            L = L_FLOOR + (L_CEIL - L_FLOOR) * level**look.gamma
         else:
-            L = L_FLOOR + (L_CEIL - L_FLOOR) * lightness + ANATOMY_NUDGE * torch.tanh(u[0])
+            L = L_FLOOR + (L_CEIL - L_FLOOR) * lightness**look.gamma
+            L = L + ANATOMY_NUDGE * torch.tanh(u[0])
         # tanh rather than a clip: saturation rolls off instead of flattening,
         # so the strongest voxels are still distinguishable from strong ones.
-        b = self.chroma * torch.tanh(1.25 * u[1])
-        a = self.chroma * torch.tanh(1.25 * u[2])
+        b = look.chroma * torch.tanh(1.25 * u1)
+        a = look.chroma * torch.tanh(1.25 * u2)
         return oklab_to_srgb(L, a, b)
 
 
@@ -388,7 +344,7 @@ def fit_map(
         raise ValueError("too few voxels in the statistics region to fit colours")
     n = x.shape[1]
     pick = np.zeros((3, n))
-    for row, c in enumerate(spec.picked()):
+    for row, c in enumerate(spec.picked(n)):
         pick[row, c] = 1.0
 
     if spec.basis == "te":
@@ -404,6 +360,8 @@ def fit_map(
         mu, sd = mu_t.double().cpu().numpy(), sd_t.double().cpu().numpy()
         if spec.basis == "pick":
             W = pick
+        elif spec.basis == "custom":
+            W = spec.custom_weights(n)
         else:
             z = (x - mu_t) / sd_t
             cov = (z.T @ z / max(z.shape[0] - 1, 1)).double().cpu().numpy()
@@ -421,7 +379,7 @@ def fit_map(
     W_t, mu_t, sd_t = t(W).to(x.device), t(mu).to(x.device), t(sd).to(x.device)
     y = ((x - mu_t) / sd_t) @ W_t.T
     center = y.median(dim=0).values
-    width = spec.spread * y.std(0)
+    width = y.std(0)
     width = torch.where(width > 0, width, torch.ones_like(width))
     l_lo, l_hi = torch.quantile(y[:, 0], torch.tensor([0.02, 0.995], device=x.device)).tolist()
 
@@ -431,8 +389,6 @@ def fit_map(
         sd=sd_t,
         center=center,
         width=width,
-        space=spec.resolved_space,
-        chroma=float(spec.chroma),
         l_lo=float(l_lo),
         l_hi=float(l_hi),
     )

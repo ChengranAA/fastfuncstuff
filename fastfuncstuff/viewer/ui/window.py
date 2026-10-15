@@ -1404,27 +1404,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             b.setToolTip(f"{tip} ({key})")
             b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 1px 5px; }}")
             b.clicked.connect(slot)
-            if text == "SAVE":
-                save_button = b
-            else:
-                stack_buttons.addWidget(b)
-        rgb_button = QtWidgets.QPushButton("RGB")
-        rgb_button.setToolTip(
-            "Draw several values per voxel as one colour layer: the selected file\n"
-            "and its siblings (_e1, _e2, ...), or the selected layer's sub-bricks.\n"
-            "Time series play as a colour movie."
-        )
-        rgb_button.setStyleSheet(
-            f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 1px 5px; }}"
-        )
-        rgb_button.clicked.connect(self._make_rgb)
-        # Beside SAVE, not under it: the column's height is the list's floor,
-        # and another row would take it from the stack it sits beside.
-        save_rgb = QtWidgets.QHBoxLayout()
-        save_rgb.setSpacing(2)
-        save_rgb.addWidget(save_button)
-        save_rgb.addWidget(rgb_button)
-        stack_buttons.addLayout(save_rgb)
+            stack_buttons.addWidget(b)
         stack_buttons.addStretch(1)
         stack_column.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Preferred
@@ -1668,26 +1648,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         bar_column.addWidget(self.rangebar, 1)
         controls.addLayout(bar_column)
         v.addLayout(controls)
-
-        # A colour layer has no colour map, range or threshold; what it has
-        # instead is how its channels become a colour, shown only while one
-        # is selected. Same declarative panel a mode's parameters use.
-        from fastfuncstuff.viewer.ui.controls import ControlPanel as _RgbPanel
-
-        self.rgb_box = QtWidgets.QWidget()
-        rgb_v = QtWidgets.QVBoxLayout(self.rgb_box)
-        rgb_v.setContentsMargins(0, 0, 0, 0)
-        rgb_v.setSpacing(2)
-        rgb_v.addWidget(self._head("COLOUR"))
-        self.rgb_meaning = QtWidgets.QLabel()
-        self.rgb_meaning.setWordWrap(True)
-        self.rgb_meaning.setObjectName("group")
-        rgb_v.addWidget(self.rgb_meaning)
-        self.rgb_panel = _RgbPanel()
-        self.rgb_panel.changed.connect(self._rgb_param_changed)
-        rgb_v.addWidget(self.rgb_panel)
-        self.rgb_box.setVisible(False)
-        v.addWidget(self.rgb_box)
 
         # Above the MODE PARAMETERS header, not under it: the input is not a
         # parameter, it is the thing the parameters are all about, and it is
@@ -2496,47 +2456,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         self._apply(SetResample, how=nxt)
 
-    def _make_rgb(self) -> None:
-        from fastfuncstuff.viewer.vocab import MakeRgb
+    def _sync_colour_rows(self) -> None:
+        """A colour layer has no colour map, sign, alpha or range: hide those rows.
 
-        key = self.current_key()
-        if key is None:
-            return
-        try:
-            self._dispatch(MakeRgb(key))
-        except (KeyError, ValueError, OSError) as exc:
-            self.statusBar().showMessage(f"RGB: {exc}", 10000)
-
-    def _rgb_param_changed(self, name: str, value: str) -> None:
-        from fastfuncstuff.viewer.vocab import SetRgb
-
-        key = self.current_key()
-        if key is None:
-            return
-        try:
-            self._dispatch(SetRgb(key, name, value))
-        except (KeyError, ValueError, OSError) as exc:
-            self.statusBar().showMessage(f"RGB {name}: {exc}", 10000)
-            self._sync_rgb_panel()
-
-    def _sync_rgb_panel(self) -> None:
-        from fastfuncstuff.viewer.chromalayer import control_values, controls
-
+        What it has instead -- how its channels become a colour -- is the RGB
+        mode's panel.
+        """
         layer = self.session.state.selected_layer()
-        is_rgb = layer is not None and layer.chroma is not None
-        self.rgb_box.setVisible(is_rgb)
+        is_colour = layer is not None and layer.colour
         for widget in (self.cmap_box, self.sign_box, self.alpha_row):
-            self._layer_form.setRowVisible(widget, not is_rgb)
-        self.rangebar.setVisible(not is_rgb)
-        self.range_head.setVisible(not is_rgb)
-        if not is_rgb:
-            return
-        assert layer is not None and layer.chroma is not None
-        self.rgb_panel.rebuild(controls(self.session, layer), control_values(layer.chroma))
-        self.rgb_meaning.setText(self.session.chroma.describe(layer))
+            self._layer_form.setRowVisible(widget, not is_colour)
+        self.rangebar.setVisible(not is_colour)
+        self.range_head.setVisible(not is_colour)
 
     def _sync_layer_controls(self) -> None:
-        self._sync_rgb_panel()
+        self._sync_colour_rows()
         key = self.current_key()
         # Off rather than left showing the last layer: an empty controller's
         # panel otherwise reads as holding the stack of the tab before it.

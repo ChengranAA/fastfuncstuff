@@ -2058,7 +2058,7 @@ class ViewerSession:
         self._display_mask_tensors[key] = tensor
         return tensor
 
-    def cluster_series(self, table, index: int) -> np.ndarray | None:
+    def cluster_series(self, table, index: int) -> tuple[np.ndarray | None, str]:
         """Mean time course of one cluster, from a run on the same grid.
 
         The cluster's average, not its peak voxel's. The peak is by definition
@@ -2066,22 +2066,24 @@ class ViewerSession:
         selected for -- plotting it is the classic way to make an effect look
         larger than it is.
 
-        ``None`` rather than blocking when no run is resident: the window asks
-        on every row click.
+        ``(None, why)`` rather than blocking when no run is resident: the window
+        asks on every row click, and says ``why`` in place of the trace -- a
+        stat bucket is not a run, so a map loaded alone never has one.
         """
         if table is None:
-            return None
+            return None, "no cluster table"
         picked = np.asarray(table.labels) == int(index)
         if not picked.any():
-            return None
-        for layer in reversed(self.graph_layers()):
-            if layer.shape != picked.shape:
-                continue
+            return None, "cluster has no voxels"
+        same_grid = [ly for ly in self.graph_layers() if ly.shape == picked.shape]
+        for layer in reversed(same_grid):
             resident = self.store.get(layer.key)
             if resident.array is None:
                 continue
-            return np.asarray(resident.array[picked].mean(0), dtype=np.float32)
-        return None
+            return np.asarray(resident.array[picked].mean(0), dtype=np.float32), ""
+        if same_grid:
+            return None, "the run on this grid is still loading"
+        return None, "no 4-D run on this grid to average -- load the time series"
 
     def install_rois(self, rois, *, name: str, source: str) -> str:
         """Adopt an ROI set as a layer, so it can be used like any other.

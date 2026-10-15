@@ -1863,6 +1863,35 @@ def test_a_cluster_plots_its_mean_and_not_its_peak_voxel(win4d, qapp, tmp_path):
     assert np.allclose(series, expected, atol=1e-4)
 
 
+def test_clicking_the_current_row_after_a_rebuild_redraws_its_mean(win4d, qapp, tmp_path):
+    """Bug of record: a rebuild (any threshold drag) cleared the trace, Qt kept the
+    current row, and clicking that row again fired no currentCellChanged -- so the
+    strip sat on "pick a cluster" however often it was clicked."""
+    from fastfuncstuff.viewer.vocab import SetThreshold
+
+    key, window = _clusters(win4d, qapp, tmp_path)
+    window.table.setCurrentCell(0, 0)
+    qapp.processEvents()
+    win4d._dispatch(SetThreshold(key, 2.5))  # same two clusters, table rebuilt
+    qapp.processEvents()
+    assert window.trace._series is None
+    assert window.table.currentRow() == 0
+
+    window.table.cellClicked.emit(0, 0)
+    qapp.processEvents()
+    assert window.trace._series is not None
+
+
+def test_a_stat_map_alone_says_why_it_has_no_cluster_mean(win, qapp, tmp_path):
+    """A stat bucket is not a run, so with nothing 4-D loaded there is no mean to
+    draw -- and the strip has to say that, not keep asking for a click."""
+    _key, window = _clusters(win, qapp, tmp_path)
+    window.table.setCurrentCell(0, 0)
+    qapp.processEvents()
+    assert window.trace._series is None
+    assert "no 4-D run" in window.trace._empty
+
+
 def test_the_cluster_window_starts_with_a_minimum_that_keeps_out_speckle(win4d, qapp, tmp_path):
     """Opening it on a loose threshold used to list every one-voxel cluster,
     which on a whole brain is tens of thousands of rows and a frozen window."""

@@ -66,12 +66,17 @@ class TraceStrip(QtWidgets.QWidget):
         self._series: np.ndarray | None = None
         self._color = (200, 200, 200)
         self._label = ""
+        self._empty = "pick a cluster for its mean"
         self.setFixedHeight(TRACE_HEIGHT)
 
-    def set_series(self, series: np.ndarray | None, color, label: str = "") -> None:
+    def set_series(
+        self, series: np.ndarray | None, color, label: str = "", empty: str | None = None
+    ) -> None:
+        """``empty`` is what the strip says when there is no series to draw."""
         self._series = None if series is None or series.size < 2 else np.asarray(series)
         self._color = tuple(int(c) for c in color)
         self._label = label
+        self._empty = empty or "pick a cluster for its mean"
         self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
@@ -81,7 +86,9 @@ class TraceStrip(QtWidgets.QWidget):
         if self._series is None:
             p.setPen(QtGui.QColor(c.faint))
             p.drawText(
-                self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "pick a cluster for its mean"
+                self.rect(),
+                QtCore.Qt.AlignmentFlag.AlignCenter | QtCore.Qt.TextFlag.TextWordWrap,
+                self._empty,
             )
             p.end()
             return
@@ -125,6 +132,7 @@ class ClusterWindow(QtWidgets.QWidget):
         self._dispatch = dispatch
         self._table: ClusterTable | None = None
         self._source_key = ""
+        self._selected_row = -1
         self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
         self.resize(560, 460)
         self.setMinimumSize(150, 140)
@@ -226,6 +234,9 @@ class ClusterWindow(QtWidgets.QWidget):
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.currentCellChanged.connect(lambda row, *_: self._select(row))
+        # A rebuild clears the trace but Qt keeps the current row, so clicking that
+        # row again changes nothing current -- only cellClicked sees it.
+        self.table.cellClicked.connect(lambda row, _col: self._select(row))
         v.addWidget(self.table, 1)
 
         self.trace = TraceStrip()
@@ -307,6 +318,9 @@ class ClusterWindow(QtWidgets.QWidget):
     def _select(self, row: int) -> None:
         if self._table is None or not (0 <= row < len(self._table)):
             return
+        if row == self._selected_row:  # a click that also moved the current cell
+            return
+        self._selected_row = row
         cluster = self._table.clusters[row]
         # The table already carries the peak in mm, on the layer's own grid.
         self.located.emit(*cluster.peak_xyz)
@@ -316,11 +330,12 @@ class ClusterWindow(QtWidgets.QWidget):
         """Average the cluster's voxels in whichever run is loaded under it."""
         from fastfuncstuff.viewer.rois import roi_color
 
-        series = self.session.cluster_series(self._table, cluster.index)
+        series, why = self.session.cluster_series(self._table, cluster.index)
         self.trace.set_series(
             series,
             roi_color(cluster.index - 1),
             f"C{cluster.index}  ·  {cluster.n_voxels} voxels",
+            empty=f"C{cluster.index}: {why}",
         )
 
     def _viewport(self) -> Viewport | None:
@@ -333,6 +348,7 @@ class ClusterWindow(QtWidgets.QWidget):
     def show_table(self, source_key: str, table: ClusterTable | None, message: str = "") -> None:
         self._table = table
         self._source_key = source_key
+        self._selected_row = -1
         self.trace.set_series(None, (0, 0, 0))
         shown = 0 if table is None else min(len(table), MAX_TABLE_ROWS)
         self.table.setUpdatesEnabled(False)

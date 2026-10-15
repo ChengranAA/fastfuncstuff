@@ -2159,11 +2159,12 @@ class SurfaceWindow(QtWidgets.QWidget):
     def _colour_slot(self, layer, cache: dict) -> OverlaySlot | None:
         """An RGB-mode layer as a palette-indexed label layer.
 
-        The shader colours an overlay from a scalar through a LUT, or from a
-        label through a palette; a colour layer is neither. Quantised to a
-        32-level RGB cube it is a label image whose palette is the cube, and
-        the label path samples nearest -- indices never blend into colours
-        that are not there. A new look is a new source, so the key follows it.
+        Quantised to a 32-level RGB cube, each voxel is an index whose palette
+        is the cube. The shader's colour kind reads the index nearest at every
+        depth sample of the window's range and averages the decoded colours,
+        so the depth slider moves it like any overlay -- the label path it
+        first went through votes at fixed depths and ignored the slider. A
+        new look is a new source, so the key follows it.
         """
         from fastfuncstuff.viewer.chromalayer import cube_palette
 
@@ -2190,7 +2191,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             stat=None,
             stat_frame=None,
             shade=s3.ShadeParams(
-                opacity=float(layer.opacity), has_data=True, labels=True, outline=outline
+                opacity=float(layer.opacity), has_data=True, colour=True, outline=outline
             ),
             palette=self._cube,
         )

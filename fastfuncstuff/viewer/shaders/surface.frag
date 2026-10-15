@@ -22,7 +22,7 @@ struct Layer {
     mat4 texFromMm;
     mat4 statFromMm;
     vec4 cmap;    // lo, hi, threshold, opacity
-    vec4 modes;   // sign mode, alpha mode, panes, kind (0 off, 1 values, 2 labels)
+    vec4 modes;   // sign mode, alpha mode, panes, kind (0 off, 1 values, 2 labels, 3 colours)
     vec4 info;    // LUT row, palette row, outline (0 none, 1 fill + outline, 2 outline only)
 };
 
@@ -162,6 +162,29 @@ int labelVote(Layer L, sampler3D vt, vec3 off)
     return (lo == hi && lo > 0) ? lo : label;
 }
 
+// A colour layer (RGB mode): each voxel is an index into an RGB cube held in
+// the palette. Indices are read nearest at every depth sample of the user's
+// range, decoded, and the *colours* averaged -- averaging the indices would
+// invent colours that are not there. Alpha 0 where no sample landed.
+vec4 colourAvg(Layer L, sampler3D vt, vec3 off)
+{
+    int ns = clamp(int(depth.z + 0.5), 1, MAX_SAMPLES);
+    ivec2 size = textureSize(palette, 0);
+    int row0 = int(L.info.y + 0.5);
+    vec3 acc = vec3(0.0);
+    float n = 0.0;
+    for (int i = 0; i < MAX_SAMPLES; ++i) {
+        if (i >= ns) break;
+        float d = ns == 1 ? depth.x : mix(depth.x, depth.y, float(i) / float(ns - 1));
+        int idx = labelAt(d, L, vt, off);
+        if (idx > 0 && idx < PALETTE_W * size.y) {
+            acc += texelFetch(palette, ivec2(idx % PALETTE_W, row0 + idx / PALETTE_W), 0).rgb;
+            n += 1.0;
+        }
+    }
+    return n > 0.0 ? vec4(acc / n, 1.0) : vec4(0.0);
+}
+
 // Depth samples reduced to one value (x) and threshold statistic (y), and
 // whether every sample was inside the volume (z), at the fragment shifted by
 // ``off`` mm. extra.z picks the reduction, in surface3d.py:DEPTH_STATS order
@@ -234,6 +257,11 @@ vec3 over(vec3 col, float light, Layer L, sampler3D vt, sampler3D st, vec3 dx, v
     int kind = int(L.modes.w + 0.5);
     int outline = int(L.info.z + 0.5);
     vec3 lit = vec3(mix(1.0, light, 0.4));
+    if (kind == 3) {
+        vec4 c = colourAvg(L, vt, vec3(0.0));
+        if (c.a > 0.0) col = mix(col, c.rgb * lit, L.cmap.w);
+        return col;
+    }
     if (kind == 2) {
         int label = labelVote(L, vt, vec3(0.0));
         bool border = false;

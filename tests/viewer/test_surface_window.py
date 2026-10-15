@@ -607,7 +607,7 @@ def test_an_rgb_mode_layer_reaches_the_surface_in_its_own_colours(window, tmp_pa
     layer = next(ly for ly in session.state.layers if ly.colour)
     win.refresh(Aspect.LAYERS)
     slot = win.canvas.overlays[-1]
-    assert slot.shade.labels and slot.palette is not None
+    assert slot.shade.colour and not slot.shade.labels and slot.palette is not None
 
     source = session.colour_sources[layer.key]
     index = source.indexed(0)

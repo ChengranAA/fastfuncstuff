@@ -456,6 +456,9 @@ class ShadeParams:
     #: A label layer: colour by value from the palette, sampled nearest at
     #: mid-depth only.
     labels: bool = False
+    #: A colour layer: the value is an index into an RGB cube in the palette,
+    #: decoded at every depth sample and the colours averaged (kind 3).
+    colour: bool = False
     outline: int = OUTLINE_NONE
 
 
@@ -518,7 +521,7 @@ def pack_uniforms(
         if k < len(shown):
             L = shown[k]
             sh = L.shade
-            kind = (2.0 if sh.labels else 1.0) if sh.has_data else 0.0
+            kind = (3.0 if sh.colour else 2.0 if sh.labels else 1.0) if sh.has_data else 0.0
             parts += [
                 _mat(L.tex_from_mm),
                 _mat(L.stat_from_mm),

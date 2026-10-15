@@ -270,3 +270,76 @@ def test_outline_only_labels_draw_borders_over_the_layer_below(tmp_path):
     finally:
         session.close()
         app.processEvents()
+
+
+def test_a_colour_layer_follows_the_depth_range(tmp_path):
+    """RGB-mode colours are sampled across the window's depth range like any
+    overlay. They first went through the label path, which votes at fixed
+    depths and ignored the depth slider."""
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        pytest.skip("QRhi needs a real platform plugin")
+    from fastfuncstuff.viewer.modes.base import PathListControl
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.surfacewindow import SurfaceWindow
+    from fastfuncstuff.viewer.vocab import (
+        OpenView,
+        SetMode,
+        SetModeParam,
+        SetSurfaceDepth,
+        SetSurfaceShape,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    shape = (30, 30, 10)
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    aff[:3, 3] = [-29.0, -29.0, -9.0]
+    k = np.broadcast_to(np.arange(10), shape)
+    # White is z = 0 (k 4.5), pial z = 3 (k 6): channel 1 is high at the white
+    # side and low at the pial side, channel 2 the other way round.
+    deep = (k <= 4).astype(np.float32)
+    rng = np.random.default_rng(0)
+    chans = (100 + 900 * deep, 100 + 900 * (1 - deep), np.full(shape, 500.0))
+    nib.save(nib.Nifti1Image(np.zeros(shape, np.float32), aff), str(tmp_path / "base.nii.gz"))
+    paths = []
+    for c, vol in enumerate(chans):
+        p = tmp_path / f"ch{c}.nii.gz"
+        noisy = vol + rng.normal(0, 5, shape)
+        nib.save(nib.Nifti1Image(noisy.astype(np.float32), aff), str(p))
+        paths.append(str(p))
+    session = ViewerSession(device=torch.device("cpu"))
+    try:
+        session.load(str(tmp_path / "base.nii.gz"))
+        session.do(SetMode("rgb"))
+        session.do(SetModeParam("live", "1"))
+        session.do(SetModeParam("masked", "0"))
+        session.do(SetModeParam("stats", "brain"))
+        session.do(SetModeParam("files", PathListControl.encode([(p, True) for p in paths])))
+        session.do(SetModeParam("basis", "pick"))
+        session.do(SetModeParam("signal", "raw"))
+        session.surfaces.hemis = {"lh": _sheet()}
+        session.surfaces.version = {"lh": 1}
+        session.do(OpenView("S1", "surface", "axial"))
+        session.do(SetSurfaceShape("S1", "flat"))
+        win = SurfaceWindow("S1", session, session.do)
+        win.canvas.resize(320, 320)
+        win.apply(session.state.viewports.get("S1"))
+        win.canvas._anim.stop()
+        win.canvas.morph = 1.0
+
+        def mean_rgb(lo: float, hi: float) -> np.ndarray:
+            session.do(SetSurfaceDepth("S1", lo, hi, 3))
+            win.apply(session.state.viewports.get("S1"))
+            grabbed = win.canvas.grabFramebuffer()
+            if grabbed.isNull():
+                pytest.skip("no QRhi available to render with")
+            img = grabbed.convertToFormat(grabbed.Format.Format_RGBA8888)
+            px = np.array(img.constBits()).reshape(img.height(), img.width(), 4)[..., :3]
+            return px[60:260, 60:260].reshape(-1, 3).astype(float).mean(0)
+
+        near_white, near_pial = mean_rgb(0.0, 0.2), mean_rgb(0.8, 1.0)
+        # pick: R is channel 1 (high deep), G channel 2 (high superficial).
+        assert near_white[0] > near_pial[0] + 40, (near_white, near_pial)
+        assert near_pial[1] > near_white[1] + 40, (near_white, near_pial)
+    finally:
+        session.close()
+        app.processEvents()

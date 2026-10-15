@@ -977,7 +977,18 @@ def test_coupling_map_is_nan_outside_the_measured_mask(tmp_path):
     import nibabel as nib
     import numpy as np
 
-    inp = _mkseries(tmp_path)
+    # The default fixture is a still head filling the whole FoV: every voxel is
+    # "brain" and r is exactly 0 everywhere, so nothing could be NaN and nothing
+    # could be non-zero. Give it real motion and an empty air border.
+    nt = 4
+    data, _ = _synth_series(
+        shape=(16, 18, 14), nt=nt, d1=[0.0, 0.6, -0.4, 0.8], d2=[0.0, -0.3, 0.5, -0.6], axes=(0, 1)
+    )
+    air = np.ones(data.shape[:3], bool)
+    air[3:-3, 3:-3, 2:-2] = False
+    data[air] = 0.0
+    inp = str(tmp_path / "in.nii.gz")
+    nib.save(nib.Nifti1Image(data.astype(np.float32), np.eye(4)), inp)
     stem = str(tmp_path / "nanmask")
     rc = _run(
         [
@@ -995,8 +1006,8 @@ def test_coupling_map_is_nan_outside_the_measured_mask(tmp_path):
     assert np.isfinite(r).any()
     assert not (np.isfinite(r) & (r == 0)).all()
     unmeasured = ~np.isfinite(r)
-    if unmeasured.any():
-        assert np.isnan(r[unmeasured]).all()
+    assert unmeasured.any()
+    assert np.isnan(r[unmeasured]).all()
 
 
 def test_detask_without_events_is_refused(tmp_path):

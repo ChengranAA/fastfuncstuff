@@ -11,6 +11,8 @@ pins WHY, so none of them can quietly come back:
   under negative BOLD, so sign alone is not evidence.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -1966,3 +1968,50 @@ def test_task_coupling_returns_maps_on_the_fields_own_device():
         assert getattr(tc, name).device == field.device, name
     # The line that actually blew up.
     responding_mask(tc.r_full, mask, 0.1)
+
+
+@pytest.mark.slow
+def test_cli_qwarp_backend_registers_the_task_cut_frames(tmp_path):
+    """-detask fit has to reach the qwarp stage, and -qwarp_uncut has to take it back out.
+
+    Regression of record: -backend qwarp registered the uncut series (multi-echo even
+    paired an uncut source with a template built from the cut copy) while only the flow
+    estimate was de-tasked. Asserted on the FIELD: with no flow pass, an uncut qwarp run
+    must reproduce the no-detask field exactly, and the default must not.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    n_t, tr, rng = 40, 2.0, np.random.default_rng(0)
+    x = np.zeros(n_t)
+    for onset in range(6, 80, 16):
+        x[int(onset / tr) : int((onset + 8) / tr)] = 1.0
+    xs, ys, zs = np.meshgrid(np.arange(16), np.arange(18), np.arange(8), indexing="ij")
+    anat = (np.sin(xs / 2.5) * np.cos(ys / 2.0) + 2.0).astype(np.float32)
+    series = np.repeat(anat[..., None], n_t, axis=3) * 100.0
+    series += rng.normal(0, 1, series.shape).astype(np.float32)
+    series[4:10, 5:12, 2:6] *= (1.0 + 0.05 * x).astype(np.float32)
+    src = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(series, np.eye(4)), str(src))
+    ev = tmp_path / "ev.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t8\tcheck\n" for o in range(6, 80, 16))
+    )
+
+    def run(stem, *extra):
+        argv = [
+            "-i", str(src), "-o", f"{stem}.nii.gz", "-pe_dir1", "AP",
+            "-backend", "qwarp", "-qwarp_levels", "1", "-qwarp_minpatch", "5",
+            "-events", str(ev), "-tr", str(tr), "-device", "cpu",
+            "-no_movie", *extra,
+        ]  # fmt: skip
+        assert main(argv) == 0
+        (flow,) = sorted(tmp_path.glob(f"{Path(stem).name}_flow*.nii.gz"))
+        return nib.load(flow).get_fdata(dtype=np.float32)
+
+    plain = run(str(tmp_path / "plain"))
+    cut = run(str(tmp_path / "cut"), "-detask", "fit")
+    uncut = run(str(tmp_path / "uncut"), "-detask", "fit", "-qwarp_uncut")
+    assert np.array_equal(plain, uncut), "-qwarp_uncut did not restore the uncut solve"
+    assert not np.allclose(plain, cut), "-detask fit never reached the qwarp stage"

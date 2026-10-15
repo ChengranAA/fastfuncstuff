@@ -1175,6 +1175,18 @@ def create_parser() -> argparse.ArgumentParser:
         "-final_qwarp polish (whose template the flow refine already sharpened). Each "
         "pass costs a full qwarp sweep.",
     )
+    qw.add_argument(
+        "-qwarp_uncut",
+        "-qwarp-uncut",
+        action="store_true",
+        dest="qwarp_uncut",
+        help="[-detask fit/filter] Let qwarp register the UNCUT frames. By default it sees "
+        "the same task-cut copy the flow/xcorr estimate does: qwarp's ncc is invariant to a "
+        "patch-wide gain but not to a response that varies inside the patch, so a task "
+        "response left in is one more thing it can read as displacement. Either way the "
+        "corrected series is resampled from the untouched input. Inert without "
+        "-detask fit/filter.",
+    )
     acc = p.add_argument_group("Accuracy (trade time for exactness)")
     acc.add_argument(
         "-warp_interp",
@@ -2038,6 +2050,18 @@ def _detask_pre_estimation(args) -> bool:
 def _detask_mode_name(args) -> str:
     """Which estimator-side mode is active, for messages that must name it."""
     return "fit" if args.detask_fit is not None else "filter"
+
+
+def _qwarp_sees_cut(args) -> bool:
+    """Does the qwarp stage register the task-cut frames (the default under -detask)?"""
+    return _detask_pre_estimation(args) and not args.qwarp_uncut
+
+
+def _qwarp_detask_note(args) -> str:
+    """One banner line saying which frames the qwarp stage registers."""
+    if _qwarp_sees_cut(args):
+        return "   🔇 qwarp registers the same task-cut frames (-qwarp_uncut to opt out)."
+    return "   ⚠️  -qwarp_uncut: the qwarp stage registers UNCUT intensities."
 
 
 def _pe_axis_name(label: str, axis: int, args) -> str:
@@ -4021,13 +4045,8 @@ def _run_multiecho(
             print(f"❌ -detask {_detask_mode_name(args)}: {exc}", file=sys.stderr)
             return 2
         print(f"   🔇 {notch_note}")
-        if args.final_qwarp:
-            # Same caveat the single-echo path carries: the polish registers raw
-            # intensities, so it never sees the notch.
-            print(
-                "   ⚠️  the -final_qwarp stage still sees UNCUT intensities — only the "
-                "flow/xcorr estimate is de-tasked."
-            )
+        if args.final_qwarp or args.backend == "qwarp":
+            print(_qwarp_detask_note(args))
 
     smooth_sigma = 0.0
     hpf_sigma = 0.0
@@ -4127,12 +4146,7 @@ def _run_multiecho(
         f"   multi-echo ({'2-D slicewise' if slicewise else '3-D'}): "
         f"{len(datas)} echoes, shape={datas[0].shape}, device={device}"
     )
-    if qwarp_backend:
-        print("   final data resampling kernel: wsinc5 (qwarp)")
-    else:
-        print(
-            f"   data resampling kernel: {_warp_kernel_label(args.warp_interp, args.warp_radius)}"
-        )
+    print(f"   data resampling kernel: {_warp_kernel_label(args.warp_interp, args.warp_radius)}")
     if args.me_interecho:
         mode, scaling = "inter-echo (align stack per TR)", "linear-in-TE (anchor=echo1)"
         if args.me_interecho_refine:
@@ -4187,7 +4201,7 @@ def _run_multiecho(
         # echoes (no flow estimation), so the flow-tuning / ref / refine flags don't apply.
         print(
             f"   TEs [{te_str}] ms, PE {_pe_label(args)} (axis {pe_axis}), backend=qwarp "
-            f"(no flow pass), template={qwarp_ref_mode} of raw echoes, "
+            f"(no flow pass), template={qwarp_ref_mode} of the echoes, "
             f"refine={qwarp_refine}, scaling={scaling}, "
             f"automask={'on' if automask else 'off'}"
         )
@@ -4209,7 +4223,7 @@ def _run_multiecho(
     # The qwarp backend has its own template-refine loop and its own note below.
     if qwarp_backend and qwarp_refine == 0:
         print(
-            f"   ℹ️  qwarp refine=0: the template ('{qwarp_ref_mode}' of the RAW echoes) still "
+            f"   ℹ️  qwarp refine=0: the template ('{qwarp_ref_mode}' of the uncorrected echoes) still "
             "carries the distortion, so it is blurred by it and biases the field LOW — add "
             "-refine/-qwarp_refine 2 to rebuild it from the corrected series."
         )
@@ -4220,6 +4234,9 @@ def _run_multiecho(
             "-refine 2/-workhard/-superhard for full magnitude."
         )
 
+    # What qwarp registers: the estimator's task-cut copy unless -qwarp_uncut. The
+    # output is always resampled from `datas`.
+    qwarp_datas = est_datas if _qwarp_sees_cut(args) else datas
     if qwarp_backend:
         # qwarp owns the whole field, so the flow ESTIMATION is skipped entirely: the
         # reference is a plain temporal median of the raw echoes (correct when the inputs
@@ -4227,7 +4244,7 @@ def _run_multiecho(
         from fastfuncstuff.processing.locomoco import make_raw_reference_me_result
 
         result = make_raw_reference_me_result(
-            est_datas,
+            qwarp_datas,
             args.echo_times,
             pe_axis,
             slice_axis,
@@ -4387,12 +4404,24 @@ def _run_multiecho(
             )
         if args.final_qwarp and args.no_corrected:
             raise SystemExit("-final_qwarp polishes the corrected series; drop -no_corrected.")
-        from fastfuncstuff.processing.locomoco import polish_me_result
+        from fastfuncstuff.processing.locomoco import polish_me_result, resample_from_raw
 
+        if args.final_qwarp and qwarp_datas is not est_datas:
+            # -qwarp_uncut: the polish moves the corrected series, which the estimator
+            # resampled from its task-cut copy. Rebuild it from the uncut input.
+            for j, res_j in enumerate(result.per_echo):
+                result.per_echo[j] = resample_from_raw(
+                    res_j,
+                    datas[j],
+                    warp_interp=args.warp_interp,
+                    warp_radius=args.warp_radius,
+                    device=device,
+                    desc=f"uncut resample e{j + 1}",
+                )
         if qwarp_backend:
             print(
-                f"🪄 qwarp backend: registering raw echoes to the {qwarp_ref_mode}-of-raw "
-                f"reference ({qwarp_refine + 1} pass{'es' if qwarp_refine else ''})..."
+                f"🪄 qwarp backend: registering echoes to their {qwarp_ref_mode} "
+                f"template ({qwarp_refine + 1} pass{'es' if qwarp_refine else ''})..."
             )
         else:
             print("🪄 Polishing residual with joint TE-scaled qwarp...")
@@ -4409,10 +4438,14 @@ def _run_multiecho(
             refine=qwarp_refine,
             slicewise=False,  # -me_3depi is 3-D-acquired: through-plane continuity is real
             raw_datas=datas,
+            source_datas=qwarp_datas,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
             device=device,
         )
 
-    if _detask_pre_estimation(args):
+    # qwarp already resampled its output from `datas`.
+    if _detask_pre_estimation(args) and not (qwarp_backend or args.final_qwarp):
         # The estimator was shown task-cut images (notched or design-projected), so the
         # series it warped carries that cut too. Re-derive it from the untouched input
         # with the same field.
@@ -4966,13 +4999,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             return 2
         print(f"   🔇 {note}")
         if args.final_qwarp or args.backend == "qwarp":
-            # The polish registers raw intensities against a raw template; -match never
-            # reached it either. Say so rather than let a partially-filtered run read as
-            # a clean one.
-            print(
-                "   ⚠️  the qwarp stage still sees UNCUT intensities — only the "
-                "flow/xcorr estimate is de-tasked."
-            )
+            print(_qwarp_detask_note(args))
 
     paired_bins = None
     if args.paired_ref:
@@ -5102,12 +5129,15 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     print(f"   accuracy: {acc_desc}")
     if qwarp_backend:
         print(
-            f"   🪄 qwarp field (E=1, ncc to {qwarp_ref_mode} of raw, refine={qwarp_refine}, "
+            f"   🪄 qwarp field (E=1, ncc to {qwarp_ref_mode} template, refine={qwarp_refine}, "
             f"no flow pass): "
             f"minpatch={_axis_txt(args.qwarp_minpatch)}, levels={args.qwarp_levels}, "
             f"iters={args.qwarp_iters}, optimizer={args.qwarp_optimizer}"
         )
 
+    # What qwarp registers: the estimator's task-cut copy unless -qwarp_uncut. The
+    # output is always resampled from `data`.
+    qwarp_data = est_data if _qwarp_sees_cut(args) else data
     if rotaware:
         if args.raw_input is None or args.moco_matrix is None:
             print(
@@ -5203,7 +5233,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         from fastfuncstuff.processing.locomoco import make_raw_reference_result
 
         result = make_raw_reference_result(
-            data, pe_axis, slice_axis, is_3dacq=args.is_3dacq, dual=dual
+            qwarp_data, pe_axis, slice_axis, is_3dacq=args.is_3dacq, dual=dual
         )
     else:
         result = estimate_residual_flow(
@@ -5258,11 +5288,26 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     if qwarp_backend or args.final_qwarp:
         # Reuse the joint machinery at E=1 (alpha=[1], no scaling): wrap the single result,
         # register raw frames (backend) or the corrected series (polish) to its median.
-        from fastfuncstuff.processing.locomoco import MultiEchoLocomocoResult, polish_me_result
+        from fastfuncstuff.processing.locomoco import (
+            MultiEchoLocomocoResult,
+            polish_me_result,
+            resample_from_raw,
+        )
 
+        if args.final_qwarp and qwarp_data is not est_data:
+            # -qwarp_uncut: the polish moves the corrected series, which the estimator
+            # resampled from its task-cut copy. Rebuild it from the uncut input.
+            result = resample_from_raw(
+                result,
+                data,
+                warp_interp=args.warp_interp,
+                warp_radius=args.warp_radius,
+                device=device,
+                desc="uncut resample",
+            )
         print(
-            f"🪄 qwarp backend: registering frames to the {qwarp_ref_mode}-of-raw "
-            f"reference ({qwarp_refine + 1} pass{'es' if qwarp_refine else ''})..."
+            f"🪄 qwarp backend: registering frames to their {qwarp_ref_mode} "
+            f"template ({qwarp_refine + 1} pass{'es' if qwarp_refine else ''})..."
             if qwarp_backend
             else "🪄 Polishing residual with qwarp..."
         )
@@ -5302,14 +5347,18 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             # 2-D multi-slice: each slice is its own acquisition instant, so the qwarp
             # patches stay 2-D like the estimator. -is_3dacq is one shot -> 3-D patches.
             slicewise=not (args.is_3dacq or args.qwarp_3d),
-            # Polish takes raw too: it warps it once by the composed w+r instead of
-            # resampling the already-corrected series a second time.
+            # The output is `data` resampled once by the total field with -warp_interp,
+            # never qwarp's own resample of the already-corrected series.
             raw_datas=[data],
+            source_datas=[qwarp_data],
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
             device=device,
         )
         result = polished.per_echo[0]
 
-    if _detask_pre_estimation(args):
+    # qwarp already resampled its output from `data`.
+    if _detask_pre_estimation(args) and not (qwarp_backend or args.final_qwarp):
         # The estimator was shown task-cut images (notched or design-projected), so the
         # series it warped carries that cut too. Re-derive it from the untouched input
         # with the same field.

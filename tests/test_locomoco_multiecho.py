@@ -1057,3 +1057,55 @@ def test_cli_detask_ica_rejects_on_every_echo_not_just_the_first(tmp_path):
         num = float(np.abs(removed[j] - removed[0]).max())
         den = float(np.abs(removed[0]).max())
         assert num < 0.05 * max(den, 1e-9), (j, num, den)
+
+
+def test_qwarp_registers_source_datas_and_resamples_raw_once_with_warp_interp():
+    """qwarp must REGISTER `source_datas` and WRITE `raw_datas` resampled once.
+
+    Under -detask fit/filter the two differ: qwarp should see the task-cut copy, and the
+    output must still be the untouched input. The raw copy here carries a frame-varying
+    bump the cut copy does not -- if it leaked into the solve the field would move. And
+    the output must be the raw data through the run's own kernel (Lanczos), not qwarp's
+    wsinc5 resample of the frames it registered.
+    """
+    from fastfuncstuff.processing.locomoco import _shift3d_axes
+
+    tes = [12.0, 30.0]
+    datas, _ = _make_multiecho(tes, [0.0, 0.6, -0.5, 0.4, -0.3])
+    bumped = []
+    for d in datas:
+        b = d.copy()
+        b[8:14, 8:14, 3:7] *= (1.0 + 0.3 * np.arange(d.shape[3]) / d.shape[3]).astype(np.float32)
+        bumped.append(b)
+    res = make_raw_reference_me_result(datas, tes, pe_axis=PE, slice_axis=PE, verbose=False)
+    common = dict(
+        minpatch=5,
+        n_levels=1,
+        iters=4,
+        cost="ncc",
+        optimizer="gn",
+        full=True,
+        refine=1,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    clean = polish_me_result(res, raw_datas=datas, **common)
+    split = polish_me_result(res, raw_datas=bumped, source_datas=datas, **common)
+    assert torch.equal(clean.w_field, split.w_field), "raw_datas leaked into the solve"
+
+    for j, a in enumerate(split.alpha.tolist()):
+        expect = torch.stack(
+            [
+                _shift3d_axes(
+                    torch.from_numpy(bumped[j][..., t])[None],
+                    [a * split.w_field[..., t][None]],
+                    [PE],
+                    mode="lanczos",
+                    radius=3,
+                )[0]
+                for t in range(bumped[j].shape[3])
+            ],
+            dim=-1,
+        )
+        got = torch.as_tensor(split.per_echo[j].corrected_series()).float()
+        assert torch.allclose(got, expect, atol=1e-5), j

@@ -2558,22 +2558,15 @@ def resample_from_raw(
     if device is None:
         device = torch.device("cpu")
     comps = result.pe_displacements()
-    axes = [ax for _, ax, _ in comps]
-    fields = [f for _, _, f in comps]
-    series = torch.from_numpy(np.ascontiguousarray(data)).float()
-    corrected = torch.zeros_like(series)
-    for t in tqdm(range(series.shape[3]), desc=desc, unit="frame", leave=True):
-        corrected[..., t] = (
-            _shift3d_axes(
-                series[..., t].to(device)[None],
-                [f[..., t].to(device)[None] for f in fields],
-                axes,
-                mode=warp_interp,
-                radius=warp_radius,
-            )[0]
-            .cpu()
-            .float()
-        )
+    corrected = _resample_once(
+        data,
+        [f for _, _, f in comps],
+        [ax for _, ax, _ in comps],
+        warp_interp=warp_interp,
+        warp_radius=warp_radius,
+        device=device,
+        desc=desc,
+    )
     return replace(result, corrected_nifti=corrected)
 
 
@@ -6560,46 +6553,73 @@ def make_raw_reference_result(
     )
 
 
-def _rewarp_raw_single_pass(
-    raw_datas: list[np.ndarray],
+def _resample_once(
+    data: np.ndarray,
+    fields: list[torch.Tensor],
+    axes: list[int],
+    *,
+    warp_interp: str,
+    warp_radius: int,
+    device: torch.device,
+    desc: str,
+    verbose: bool = True,
+) -> torch.Tensor:
+    """Resample ``data`` ``(nx, ny, nz, T)`` ONCE by per-axis PE ``fields``, same shape.
+
+    The one resampler every locomoco output goes through: :func:`_shift3d_axes` with
+    the run's ``-warp_interp`` kernel, so a qwarp result is written with the same
+    kernel (Lanczos by default) as a flow result, and no output is a resample of a
+    resample.
+    """
+    series = torch.from_numpy(np.ascontiguousarray(data)).float()
+    out = torch.empty_like(series)
+    for t in tqdm(
+        range(series.shape[3]),
+        desc=desc,
+        unit="frame",
+        leave=True,
+        disable=series.shape[3] < 2 or not verbose,
+    ):
+        out[..., t] = (
+            _shift3d_axes(
+                series[..., t].to(device)[None],
+                [f[..., t].to(device)[None] for f in fields],
+                axes,
+                mode=warp_interp,
+                radius=warp_radius,
+            )[0]
+            .cpu()
+            .float()
+        )
+    return out
+
+
+def _resample_echoes(
+    datas: list[np.ndarray],
     w_axes: list[torch.Tensor],
     axes: list[int],
     alpha_ch: torch.Tensor,
+    *,
+    warp_interp: str,
+    warp_radius: int,
     device: torch.device,
+    what: str,
     verbose: bool,
 ) -> list[torch.Tensor]:
-    """Warp the RAW echoes by the TOTAL field in one wsinc5 pass, ``(nx, ny, nz, T)`` each.
-
-    The qwarp polish registers the CORRECTED series, so its own warped output has been
-    resampled twice: once by the estimator (historically bilinear) and
-    again by qwarp. The second pass cannot put back what the first one blurred, and it
-    also leaves the saved series describing a slightly different transform from the saved
-    warp, which is the additive total ``w + r``. Applying that total to the raw data
-    instead costs one extra resample of the raw and removes both problems.
-    """
-    from .interp import warp_image
-
-    nx, ny, nz, nt = w_axes[0].shape
-    out = []
-    for j, raw_j in enumerate(raw_datas):
-        raw = torch.from_numpy(np.ascontiguousarray(raw_j)).float()  # (nx, ny, nz, T)
-        dst = torch.empty(nx, ny, nz, nt)
-        chans = [torch.zeros(nz, ny, nx, device=device) for _ in range(3)]
-        for t in tqdm(
-            range(nt),
-            desc=f"qwarp resample (echo {j + 1})",
-            unit="frame",
-            leave=True,
-            disable=nt < 2 or not verbose,
-        ):
-            for c in chans:
-                c.zero_()
-            for k, ax in enumerate(axes):
-                chans[ax] = (float(alpha_ch[ax, j]) * w_axes[k][..., t]).permute(2, 1, 0).to(device)
-            src = raw[..., t].permute(2, 1, 0).contiguous().to(device)
-            dst[..., t] = warp_image(src, *chans, mode="wsinc5").permute(2, 1, 0).cpu()
-        out.append(dst.contiguous())
-    return out
+    """Each echo of ``datas`` resampled once by its own ``alpha_e``-scaled field."""
+    return [
+        _resample_once(
+            d,
+            [float(alpha_ch[ax, j]) * wk for ax, wk in zip(axes, w_axes, strict=True)],
+            axes,
+            warp_interp=warp_interp,
+            warp_radius=warp_radius,
+            device=device,
+            desc=f"{what} (echo {j + 1})",
+            verbose=verbose,
+        )
+        for j, d in enumerate(datas)
+    ]
 
 
 def polish_me_result(
@@ -6614,8 +6634,11 @@ def polish_me_result(
     full: bool = False,
     slicewise: bool = True,
     raw_datas: list[np.ndarray] | None = None,
+    source_datas: list[np.ndarray] | None = None,
     ref_mode: str = "median",
     refine: int = 0,
+    warp_interp: str = "lanczos",
+    warp_radius: int = 3,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -6627,13 +6650,23 @@ def polish_me_result(
     * ``full=False`` (**polish**, ``-final_qwarp``): register the *corrected* series
       (seed 0) to the reference, finding the residual ``r`` the estimator's search
       couldn't resolve; total field is ``w + r``. Sign-safe (no seeding with ``w``).
-      Given ``raw_datas`` the returned series is the RAW data warped once by ``w + r``
-      rather than qwarp's twice-resampled output; see
-      :func:`_rewarp_raw_single_pass`.
-    * ``full=True`` (**backend**, ``-backend qwarp``): register the *raw* echoes
-      (``raw_datas``, seed 0) to the reference -- qwarp owns the whole field, output is
+    * ``full=True`` (**backend**, ``-backend qwarp``): register the uncorrected echoes
+      (``source_datas``, seed 0) to the reference -- qwarp owns the whole field, output is
       just the qwarp field (the flow pass only built the reference). Needs a fuller
       cascade (more levels) since it starts from the full distortion.
+
+    Two data sets, because what qwarp should SEE and what the output should BE differ
+    under ``-detask fit/filter``: ``source_datas`` are the frames it registers (the
+    task-cut copy the estimator saw, so BOLD cannot be read as displacement here
+    either), ``raw_datas`` the untouched input the returned series is resampled from.
+    ``source_datas`` defaults to ``raw_datas``. On the polish path the caller's
+    corrected series must be ``source_datas`` resampled by ``w``.
+
+    Given ``raw_datas`` the returned series is the raw data resampled ONCE by the total
+    field with ``warp_interp``/``warp_radius`` -- the kernel every other locomoco output
+    uses -- never qwarp's own wsinc5 output, which on the polish path is a resample of
+    an already-resampled series. Refine templates are likewise ``source_datas``
+    resampled once by the current total field.
 
     ``slicewise=True`` (the default, for 2-D multi-slice EPI) makes the qwarp patches
     2-D: one voxel thick along the slice axis, in-plane basis only. That matches the
@@ -6693,12 +6726,13 @@ def polish_me_result(
             flush=True,
         )
     corr_series = [result.per_echo[j].corrected_series().float() for j in range(e)]
+    reg_datas = source_datas if source_datas is not None else raw_datas
     if full:
-        if raw_datas is None:
+        if reg_datas is None:
             raise ValueError("polish_me_result(full=True) needs raw_datas (the raw echoes).")
         source_series = torch.stack(
             [
-                torch.from_numpy(np.ascontiguousarray(raw_datas[j])).float().permute(2, 1, 0, 3)
+                torch.from_numpy(np.ascontiguousarray(reg_datas[j])).float().permute(2, 1, 0, 3)
                 for j in range(e)
             ]
         ).contiguous()
@@ -6770,7 +6804,23 @@ def polish_me_result(
         if it < int(refine):
             # Next pass registers the SAME source against a template built from this
             # pass's output — re-solved from seed 0, never seeded with the field above.
-            template = warped_nifti
+            # Resampled once from the registration frames by the TOTAL field: qwarp's own
+            # output is a second resample on the polish path, and blurs the template.
+            template = (
+                warped_nifti
+                if reg_datas is None
+                else _resample_echoes(
+                    reg_datas,
+                    w_axes_new,
+                    list(axes),
+                    alpha_ch,
+                    warp_interp=warp_interp,
+                    warp_radius=warp_radius,
+                    device=dev,
+                    what="qwarp template",
+                    verbose=verbose,
+                )
+            )
         if verbose and prev:
             d = torch.stack([(a - b) for a, b in zip(w_axes_new, prev, strict=True)])
             moved = d[d != 0]
@@ -6778,13 +6828,18 @@ def polish_me_result(
             print(f"   qwarp refine pass {it}/{int(refine)}: Δfield rms {rms:.4f} vox")
     del template, source_series, seed_series
     w_new = w_axes_new[-1]
-    if not full and raw_datas is not None:
-        # Prefer one resample of the raw over qwarp's second pass on already-corrected
-        # data -- see :func:`_rewarp_raw_single_pass`. Only the polish needs this; the
-        # full backend already registers raw.
+    if raw_datas is not None:
         del warped_nifti
-        warped_nifti = _rewarp_raw_single_pass(
-            raw_datas, w_axes_new, list(axes), alpha_ch, dev, verbose
+        warped_nifti = _resample_echoes(
+            raw_datas,
+            w_axes_new,
+            list(axes),
+            alpha_ch,
+            warp_interp=warp_interp,
+            warp_radius=warp_radius,
+            device=dev,
+            what="qwarp resample",
+            verbose=verbose,
         )
 
     perm4, pe_flow_is_u = ref.perm, ref.pe_flow_is_u

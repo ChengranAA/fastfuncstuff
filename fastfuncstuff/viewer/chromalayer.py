@@ -17,6 +17,7 @@ and a matmul rather than a gather out of host memory.
 
 from __future__ import annotations
 
+import itertools
 import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -49,6 +50,11 @@ PSC_FRAMES = 16
 MAX_SAMPLES = 400_000
 #: The brain mask is eroded this many voxels for ``stats=core``.
 CORE_EROSION = 2
+#: Levels per channel when a colour layer is drawn as a palette index (the 3-D
+#: window's label path): 32**3 = 32768 colours, a step of 8/255 -- below what
+#: shows on a shaded surface, and few enough palette rows to upload at once.
+CUBE_LEVELS = 32
+
 #: An automask covering more of the field of view than this has swept in the
 #: background: the channel's background is noise, not dark -- MP2RAGE's UNI.
 NOISY_MASK_FRACTION = 0.6
@@ -367,6 +373,9 @@ def load_channels(
     return chans
 
 
+_SERIALS = itertools.count()
+
+
 @dataclass
 class ColourSource:
     """A fitted colour view of a channel set: what a colour layer draws from."""
@@ -384,6 +393,10 @@ class ColourSource:
     masked: bool = True
     window: int = 1
     _frames: dict[int, Tensor] = field(default_factory=dict, repr=False)
+    #: Unique per source, and new on every ``with_look`` (``replace`` runs the
+    #: factory again for a field it may not copy): what a consumer caches by.
+    #: Not ``id()``, which Python reuses as soon as the old source is freed.
+    serial: int = field(default_factory=lambda: next(_SERIALS), init=False)
 
     def with_look(self, look: Look, *, masked: bool, window: int) -> ColourSource:
         """The same fit drawn differently. Frames survive unless the window changed."""
@@ -458,6 +471,28 @@ class ColourSource:
         vol = self.frame(t)
         rgb = self.colors(vol) * vol[-2].unsqueeze(-1)
         return (rgb * 255.0).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+
+    def rgb_at(self, ijk: np.ndarray, t: int) -> tuple[np.ndarray, np.ndarray]:
+        """``(M, 3)`` colours in [0, 1] at voxel indices ``(M, 3)``, and whether each is drawn."""
+        vol = self.frame(t)
+        i, j, k = (torch.as_tensor(ijk[:, a], device=vol.device) for a in range(3))
+        picked = vol[:, i, j, k]
+        rgb = self.colors(picked).clamp(0.0, 1.0).cpu().numpy()
+        return rgb, (picked[self.chans.n] > 0.5).cpu().numpy()
+
+    def indexed(self, t: int) -> np.ndarray:
+        """(X, Y, Z) float32 palette index of each voxel's colour; 0 outside the mask.
+
+        For a renderer that colours from a palette rather than from RGB: the
+        3-D window's label path, sampled nearest, so indices never blend into
+        colours that are not there. Index ``1 + r*L*L + g*L + b`` into
+        :func:`cube_palette`.
+        """
+        vol = self.frame(t)
+        q = (self.colors(vol).clamp(0.0, 1.0) * (CUBE_LEVELS - 1)).round().to(torch.int64)
+        idx = 1 + (q[..., 0] * CUBE_LEVELS + q[..., 1]) * CUBE_LEVELS + q[..., 2]
+        idx = torch.where(vol[self.chans.n] > 0.5, idx, torch.zeros_like(idx))
+        return idx.to(torch.float32).cpu().numpy()
 
     def save(self, path: str | Path) -> Path:
         """Write the colours as an RGB24 NIfTI (datatype 128), every frame.
@@ -626,6 +661,14 @@ def fit_source(
         masked=masked,
         window=window,
     )
+
+
+def cube_palette() -> np.ndarray:
+    """``(1 + L**3, 3)`` colours in [0, 1] for :meth:`ColourSource.indexed`; entry 0 unused."""
+    levels = np.linspace(0.0, 1.0, CUBE_LEVELS)
+    r, g, b = np.meshgrid(levels, levels, levels, indexing="ij")
+    cube = np.stack([r.ravel(), g.ravel(), b.ravel()], 1)
+    return np.concatenate([np.zeros((1, 3)), cube])
 
 
 def coordinate_names(spec: ChromaSpec, names: tuple[str, ...]) -> tuple[str, str, str]:

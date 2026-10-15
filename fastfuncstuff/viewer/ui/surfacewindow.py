@@ -1155,6 +1155,8 @@ class SurfaceWindow(QtWidgets.QWidget):
         #: Texture-ready voxels per overlay key, so a redraw that changes only
         #: a threshold does not re-read or re-transpose a volume.
         self._slot_cache: dict[tuple, tuple[np.ndarray, np.ndarray | None]] = {}
+        #: The RGB cube as a palette texture, for colour layers; built once.
+        self._cube: np.ndarray | None = None
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -2068,6 +2070,11 @@ class SurfaceWindow(QtWidgets.QWidget):
         slots: list[OverlaySlot] = []
         cache: dict[tuple, tuple[np.ndarray, np.ndarray | None]] = {}
         for layer in self._overlay_layers()[-s3.MAX_LAYERS :]:
+            if layer.colour:
+                slot = self._colour_slot(layer, cache)
+                if slot is not None:
+                    slots.append(slot)
+                continue
             idx = int(st.time_index if layer.time_linked else layer.volume_index)
             thr = layer.threshold_index
             try:
@@ -2148,6 +2155,45 @@ class SurfaceWindow(QtWidgets.QWidget):
         # Keep only what is drawn: a dropped layer's 100 MB goes with it.
         self._slot_cache = cache
         self.canvas.set_overlays(slots)
+
+    def _colour_slot(self, layer, cache: dict) -> OverlaySlot | None:
+        """An RGB-mode layer as a palette-indexed label layer.
+
+        The shader colours an overlay from a scalar through a LUT, or from a
+        label through a palette; a colour layer is neither. Quantised to a
+        32-level RGB cube it is a label image whose palette is the cube, and
+        the label path samples nearest -- indices never blend into colours
+        that are not there. A new look is a new source, so the key follows it.
+        """
+        from fastfuncstuff.viewer.chromalayer import cube_palette
+
+        source = self.session.colour_sources.get(layer.key)
+        if source is None:
+            return None
+        t = self.session.layer_time(layer)
+        key = ("colour", layer.key, source.serial, t, np.asarray(layer.affine).tobytes())
+        data = self._slot_cache.get(key)
+        if data is None:
+            data = (s3.texture_data(source.indexed(t)), None)
+        cache[key] = data
+        if self._cube is None:
+            self._cube = s3.palette_texture(cube_palette())
+        outline = (
+            s3.OUTLINE_ONLY
+            if layer.edges
+            else (s3.OUTLINE_BOXED if layer.boxed else s3.OUTLINE_NONE)
+        )
+        return OverlaySlot(
+            key=key,
+            value=data[0],
+            value_frame=s3.texture_from_mm(layer.shape, layer.affine),
+            stat=None,
+            stat_frame=None,
+            shade=s3.ShadeParams(
+                opacity=float(layer.opacity), has_data=True, labels=True, outline=outline
+            ),
+            palette=self._cube,
+        )
 
     def _refresh_cross(self) -> None:
         """Mark the crosshair on its nearest vertex.

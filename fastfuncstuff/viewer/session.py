@@ -1143,6 +1143,15 @@ class ViewerSession:
         shape = np.asarray(volume.shape[:3])
         inside = np.all((own >= 0) & (own < shape), axis=1)
         clipped = np.clip(own, 0, shape - 1)
+        if layer.colour:
+            source = self.colour_sources.get(layer.key)
+            if source is None:
+                return None
+            rgb_c, drawn = source.rgb_at(clipped, self.layer_time(layer))
+            return [
+                (float(r), float(g), float(b)) if d and k else None
+                for (r, g, b), d, k in zip(rgb_c, drawn, inside, strict=True)
+            ]
         index = torch.as_tensor(clipped.T, device=volume.device)
         values = volume[index[0], index[1], index[2]].float()
 

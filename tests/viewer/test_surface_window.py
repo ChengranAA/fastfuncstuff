@@ -578,3 +578,50 @@ def test_nearest_vertex_is_remembered_until_positions_move(window):
     w, p = c._cpu["lh"]["white"] + [10.0, 0, 0], c._cpu["lh"]["pial"] + [10.0, 0, 0]
     c.set_hemisphere("lh", pos_a=None, pos_b=None, nrm_a=None, nrm_b=None, white=w, pial=p)
     assert c.nearest_vertex((5.0, -7.0, 1.5)) != first
+
+
+def test_an_rgb_mode_layer_reaches_the_surface_in_its_own_colours(window, tmp_path):
+    """A colour layer has no scale; the surface draws it as a palette index into
+    an RGB cube, and the colour it decodes to is the one the slices show."""
+    from fastfuncstuff.viewer.chromalayer import CUBE_LEVELS, cube_palette
+    from fastfuncstuff.viewer.modes.base import PathListControl
+    from fastfuncstuff.viewer.vocab import SetMode, SetModeParam
+
+    session, win = window
+    aff = session.state.layers.base.affine
+    zz, yy, xx = np.meshgrid(np.arange(10), np.arange(30), np.arange(30), indexing="ij")
+    xx, yy, zz = (a.transpose(2, 1, 0) for a in (xx, yy, zz))
+    head = ((xx - 15) / 11) ** 2 + ((yy - 15) / 11) ** 2 + ((zz - 5) / 4) ** 2 < 1
+    rng = np.random.default_rng(0)
+    paths = []
+    for c, gain in enumerate((1.0, 0.6, 0.3)):
+        vol = np.where(head, 1000.0 * gain * (1 + 0.3 * xx / 30), 2.0) + rng.normal(
+            0, 1, head.shape
+        )
+        p = tmp_path / f"ch{c}.nii.gz"
+        nib.save(nib.Nifti1Image(vol.astype(np.float32), aff), str(p))
+        paths.append(str(p))
+    session.do(SetMode("rgb"))
+    session.do(SetModeParam("live", "1"))
+    session.do(SetModeParam("files", PathListControl.encode([(p, True) for p in paths])))
+    layer = next(ly for ly in session.state.layers if ly.colour)
+    win.refresh(Aspect.LAYERS)
+    slot = win.canvas.overlays[-1]
+    assert slot.shade.labels and slot.palette is not None
+
+    source = session.colour_sources[layer.key]
+    index = source.indexed(0)
+    truth = source.rgb_volume(0).astype(float) / 255.0
+    inside = index > 0
+    decoded = cube_palette()[index[inside].astype(int)]
+    # Half a cube step, plus half an 8-bit step for the reference's own rounding.
+    assert np.abs(decoded - truth[inside]).max() <= 0.5 / (CUBE_LEVELS - 1) + 0.5 / 255 + 1e-6
+
+    before = slot.value
+    session.do(SetModeParam("hue", "90"))
+    win.refresh(Aspect.LAYERS)
+    assert not np.array_equal(win.canvas.overlays[-1].value, before), "a new look did not upload"
+    # And the graph tints read the same colours, not a grey scalar.
+    cells = [(15, 15, 5)]
+    tint = session.overlay_colors(cells)
+    assert tint is not None and tint[0] is not None

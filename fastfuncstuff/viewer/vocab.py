@@ -103,6 +103,35 @@ class Denoise(Command):
 
 @command
 @dataclass(frozen=True)
+class MakeRgb(Command):
+    """Draw several channels as one colour layer (viewer.chroma).
+
+    ``channels`` is ``KEY[:OFFSET[+STRIDE]]`` per channel, comma-separated;
+    empty guesses from ``key`` -- its sibling files (``_e1``, ``_e2``...) or
+    its own sub-bricks.
+    """
+
+    name = "MAKE_RGB"
+    aspects = Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
+    major = True
+    key: str
+    channels: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class SetRgb(Command):
+    """Set one parameter of a colour layer: basis, space, signal, spread, ..."""
+
+    name = "SET_RGB"
+    aspects = Aspect.SLICES | Aspect.LAYERS
+    key: str
+    param: str
+    value: str
+
+
+@command
+@dataclass(frozen=True)
 class SetTheme(Command):
     """Switch the interface palette. ``dark`` or ``light``."""
 
@@ -2169,6 +2198,20 @@ def install(
             polort=int(cmd.polort),
             keep_mean=bool(cmd.keep_mean),
         )
+
+    @bus.handle(MakeRgb.name)
+    def _make_rgb(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, MakeRgb)
+        if session is None:
+            raise RuntimeError("MAKE_RGB needs a session")
+        return session.chroma.make(cmd.key, cmd.channels)
+
+    @bus.handle(SetRgb.name)
+    def _set_rgb(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetRgb)
+        if session is None:
+            raise RuntimeError("SET_RGB needs a session")
+        return session.chroma.set_param(cmd.key, cmd.param, cmd.value)
 
     @bus.handle(SetTheme.name)
     def _set_theme(cmd: Command, st: ViewerState) -> Aspect:

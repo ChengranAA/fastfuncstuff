@@ -175,6 +175,22 @@ def render_plane(
     box_overlays: list[Tensor] = []
 
     for layer in visible:
+        if layer.chroma is not None:
+            # Colour is made from the channels, not looked up from a scale;
+            # a channel dropped from the stack leaves nothing to draw.
+            try:
+                rgb, alpha = session.chroma.render(
+                    layer,
+                    grid,
+                    plane,
+                    pos,
+                    view=view,
+                    mode=_GRID_SAMPLE[session.resample_mode(layer)],
+                )
+            except (KeyError, ValueError):
+                continue
+            stacked.append((rgb, alpha))
+            continue
         volume = session.display_volume(layer.key)
         if volume is None:
             continue

@@ -16,8 +16,12 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from fastfuncstuff.viewer.chroma import ChromaSpec
 
 
 class SignMode(StrEnum):
@@ -155,6 +159,10 @@ class Layer:
     #: ``cubic`` is never chosen automatically; it is the sharper alternative
     #: to linear for an anatomy upsampled onto a finer display grid.
     resample: str = "auto"
+    #: Set for a colour layer: several channels -- other layers' sub-bricks --
+    #: drawn as one colour per voxel (viewer.chroma). The colour map, range,
+    #: sign and threshold fields do not apply to it.
+    chroma: ChromaSpec | None = None
 
     def with_(self, **changes: object) -> Layer:
         """Return a copy with fields replaced."""

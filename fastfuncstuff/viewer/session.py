@@ -18,6 +18,7 @@ import torch
 from fastfuncstuff.io.dsetinfo import DatasetInfo
 from fastfuncstuff.viewer import catalog as catalog_mod
 from fastfuncstuff.viewer.catalog import CatalogEntry
+from fastfuncstuff.viewer.chromalayer import ChromaLayers
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
 from fastfuncstuff.viewer.design import Design, Provenance, RegressorTrace, run_of
 from fastfuncstuff.viewer.layers import Layer, SignMode
@@ -252,6 +253,8 @@ class ViewerSession:
         self.clock: Callable[[], float] = time.monotonic
         self._last_move = float("-inf")
         self.store = store or VolumeStore(device=device)
+        #: Colour layers' fits and frames (viewer.chromalayer).
+        self.chroma = ChromaLayers(self)
         self.bus = install(
             CommandBus(self.state, record=record), open_layer=self._open, session=self
         )
@@ -1071,6 +1074,12 @@ class ViewerSession:
             if volume is None:
                 continue
             prefix = f"{_short(layer.name)}  " if len(overlays) > 1 else ""
+            if layer.chroma is not None:
+                try:
+                    lines.append(ValueLine(prefix, self.chroma.readout(layer, st.crosshair)))
+                except (KeyError, ValueError):
+                    pass
+                continue
             if layer.roi:
                 rois = self.roi_set(layer.key)
                 found = rois.at(st.crosshair) if rois is not None else None
@@ -1592,6 +1601,7 @@ class ViewerSession:
         if key in held:
             return
         self.invalidate(key)
+        self.chroma.forget(key)
         for stale in [k for k in self._threshold_scales if k[0] == key]:
             del self._threshold_scales[stale]
         for stale in [k for k in self._source_masks if k[0] == key]:
@@ -2166,6 +2176,8 @@ class ViewerSession:
         from fastfuncstuff.io.afni import save_nifti
 
         layer = self.state.layers.get(key)
+        if layer.chroma is not None:
+            return self.chroma.save(key, path)
         data = np.asarray(self.store.ensure_ram(key), dtype=np.float32)
         if data.ndim == 4 and data.shape[3] == 1:
             data = data[..., 0]

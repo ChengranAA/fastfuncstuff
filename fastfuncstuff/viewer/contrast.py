@@ -45,6 +45,9 @@ DIVERSITY = 0.5
 #: voxel's hue at once -- the whole brain red -- because a global tint costs
 #: separation nothing; hue should mark where A and B differ, not everything.
 BALANCE = 2.0
+#: Temperature of the soft minimum over A-vs-B pairs, in Oklab units: well
+#: below a typical separation (0.1-0.5), so it is close to the true minimum.
+SOFTMIN = 0.03
 #: Context samples kept per step: enough for the clipped fraction to be stable.
 MAX_CONTEXT = 4_000
 
@@ -56,10 +59,12 @@ class ContrastResult:
     weights: np.ndarray  # (3, N), rows unit length, on the standardised channels
     shift: tuple[float, float, float]
     stretch: tuple[float, float, float]
-    separation: float  # Oklab distance between region means
+    separation: float  # Oklab distance between A's mean and the nearest B's
     before: float  # the same at the starting settings
     clipped: float  # fraction of context voxels with a coordinate past the roll-off knee
     start: str  # "current" or "lda"
+    #: Oklab distance from A to each B, in the order given.
+    separations: tuple[float, ...] = ()
 
     def weights_text(self) -> str:
         return "; ".join(",".join(f"{v:.3f}" for v in row) for row in self.weights)
@@ -88,31 +93,45 @@ def _lab(z, W, window, look, shift, stretch, light) -> tuple[Tensor, Tensor]:
 
 
 def _objective(
-    za, zb, zc, W, shift, stretch, look, la, lb, lc, context: float
+    za, zbs, zc, W, shift, stretch, look, la, lbs, lc, context: float
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """(score, separation, context units) -- higher score is better."""
+    """(score, separation from each B, context units) -- higher score is better.
+
+    With several non-target regions the separation is a soft minimum over
+    the pairs, so the worst-separated B is what the gradient works on first:
+    a B already far from A is not where colour should be spent, and the mean
+    of the pairs would happily leave one B sitting on top of A.
+    """
     window = _window(W, zc)
-    # One pass over A, B and the context together: a step is a few hundred
-    # small ops, so their count, not the data, is the cost.
-    z = torch.cat([za, zb, zc])
-    light = None if la is None else torch.cat([la, lb, lc])
+    # One pass over A, every B and the context together: a step is a few
+    # hundred small ops, so their count, not the data, is the cost.
+    z = torch.cat([za, *zbs, zc])
+    light = None if la is None else torch.cat([la, *lbs, lc])
     lab, u = _lab(z, W, window, look, shift, stretch, light)
-    na, nb = za.shape[0], zb.shape[0]
-    lab_a, lab_b, u_c = lab[:na], lab[na : na + nb], u[:, na + nb :]
-    tint = lab[na + nb :, 1:].mean(0).norm()
-    sep = torch.linalg.vector_norm(lab_a.mean(0) - lab_b.mean(0))
-    spread = lab_a.std(0).norm() + lab_b.std(0).norm()
+    sizes = [za.shape[0], *(zb.shape[0] for zb in zbs)]
+    edges = np.cumsum([0, *sizes])
+    lab_a = lab[: sizes[0]]
+    lab_bs = [lab[edges[j] : edges[j + 1]] for j in range(1, len(sizes))]
+    u_c = u[:, edges[-1] :]
+    tint = lab[edges[-1] :, 1:].mean(0).norm()
+    seps = torch.stack([torch.linalg.vector_norm(lab_a.mean(0) - b.mean(0)) for b in lab_bs])
+    sep = -SOFTMIN * torch.logsumexp(-seps / SOFTMIN, 0) if len(lab_bs) > 1 else seps[0]
+    spread = lab_a.std(0).norm() + torch.stack([b.std(0).norm() for b in lab_bs]).mean()
     corr = torch.corrcoef(u_c)
     redundant = (corr - torch.diag(torch.diagonal(corr))).pow(2).sum() / 6.0
     # Past ~1.5 window units tanh has flattened: a voxel there has lost its
     # detail. Smooth, so the gradient sees the knee coming.
     clipped = torch.nn.functional.softplus(8.0 * (u_c.abs() - 1.5)).mean() / 8.0
     score = sep - UNIFORMITY * spread - context * clipped - DIVERSITY * redundant - BALANCE * tint
-    return score, sep, u_c
+    return score, seps, u_c
 
 
 def _lda_start(za: Tensor, zb: Tensor, W0: Tensor) -> Tensor:
-    """W0 with its weakest-separating chroma row replaced by Fisher's direction."""
+    """W0 with its weakest-separating chroma row replaced by Fisher's direction.
+
+    With several B regions, ``zb`` is all of them together: the start only
+    needs to point roughly away from the non-targets, the ascent does the rest.
+    """
     diff = za.mean(0) - zb.mean(0)
     pooled = torch.cov(za.T) + torch.cov(zb.T)
     pooled = pooled + 1e-3 * torch.eye(pooled.shape[0], device=za.device) * pooled.diagonal().mean()
@@ -127,12 +146,12 @@ def _lda_start(za: Tensor, zb: Tensor, W0: Tensor) -> Tensor:
 
 def optimise_contrast(
     za: Tensor,
-    zb: Tensor,
+    zb: Tensor | list[Tensor],
     zc: Tensor,
     W0: Tensor,
     look: Look,
     *,
-    light: tuple[Tensor, Tensor, Tensor] | None = None,
+    light: tuple[Tensor, Tensor | list[Tensor], Tensor] | None = None,
     context: float = 1.0,
     steps: int = 60,
     lr: float = 0.05,
@@ -141,9 +160,16 @@ def optimise_contrast(
     """Climb the objective from two starts; return the better settings.
 
     ``za``/``zb``/``zc`` are standardised channel samples (M, N) for region A,
-    region B and the context (the stats region). ``light`` gives each set's
-    anatomy lightness when the look takes lightness from anatomy.
+    the non-target region(s) B -- one tensor, or a list of them, each its own
+    region to separate A from -- and the context (the stats region).
+    ``light`` gives each set's anatomy lightness when the look takes lightness
+    from anatomy, B's as a list matching ``zb``.
     """
+    zbs = list(zb) if isinstance(zb, (list, tuple)) else [zb]
+    if light is not None:
+        lb = light[1]
+        light = (light[0], list(lb) if isinstance(lb, (list, tuple)) else [lb], light[2])
+    zb = zbs  # type: ignore[assignment]
     if za.device.type == "cpu":
         # A few thousand points per op: more threads only add the cost of
         # handing the work out, which on 6 cores tripled the step time.
@@ -162,8 +188,8 @@ def _threads(n: int):
         torch.set_num_threads(before)
 
 
-def _optimise(za, zb, zc, W0, look, light, context, steps, lr, seed) -> ContrastResult:
-    if za.shape[0] < 2 or zb.shape[0] < 2:
+def _optimise(za, zbs, zc, W0, look, light, context, steps, lr, seed) -> ContrastResult:
+    if za.shape[0] < 2 or not zbs or any(zb.shape[0] < 2 for zb in zbs):
         raise ValueError("each region needs at least two voxels inside the mask")
     gen = torch.Generator().manual_seed(seed)
     if zc.shape[0] > MAX_CONTEXT:
@@ -186,11 +212,11 @@ def _optimise(za, zb, zc, W0, look, light, context, steps, lr, seed) -> Contrast
     s0, k0 = to_params(look.shift, look.stretch)
     with torch.no_grad():
         shift, stretch = from_params(s0, k0)
-        _, before, _ = _objective(za, zb, zc, W0, shift, stretch, look, la, lb, lc, context)
+        _, before, _ = _objective(za, zbs, zc, W0, shift, stretch, look, la, lb, lc, context)
 
     best: ContrastResult | None = None
     best_score = -float("inf")
-    for name, W_init in (("current", W0), ("lda", _lda_start(za, zb, W0))):
+    for name, W_init in (("current", W0), ("lda", _lda_start(za, torch.cat(zbs), W0))):
         W = W_init.clone().requires_grad_(True)
         s = s0.clone().requires_grad_(True)
         k = k0.clone().requires_grad_(True)
@@ -203,7 +229,7 @@ def _optimise(za, zb, zc, W0, look, light, context, steps, lr, seed) -> Contrast
         for step in range(steps):
             opt.zero_grad()
             shift, stretch = from_params(s, k)
-            score, _, _ = _objective(za, zb, zc, W, shift, stretch, look, la, lb, lc, context)
+            score, _, _ = _objective(za, zbs, zc, W, shift, stretch, look, la, lb, lc, context)
             (-score).backward()
             if frozen:
                 assert W.grad is not None and s.grad is not None and k.grad is not None
@@ -219,7 +245,7 @@ def _optimise(za, zb, zc, W0, look, light, context, steps, lr, seed) -> Contrast
                 last = float(score.detach())
         with torch.no_grad():
             shift, stretch = from_params(s, k)
-            score, sep, u_c = _objective(za, zb, zc, W, shift, stretch, look, la, lb, lc, context)
+            score, seps, u_c = _objective(za, zbs, zc, W, shift, stretch, look, la, lb, lc, context)
             clipped = (u_c.abs() > 1.5).any(0).float().mean()
             if float(score) > best_score:
                 best_score = float(score)
@@ -228,8 +254,9 @@ def _optimise(za, zb, zc, W0, look, light, context, steps, lr, seed) -> Contrast
                     weights=rows.cpu().numpy(),
                     shift=tuple(float(v) for v in shift),  # type: ignore[arg-type]
                     stretch=tuple(float(v) for v in stretch),  # type: ignore[arg-type]
-                    separation=float(sep),
-                    before=float(before),
+                    separation=float(seps.min()),
+                    before=float(before.min()),
+                    separations=tuple(float(v) for v in seps),
                     clipped=float(clipped),
                     start=name,
                 )

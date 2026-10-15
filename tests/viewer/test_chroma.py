@@ -587,3 +587,56 @@ def test_image_windows_draw_both_regions_where_the_slice_cuts_them(tmp_path):
         win.close()
         s.close()
         app.processEvents()
+
+
+def test_optimise_separates_a_target_label_from_each_other_label(tmp_path, session):
+    """A from an ROI layer: label 1 against labels 2 and 3, each its own pair."""
+    paths, a, b = _two_tissues(tmp_path)
+    xx, yy, zz = _grids()
+    c3 = ((xx - 12) ** 2 + (yy - 5) ** 2 + (zz - 8) ** 2) < 6
+    labels = (a * 1 + b * 2 + c3 * 3).astype(np.float32)
+    roi_path = tmp_path / "regions.nii.gz"
+    nib.save(nib.Nifti1Image(labels, np.diag([2.0, 2.0, 2.0, 1.0])), str(roi_path))
+    rk = session.load(roi_path)
+    assert session.state.layers.get(rk).roi
+    layer = _enter(session, paths, basis="pick", signal="raw")
+    choice = next(
+        c
+        for c in next(x for x in session.mode.controls() if x.name == "regions").choices
+        if c.startswith(rk)
+    )
+    session.do(SetModeParam("regions", choice))
+    session.do(SetModeParam("a_label", "1"))
+    before = _lab_gap(session.colour_sources[layer.key], a, b)
+    session.do(ModeAction("optimise"))
+    status = session.mode.status()
+    assert "closest" in status and "[" in status, status  # one distance per B
+    assert _lab_gap(session.colour_sources[layer.key], a, b) > 2 * before
+    assert session.mode.marks() == []  # the ROI layer shows the regions
+
+
+def test_painted_regions_drive_the_optimiser(tmp_path, session):
+    """The workflow: paint A and B in PAINT mode, then separate them in RGB."""
+    from fastfuncstuff.viewer.state import Plane
+
+    paths, a, b = _two_tissues(tmp_path)
+    session.load(paths[0])
+    session.do(SetMode("paint"))
+    paint = session.mode
+    for value, ijk in ((1, (7, 12, 8)), (2, (17, 12, 8))):
+        session.do(SetModeParam("value", str(value)))
+        session.do(SetModeParam("radius", "4"))
+        paint.begin(np.asarray(session.state.grid.ijk_to_mm(ijk)), Plane.AXIAL, erase=False)
+        paint.end()
+    painted = paint.target()
+    layer = _enter(session, paths, basis="pick", signal="raw")
+    choice = next(
+        c
+        for c in next(x for x in session.mode.controls() if x.name == "regions").choices
+        if c.startswith(painted)
+    )
+    session.do(SetModeParam("regions", choice))
+    before = _lab_gap(session.colour_sources[layer.key], a, b)
+    session.do(ModeAction("optimise"))
+    assert session.mode.params["basis"] == "custom"
+    assert _lab_gap(session.colour_sources[layer.key], a, b) > 2 * before

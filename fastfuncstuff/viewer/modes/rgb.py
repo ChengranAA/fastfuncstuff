@@ -126,6 +126,11 @@ class RGBMode(Mode):
         n = len(names)
         coords = self._coordinate_names()
         stats_layers, light_layers = self._layer_choices()
+        roi_layers = tuple(
+            _layer_choice(ly)
+            for ly in (self.session.state.layers if self.session is not None else [])
+            if ly.roi
+        )
         rgb_visible = ("basis", ("pick", "dstretch"))
         return (
             PathListControl(
@@ -420,6 +425,34 @@ class RGBMode(Mode):
                 placeholder="tick move B",
                 span=HALF,
                 help="B's centre in mm (x,y,z), set by clicking with move B ticked.",
+            ),
+            ChoiceControl(
+                name="regions",
+                label="regions from",
+                choices=("spheres", *roi_layers),
+                default="spheres",
+                newline=True,
+                help="spheres: A around the crosshair, B placed with move B. An ROI "
+                "layer -- painted, an atlas, any label file -- gives A as one label and "
+                "B as one or more others, each separated from A in its own right.",
+            ),
+            IntControl(
+                name="a_label",
+                label="target (A)",
+                lo=1,
+                hi=9999,
+                default=1,
+                span=HALF,
+                newline=True,
+                help="The label that is region A in the ROI layer.",
+            ),
+            TextControl(
+                name="b_labels",
+                label="others (B)",
+                placeholder="all other labels",
+                span=HALF,
+                help="The non-target labels, comma-separated (e.g. 2,3,7). Empty: every "
+                "other label in the layer. A is pulled away from each, the closest first.",
             ),
             FloatControl(
                 name="context",
@@ -802,7 +835,7 @@ class RGBMode(Mode):
         self.params[name] = value
         if name == "move_b":
             return self._toggle_move_b(bool(value))
-        if name in ("radius_a", "radius_b", "b_at", "context"):
+        if name in ("radius_a", "radius_b", "b_at", "context", "regions", "a_label", "b_labels"):
             return Aspect.SLICES  # the circles; nothing to refit
         if name == "live":
             return self._apply() if value else Aspect.GRAPH
@@ -881,6 +914,8 @@ class RGBMode(Mode):
         return (x, y, z)
 
     def marks(self) -> list[Mark]:
+        if str(self.params.get("regions") or "spheres") != "spheres":
+            return []  # the ROI layer itself shows the regions
         out = []
         a = self._a_mm()
         if a is not None:
@@ -921,29 +956,91 @@ class RGBMode(Mode):
         centre = torch.tensor(mm, dtype=torch.float32, device=chans.device)
         return ((pos - centre) ** 2).sum(-1).le(radius**2) & src.brain
 
+    def _region_masks(self) -> tuple[torch.Tensor, list[torch.Tensor], list[str]] | str:
+        """Region A, the B regions and their names on the channels' grid -- or why not."""
+        chans = self._chans
+        assert chans is not None and self.session is not None
+        choice = str(self.params.get("regions") or "spheres")
+        if choice == "spheres":
+            a, b = self._a_mm(), self._b_mm()
+            if a is None or b is None:
+                return "place B first: tick move B and click"
+            in_a = self._sphere(a, float(self.params["radius_a"]))
+            in_b = self._sphere(b, float(self.params["radius_b"]))
+            if int(in_a.sum()) < 2 or int(in_b.sum()) < 2:
+                return "A and B each need voxels inside the mask"
+            return in_a, [in_b], ["B"]
+        layer = self._layer_of(choice)
+        if layer is None or not layer.roi:
+            return f"no ROI layer {choice.split(' ', 1)[0]}"
+        from fastfuncstuff.viewer.paintlayer import resample_labels_nearest
+
+        # Read fresh: a painted layer changes in place, with no new generation.
+        native = np.rint(
+            np.nan_to_num(np.asarray(self.session.volume(layer.key, layer.volume_index)))
+        ).astype(np.int32)
+        labels = torch.as_tensor(
+            resample_labels_nearest(native, layer.affine, chans.shape, chans.affine),
+            device=chans.device,
+        )
+        target = int(self.params["a_label"])
+        text = str(self.params.get("b_labels") or "").strip()
+        try:
+            others = [int(v) for v in text.replace(";", ",").split(",") if v.strip()]
+        except ValueError:
+            return f"others must be label numbers, got {text!r}"
+        if not others:
+            others = [int(v) for v in torch.unique(labels).tolist() if v > 0 and v != target]
+        if not others:
+            return f"no labels besides {target} in {layer.name} to separate from"
+        a_mask = labels == target
+        b_masks = [labels == v for v in others]
+        empty = [
+            str(v)
+            for v, m in zip([target, *others], [a_mask, *b_masks], strict=True)
+            if int(m.sum()) < 2
+        ]
+        if empty:
+            return f"label(s) {', '.join(empty)} have fewer than two voxels on the channels' grid"
+        names = [self.session.region_name(layer, float(v)) for v in others]
+        names = [n if n != "--" else str(v) for n, v in zip(names, others, strict=True)]
+        return a_mask, b_masks, names
+
+    #: Voxels per region given to the optimiser; past this a region's mean and
+    #: spread are settled, and every voxel more is a step's worth of ops.
+    MAX_REGION = 3000
+
     def _optimise(self) -> Aspect:
         from fastfuncstuff.viewer.contrast import optimise_contrast
 
         src, chans = self._source, self._chans
-        a, b = self._a_mm(), self._b_mm()
         if src is None or chans is None or self.session is None:
             self._message = "\u26a0 nothing to optimise yet: press GO"
             return Aspect.GRAPH
-        if a is None or b is None:
-            self._message = "\u26a0 place B first: tick move B and click"
+        regions = self._region_masks()
+        if isinstance(regions, str):
+            self._message = f"\u26a0 {regions}"
             return Aspect.GRAPH
+        in_a, in_bs, b_names = regions
         live = self.session.state.layers.find_by_source(self.layer_source)
         t = 0 if live is None else self.session.layer_time(live)
         x = src.frame(t)[: chans.n]
-        in_a = self._sphere(a, float(self.params["radius_a"]))
-        in_b = self._sphere(b, float(self.params["radius_b"]))
-        if int(in_a.sum()) < 2 or int(in_b.sum()) < 2:
-            self._message = "\u26a0 A and B each need voxels inside the mask"
-            return Aspect.GRAPH
+        gen = torch.Generator().manual_seed(0)
+
+        def thin(mask: torch.Tensor) -> torch.Tensor:
+            where = mask.reshape(-1).nonzero()[:, 0]
+            if where.numel() > self.MAX_REGION:
+                pick = torch.randperm(where.numel(), generator=gen)[: self.MAX_REGION]
+                where = where[pick.to(where.device)]
+            return where
+
         assert src.fit_mu is not None and src.fit_sd is not None and src.context is not None
         mu, sd = src.fit_mu, src.fit_sd
-        za = ((x[:, in_a].T - mu) / sd).cpu()
-        zb = ((x[:, in_b].T - mu) / sd).cpu()
+        flat_x = x.reshape(chans.n, -1)
+        a_idx = thin(in_a)
+        b_idx = [thin(m) for m in in_bs]
+        za = ((flat_x[:, a_idx].T - mu) / sd).cpu()
+        zbs = [((flat_x[:, i].T - mu) / sd).cpu() for i in b_idx]
         zc = ((src.context - mu) / sd).cpu()
         # The current map in the optimiser's coordinates: y = W (x - m) / s is
         # W diag(sd / s) z plus a constant, which the window's centre absorbs.
@@ -954,12 +1051,12 @@ class RGBMode(Mode):
             flat = src.anatomy.reshape(-1)
             assert src.context_where is not None
             light = (
-                src.anatomy[in_a].cpu(),
-                src.anatomy[in_b].cpu(),
+                flat[a_idx].cpu(),
+                [flat[i].cpu() for i in b_idx],
                 flat[src.context_where].cpu(),
             )
         result = optimise_contrast(
-            za, zb, zc, W0, look, light=light, context=float(self.params["context"])
+            za, zbs, zc, W0, look, light=light, context=float(self.params["context"])
         )
         # Into the panel, where it can be read and tweaked: a custom basis in
         # the space it was optimised in, and the shifts and stretches found.
@@ -970,9 +1067,15 @@ class RGBMode(Mode):
             self.params[f"shift{k}"] = round(result.shift[k], 3)
             self.params[f"stretch{k}"] = round(result.stretch[k], 3)
         dirty = self._apply()
+        pairs = ""
+        if len(b_names) > 1:
+            each = ", ".join(
+                f"{n} {v:.2f}" for n, v in zip(b_names, result.separations, strict=True)
+            )
+            pairs = f" [{each}]"
         self._contrast_note = (
-            f"A\u2260B: \u0394E {result.before:.3f} \u2192 {result.separation:.3f} (Oklab), "
-            f"context past the knee {result.clipped:.0%}"
+            f"A\u2260B: closest \u0394E {result.before:.3f} \u2192 {result.separation:.3f}"
+            f"{pairs} (Oklab), context past the knee {result.clipped:.0%}"
         )
         return dirty | Aspect.GRAPH
 

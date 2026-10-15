@@ -1201,6 +1201,8 @@ def create_parser() -> argparse.ArgumentParser:
         " -warp_radius): 1-D for single PE, 2-D for dual PE on CUDA. Preserves sub-voxel signal"
         " that trilinear blurs out of the CORRECTED output and the refine template. ~2x per"
         " warp, and it passes more thermal noise — verify on your data.\n"
+        "Rotation-aware runs correct with a general 3-D displacement, which the PE shifters"
+        " cannot take: there bicubic means AFNI's cubic and lanczos its wsinc5.\n"
         "This is about OUTPUT fidelity, not shift accuracy: the shift estimate itself is set by"
         " the pooling window (-window), not by the resampler.",
     )
@@ -1850,8 +1852,11 @@ def _resolve_warp_interp(requested: str, *, rotaware: bool) -> str:
     return "bicubic" if rotaware else "lanczos"
 
 
-def _warp_kernel_label(interp: str, radius: int) -> str:
+def _warp_kernel_label(interp: str, radius: int, *, rotaware: bool = False) -> str:
     """User-facing name for the actual correction resampler."""
+    if rotaware and interp != "bilinear":
+        # A general 3-D displacement: AFNI's separable kernels, not the PE shifters.
+        return {"bicubic": "cubic", "lanczos": "wsinc5"}[interp] + " (3-D)"
     return f"Lanczos-{radius}" if interp == "lanczos" else interp
 
 
@@ -4837,16 +4842,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             )
             return 2
 
-    # Rotation-aware synthesis is a genuine arbitrary 3-D warp and still has no
-    # Lanczos implementation. Dual PE is only a 2-D warp and now has a fused CUDA path.
-    if args.warp_interp == "lanczos":
-        if rotaware:
-            print(
-                "❌ -warp_interp lanczos does not yet support rotation-aware 3-D warps; use "
-                "bilinear/bicubic.",
-                file=sys.stderr,
-            )
-            return 2
     slice_axis = args.slice_axis
     if args.is_3dacq and args.backend == "phase":
         print(
@@ -5104,7 +5099,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     print_cli_header("ffs_locomoco", "Residual nonlinear motion correction")
     print_cli_section("Configuration", leading_blank=False)
     print(f"   input: {args.input}, shape={data.shape}, device={device}")
-    print(f"   data resampling kernel: {_warp_kernel_label(args.warp_interp, args.warp_radius)}")
+    print(
+        f"   data resampling kernel: {_warp_kernel_label(args.warp_interp, args.warp_radius, rotaware=rotaware)}"
+    )
     if dual3d:
         axes_desc = (
             f"primary PE {args.pe_dir[0]} (axis {pe_axis}) + partition "

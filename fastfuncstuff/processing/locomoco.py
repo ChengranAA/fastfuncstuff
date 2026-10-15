@@ -2684,9 +2684,40 @@ def _fuse_tridiag(
     return p.reshape(T, *shape).float()
 
 
-def _warp3d_pull(vol: torch.Tensor, dx: torch.Tensor, dy: torch.Tensor, dz: torch.Tensor):
-    """Sample ``vol`` (nx,ny,nz) at ``(x+dx, y+dy, z+dz)`` — a voxel-space pull warp."""
+# -warp_interp -> AFNI separable kernel for a general 3-D displacement, which the 1-D/2-D
+# Lanczos shifters cannot take (the rotation-aware field is not axis-aligned).
+_WARP3D_KERNEL = {"bicubic": "cubic", "lanczos": "wsinc5"}
+
+
+def _warp3d_pull(
+    vol: torch.Tensor,
+    dx: torch.Tensor,
+    dy: torch.Tensor,
+    dz: torch.Tensor,
+    mode: str = "bilinear",
+):
+    """Sample ``vol`` (nx,ny,nz) at ``(x+dx, y+dy, z+dz)`` — a voxel-space pull warp.
+
+    ``mode`` is the ``-warp_interp`` name. The high-order kernels zero samples outside
+    the volume, so the coordinates are clamped into it first: the same edge behaviour
+    as the bilinear path's ``padding_mode="border"``.
+    """
     nx, ny, nz = vol.shape
+    if mode in _WARP3D_KERNEL:
+        from .interp import warp_image
+
+        def inside(d: torch.Tensor, n: int, ax: int) -> torch.Tensor:
+            shape = [1, 1, 1]
+            shape[ax] = n
+            base = torch.arange(n, device=d.device, dtype=d.dtype).reshape(shape)
+            return (base + d).clamp(0, n - 1) - base
+
+        zyx = [
+            inside(d, n, a).permute(2, 1, 0)
+            for a, (d, n) in enumerate(((dx, nx), (dy, ny), (dz, nz)))
+        ]
+        out = warp_image(vol.permute(2, 1, 0).contiguous(), *zyx, mode=_WARP3D_KERNEL[mode])
+        return out.permute(2, 1, 0).contiguous()
     xs, ys, zs = torch.meshgrid(
         torch.arange(nx, device=vol.device, dtype=vol.dtype),
         torch.arange(ny, device=vol.device, dtype=vol.dtype),
@@ -2942,7 +2973,7 @@ def estimate_residual_flow_rotaware(
         pf = p[..., t].to(device)
         dcomp = [pf * float(weights[t, a]) for a in range(3)]  # voxel-pull disp per axis
         corrected[..., t] = _warp3d_pull(
-            moco[..., t].to(device), dcomp[0], dcomp[1], dcomp[2]
+            moco[..., t].to(device), dcomp[0], dcomp[1], dcomp[2], mode=warp_interp
         ).cpu()
 
     # Pack into a LocomocoResult: store p as the PE flow so the flow map / movie work;

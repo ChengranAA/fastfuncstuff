@@ -1651,3 +1651,37 @@ def test_ngf_match_says_so_when_the_encode_axis_is_unavailable():
         _match_prep(vol, "ngf", 6.0)
     with pytest.raises(ValueError, match="localnorm"):
         _match_prep(vol, "ngf", 6.0, skip_axis=1, pe_axis=1)
+
+
+def test_warp3d_pull_honours_the_kernel_and_clamps_at_the_edge():
+    """The rotation-aware correction was trilinear whatever -warp_interp said.
+
+    On a band-limited volume a sub-voxel 3-D pull must come out closer to the analytic
+    answer with the high-order kernels than with trilinear, and a pull past the edge
+    must clamp (grid_sample's border padding), not zero the face.
+    """
+    from fastfuncstuff.processing.locomoco import _warp3d_pull
+
+    n = 24
+    g = torch.arange(n, dtype=torch.float32)
+    x, y, z = torch.meshgrid(g, g, g, indexing="ij")
+
+    def f(x, y, z):
+        return torch.sin(2 * torch.pi * x / 8) * torch.cos(2 * torch.pi * y / 9) + torch.sin(
+            2 * torch.pi * z / 7
+        )
+
+    vol = f(x, y, z)
+    dx, dy, dz = (torch.full_like(vol, s) for s in (0.37, -0.29, 0.41))
+    truth = f(x + dx, y + dy, z + dz)
+    core = (slice(6, -6),) * 3
+    err = {
+        m: float((_warp3d_pull(vol, dx, dy, dz, mode=m) - truth)[core].abs().mean())
+        for m in ("bilinear", "bicubic", "lanczos")
+    }
+    assert err["bicubic"] < 0.5 * err["bilinear"], err
+    assert err["lanczos"] < 0.5 * err["bilinear"], err
+
+    out = torch.full_like(vol, 2.0)
+    edge = _warp3d_pull(out, torch.full_like(vol, -3.0), dy * 0, dz * 0, mode="lanczos")
+    assert torch.allclose(edge, out), "a pull past the edge zeroed the face"

@@ -196,8 +196,8 @@ class TestSearchSpace:
         assert list(x.ravel()) == sorted(x.ravel())
 
     def test_log_encoding_spreads_the_small_end(self):
-        """0.0 -> 0.5 is a bigger change than 1.0 -> 2.0, and the encoding says so."""
-        space = SearchSpace.from_params([_param("a", (0.0, 0.5, 1.0, 2.0))])
+        """Equal additive changes occupy more of the encoding near zero."""
+        space = SearchSpace.from_params([_param("a", (0.0, 0.5, 2.0, 2.5))])
         x = space.encode(space.lattice()).ravel()
         assert (x[1] - x[0]) > (x[3] - x[2])
 

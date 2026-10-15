@@ -32,7 +32,7 @@ def _table():
     return np.array([[22 + 6 * j + 5 * i for j in range(4)] for i in range(4)], dtype=float)
 
 
-def _written(tmp_path, nn=1, sidedness="2-sided"):
+def _written(tmp_path, nn=1, sidedness="2-sided", mask_name=None):
     path = tmp_path / f"cs.NN{nn}.niml"
     write_clustsim_niml(
         path,
@@ -46,6 +46,7 @@ def _written(tmp_path, nn=1, sidedness="2-sided"):
         athr=ATHR,
         n_perms=10000,
         mask_count=12345,
+        mask_name=mask_name,
     )
     return path
 
@@ -99,6 +100,14 @@ def test_a_dataset_without_tables_says_so_rather_than_guessing():
     assert read_clustsim_tables(_Bare()) == {}
 
 
+def test_a_quoted_angle_bracket_does_not_end_the_tag(tmp_path):
+    """Bug of record: ffs_perm without -mask writes mask_dset_name="<inline>", and
+    the open tag ended at that '>' -- the table never parsed, so no alphas."""
+    parsed = parse_clustsim_niml(_written(tmp_path, mask_name="<inline>").read_text())
+    assert parsed is not None
+    assert parsed.athr == ATHR
+
+
 def test_tables_are_found_by_nn_and_sidedness(tmp_path):
     """Three NNs times three sidednesses live in one header; the wrong one is
     a different cluster-size threshold, so the key has to be exact."""
@@ -115,6 +124,27 @@ def test_tables_are_found_by_nn_and_sidedness(tmp_path):
     assert set(found) == {(1, "1-sided"), (2, "bi-sided")}
     assert isinstance(found[(1, "1-sided")], ClustSimTable)
     assert found[(2, "bi-sided")].nn == 2
+
+
+@pytest.mark.parametrize("suffix", [".nii", ".nii.gz"])
+def test_tables_survive_the_round_trip_through_a_file(tmp_path, suffix):
+    """Bug of record: the viewer read tables via read_nifti_header, which stops
+    at byte 348 -- before the extensions -- so every on-disk table came back
+    empty and no cluster ever got an alpha. Only in-memory headers were tested."""
+    import nibabel as nib
+
+    from fastfuncstuff.io.afni import set_afni_atr
+    from fastfuncstuff.io.headers import read_nifti_header
+
+    img = nib.Nifti1Image(np.zeros((4, 4, 4), np.float32), np.eye(4))
+    content = _written(tmp_path, nn=1, sidedness="2-sided").read_text().rstrip()
+    set_afni_atr(img.header, "AFNI_CLUSTSIM_NN1_2sided", content, ni_type="String")
+    path = tmp_path / f"stat{suffix}"
+    nib.save(img, str(path))
+
+    assert read_clustsim_tables(read_nifti_header(path)) == {}
+    found = read_clustsim_tables(read_nifti_header(path, extensions=True))
+    assert set(found) == {(1, "2-sided")}
 
 
 def test_the_size_for_an_alpha_is_afni_find_cluster_thresh():

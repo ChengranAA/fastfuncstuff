@@ -17,9 +17,7 @@ why the conversion lives in exactly one place.
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass, field
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +27,7 @@ import numpy as np
 from fastfuncstuff.io.headers import (
     _afni_ext_text,
     _read_leading_bytes,
+    _read_nifti_header_with_ext,
     _resolve_indices,
     parse_subbrick_selector,
     read_brick_labels,
@@ -285,28 +284,6 @@ def _decode_history(text: str) -> str:
     import html
 
     return html.unescape(text).replace("\\n", "\n").strip()
-
-
-def _read_nifti_header_with_ext(path: Path) -> nib.Nifti1Header | nib.Nifti2Header:
-    """Header *plus* extensions, reading only as far as the image data starts.
-
-    Two peeks: 544 bytes to learn ``vox_offset``, then that many bytes so
-    nibabel's own extension parser sees the whole AFNI blob and nothing else.
-    """
-    lead = _read_leading_bytes(path, 544)
-    for endian in ("<", ">"):
-        (sizeof_hdr,) = struct.unpack(endian + "i", lead[:4])
-        if sizeof_hdr in (348, 540):
-            break
-    else:
-        raise ValueError(f"Not a recognizable NIfTI-1/2 header (bad sizeof_hdr): {path}")
-
-    klass: Any = nib.Nifti1Header if sizeof_hdr == 348 else nib.Nifti2Header
-    stub = klass(binaryblock=lead[:sizeof_hdr], check=False)
-    vox_offset = int(stub["vox_offset"]) or sizeof_hdr + 4
-    # Cap the extension read: a corrupt vox_offset should not pull the payload in.
-    raw = lead if vox_offset <= len(lead) else _read_leading_bytes(path, min(vox_offset, 1 << 22))
-    return klass.from_fileobj(BytesIO(raw), check=False)
 
 
 def _slice_timing_from(header: Any, ext_text: str, n_slices: int) -> list[float] | None:

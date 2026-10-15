@@ -1911,7 +1911,9 @@ class ViewerSession:
             try:
                 from fastfuncstuff.io.headers import read_nifti_header
 
-                cache = read_clustsim_tables(read_nifti_header(self.store.get(key).path))
+                cache = read_clustsim_tables(
+                    read_nifti_header(self.store.get(key).path, extensions=True)
+                )
             except Exception:  # a header that will not parse simply has no tables
                 cache = {}
             self._clustsim[key] = cache

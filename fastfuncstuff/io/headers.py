@@ -12,8 +12,11 @@ only as far as the header extends, even for a multi-GB ``.nii.zst``.
 from __future__ import annotations
 
 import re
+import struct
 import subprocess
+from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import nibabel as nib
 import numpy as np
@@ -264,13 +267,41 @@ def _read_leading_bytes(filepath: Path, n: int) -> bytes:
         return fh.read(n)
 
 
-def read_nifti_header(filepath: str | Path) -> nib.Nifti1Header | nib.Nifti2Header:
+def _read_nifti_header_with_ext(path: Path) -> nib.Nifti1Header | nib.Nifti2Header:
+    """Header *plus* extensions, reading only as far as the image data starts.
+
+    Two peeks: 544 bytes to learn ``vox_offset``, then that many bytes so
+    nibabel's own extension parser sees the whole AFNI blob and nothing else.
+    """
+    lead = _read_leading_bytes(path, 544)
+    for endian in ("<", ">"):
+        (sizeof_hdr,) = struct.unpack(endian + "i", lead[:4])
+        if sizeof_hdr in (348, 540):
+            break
+    else:
+        raise ValueError(f"Not a recognizable NIfTI-1/2 header (bad sizeof_hdr): {path}")
+
+    klass: Any = nib.Nifti1Header if sizeof_hdr == 348 else nib.Nifti2Header
+    stub = klass(binaryblock=lead[:sizeof_hdr], check=False)
+    vox_offset = int(stub["vox_offset"]) or sizeof_hdr + 4
+    # Cap the extension read: a corrupt vox_offset should not pull the payload in.
+    raw = lead if vox_offset <= len(lead) else _read_leading_bytes(path, min(vox_offset, 1 << 22))
+    return klass.from_fileobj(BytesIO(raw), check=False)
+
+
+def read_nifti_header(
+    filepath: str | Path, *, extensions: bool = False
+) -> nib.Nifti1Header | nib.Nifti2Header:
     """Read just the NIfTI header, without decompressing the image payload.
 
     Works for ``.nii``, ``.nii.gz`` and ``.nii.zst``. Detects NIfTI-1 vs NIfTI-2
     and endianness from ``sizeof_hdr``. Any ``[selector]`` suffix is ignored here
     (selectors change the volume count, not the on-disk header); use
     :func:`nifti_shape` if you need the selector-adjusted shape.
+
+    The default stops at the fixed 348/540 bytes, so the header carries no
+    extensions. ``extensions=True`` reads on to ``vox_offset``, which anything
+    after the AFNI attributes (labels, stat types, ClustSim tables) needs.
     """
     clean_path, _ = parse_subbrick_selector(str(filepath))
     filepath = Path(clean_path)
@@ -281,6 +312,9 @@ def read_nifti_header(filepath: str | Path) -> nib.Nifti1Header | nib.Nifti2Head
         from fastfuncstuff.io.gifti import gifti_as_nifti
 
         return gifti_as_nifti(filepath).header
+
+    if extensions:
+        return _read_nifti_header_with_ext(filepath)
 
     # NIfTI-1 header is 348 bytes, NIfTI-2 is 540; read enough for either.
     raw = _read_leading_bytes(filepath, 544)

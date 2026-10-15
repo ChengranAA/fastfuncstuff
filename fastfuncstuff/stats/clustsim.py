@@ -899,8 +899,11 @@ def attach_clustsim_tables(
 # spelling there rather than inventing one.
 # ---------------------------------------------------------------------------
 
+# Quoted attribute values may hold '>' (ffs_perm writes mask_dset_name="<inline>"
+# when no -mask is given), so the open tag ends at the first '>' outside quotes.
 _CS_HEAD_RE = re.compile(
-    r"<3dClustSim_NN[123]\b(?P<attrs>.*?)>(?P<body>.*?)</3dClustSim_NN[123]>", re.S
+    r'<3dClustSim_NN[123]\b(?P<attrs>(?:[^>"]|"[^"]*")*)>(?P<body>.*?)</3dClustSim_NN[123]>',
+    re.S,
 )
 _CS_KV_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
 

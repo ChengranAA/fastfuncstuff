@@ -5366,12 +5366,13 @@ def add_preallineate_args(group, tool: str) -> None:
         "-allineate",
         action="store_true",
         help="Affine-align the source to the base first (ffs_allineate, in-process), "
-        "then warp. Replaces running ffs_allineate and passing its matrix as -matrix: "
-        "the matrix is saved as {warp prefix}_al.aff12.1D and used exactly as -matrix "
-        "would be (warp solved on the SOURCE grid, source interpolated once). Also "
-        "writes {prefix}_al (affine only, base grid: the before-warp baseline) and "
-        "{prefix}_in_base (affine + warp, base grid, one interpolation via the "
-        "'aff12 + WARP' chain). The warp is always saved. 3D source only.",
+        "then warp: the same result as running ffs_allineate and then this tool on its "
+        "output, in one step. Writes {warp prefix}_al.aff12.1D (the affine), {prefix}_al "
+        "(affine only, on the base grid: the before-warp baseline) and the WARP, which "
+        "lives in BASE space like any other base-grid warp, so the chain is the AFNI one: "
+        "ffs_nwarp -nwarp 'WARP.nii al.aff12.1D' -master base. The main output is that "
+        "chain applied to the ORIGINAL source (one interpolation). The warp is always "
+        "saved. 3D source only.",
     )
     option_string_value(
         group.add_argument(
@@ -5386,16 +5387,12 @@ def add_preallineate_args(group, tool: str) -> None:
     )
 
 
-def preallineate_outputs(image_stem: str, ext: str, warp_stem: str) -> tuple[str, str, str]:
-    """``(matrix, affine-only image, base-space image)`` paths an -allineate run writes.
+def preallineate_outputs(image_stem: str, ext: str, warp_stem: str) -> tuple[str, str]:
+    """``(matrix, affine-only image)`` paths an -allineate run writes beyond its own.
 
-    The matrix belongs to the warp family (``-warp_prefix``), the images to ``-prefix``.
+    The matrix belongs to the warp family (``-warp_prefix``), the image to ``-prefix``.
     """
-    return (
-        f"{warp_stem}_al.aff12.1D",
-        f"{image_stem}_al{ext}",
-        f"{image_stem}_in_base{ext}",
-    )
+    return f"{warp_stem}_al.aff12.1D", f"{image_stem}_al{ext}"
 
 
 def run_with_preallineate(
@@ -5411,10 +5408,13 @@ def run_with_preallineate(
 ) -> int:
     """Run ``dispatch`` (a warp CLI's per-pair body) after an in-process ffs_allineate.
 
-    The affine goes in through the tool's own ``-matrix`` path rather than by
-    resampling the source onto the base: that keeps the source interpolated once
-    and the saved WARP composable with the saved matrix, so the base-space copy at
-    the end is ``ffs_nwarp -nwarp 'matrix WARP' -master base`` and nothing new.
+    Exactly the two-step workflow -- align, then warp the aligned image on the base
+    grid -- so the WARP lives in base space and composes the AFNI way, 'WARP aff'.
+    The one change: the main output is rebuilt from the ORIGINAL source through
+    that chain, so the data is interpolated once rather than once per step.
+    ``-matrix`` is deliberately not used: it solves on the source grid, a choice
+    for pipelines that need a particular grid axis, and its warp composes the
+    other way round.
     """
     import copy
     import shlex
@@ -5439,7 +5439,7 @@ def run_with_preallineate(
         return 1
     del src
 
-    matrix_path, al_image, in_base = preallineate_outputs(image_stem, ext, warp_stem)
+    matrix_path, al_image = preallineate_outputs(image_stem, ext, warp_stem)
     al_argv = [
         *("-base", args.base, "-source", args.source),
         *("-prefix", al_image, "-1Dmatrix_save", matrix_path),
@@ -5450,20 +5450,23 @@ def run_with_preallineate(
 
     run = copy.copy(args)
     run.allineate = False
-    run.matrix = matrix_path
-    # The base-space copy needs the warp on disk; the flag differs per tool.
+    run.source = al_image
+    # The one-interpolation output below is built from the warp on disk; the
+    # flag differs per tool.
     run.save_warp = True
     run.no_save_warp = False
     rc = dispatch(run, device)
     if rc != 0:
         return rc
 
+    out = f"{image_stem}{ext}"
     if args.verb >= 1:
-        print(f"\nApplying {Path(matrix_path).name} + {Path(warp_path).name} -> base grid")
+        print(f"\nRebuilding {Path(out).name} from {Path(args.source).name} in one "
+              f"interpolation: {Path(warp_path).name} + {Path(matrix_path).name}")  # fmt: skip
     nwarpforge(
         source_path=args.source,
-        nwarp_specs=[matrix_path, warp_path],
-        prefix=in_base,
+        nwarp_specs=[warp_path, matrix_path],
+        prefix=out,
         master_path=args.base,
         interp=final_interp,
         device=device,
@@ -5471,6 +5474,4 @@ def run_with_preallineate(
         auto_pad=False,
         progress=lambda message: spinner(message, enabled=args.verb >= 1),
     )
-    if args.verb >= 1:
-        print(f"Saved base-space image: {in_base}")
     return 0

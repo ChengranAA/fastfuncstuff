@@ -384,29 +384,35 @@ def test_cli_matrix_estimates_on_the_source_grid(tmp_path):
     assert nib.load(str(tmp_path / "out_WARP.nii.gz")).shape == (snx, sny, snz, 3)
 
 
-def test_cli_allineate_runs_affine_then_warp_and_lands_in_base(tmp_path):
-    """-allineate = ffs_allineate + -matrix + ffs_nwarp 'matrix WARP' -master base.
+def test_cli_allineate_is_allineate_then_warp_with_an_afni_order_chain(tmp_path):
+    """-allineate = ffs_allineate, then the warp on the base grid, in one call.
 
-    The source is displaced 3 voxels from the base on a different grid. The warp
-    outputs stay on the SOURCE grid (the -matrix contract); _al and _in_base are on
-    the BASE grid, and _in_base must line up with the base -- a matrix taken the
-    wrong way round in the chain doubles the shift instead of undoing it.
+    Everything lands on the BASE grid, and the WARP composes the AFNI way,
+    'WARP aff': warping the affine-only image with the WARP alone (the two-step
+    workflow) must give the main output, which is that chain applied to the
+    original source. A warp solved on the source grid -- or a chain taken the
+    other way round -- reads the field ~3 voxels off and fails this.
     """
     import numpy as np
 
     nib = pytest.importorskip("nibabel")
     from fastfuncstuff.cli.formwarp import main as fmain
-    from fastfuncstuff.processing.affine import apply_affine_interp
+    from fastfuncstuff.processing.nwarpforge import nwarpforge
 
-    nz, ny, nx = 24, 28, 26
-    snz, sny, snx = 22, 26, 24
-    base = _blobs(nz, ny, nx) + 0.2
-    affine = np.diag([2.0, 2.0, 2.0, 1.0])
-    m_b2s = torch.eye(4)
-    m_b2s[2, 3] = 3.0
-    source = apply_affine_interp(
-        base, torch.linalg.inv(m_b2s.double()).float(), output_shape=(snz, sny, snx)
+    # Two blobs; in the source the pair is shifted 5 voxels (the affine's job) and
+    # the second blob alone moves another 2.5 voxels in x (the warp's job), so a
+    # warp read in the wrong place -- 5 voxels off -- shows.
+    nz, ny, nx = 28, 32, 32
+    zz, yy, xx = torch.meshgrid(
+        *(torch.arange(n, dtype=torch.float32) for n in (nz, ny, nx)), indexing="ij"
     )
+
+    def blob(cx, cy, cz, s=3.0):
+        return torch.exp(-(((xx - cx) / s) ** 2 + ((yy - cy) / s) ** 2 + ((zz - cz) / s) ** 2))
+
+    base = blob(13, 16, 12) + 0.8 * blob(19, 16, 15) + 0.2
+    source = blob(13, 16, 17) + 0.8 * blob(21.5, 16, 20) + 0.2
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
     bp, sp = tmp_path / "b.nii.gz", tmp_path / "s.nii.gz"
     nib.save(nib.Nifti1Image(base.permute(2, 1, 0).numpy(), affine), bp)
     nib.save(nib.Nifti1Image(source.permute(2, 1, 0).numpy(), affine), sp)
@@ -416,25 +422,45 @@ def test_cli_allineate_runs_affine_then_warp_and_lands_in_base(tmp_path):
         [
             *("-base", str(bp), "-source", str(sp), "-prefix", str(out)),
             *("-allineate", "-allineate_opts", "-rigid -cost ls -superfast"),
-            *("-shrink", "2x1", "-smooth", "1x0", "-iters", "4x3"),
-            *("-device", "cpu", "-verb", "0"),
+            *("-shrink", "2x1", "-smooth", "1x0", "-iters", "40x30"),
+            *("-final_interp", "linear", "-device", "cpu", "-verb", "0"),
         ]
     )
     assert rc == 0
-    assert (tmp_path / "out_al.aff12.1D").exists()
-    assert nib.load(str(out)).shape == (snx, sny, snz)
-    assert nib.load(str(tmp_path / "out_WARP.nii.gz")).shape == (snx, sny, snz, 3)
-    assert nib.load(str(tmp_path / "out_al.nii.gz")).shape == (nx, ny, nz)
-    in_base = nib.load(str(tmp_path / "out_in_base.nii.gz"))
-    assert in_base.shape == (nx, ny, nz)
+    warp, al, mat = (
+        tmp_path / "out_WARP.nii.gz",
+        tmp_path / "out_al.nii.gz",
+        tmp_path / "out_al.aff12.1D",
+    )
+    assert mat.exists()
+    assert nib.load(str(out)).shape == (nx, ny, nz)
+    assert nib.load(str(al)).shape == (nx, ny, nz)
+    assert nib.load(str(warp)).shape == (nx, ny, nz, 3)
+    assert not (tmp_path / "out_in_base.nii.gz").exists()
 
-    # Interior only: the source grid is smaller, so the base-grid edge is zero-filled.
-    # Unaligned the interior correlates ~0.77; the affine recovers most of the shift
-    # (the phantom is clipped by the smaller source FoV, so not all of it), and a
-    # matrix inverted in the chain would land ~2x the shift away, far below that.
-    got = np.asarray(in_base.get_fdata()).transpose(2, 1, 0)[3:-3, 3:-3, 3:-3]
-    ref = base.numpy()[3:-3, 3:-3, 3:-3]
-    assert np.corrcoef(got.ravel(), ref.ravel())[0, 1] > 0.92
+    inner = (slice(3, -3), slice(3, -3), slice(3, -3))
+    got = np.asarray(nib.load(str(out)).dataobj).transpose(2, 1, 0)
+
+    # Each step helps: source < affine only < affine + warp.
+    def r(img):
+        return np.corrcoef(img[inner].ravel(), base.numpy()[inner].ravel())[0, 1]
+
+    al_img = np.asarray(nib.load(str(al)).dataobj).transpose(2, 1, 0)
+    assert r(source.numpy()) < r(al_img) < r(got)
+
+    # The two-step workflow, by hand: the WARP alone on the affine-only image.
+    two = tmp_path / "two.nii.gz"
+    nwarpforge(str(al), [str(warp)], str(two), master_path=str(bp), interp="linear",
+               device=torch.device("cpu"), verb=0, auto_pad=False)  # fmt: skip
+    ref = np.asarray(nib.load(str(two)).dataobj).transpose(2, 1, 0)
+    # Inside the affine-only image's coverage, away from its edge: the two-step
+    # route resamples a zero-filled border once more, which only the edge sees.
+    from scipy.ndimage import binary_erosion
+
+    covered = binary_erosion(np.asarray(nib.load(str(al)).dataobj).transpose(2, 1, 0) != 0,
+                             iterations=2)  # fmt: skip
+    # Measured: 0.05 of the range for this chain, 0.31 with the order flipped.
+    assert np.abs(got - ref)[covered].max() < 0.1 * float(base.max())
 
 
 def test_cli_warp_prefix_names_the_warp_independently(tmp_path):

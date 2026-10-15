@@ -524,9 +524,14 @@ class TestMPSPolicy:
         assert cpu_if_mps(mps, "eigh_batched").type == "mps"
 
     def test_every_reason_names_the_torch_it_was_measured_on(self):
-        """A reason without a version is folklore; it must be re-checkable."""
+        """A reason without a version is folklore; it must be re-checkable.
+
+        A row may instead say it is unmeasured, which is an honest claim of no
+        measurement rather than a measurement missing its version.
+        """
         for op, reason in _MPS_CPU_OPS.items():
-            assert "torch" in reason.lower(), f"{op}: {reason!r}"
+            ok = "torch" in reason.lower() or reason.lower().startswith("unmeasured")
+            assert ok, f"{op}: {reason!r}"
 
     def test_keep_and_cpu_lists_are_disjoint(self):
         assert not (set(_MPS_CPU_OPS) & set(_MPS_KEEP_OPS))

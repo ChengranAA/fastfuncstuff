@@ -201,6 +201,7 @@ def save_image(
     header_info: dict | None = None,
     affine: np.ndarray | None = None,
     brick_labels: list[str] | None = None,
+    brick_stataux: dict[int, tuple[int, tuple[float, ...]]] | None = None,
 ) -> None:
     """Save a torch tensor as a NIfTI image.
 
@@ -211,6 +212,8 @@ def save_image(
         affine: 4x4 affine matrix. Uses header_info's affine or identity if None.
         brick_labels: Optional per-sub-brick labels written into the AFNI NIfTI
             extension (BRICK_LABS) so AFNI viewers show them.
+        brick_stataux: Optional ``{sub_brick: (stat_code, params)}`` so AFNI can
+            threshold those sub-bricks (BRICK_STATAUX).
     """
     arr = data.detach().cpu().numpy()
 
@@ -233,6 +236,7 @@ def save_image(
         affine=affine,
         header=header,
         brick_labels=brick_labels,
+        brick_stataux=brick_stataux,
     )
 
 

@@ -953,7 +953,9 @@ def test_subbrick_selector_still_reads_a_plain_4d_series(tmp_path):
     assert load_nifti(f"{p}[2..4]").shape == (4, 5, 6, 3)
 
 
-def _write_afni(path_stem: Path, data: np.ndarray, gz: bool = False) -> Path:
+def _write_afni(
+    path_stem: Path, data: np.ndarray, gz: bool = False, taxis: bool = True, extra=()
+) -> Path:
     """Hand-write a tiny +orig dataset: RAI, 2 mm, scaled shorts, TR 2 s.
 
     RAI (AFNI's default) is the orientation that flips x and y relative to RAS,
@@ -974,11 +976,15 @@ def _write_afni(path_stem: Path, data: np.ndarray, gz: bool = False) -> Path:
         # ijk -> DICOM (RAI) mm; nibabel reads the affine from this, as AFNI does
         ("float", "IJK_TO_DICOM_REAL", [2.0, 0, 0, 10.0, 0, 2.0, 0, 20.0, 0, 0, 2.0, -30.0]),
         ("integer", "SCENE_DATA", [0, 2, 0, -999, -999, -999, -999, -999]),
-        ("integer", "TAXIS_NUMS", [nt, 0, 77002, -999, -999, -999, -999, -999]),
-        ("float", "TAXIS_FLOATS", [0.0, 2.0, 0.0, 0.0, 0.0, -999999.0, -999999.0, -999999.0]),
         ("string", "TYPESTRING", "3DIM_HEAD_ANAT"),
         ("string", "BYTEORDER_STRING", "LSB_FIRST"),
+        *extra,
     ]
+    if taxis:
+        attrs += [
+            ("integer", "TAXIS_NUMS", [nt, 0, 77002, -999, -999, -999, -999, -999]),
+            ("float", "TAXIS_FLOATS", [0.0, 2.0, 0.0, 0.0, 0.0, -999999.0, -999999.0, -999999.0]),
+        ]
     lines = []
     for kind, name, val in attrs:
         if kind == "string":
@@ -1027,3 +1033,43 @@ def test_load_image_reads_afni_natively(tmp_path, gz, spelling):
     assert float(load_nifti(path).header.get_zooms()[3]) == pytest.approx(2.0)
     one, _ = load_image(path + "[1]", device=torch.device("cpu"))
     np.testing.assert_array_equal(one.numpy(), data[..., 1].transpose(2, 1, 0))
+
+
+def test_afni_stats_bucket_keeps_labels_and_stat_types_through_a_warp(tmp_path):
+    """A 3dDeconvolve-style bucket: labels and stat type/DOF must survive loading
+    AND an ffs_nwarp onto a master (the save drops per-brick attributes unless
+    handed them). It stays plain 4-D -- not AFNI's (x,y,z,1,n) -- with no fake TR,
+    and a [i] selector still picks one brick."""
+    import torch
+
+    from fastfuncstuff.io.afni import load_nifti, read_brick_labels, read_brick_stataux
+    from fastfuncstuff.processing.nwarpforge import nwarpforge
+
+    data = np.arange(5 * 4 * 3 * 3, dtype=np.float32).reshape(5, 4, 3, 3) * 0.5
+    extra = [
+        ("string", "BRICK_LABS", "Full_Fstat~a#0_Coef~a#0_Tstat"),
+        ("float", "BRICK_STATAUX", [0, 4, 2, 6, 1826, 2, 3, 1, 1826]),
+    ]
+    head = _write_afni(tmp_path / "stats", data, taxis=False, extra=extra)
+
+    img = load_nifti(head)
+    assert img.shape == (5, 4, 3, 3)
+    assert img.header.get_zooms()[3] == 0.0
+    assert read_brick_labels(img) == ["Full_Fstat", "a#0_Coef", "a#0_Tstat"]
+    assert read_brick_stataux(img) == {0: (4, (6.0, 1826.0)), 2: (3, (1826.0,))}
+
+    master = tmp_path / "master.nii.gz"
+    nib.save(
+        nib.Nifti1Image(np.zeros((6, 5, 4), np.float32), np.diag([2.0, 2.0, 2.0, 1.0])), master
+    )
+    ident = tmp_path / "ident.aff12.1D"
+    ident.write_text("1 0 0 0 0 1 0 0 0 0 1 0\n")
+    out = tmp_path / "warped.nii.gz"
+    nwarpforge(str(head), [str(ident)], str(out), master_path=str(master), interp="nearest",
+               device=torch.device("cpu"), verb=0, auto_pad=False)  # fmt: skip
+    w = nib.load(str(out))
+    assert w.shape == (6, 5, 4, 3)
+    assert read_brick_labels(w) == ["Full_Fstat", "a#0_Coef", "a#0_Tstat"]
+    assert read_brick_stataux(w) == {0: (4, (6.0, 1826.0)), 2: (3, (1826.0,))}
+    one = np.asarray(load_nifti(f"{out}[2]").dataobj).squeeze()
+    np.testing.assert_array_equal(one, np.asarray(w.dataobj)[..., 2])

@@ -2822,8 +2822,28 @@ def nwarpforge(
         out_hdr = None
 
     output_header = {"affine": obliquity @ output_affine, "header": out_hdr}
+    # The source's bricks keep their meaning (labels; stat type and DOF, so AFNI
+    # can still threshold) whichever extension supplied the space. Passed to the
+    # save, which otherwise drops every per-brick attribute. Only for an unchanged
+    # count: a -time_range subset is a different set of bricks.
+    brick_labels, brick_stataux = None, None
+    n_out = int(output.shape[0]) if output.ndim == 4 else 1
+    if src_hdr is not None and n_out > 1:
+        from fastfuncstuff.io.afni import read_brick_labels, read_brick_stataux
+
+        src_dim = [int(v) for v in src_hdr["dim"]]
+        if int(np.prod(src_dim[4 : src_dim[0] + 1])) == n_out:
+            labels = read_brick_labels(src_hdr)
+            brick_labels = labels if len(labels) == n_out else None
+            brick_stataux = read_brick_stataux(src_hdr) or None
     with progress_context(f"Writing {prefix}"):
-        save_image(output, prefix, header_info=output_header)
+        save_image(
+            output,
+            prefix,
+            header_info=output_header,
+            brick_labels=brick_labels,
+            brick_stataux=brick_stataux,
+        )
 
     # Temporal reductions of the warped series. max/min are coverage images: a
     # voxel that left the FoV (motion, or the warp itself) is 0 in the volumes

@@ -38,6 +38,18 @@ def _action(**kwargs) -> argparse.Action:
     return parser.add_argument("-x", **kwargs)
 
 
+def test_every_tool_parser_accepts_afni_help(capsys):
+    from fastfuncstuff.cli.completion import _entry_points
+
+    for name, module in _entry_points().items():
+        parser = load_parser(module)
+        assert parser is not None, name
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["-help"])
+        assert exc.value.code == 0, name
+        assert capsys.readouterr().out, name
+
+
 class TestCompletionKind:
     def test_choices_win(self):
         assert _completion_kind(_action(choices=["a", "b"])) == "choices"

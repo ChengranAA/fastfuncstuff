@@ -288,6 +288,15 @@ class FfsArgumentParser(argparse.ArgumentParser):
         if self._ffs_aliases_applied:
             return
         self._ffs_aliases_applied = True
+        # An exact alias prevents -help from competing with -help_dir prefixes.
+        if "-help" not in self._option_string_actions:
+            help_action = next(
+                (action for action in self._actions if isinstance(action, argparse._HelpAction)),
+                None,
+            )
+            if help_action is not None:
+                self._option_string_actions["-help"] = help_action
+                self._ffs_alias_strings.add("-help")
         for action in self._actions:
             for option in action.option_strings:
                 for variant in spelling_variants(option):

@@ -81,6 +81,25 @@ class TestAliasContract:
 
 
 class TestAbbreviation:
+    def test_help_is_exact_even_with_a_help_prefixed_flag(self, capsys):
+        parser = FfsArgumentParser(prog="demo")
+        parser.add_argument("-help_dir")
+        parser.add_argument("-required", required=True)
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["-help"])
+        assert exc.value.code == 0
+        assert "-help_dir" in capsys.readouterr().out
+
+    def test_explicit_help_flag_is_preserved(self):
+        parser = FfsArgumentParser(add_help=False)
+        parser.add_argument("-help", action="store_true")
+        assert parser.parse_args(["-help"]).help
+
+    def test_disabled_help_is_not_added(self):
+        parser = FfsArgumentParser(add_help=False)
+        args, unknown = parser.parse_known_args(["-help"])
+        assert unknown == ["-help"]
+
     def _error(self, parser, argv) -> str:
         err = io.StringIO()
         with contextlib.redirect_stderr(err), pytest.raises(SystemExit):

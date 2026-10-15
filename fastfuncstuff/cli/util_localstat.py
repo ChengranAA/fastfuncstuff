@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.stats.localstat import (
     ACF_LABELS,
@@ -75,7 +75,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=50,
         help="Levenberg-Marquardt iterations for the ACF fit (default: 50)",
     )
-    parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
+    add_device_arg(parser)
     add_verbose_arg(parser, default=1)
     return parser.parse_args(argv)
 

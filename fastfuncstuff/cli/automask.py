@@ -19,6 +19,7 @@ import torch
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
+    add_device_arg,
     add_verbose_arg,
     collect_batch_jobs,
     run_batch_jobs,
@@ -65,7 +66,7 @@ def parse_args(
     )
     # Keep -clip_frac as hidden alias for backwards compat
     parser.add_argument("-clip_frac", type=float, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
+    add_device_arg(parser)
     add_batch_args(
         parser,
         tool="ffs_util_automask",

@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, add_device_arg
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
@@ -114,11 +114,7 @@ Output:
     )
     parser.add_argument("-plot", default=None, help="Save heatmap plot to file (PNG/PDF/SVG)")
     parser.add_argument("-plot_dpi", type=int, default=150, help="Plot DPI (default: 150)")
-    parser.add_argument(
-        "-device",
-        default=None,
-        help="PyTorch device: cuda, cpu, mps (auto-detected)",
-    )
+    add_device_arg(parser)
     parser.add_argument(
         "-thresholds",
         default="0.5,0.7,0.8,0.9,0.95",

@@ -46,7 +46,7 @@ import torch
 
 from fastfuncstuff.cli.bbr import _normalize_targets, _ribbon_wm
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_chain
 from fastfuncstuff.processing.bbr import (
     auto_polarity,
@@ -277,9 +277,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-iters", type=int, default=200, help="Adam iteration cap per level (default 200)"
     )
     fit.add_argument("-lr", type=float, default=0.3, help="Adam learning rate (default 0.3)")
-    fit.add_argument(
-        "-device", default=None, help="Compute device: cuda / mps / cpu (default: auto-detect)"
-    )
+    add_device_arg(fit)
     add_verbose_arg(p)
     return p.parse_args(argv)
 

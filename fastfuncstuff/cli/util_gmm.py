@@ -36,6 +36,7 @@ import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
+    add_device_arg,
     add_verbose_arg,
     parse_prefix,
     print_cli_header,
@@ -118,7 +119,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="Skip the P(signal) map",
     )
-    parser.add_argument("-device", default=None, help="cuda | cpu | mps (default: auto)")
+    add_device_arg(parser)
     add_verbose_arg(parser, default=1)
     return parser.parse_args(argv)
 

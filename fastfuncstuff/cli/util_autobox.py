@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, spinner
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.autobox import (
     DEFAULT_CLFRAC,
     DEFAULT_PEELCOUNT,
@@ -30,7 +30,7 @@ from fastfuncstuff.processing.autobox import (
 )
 from fastfuncstuff.processing.grid import afni_orient_code, grid_extent_rai
 from fastfuncstuff.processing.io import load_image, save_image
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -128,7 +128,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_PEELCOUNT,
         help=f"Peel/re-dilate layers when clustering (default: {DEFAULT_PEELCOUNT})",
     )
-    parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
+    add_device_arg(parser)
     add_verbose_arg(parser, default=1)
     parser.add_argument("dataset", nargs="?", help=argparse.SUPPRESS)
 
@@ -160,8 +160,7 @@ def _ijkord_rows(orient: str, bounds: tuple[int, ...]) -> list[tuple[str, int, i
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
     verb = args.verb
 
     t0 = time.time()

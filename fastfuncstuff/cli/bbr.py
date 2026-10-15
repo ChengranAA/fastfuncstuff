@@ -43,7 +43,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_chain, save_matrix_1D
 from fastfuncstuff.processing.bbr import (
     MODE_FREE_PARAMS,
@@ -308,9 +308,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "it barely moves (params stuck at ~lr-sized steps), lower this (e.g. 0.05) and/or "
         "raise -iters so it can settle.",
     )
-    fit.add_argument(
-        "-device", default=None, help="Compute device: cuda / mps / cpu (default: auto-detect)"
-    )
+    add_device_arg(fit)
     add_verbose_arg(p)
     return p.parse_args(argv)
 

@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, spinner
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.io.afni import load_nifti
 from fastfuncstuff.processing.grid import (
     BOUND_TYPES,
@@ -38,7 +38,7 @@ from fastfuncstuff.processing.grid import (
     validate_orient,
 )
 from fastfuncstuff.processing.io import load_image, save_image
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -109,7 +109,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Scale voxel sizes by FAC (> 0)",
     )
 
-    parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
+    add_device_arg(parser)
     add_verbose_arg(parser, default=1)
     parser.add_argument("-debug", type=int, default=None, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
@@ -152,8 +152,7 @@ def _resolve_dxyz(args: argparse.Namespace, src_vox: np.ndarray) -> tuple[np.nda
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
     verb = args.debug if args.debug is not None else args.verb
 
     if args.bound_type.upper() not in BOUND_TYPES:

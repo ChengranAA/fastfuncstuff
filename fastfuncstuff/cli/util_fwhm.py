@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image
 from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
 from fastfuncstuff.utils import REGISTRATION_TF32
@@ -108,7 +108,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="FILE",
         help="Write the fitted ACF params to a text file (a b c FWHM), one row.",
     )
-    parser.add_argument("-device", default=None, help="cuda | cpu | mps (default: auto).")
+    add_device_arg(parser)
     add_verbose_arg(parser, default=1)
     return parser.parse_args(argv)
 

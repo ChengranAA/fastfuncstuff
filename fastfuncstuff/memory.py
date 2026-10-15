@@ -32,8 +32,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import threading
-import time
 from dataclasses import dataclass
 
 import torch
@@ -745,6 +743,22 @@ def bytes_per_voxel_arma_dsort(
     return (n_timepoints * p_ext + 3 * p_ext * p_ext + (3 + n_dsort) * n_timepoints) * 4
 
 
+_MOCO_RESAMPLE_NTAPS = {"wsinc5": 11, "heptic": 8, "quintic": 6, "cubic": 4, "linear": 1}
+
+
+def moco_resample_bytes(nz: int, ny: int, nx: int, batch: int, interp: str = "wsinc5") -> int:
+    """GPU bytes for one Pass-2 resampling batch of ``batch`` volumes.
+
+    The one formula behind both :func:`compute_moco_resample_batch_size` and the
+    VRAM debugger's prediction.  They used to carry separate models, so the
+    debugger reported "under-predicted 2.6x" against a figure the planner never
+    used.
+    """
+    ntaps = _MOCO_RESAMPLE_NTAPS.get(interp, 11)
+    vol_bytes = nz * ny * nx * 4  # float32
+    return (5 * batch + 6 * ntaps) * vol_bytes
+
+
 def compute_moco_resample_batch_size(
     nz: int,
     ny: int,
@@ -785,8 +799,7 @@ def compute_moco_resample_batch_size(
     int
         Batch size (number of volumes per GPU batch), at least 1.
     """
-    _ntaps = {"wsinc5": 11, "heptic": 8, "quintic": 6, "cubic": 4, "linear": 1}
-    ntaps = _ntaps.get(interp, 11)
+    ntaps = _MOCO_RESAMPLE_NTAPS.get(interp, 11)
 
     vol_bytes = nz * ny * nx * 4  # float32
     per_vol_bytes = 5 * vol_bytes
@@ -1703,27 +1716,28 @@ def estimate_keep_on_cpu(
 
 class VRAMDebugger:
     """
-    Context manager that samples peak GPU allocation during chunk processing
+    Context manager that records peak GPU allocation during chunk processing
     and compares it to the memory module's prediction.
 
-    Sampling uses ``torch.cuda.memory_allocated()`` from a background daemon
-    thread.  That call reads PyTorch's internal allocator counter — an atomic
-    read with no CUDA driver interaction and no GPU synchronisation.  Overhead
-    is in the microsecond range per sample; the thread sleeps between samples.
+    The peak is the allocator's own high-water mark
+    (``torch.cuda.reset_peak_memory_stats`` / ``max_memory_allocated``), read once
+    at exit.  A background sampling thread used to do this and was wrong in the
+    one way that matters: on a tight GPU loop it got a single sample in 4.7 s, so
+    the report said "0.00x, very conservative" about a stage whose true peak was
+    gigabytes.  The allocator counter cannot miss a peak, and costs nothing while
+    the loop runs.
 
     Parameters
     ----------
     device : torch.device
         CUDA device to monitor.
     predicted_peak_bytes : int
-        Expected peak allocation for one chunk (``chunk_size × bytes_per_voxel``).
+        Expected peak allocation for one chunk.  Take it from the same function
+        the planner sized the chunk with, or the ratio compares two models.
     operation : str
         Label for the report header (e.g. ``"glm"``, ``"xval"``).
     chunk_size : int
         Chunk size used, for reporting.
-    sample_ms : float, default=25
-        Sampling interval in milliseconds.  25ms catches peaks in operations
-        that take > ~50ms; lower it if chunks are very fast.
 
     Examples
     --------
@@ -1745,7 +1759,6 @@ class VRAMDebugger:
         predicted_peak_bytes: int,
         operation: str = "unknown",
         chunk_size: int = 0,
-        sample_ms: float = 25.0,
     ) -> None:
         if device.type != "cuda":
             raise ValueError("VRAMDebugger only supports CUDA devices")
@@ -1753,41 +1766,21 @@ class VRAMDebugger:
         self.predicted_peak_bytes = predicted_peak_bytes
         self.operation = operation
         self.chunk_size = chunk_size
-        self._sample_interval = sample_ms / 1000.0
         self._baseline: int = 0
         self._peak: int = 0
-        self._n_samples: int = 0
-        self._running: bool = False
-        self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        """Flush pending GPU work, snapshot baseline, start sampling thread."""
+        """Flush pending GPU work, snapshot the baseline, reset the peak counter."""
         torch.cuda.synchronize(self.device)  # flush queued ops so baseline is clean
         self._baseline = torch.cuda.memory_allocated(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
         self._peak = self._baseline
-        self._n_samples = 0
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._sample_loop, daemon=True, name="ffs-vram-debug"
-        )
-        self._thread.start()
 
     def stop(self) -> dict[str, float]:
-        """Stop the sampling thread and print the comparison report."""
-        self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        """Read the allocator's peak and print the comparison report."""
+        torch.cuda.synchronize(self.device)
+        self._peak = max(self._baseline, torch.cuda.max_memory_allocated(self.device))
         return self.report()
-
-    def _sample_loop(self) -> None:
-        # Hot loop: atomic read + compare, then sleep.
-        # torch.cuda.memory_allocated() never touches the CUDA driver.
-        while self._running:
-            current = torch.cuda.memory_allocated(self.device)
-            if current > self._peak:
-                self._peak = current
-            self._n_samples += 1
-            time.sleep(self._sample_interval)
 
     def report(self) -> dict[str, float]:
         """Print comparison and return a stats dict."""
@@ -1813,7 +1806,6 @@ class VRAMDebugger:
         print(f"  Net delta:              {net_peak / _gb:.3f} GB")
         print(f"  Model predicted:        {predicted / _gb:.3f} GB")
         print(f"  Ratio actual/predicted: {ratio:.2f}x  →  {verdict}")
-        print(f"  Samples: {self._n_samples} @ {self._sample_interval * 1000:.0f} ms intervals")
 
         return {
             "baseline_gb": self._baseline / _gb,
@@ -1821,7 +1813,6 @@ class VRAMDebugger:
             "net_peak_gb": net_peak / _gb,
             "predicted_gb": predicted / _gb,
             "ratio": ratio,
-            "n_samples": self._n_samples,
         }
 
     def __enter__(self) -> VRAMDebugger:
@@ -1838,7 +1829,6 @@ def make_vram_debugger(
     operation: str = "unknown",
     chunk_size: int = 0,
     enabled: bool | None = None,
-    sample_ms: float = 25.0,
 ) -> VRAMDebugger | contextlib.AbstractContextManager[None]:
     """
     Return a :class:`VRAMDebugger` when debug mode is active, otherwise a
@@ -1857,9 +1847,6 @@ def make_vram_debugger(
         If ``None``, checks the ``FFS_DEBUG_VRAM`` environment variable
         (any non-empty value other than ``"0"``, ``"false"``, or ``"no"``
         activates it).  Pass ``True`` / ``False`` to override.
-    sample_ms : float, default=25
-        Sampling interval passed to :class:`VRAMDebugger`.
-
     Returns
     -------
     context manager
@@ -1887,5 +1874,5 @@ def make_vram_debugger(
         enabled = raw not in ("", "0", "false", "no")
 
     if enabled and device.type == "cuda":
-        return VRAMDebugger(device, predicted_peak_bytes, operation, chunk_size, sample_ms)
+        return VRAMDebugger(device, predicted_peak_bytes, operation, chunk_size)
     return contextlib.nullcontext()

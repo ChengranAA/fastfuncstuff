@@ -18,7 +18,11 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from fastfuncstuff.memory import compute_moco_resample_batch_size, make_vram_debugger
+from fastfuncstuff.memory import (
+    compute_moco_resample_batch_size,
+    make_vram_debugger,
+    moco_resample_bytes,
+)
 
 # Suppress PyTorch internal deprecation warnings from torch.compile
 warnings.filterwarnings("ignore", message=".*torch._prims_common.check.*", category=FutureWarning)
@@ -1134,7 +1138,7 @@ def resample_timeseries(
 
     _resample_dbg = make_vram_debugger(
         device,
-        nz * ny * nx * 4 * (3 + batch_size),
+        moco_resample_bytes(nz, ny, nx, batch_size, config.final_interp),
         operation="moco_resample",
         chunk_size=batch_size,
         enabled=config.debug_memory,
@@ -1546,6 +1550,26 @@ def moco(
     # Create progress bar
     disable_pbar = config.verb == 0
 
+    # Entered before the batched pass, not before the per-volume loop: in batched
+    # mode that loop is range(0), and a debugger wrapped around it measured an
+    # empty block and reported "0.00x" for the whole registration.
+    if batched_eligible:
+        # Batched estimation sizes its chunks with the resample model
+        # (_run_batched_estimation), so that is the prediction to hold it to.
+        _reg_chunk = max(1, compute_moco_resample_batch_size(nz, ny, nx, nt, device, config.interp))
+        _reg_bytes = moco_resample_bytes(nz, ny, nx, _reg_chunk, config.interp)
+    else:
+        _reg_chunk = 1
+        _reg_bytes = nz * ny * nx * 4 * 10  # base + source + Jacobian intermediates (rough)
+    _reg_dbg = make_vram_debugger(
+        device,
+        _reg_bytes,
+        operation="moco_registration",
+        chunk_size=_reg_chunk,
+        enabled=config.debug_memory,
+    )
+    _reg_dbg.__enter__()
+
     # ── Pass 1 (batched): estimate all volumes at once via fused shears ────
     if batched_eligible:
         _coarse = (
@@ -1582,11 +1606,6 @@ def moco(
         unit="vol",
         ncols=80,
     )
-    _vol_bytes = nz * ny * nx * 4 * 10  # base + source + Jacobian intermediates (rough)
-    _reg_dbg = make_vram_debugger(
-        device, _vol_bytes, operation="moco_registration", chunk_size=1, enabled=config.debug_memory
-    )
-    _reg_dbg.__enter__()
     for t in pbar:
         # Mark step begin for CUDA graphs (prevents output tensor reuse issues)
         if use_cudagraphs:

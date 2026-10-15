@@ -1911,8 +1911,11 @@ def _locomoco_run(tmp_path, stem, *extra):
     return rc
 
 
-def test_component_scan_runs_by_default_and_changes_no_field(capsys, tmp_path):
-    """-events scores the field's INDEPENDENT components without touching it.
+def test_component_scan_runs_with_task_qc_and_changes_no_field(capsys, tmp_path):
+    """-task_qc scores the field's INDEPENDENT components without touching it.
+
+    The scan is opt-in (a3bcac80): -events alone only supplies the design that
+    -detask / -reject / -ref paired need, and must not buy the slow diagnostic.
 
     The field enrichment printed above the scan is the number that says how
     contaminated the field is, but it cannot say which part of the field carries the
@@ -1921,7 +1924,7 @@ def test_component_scan_runs_by_default_and_changes_no_field(capsys, tmp_path):
     leave the correction alone.
     """
     stem = str(tmp_path / "scan")
-    _locomoco_run(tmp_path, stem, "-task_comps", "8")
+    _locomoco_run(tmp_path, stem, "-task_qc", "-task_comps", "8")
     out = capsys.readouterr().out
     assert "WARP TASK SCAN" in out
     assert "DIAGNOSTIC ONLY" in out
@@ -1932,7 +1935,7 @@ def test_component_scan_runs_by_default_and_changes_no_field(capsys, tmp_path):
 
 def test_task_comps_off_skips_the_scan(capsys, tmp_path):
     stem = str(tmp_path / "off")
-    _locomoco_run(tmp_path, stem, "-task_comps", "off")
+    _locomoco_run(tmp_path, stem, "-task_qc", "-task_comps", "off")
     assert "WARP TASK SCAN" not in capsys.readouterr().out
 
 

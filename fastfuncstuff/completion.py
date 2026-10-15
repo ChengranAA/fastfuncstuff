@@ -597,8 +597,8 @@ function __ffs_flag_help --description 'Full -help text of the ffs_* flag at the
     commandline -f repaint
 end
 
-bind \eh __ffs_flag_help
-bind -M insert \eh __ffs_flag_help
+bind \\eh __ffs_flag_help
+bind -M insert \\eh __ffs_flag_help
 """
 
 
@@ -662,16 +662,17 @@ __ffs_flag_help() {{
     # The token under the cursor: the tail of what is left of it, plus the head
     # of what is right of it.
     if [[ -n $left && $left != *[[:space:]] && ${{#words[@]}} -gt 0 ]]; then
-        tok=${{words[-1]}}
-        unset 'words[-1]'
+        local last=$((${{#words[@]}} - 1))
+        tok=${{words[$last]}}
+        unset 'words[last]'
     fi
     tok+=${{right%%[[:space:]]*}}
     echo
     sh "$__FFS_FLAG_HELP_DIR/{HELP_LOOKUP_SCRIPT}" "$__FFS_FLAG_HELP_DIR" "$cmd" "$tok" "${{words[@]:1}}"
 }}
 
-bind -x '"\eh": __ffs_flag_help'
-bind -m vi-insert -x '"\eh": __ffs_flag_help'
+bind -x '"\\eh": __ffs_flag_help'
+bind -m vi-insert -x '"\\eh": __ffs_flag_help'
 """
 
 

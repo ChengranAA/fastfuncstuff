@@ -640,3 +640,31 @@ def test_painted_regions_drive_the_optimiser(tmp_path, session):
     session.do(ModeAction("optimise"))
     assert session.mode.params["basis"] == "custom"
     assert _lab_gap(session.colour_sources[layer.key], a, b) > 2 * before
+
+
+@pytest.mark.gpu
+def test_the_graphed_optimiser_step_is_the_eager_one():
+    """The CUDA graph replays the same arithmetic: agree to float noise over a
+    few steps. (Over a full run the millionths compound in a non-convex
+    landscape, so whole results are not compared.)"""
+    from fastfuncstuff.viewer import contrast
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+    gen = torch.Generator().manual_seed(0)
+    ctx = torch.randn(3000, 3, generator=gen).cuda()
+    za = (torch.randn(800, 3, generator=gen) * 0.5 + 0.3).cuda()
+    zb = (torch.randn(800, 3, generator=gen) * 0.5 - 0.3).cuda()
+    runs = []
+    try:
+        for graphs in (True, False):
+            contrast.USE_CUDA_GRAPHS = graphs
+            runs.append(
+                contrast.optimise_contrast(
+                    za, zb, ctx, torch.eye(3, device="cuda"), Look(space="oklab"), steps=5
+                )
+            )
+    finally:
+        contrast.USE_CUDA_GRAPHS = True
+    np.testing.assert_allclose(runs[0].weights, runs[1].weights, atol=1e-4)
+    np.testing.assert_allclose(runs[0].stretch, runs[1].stretch, atol=1e-4)

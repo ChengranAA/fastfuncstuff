@@ -45,6 +45,10 @@ DIVERSITY = 0.5
 #: voxel's hue at once -- the whole brain red -- because a global tint costs
 #: separation nothing; hue should mark where A and B differ, not everything.
 BALANCE = 2.0
+#: Replay each optimiser step as a captured CUDA graph on a CUDA device. Off
+#: is the eager loop -- the same arithmetic, a launch per op -- for checking
+#: the graph against, and as a way out if a torch upgrade breaks capture.
+USE_CUDA_GRAPHS = True
 #: Temperature of the soft minimum over A-vs-B pairs, in Oklab units: well
 #: below a typical separation (0.1-0.5), so it is close to the true minimum.
 SOFTMIN = 0.03
@@ -80,8 +84,9 @@ def _window(W: Tensor, ctx: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     y = W @ ctx.T
     center = y.median(dim=1).values
     width = y.std(dim=1).clamp(min=1e-6)
-    q = torch.quantile(y[0], torch.tensor([0.02, 0.995], device=ctx.device))
-    return center, width, q[0], q[1]
+    # Levels as Python floats: a tensor built here would be a host-to-device
+    # copy inside the captured CUDA graph, which capture forbids.
+    return center, width, torch.quantile(y[0], 0.02), torch.quantile(y[0], 0.995)
 
 
 def _lab(z, W, window, look, shift, stretch, light) -> tuple[Tensor, Tensor]:
@@ -117,7 +122,12 @@ def _objective(
     seps = torch.stack([torch.linalg.vector_norm(lab_a.mean(0) - b.mean(0)) for b in lab_bs])
     sep = -SOFTMIN * torch.logsumexp(-seps / SOFTMIN, 0) if len(lab_bs) > 1 else seps[0]
     spread = lab_a.std(0).norm() + torch.stack([b.std(0).norm() for b in lab_bs]).mean()
-    corr = torch.corrcoef(u_c)
+    # Written out rather than torch.corrcoef, which syncs with the host and so
+    # cannot be captured in the CUDA graph the GPU path replays.
+    centred = u_c - u_c.mean(1, keepdim=True)
+    cov = centred @ centred.T
+    sd = cov.diagonal().clamp(min=1e-12).sqrt()
+    corr = cov / (sd[:, None] * sd[None, :])
     redundant = (corr - torch.diag(torch.diagonal(corr))).pow(2).sum() / 6.0
     # Past ~1.5 window units tanh has flattened: a voxel there has lost its
     # detail. Smooth, so the gradient sees the knee coming.
@@ -211,38 +221,98 @@ def _optimise(za, zbs, zc, W0, look, light, context, steps, lr, seed) -> Contras
 
     s0, k0 = to_params(look.shift, look.stretch)
     with torch.no_grad():
-        shift, stretch = from_params(s0, k0)
-        _, before, _ = _objective(za, zbs, zc, W0, shift, stretch, look, la, lb, lc, context)
+        shift0, stretch0 = from_params(s0, k0)
+        score0, before, u0 = _objective(
+            za, zbs, zc, W0, shift0, stretch0, look, la, lb, lc, context
+        )
 
-    best: ContrastResult | None = None
-    best_score = -float("inf")
+    # In Oklab the first coordinate is lightness: the anatomy. It stays as it
+    # is and the contrast goes into hue -- brightness for structure, colour
+    # for the discriminant.
+    frozen = look.space == "oklab"
+    graphed = dev.type == "cuda" and USE_CUDA_GRAPHS
+    W = W0.clone().requires_grad_(True)
+    s = s0.clone().requires_grad_(True)
+    k = k0.clone().requires_grad_(True)
+    opt = torch.optim.Adam([W, s, k], lr=lr, capturable=graphed)
+    # Masks rather than ``grad[0] = 0``: that assigns a host scalar, a copy
+    # the CUDA graph cannot capture.
+    keep_row = torch.ones(3, device=dev)
+    if frozen:
+        keep_row[0] = 0.0
+
+    def train_step() -> Tensor:
+        shift, stretch = from_params(s, k)
+        score, _, _ = _objective(za, zbs, zc, W, shift, stretch, look, la, lb, lc, context)
+        (-score).backward()
+        if frozen:
+            assert W.grad is not None and s.grad is not None and k.grad is not None
+            W.grad.mul_(keep_row[:, None])
+            s.grad.mul_(keep_row)
+            k.grad.mul_(keep_row)
+        opt.step()
+        return score.detach()
+
+    def restart(W_init: Tensor) -> None:
+        with torch.no_grad():
+            W.copy_(W_init)
+            s.copy_(s0)
+            k.copy_(k0)
+        for state in opt.state.values():
+            for value in state.values():
+                if isinstance(value, Tensor):
+                    value.zero_()
+
+    step_once = train_step
+    if graphed:
+        # A step is ~560 tiny kernels and 0.8 ms of GPU work; dispatched one by
+        # one from Python it took 27 ms, the card idle. Captured once as a
+        # CUDA graph, a step is one launch. Shapes are fixed for the press,
+        # and nothing in the step syncs with the host. Warm-up runs on a side
+        # stream, as capture requires; the restart below undoes its steps.
+        side = torch.cuda.Stream(device=dev)
+        side.wait_stream(torch.cuda.current_stream(dev))
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                opt.zero_grad(set_to_none=True)
+                train_step()
+        torch.cuda.current_stream(dev).wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        opt.zero_grad(set_to_none=True)
+        with torch.cuda.graph(graph):
+            static_score = train_step()
+
+        def step_once() -> Tensor:  # noqa: F811 -- the graphed step replaces the eager one
+            graph.replay()
+            return static_score
+
+    # Where you are is a candidate too: if no start scores better, the panel is
+    # left as it was rather than handed a worse picture.
+    rows0 = W0 / W0.norm(dim=1, keepdim=True).clamp(min=1e-12)
+    best: ContrastResult | None = ContrastResult(
+        weights=rows0.detach().cpu().numpy(),
+        shift=tuple(float(v) for v in shift0),  # type: ignore[arg-type]
+        stretch=tuple(float(v) for v in stretch0),  # type: ignore[arg-type]
+        separation=float(before.min()),
+        before=float(before.min()),
+        separations=tuple(float(v) for v in before),
+        clipped=float((u0.abs() > 1.5).any(0).float().mean()),
+        start="unchanged",
+    )
+    best_score = float(score0)
     for name, W_init in (("current", W0), ("lda", _lda_start(za, torch.cat(zbs), W0))):
-        W = W_init.clone().requires_grad_(True)
-        s = s0.clone().requires_grad_(True)
-        k = k0.clone().requires_grad_(True)
-        opt = torch.optim.Adam([W, s, k], lr=lr)
-        # In Oklab the first coordinate is lightness: the anatomy. It stays as
-        # it is and the contrast goes into hue -- brightness for structure,
-        # colour for the discriminant.
-        frozen = look.space == "oklab"
+        restart(W_init)
         last = -float("inf")
         for step in range(steps):
-            opt.zero_grad()
-            shift, stretch = from_params(s, k)
-            score, _, _ = _objective(za, zbs, zc, W, shift, stretch, look, la, lb, lc, context)
-            (-score).backward()
-            if frozen:
-                assert W.grad is not None and s.grad is not None and k.grad is not None
-                W.grad[0] = 0.0
-                s.grad[0] = 0.0
-                k.grad[0] = 0.0
-            opt.step()
+            if not graphed:
+                opt.zero_grad()
+            score = step_once()
             # Adam reached its plateau in ~40 steps on every case tried; stop
             # once ten steps have bought less than a thousandth.
             if step % 10 == 9:
-                if float(score.detach()) - last < 1e-3:
+                if float(score) - last < 1e-3:
                     break
-                last = float(score.detach())
+                last = float(score)
         with torch.no_grad():
             shift, stretch = from_params(s, k)
             score, seps, u_c = _objective(za, zbs, zc, W, shift, stretch, look, la, lb, lc, context)

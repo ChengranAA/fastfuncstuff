@@ -1039,25 +1039,33 @@ class RGBMode(Mode):
         flat_x = x.reshape(chans.n, -1)
         a_idx = thin(in_a)
         b_idx = [thin(m) for m in in_bs]
-        za = ((flat_x[:, a_idx].T - mu) / sd).cpu()
-        zbs = [((flat_x[:, i].T - mu) / sd).cpu() for i in b_idx]
-        zc = ((src.context - mu) / sd).cpu()
+        # On the channels' device: on CUDA the optimiser replays each step as
+        # a captured graph (~5x the CPU at these sizes); elsewhere it loops.
+        za = (flat_x[:, a_idx].T - mu) / sd
+        zbs = [(flat_x[:, i].T - mu) / sd for i in b_idx]
+        zc = (src.context - mu) / sd
         # The current map in the optimiser's coordinates: y = W (x - m) / s is
         # W diag(sd / s) z plus a constant, which the window's centre absorbs.
-        W0 = (src.map.W * (sd / src.map.sd)[None, :]).cpu()
+        W0 = src.map.W * (sd / src.map.sd)[None, :]
         look = src.look
         light = None
         if look.lightness == "anatomy":
             flat = src.anatomy.reshape(-1)
             assert src.context_where is not None
             light = (
-                flat[a_idx].cpu(),
-                [flat[i].cpu() for i in b_idx],
-                flat[src.context_where].cpu(),
+                flat[a_idx],
+                [flat[i] for i in b_idx],
+                flat[src.context_where],
             )
         result = optimise_contrast(
             za, zbs, zc, W0, look, light=light, context=float(self.params["context"])
         )
+        if result.start == "unchanged":
+            self._contrast_note = (
+                f"A\u2260B: no setting separates these further (\u0394E {result.before:.3f}) "
+                "without costing the anatomy -- lower context to push harder"
+            )
+            return Aspect.GRAPH
         # Into the panel, where it can be read and tweaked: a custom basis in
         # the space it was optimised in, and the shifts and stretches found.
         self.params["space"] = look.space
@@ -1073,10 +1081,18 @@ class RGBMode(Mode):
                 f"{n} {v:.2f}" for n, v in zip(b_names, result.separations, strict=True)
             )
             pairs = f" [{each}]"
-        self._contrast_note = (
-            f"A\u2260B: closest \u0394E {result.before:.3f} \u2192 {result.separation:.3f}"
-            f"{pairs} (Oklab), context past the knee {result.clipped:.0%}"
-        )
+        if result.separation < result.before + 1e-3:
+            # Said plainly: the balanced optimum can hold less raw separation
+            # than the start, and reporting that as a result would mislead.
+            self._contrast_note = (
+                f"A\u2260B: no setting separates these further (\u0394E {result.before:.3f}) "
+                "without costing the anatomy -- lower context to push harder"
+            )
+        else:
+            self._contrast_note = (
+                f"A\u2260B: closest \u0394E {result.before:.3f} \u2192 {result.separation:.3f}"
+                f"{pairs} (Oklab), context past the knee {result.clipped:.0%}"
+            )
         return dirty | Aspect.GRAPH
 
     def _select(self) -> Aspect:

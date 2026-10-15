@@ -43,6 +43,7 @@ from fastfuncstuff.viewer.modes.base import (
     OptionalFloatControl,
     PathControl,
     PathListControl,
+    TextControl,
 )
 from fastfuncstuff.viewer.ortvec import describe_entry, with_op
 from fastfuncstuff.viewer.ui.widgets import RowSizedList
@@ -333,6 +334,8 @@ class ControlPanel(QtWidgets.QWidget):
             return self._build_path_list(spec, value)
         if isinstance(spec, PathControl):
             return self._build_path(spec, value)
+        if isinstance(spec, TextControl):
+            return self._build_text(spec, value)
         if isinstance(spec, ChoiceControl):
             if spec.style == "radio":
                 return self._build_radio(spec, value)
@@ -351,6 +354,16 @@ class ControlPanel(QtWidgets.QWidget):
         box.toggled.connect(lambda on, n=spec.name: self._queue(n, "1" if on else "0", now=True))
         self._setters[spec.name] = lambda v, b=box: b.setChecked(bool(v))
         return box
+
+    def _build_text(self, spec: TextControl, value: object) -> QtWidgets.QWidget:
+        edit = QtWidgets.QLineEdit(str(value if value is not None else spec.default))
+        edit.setPlaceholderText(spec.placeholder)
+        edit.setMinimumWidth(40)
+        edit.editingFinished.connect(
+            lambda n=spec.name, e=edit: self._queue(n, e.text().strip(), now=True)
+        )
+        self._setters[spec.name] = lambda v, e=edit: e.setText(str(v or ""))
+        return edit
 
     def _build_path(self, spec: PathControl, value: object) -> QtWidgets.QWidget:
         row = QtWidgets.QWidget()

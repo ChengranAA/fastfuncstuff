@@ -335,17 +335,24 @@ def sample_volume(
 ) -> Tensor:
     """Sample a 3-D volume at fractional voxel indices.
 
-    ``volume`` is ``(nx, ny, nz)`` and ``layer_ijk`` is ``(..., 3)`` in that same
-    index order. Samples outside the volume come back as ``fill`` rather than
-    edge-clamped, so a layer with a smaller field of view shows its actual
-    extent instead of smearing its border across the display.
+    ``volume`` is ``(nx, ny, nz)`` -- or ``(C, nx, ny, nz)``, giving ``(C, ...)``
+    -- and ``layer_ijk`` is ``(..., 3)`` in that same index order. Samples
+    outside the volume come back as ``fill`` rather than edge-clamped, so a
+    layer with a smaller field of view shows its actual extent instead of
+    smearing its border across the display.
     """
-    if volume.ndim != 3:
+    if volume.ndim not in (3, 4):
         raise ValueError(f"expected a 3-D volume, got shape {tuple(volume.shape)}")
     if mode == "cubic":
+        if volume.ndim == 4:
+            return torch.stack([_sample_cubic(v, layer_ijk, fill=fill) for v in volume])
         return _sample_cubic(volume, layer_ijk, fill=fill)
-    nx, ny, nz = volume.shape
-    out_shape = layer_ijk.shape[:-1]
+    nx, ny, nz = volume.shape[-3:]
+    # A leading channel axis rides along in grid_sample's C, so a colour
+    # layer's channels, mask and anatomy are one sample rather than five.
+    out_shape = (
+        (volume.shape[0], *layer_ijk.shape[:-1]) if volume.ndim == 4 else layer_ijk.shape[:-1]
+    )
 
     # grid_sample wants normalized [-1, 1] coordinates whose last axis is
     # ordered (w, h, d) -- the reverse of the volume's (nx, ny, nz). Getting
@@ -354,7 +361,7 @@ def sample_volume(
     norm = 2.0 * layer_ijk / (sizes - 1).clamp(min=1) - 1.0
     grid = norm.flip(-1).reshape(1, 1, 1, -1, 3)
 
-    src = volume.unsqueeze(0).unsqueeze(0)
+    src = volume.unsqueeze(0) if volume.ndim == 4 else volume.unsqueeze(0).unsqueeze(0)
     sampled = torch.nn.functional.grid_sample(
         src, grid, mode=mode, padding_mode="zeros", align_corners=True
     ).reshape(out_shape)

@@ -162,6 +162,19 @@ class PathControl(Control):
     directory: bool = False
 
 
+@dataclass(frozen=True)
+class TextControl(Control):
+    """Free text in a small grammar of the caller's -- a channel list, a few numbers.
+
+    Committed on enter or focus-out, never per keystroke, for the same reason
+    a path is: a half-typed value is not a parameter.
+    """
+
+    default: str = ""
+    #: Shown greyed while the field is empty: what leaving it empty means.
+    placeholder: str = ""
+
+
 #: Separates entries in a :class:`PathListControl` value. A parameter has to
 #: survive being written down as one string -- that is what makes it
 #: replayable through ``SET_MODE_PARAM`` -- so the list is encoded rather than

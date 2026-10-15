@@ -72,7 +72,7 @@ IMAGE_FILTER = "Images (*.nii *.nii.gz *.nii.zst *.HEAD);;All (*)"
 #: a repaint and always applies at once.
 GATED = frozenset(
     {"files", "basis", "signal", "fit_on", "floor", "red", "green", "blue", "te", "weights"}
-    | {"stats", "radius", "lightness"}
+    | {"stats", "radius", "lightness", "mask_from"}
 )
 STATS_FIXED = ("core", "brain", "slice", "crosshair")
 LIGHT_FIXED = ("basis", "channel 1")
@@ -260,6 +260,23 @@ class RGBMode(Mode):
                 visible_when=("stats", ("crosshair",)),
                 help="Radius of the crosshair sphere the stats are read from.",
             ),
+            ChoiceControl(
+                name="mask_from",
+                label="mask from",
+                choices=(
+                    "auto",
+                    *(f"ch {c + 1} {nm}" for c, nm in enumerate(names)),
+                    *stats_layers,
+                ),
+                default="auto",
+                span=HALF,
+                newline=True,
+                help="The one mask the colour is drawn in and core/brain stats read. "
+                "auto: channel 1's automask, unless its background is noise (a mask "
+                "over most of the field of view, as UNI gives) -- then the first "
+                "channel that masks cleanly (INV1, INV2). A channel: its automask. "
+                "A layer: its mask (an ROI, or automasked).",
+            ),
             # -- look ----------------------------------------------------
             ChoiceControl(
                 name="space",
@@ -313,7 +330,7 @@ class RGBMode(Mode):
                 label="mask",
                 default=True,
                 span=THIRD,
-                help="Hide voxels outside the first channel's automask.",
+                help="Hide voxels outside the mask (see mask from).",
             ),
             FloatControl(
                 name="chroma",
@@ -510,7 +527,7 @@ class RGBMode(Mode):
             ijk = self._crosshair_voxel()
             if ijk is None:
                 return None
-            brain = chans.brain.cpu().numpy()
+            brain = self._brain().cpu().numpy()
             out = np.zeros(chans.shape, dtype=bool)
             if stats == "slice":
                 k = min(max(ijk[2], 0), chans.shape[2] - 1)
@@ -527,6 +544,27 @@ class RGBMode(Mode):
 
         like = self.session.mask_from_layer(layer.key, layer)
         return resample_mask_nearest(like, layer.affine, chans.shape, chans.affine)
+
+    def _brain(self) -> torch.Tensor:
+        """The mask chosen in ``mask from``, on the channels' grid and device."""
+        chans = self._chans
+        assert chans is not None
+        choice = str(self._p["mask_from"])
+        if choice == "auto":
+            return chans.brain
+        if choice.startswith("ch "):
+            c = int(choice.split(" ")[1]) - 1
+            if not 0 <= c < chans.n:
+                raise ValueError(f"mask from channel {c + 1}: there are {chans.n}")
+            return chans.automask_of(c)
+        layer = self._layer_of(choice)
+        if layer is None or self.session is None:
+            raise ValueError(f"no layer {choice.split(' ', 1)[0]} to mask from")
+        from fastfuncstuff.viewer.session import resample_mask_nearest
+
+        native = self.session.mask_from_layer(layer.key, layer)
+        keep = resample_mask_nearest(native, layer.affine, chans.shape, chans.affine)
+        return torch.as_tensor(keep, device=chans.device)
 
     def _light_ref(self) -> torch.Tensor | None:
         """A loaded layer resampled onto the channels' grid, for lightness."""
@@ -636,6 +674,7 @@ class RGBMode(Mode):
             str(p["stats"]),
             float(p["radius"]),
             str(p["lightness"]),
+            str(p["mask_from"]),
             self._crosshair_voxel() if moving_stats else None,
         )
         try:
@@ -649,6 +688,7 @@ class RGBMode(Mode):
                     stats_mask=self._stats_mask(),
                     fit_on=str(p["fit_on"]),
                     light_ref=self._light_ref(),
+                    brain=self._brain(),
                     masked=bool(p["masked"]),
                     window=int(p["window"]),
                 )

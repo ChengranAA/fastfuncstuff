@@ -50,6 +50,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff.utils import quantiles
+
 BASES = ("pick", "dstretch", "pca", "te", "custom")
 SPACES = ("auto", "rgb", "oklab")
 SIGNALS = ("raw", "log", "psc")
@@ -381,7 +383,7 @@ def fit_map(
     center = y.median(dim=0).values
     width = y.std(0)
     width = torch.where(width > 0, width, torch.ones_like(width))
-    l_lo, l_hi = torch.quantile(y[:, 0], torch.tensor([0.02, 0.995], device=x.device)).tolist()
+    l_lo, l_hi = quantiles(y[:, 0], (0.02, 0.995))
 
     return ChromaMap(
         W=W_t,

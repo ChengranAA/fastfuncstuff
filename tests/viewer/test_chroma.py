@@ -433,3 +433,34 @@ def test_script_replays(tmp_path, session):
         np.testing.assert_array_equal(a, b)
     finally:
         replay.close()
+
+
+def test_auto_mask_skips_a_channel_whose_background_is_noise(tmp_path, session):
+    """MP2RAGE: UNI's background is salt-and-pepper, INV1/INV2's is dark."""
+    echoes, _ = _head()
+    rng = np.random.default_rng(5)
+    xx, yy, zz = _grids()
+    c = np.array(SHAPE) / 2
+    head = (((xx - c[0]) / 9) ** 2 + ((yy - c[1]) / 9) ** 2 + ((zz - c[2]) / 6) ** 2) < 1
+    uni = np.where(head, 2000.0, rng.uniform(0, 4000, SHAPE)).astype(np.float32)
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    paths = []
+    for name, data in (("uni", uni), ("inv1", echoes[0][..., 0]), ("inv2", echoes[1][..., 0])):
+        nib.save(nib.Nifti1Image(data, aff), str(tmp_path / f"{name}.nii.gz"))
+        paths.append(tmp_path / f"{name}.nii.gz")
+    layer = _enter(session, paths, basis="pick", signal="raw")
+    source = session.colour_sources[layer.key]
+    assert float(source.chans.automask_of(0).float().mean()) > 0.6
+    assert abs(float(source.brain.float().mean()) - float(head.mean())) < 0.1
+    # Asked for by name, the noisy one is what you get.
+    session.do(SetModeParam("mask_from", "ch 1 uni"))
+    assert float(session.colour_sources[layer.key].brain.float().mean()) > 0.6
+
+
+def test_quantiles_have_no_size_ceiling():
+    """torch.quantile refuses > 2**24 elements; a whole-head MP2RAGE is more."""
+    from fastfuncstuff.utils import quantiles
+
+    x = torch.arange(17_000_000, dtype=torch.float32)
+    lo, mid = quantiles(x, (0.0, 0.5))
+    assert lo == 0.0 and abs(mid - 8_500_000) < 2

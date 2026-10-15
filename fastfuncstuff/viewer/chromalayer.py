@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff.utils import quantiles
 from fastfuncstuff.viewer.chroma import (
     ChromaMap,
     ChromaSpec,
@@ -48,6 +49,9 @@ PSC_FRAMES = 16
 MAX_SAMPLES = 400_000
 #: The brain mask is eroded this many voxels for ``stats=core``.
 CORE_EROSION = 2
+#: An automask covering more of the field of view than this has swept in the
+#: background: the channel's background is noise, not dark -- MP2RAGE's UNI.
+NOISY_MASK_FRACTION = 0.6
 
 
 def _strip_selector(entry: str) -> str:
@@ -158,6 +162,7 @@ class ChannelSet:
     #: One-volume channels from another grid, resampled onto this one once at
     #: load: a T1 or a UNI beside EPI-space maps. By channel index.
     fixed: dict[int, Tensor] = field(default_factory=dict, repr=False)
+    _automasks: dict[int, Tensor] = field(default_factory=dict, repr=False)
 
     @property
     def n(self) -> int:
@@ -249,6 +254,34 @@ class ChannelSet:
             out.append(float(np.nan_to_num(v).mean()))
         return torch.tensor(out, dtype=torch.float32, device=self.device)
 
+    def automask_of(self, c: int) -> Tensor:
+        """Channel ``c``'s automask (bool, on the device), computed once."""
+        hit = self._automasks.get(c)
+        if hit is None:
+            from fastfuncstuff.processing.mask import automask
+
+            ref = self.means[c]
+            hit = automask(ref, dilate_extra=1).to(device=ref.device, dtype=torch.bool)
+            if not bool(hit.any()):
+                hit = ref > 0
+            self._automasks[c] = hit
+        return hit
+
+    def auto_mask(self) -> tuple[Tensor, int]:
+        """One mask for every channel, and which channel it came from.
+
+        The first channel's automask, unless its background is noise -- an
+        automask over most of the field of view, as MP2RAGE's UNI gives --
+        then the first channel whose mask is compact. One mask, not one per
+        channel: per-channel masks disagree at the edge, and the disagreement
+        is a coloured fringe.
+        """
+        for c in range(self.n):
+            m = self.automask_of(c)
+            if float(m.float().mean()) <= NOISY_MASK_FRACTION:
+                return m, c
+        return self.automask_of(0), 0
+
     def mean_of(self, c: int) -> Tensor:
         if self.frames[c] <= 1 or c in self.fixed:
             return self._volume(c, 0)
@@ -272,7 +305,6 @@ def load_channels(
     while files inflate, so it belongs on a worker.
     """
     from fastfuncstuff.io.dsetinfo import read_info
-    from fastfuncstuff.processing.mask import automask
 
     if len(entries) < 2:
         raise ValueError("tick at least two channels")
@@ -328,14 +360,10 @@ def load_channels(
             device,
         )
     chans.means = torch.stack([chans.mean_of(c) for c in range(chans.n)])
-    # One mask from the first channel for every channel: per-channel masks
-    # disagree at the edge, and the disagreement is a coloured fringe.
-    brain = automask(chans.means[0], dilate_extra=1).to(device=device, dtype=torch.bool)
-    if not bool(brain.any()):
-        brain = chans.means[0] > 0
+    brain, _ = chans.auto_mask()
     chans.brain = brain
     if bool(brain.any()):
-        chans.eps = max(float(torch.quantile(chans.means[0][brain].float(), 0.98)) * 1e-3, 1e-6)
+        chans.eps = max(quantiles(chans.means[0][brain], (0.98,))[0] * 1e-3, 1e-6)
     return chans
 
 
@@ -349,6 +377,8 @@ class ColourSource:
     map: ChromaMap
     #: (X, Y, Z) first-channel mean as a [0, 1] lightness, for ``lightness=anatomy``.
     anatomy: Tensor
+    #: (X, Y, Z) bool: where the colour is drawn and SELECT may reach.
+    brain: Tensor
     te_ms: tuple[float, ...] | None
     te_source: str
     masked: bool = True
@@ -379,7 +409,7 @@ class ColourSource:
         chans = transform(
             self.chans.raw(t, self.window), self.spec.signal, eps=self.chans.eps, mean=mean
         )
-        mask = self.chans.brain if self.masked else torch.ones_like(self.chans.brain)
+        mask = self.brain if self.masked else torch.ones_like(self.brain)
         out = torch.cat([chans, mask.to(chans.dtype)[None], self.anatomy[None]])
         self._frames.clear()
         self._frames[t] = out
@@ -482,7 +512,7 @@ class ColourSource:
         i, j, k = ijk
         here = u[:, i, j, k].reshape(3, 1, 1, 1)
         dist = torch.linalg.vector_norm(u - here, dim=0)
-        keep = (dist <= tolerance) & self.chans.brain
+        keep = (dist <= tolerance) & self.brain
         return keep.cpu().numpy()
 
     def coordinate_names(self) -> tuple[str, str, str]:
@@ -513,12 +543,11 @@ def lightness_from(ref: Tensor, region: Tensor) -> Tensor:
     Split so a mask or a label image used as lightness -- every value in the
     region the same -- still has a window, rather than a zero-width one.
     """
-    flat = ref.float().reshape(-1)[:16_000_000]
-    vals = ref[region].float()[:16_000_000]
-    lo = float(torch.quantile(flat, 0.02))
-    hi = float(torch.quantile(vals, 0.995)) if vals.numel() else float(flat.max())
+    vals = ref[region]
+    (lo,) = quantiles(ref, (0.02,))
+    hi = quantiles(vals, (0.995,))[0] if vals.numel() else float(ref.max())
     if hi <= lo:
-        hi = float(flat.max())
+        hi = float(ref.max())
     return ((ref - lo) / max(hi - lo, 1e-12)).clamp(0.0, 1.0).float()
 
 
@@ -531,6 +560,7 @@ def fit_source(
     stats_mask: np.ndarray | None = None,
     fit_on: str = "auto",
     light_ref: Tensor | None = None,
+    brain: Tensor | None = None,
     masked: bool = True,
     window: int = 1,
 ) -> ColourSource:
@@ -541,18 +571,21 @@ def fit_source(
     across voxels and time (change colour). ``auto`` is frames for percent
     change, whose mean is zero by construction, and the mean otherwise.
     ``light_ref`` is the volume lightness comes from when the look asks for
-    anatomy; the first channel's mean when ``None``.
+    anatomy; the first channel's mean when ``None``. ``brain`` is the mask the
+    colour is drawn in and core/brain stats read; the channels' auto mask
+    when ``None``.
     """
     device = chans.means.device
+    brain = chans.brain if brain is None else brain.to(device=device, dtype=torch.bool)
     if stats_mask is not None:
         region = torch.as_tensor(stats_mask, device=device, dtype=torch.bool)
         if int(region.sum()) < 8:
             raise ValueError("the stats region covers fewer than 8 voxels")
     elif stats == "core":
-        region = _erode(chans.brain, CORE_EROSION)
-        region = region if int(region.sum()) >= 64 else chans.brain
+        region = _erode(brain, CORE_EROSION)
+        region = region if int(region.sum()) >= 64 else brain
     else:
-        region = chans.brain
+        region = brain
 
     dynamic = fit_on == "frames" or (fit_on == "auto" and spec.signal == "psc")
     if spec.signal == "psc" and not dynamic:
@@ -587,6 +620,7 @@ def fit_source(
         look=look,
         map=cmap,
         anatomy=lightness_from(ref, region if light_ref is None else ref != 0),
+        brain=brain,
         te_ms=None if te_ms is None else tuple(te_ms),
         te_source=te_source,
         masked=masked,

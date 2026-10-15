@@ -531,6 +531,9 @@ def evaluate_combinations_cross_run(
     candidate can only win by producing better betas. Averaging over every
     *h* also puts N-1 runs of evidence behind each decision instead of one.
 
+    Moment downdates use float64. On Metal this scoring stage runs on CPU with
+    an explicit warning; the surrounding denoising pipeline keeps its device.
+
     Parameters
     ----------
     data_criteria : torch.Tensor
@@ -554,6 +557,21 @@ def evaluate_combinations_cross_run(
     from fastfuncstuff.glm.moments import run_bounds
     from fastfuncstuff.glm.xval import compute_qr_projectors
     from fastfuncstuff.memory import estimate_chunk_size
+    from fastfuncstuff.utils import linalg_device, warn_mps_cpu_fallback
+
+    # Candidate downdates and residual-energy differences need float64 moments.
+    work = linalg_device(device)
+    if work != device:
+        warn_mps_cpu_fallback("cross-run PC scoring")
+        data_criteria = data_criteria.to(device=work)
+        nuisance_per_run = [n.to(device=work) for n in nuisance_per_run]
+        pcs = pcs.to(device=work)
+        design = design.to(device=work) if design is not None else None
+        if designs_by_hrf is not None:
+            designs_by_hrf = {h: d.to(device=work) for h, d in designs_by_hrf.items()}
+        if criteria_hrf_indices is not None:
+            criteria_hrf_indices = criteria_hrf_indices.to(device=work)
+        device = work
 
     n_runs = len(run_starts)
     other_runs = [h for h in range(n_runs) if h != target_run]

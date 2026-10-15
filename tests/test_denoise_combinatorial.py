@@ -1245,6 +1245,36 @@ class TestCrossRunBatchedParity:
         assert calls, "the scorer must size its chunks through memory.py, not a constant"
         assert np.abs(whole - chunked).max() < 1e-10
 
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+    @pytest.mark.parametrize("resident", [False, True])
+    @pytest.mark.parametrize("per_hrf", [False, True])
+    def test_mps_float64_scoring_matches_cpu(self, monkeypatch, resident, per_hrf):
+        from fastfuncstuff import utils
+        from fastfuncstuff.denoise.combinatorial import evaluate_combinations_cross_run
+
+        case = self._case(n_criteria=24, run_len=20, seed=5)
+        combos = [(), (0,), (1, 2)]
+        if per_hrf:
+            case["designs_by_hrf"] = {0: case["design"], 1: case["design"].roll(1, dims=0)}
+            case["criteria_hrf_indices"] = torch.arange(24) % 2
+            case["design"] = None
+        expected = evaluate_combinations_cross_run(combinations=combos, **case)[0]
+        if resident:
+            for key in ("data_criteria", "pcs", "design"):
+                if case[key] is not None:
+                    case[key] = case[key].to("mps")
+            case["nuisance_per_run"] = [n.to("mps") for n in case["nuisance_per_run"]]
+            if per_hrf:
+                case["designs_by_hrf"] = {h: d.to("mps") for h, d in case["designs_by_hrf"].items()}
+                case["criteria_hrf_indices"] = case["criteria_hrf_indices"].to("mps")
+        case["device"] = torch.device("mps")
+        warnings = []
+        monkeypatch.setattr(utils, "warn_mps_cpu_fallback", warnings.append)
+        got = evaluate_combinations_cross_run(combinations=combos, **case)[0]
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-8)
+        assert warnings == ["cross-run PC scoring"]
+
 
 class TestCriterionDefault:
     """cross_run is the default in both layers.

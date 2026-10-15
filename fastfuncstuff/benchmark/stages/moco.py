@@ -184,8 +184,8 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     for task, run, out in pairs:
         mean_src = ctx.processing_dir / f"mean_{Path(out).name}"
         mean_dst = Path(_ffs_mean_path(ctx, task, run))
-        if mean_src.exists() and not mean_dst.exists():
-            mean_src.rename(mean_dst)
+        if mean_src.exists():
+            mean_src.replace(mean_dst)
     return elapsed
 
 

@@ -105,18 +105,21 @@ def test_moco_all_present_runs_nothing(ctx, commands):
     assert ctx._timing_meta["ffs"] == {"ran": 0, "total": 3}
 
 
-def test_moco_renames_means_after_the_batch(ctx, commands):
+@pytest.mark.parametrize("existing", [False, True])
+def test_moco_renames_means_after_the_batch(ctx, commands, existing):
     """The mean lands beside -prefix as mean_<name>; the validator wants ours."""
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
             out = Path(moco._ffs_moco_path(ctx, task, run))
-            (ctx.processing_dir / f"mean_{out.name}").touch()
+            (ctx.processing_dir / f"mean_{out.name}").write_bytes(b"fresh mean")
+            if existing:
+                Path(moco._ffs_mean_path(ctx, task, run)).write_bytes(b"stale mean")
 
     moco.run_ffs(ctx)
 
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
-            assert Path(moco._ffs_mean_path(ctx, task, run)).exists()
+            assert Path(moco._ffs_mean_path(ctx, task, run)).read_bytes() == b"fresh mean"
 
 
 def test_warp_manifest_keeps_the_quoted_nwarp_chain(ctx, commands, monkeypatch):

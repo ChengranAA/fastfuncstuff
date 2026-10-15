@@ -1313,3 +1313,41 @@ def test_task_qc_without_events_is_refused(tmp_path):
         ]
     )  # fmt: skip
     assert rc == 2
+
+
+def test_cli_jacobian_reaches_the_3d_two_axis_output(tmp_path):
+    """-jacobian was applied inside the 2-D slicewise estimator only: a 3-D / two-axis
+    run printed jacobian=on and wrote an unmodulated series, and every re-derivation
+    from raw (-detask, -warp_recon, qwarp) dropped it too. It is now an output step on
+    the final field, so the modulated series must be the plain one times J."""
+    import nibabel as nib
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.processing.locomoco import apply_pe_jacobian
+
+    data, _ = _synth_series(
+        shape=(16, 18, 14), nt=4, d1=[0.0, 0.4, -0.3, 0.2], d2=[0.0, -0.2, 0.3, 0.1]
+    )
+    inp = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(data.astype(np.float32), np.eye(4)), str(inp))
+
+    def run(stem, *extra):
+        argv = [
+            "-input", str(inp), "-prefix", str(tmp_path / stem), "-pe_dir", "x",
+            "-pe_dir2", "y", "-device", "cpu", "-no_movie", "-no_warp", "-allow_neg",
+            *extra,
+        ]  # fmt: skip
+        assert _run(argv) == 0
+        return nib.load(tmp_path / f"{stem}_locomoco.nii.gz").get_fdata(dtype=np.float32)
+
+    plain = run("plain")
+    jac = run("jac", "-jacobian")
+    f1 = torch.from_numpy(nib.load(tmp_path / "plain_flow_pe1.nii.gz").get_fdata(dtype=np.float32))
+    f2 = torch.from_numpy(nib.load(tmp_path / "plain_flow_pe2.nii.gz").get_fdata(dtype=np.float32))
+    from types import SimpleNamespace
+
+    res = SimpleNamespace(pe_displacements=lambda: [("pe1", 0, f1), ("pe2", 1, f2)])
+    expect = apply_pe_jacobian(res, torch.from_numpy(plain.copy())).numpy()
+    assert not np.allclose(plain, jac), "-jacobian never reached the 3-D output"
+    assert np.allclose(jac, expect, rtol=1e-4, atol=1e-4)

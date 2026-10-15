@@ -5261,7 +5261,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             converge=args.converge,
             converge_rel=args.converge_rel,
             first_n=args.first_n,
-            jacobian=args.jacobian,
             is_3dacq=args.is_3dacq,
             pe_axis2=pe_axis2 if dual3d else None,
             automask=automask,
@@ -5476,6 +5475,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         or args.want_pcs is not None
     )
     corrected_series = result.corrected_series() if want_corrected else None
+    if corrected_series is not None and args.jacobian and not rotaware:
+        from fastfuncstuff.processing.locomoco import apply_pe_jacobian
+
+        # From the FINAL field, after every re-derivation from raw (-detask, -warp_recon,
+        # qwarp) -- each of which would otherwise drop it. In place: this is the one
+        # materialisation every output below shares.
+        apply_pe_jacobian(result, corrected_series)
 
     # PCs BEFORE the task-fit report: each is scored against the data it will be
     # regressed on, and the report then fits the task with them in the model, so one

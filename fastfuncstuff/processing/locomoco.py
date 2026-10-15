@@ -1633,27 +1633,39 @@ def _build_soft_mask(
     return _canon(_gaussian_blur3d(m, sigma)).cpu()
 
 
-def _jacobian_det(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Jacobian determinant of the pull map ``(row,col) → (row+v, col+u)``.
+def apply_pe_jacobian(result, series: torch.Tensor) -> torch.Tensor:
+    """Multiply ``series`` ``(nx, ny, nz, T)`` IN PLACE by the PE Jacobian of ``result``.
 
-    ``u`` (along W/col), ``v`` (along H/row) are canonical ``(T, nS, H, W)`` fields.
-    ``J = (1 + ∂v/∂H)(1 + ∂u/∂W) − (∂v/∂W)(∂u/∂H)`` by central differences. Multiplying
-    the corrected series by J conserves PE signal: stretched regions (J>1) brighten,
-    compressed regions (J<1) dim. Clamped positive to keep folds from exploding.
+    ``J = det(I + ∇d)`` over the encode axes the field displaces along -- ``1 + ∂d/∂a``
+    for one axis, the 2x2 determinant for two -- by central differences, clamped
+    positive so a fold cannot flip the sign. Stretched regions (J > 1) brighten,
+    compressed ones dim, conserving PE signal.
+
+    Taken from the FINAL field and applied to the final series, in NIfTI space, so
+    every path gets the same factor: 2-D or 3-D, one axis or two, flow or qwarp,
+    and after -detask / -warp_recon re-derive the series from the raw input. Applied
+    inside the estimator it was lost on every one of those re-derivations.
     """
+    comps = result.pe_displacements()
+    axes = [ax for _, ax, _ in comps]
+    fields = [f for _, _, f in comps]
 
-    def d_w(x: torch.Tensor) -> torch.Tensor:  # ∂/∂W (columns, last axis)
+    def grad(x: torch.Tensor, ax: int) -> torch.Tensor:
         d = torch.zeros_like(x)
-        d[..., 1:-1] = 0.5 * (x[..., 2:] - x[..., :-2])
+        n = x.shape[ax]
+        if n > 2:
+            d.narrow(ax, 1, n - 2).copy_(0.5 * (x.narrow(ax, 2, n - 2) - x.narrow(ax, 0, n - 2)))
         return d
 
-    def d_h(x: torch.Tensor) -> torch.Tensor:  # ∂/∂H (rows, second-to-last axis)
-        d = torch.zeros_like(x)
-        d[..., 1:-1, :] = 0.5 * (x[..., 2:, :] - x[..., :-2, :])
-        return d
-
-    j = (1.0 + d_h(v)) * (1.0 + d_w(u)) - d_w(v) * d_h(u)
-    return j.clamp_min(0.1)
+    for t in range(series.shape[3]):
+        f = [fk[..., t].float() for fk in fields]
+        if len(axes) == 1:
+            j = 1.0 + grad(f[0], axes[0])
+        else:
+            (fa, fb), (a, b) = f, axes
+            j = (1.0 + grad(fa, a)) * (1.0 + grad(fb, b)) - grad(fa, b) * grad(fb, a)
+        series[..., t] *= j.clamp_min(0.1)
+    return series
 
 
 def _correct_pe(
@@ -1940,7 +1952,6 @@ def estimate_residual_flow(
     converge: float = 0.0,
     converge_rel: float = 0.0,
     first_n: int | None = None,
-    jacobian: bool = False,
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
@@ -2016,8 +2027,8 @@ def estimate_residual_flow(
     estimation and correction. Lanczos preserves the high-frequency structure that
     bilinear interpolation removes from later refine templates. ``refine_rounds`` re-registers against the
     corrected-data mean that many extra times, converging the reference template out
-    of its bias. ``jacobian`` scales the corrected series by the PE Jacobian so signal
-    is conserved (stretched regions dim, compressed regions brighten).
+    of its bias. (Signal-conserving Jacobian modulation is an output step,
+    :func:`apply_pe_jacobian`, not part of the estimate.)
 
     ``hpf_sigma`` (voxels, experimental) spatially high-passes ONLY the frames fed to
     the estimator (``img − blur(img, hpf_sigma)``), keeping smooth non-motion
@@ -2325,12 +2336,6 @@ def estimate_residual_flow(
             note=lambda: conv_note["txt"],
         )
         u_all, v_all = pair
-
-    if jacobian:
-        # Conserve signal along PE: where the unwarp stretches a region (Jacobian > 1)
-        # scale intensity up, where it compresses (< 1) scale down. J = det(I + ∇disp)
-        # over the in-plane (H, W) axes; single-PE reduces to 1 + ∂PE-disp/∂PE.
-        corrected = corrected * _jacobian_det(u_all, v_all)
 
     result = LocomocoResult(
         u_canon=u_all,

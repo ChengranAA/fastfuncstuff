@@ -455,16 +455,28 @@ def test_dual_pe_recovers_both_axes(backend):
     assert np.abs(est_u + sy).max() < 0.4 and np.abs(est_v + sx).max() < 0.4
 
 
-def test_jacobian_det_linear_ramp():
-    from fastfuncstuff.processing.locomoco import _jacobian_det
+def test_apply_pe_jacobian_matches_a_linear_ramp_on_one_and_two_axes():
+    """J = 1 + a for a single-axis ramp; the 2x2 determinant for two (shear terms too)."""
+    from types import SimpleNamespace
 
-    # u = a*x along W → J = 1 + a everywhere (interior); v=0.
-    nx = ny = 24
-    xs = torch.arange(ny, dtype=torch.float32)
-    for a in (0.2, -0.3):
-        u = (a * xs)[None, None, None, :].expand(1, 1, nx, ny).contiguous()
-        j = _jacobian_det(u, torch.zeros_like(u))
-        assert abs(float(j[..., 2:-2].median()) - (1.0 + a)) < 1e-3
+    from fastfuncstuff.processing.locomoco import apply_pe_jacobian
+
+    n, nt = 24, 2
+    x = torch.arange(n, dtype=torch.float32)
+    ramp_y = (0.2 * x)[None, :, None, None].expand(n, n, 4, nt).contiguous()  # d/dy = 0.2
+    ramp_x = (-0.3 * x)[:, None, None, None].expand(n, n, 4, nt).contiguous()  # d/dx = -0.3
+    core = (slice(2, -2), slice(2, -2))
+
+    one = SimpleNamespace(pe_displacements=lambda: [("pe", 1, ramp_y)])
+    j1 = apply_pe_jacobian(one, torch.ones(n, n, 4, nt))
+    assert torch.allclose(j1[core], torch.tensor(1.2))
+
+    # Diagonal terms -0.3 (x) and 0.2 (y); cross terms d_x/dy = 0.1, d_y/dx = 0.05.
+    d_x = ramp_x + (0.1 * x)[None, :, None, None]
+    d_y = ramp_y + (0.05 * x)[:, None, None, None]
+    two = SimpleNamespace(pe_displacements=lambda: [("pe1", 0, d_x), ("pe2", 1, d_y)])
+    j2 = apply_pe_jacobian(two, torch.ones(n, n, 4, nt))
+    assert torch.allclose(j2[core], torch.tensor((1 - 0.3) * (1 + 0.2) - 0.1 * 0.05))
 
 
 def test_local_field_recovers_spatial_variation():

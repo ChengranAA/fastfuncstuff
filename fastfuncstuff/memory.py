@@ -606,6 +606,16 @@ def bytes_per_voxel_ica_varnorm(
     return n_timepoints * 4 * 2
 
 
+def bytes_per_voxel_paired_corr(n_timepoints: int, n_datasets: int) -> int:
+    """Working memory per voxel for ``stats.paired_correlation``.
+
+    Every dataset's unit-normalised (T,) row stays live until the pairs are formed;
+    the one being prepared adds its raw copy, the detrend product and the division
+    temporary.
+    """
+    return (n_datasets + 3) * n_timepoints * 4
+
+
 def bytes_per_voxel_phasereg(n_timepoints: int, explore: bool = False) -> int:
     """Working memory per voxel for one chunk of ``phasereg.core.phase_regress``.
 
@@ -1571,6 +1581,10 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_voxel_prf(n_timepoints, n_regressors)
     elif operation == "arma":
         bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
+    elif operation == "paired_corr":
+        # n_trials carries the dataset count (the lss precedent for an
+        # operation-specific multiplicity).
+        bytes_per_voxel = bytes_per_voxel_paired_corr(n_timepoints, max(2, n_trials))
     elif operation == "phasereg":
         # n_trials > 1 flags the data-driven SGF search (phase_filter="explore").
         bytes_per_voxel = bytes_per_voxel_phasereg(n_timepoints, explore=n_trials > 1)

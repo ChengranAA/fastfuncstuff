@@ -853,3 +853,57 @@ def test_warp_after_affine_is_sampled_on_its_own_grid_not_the_masters(tmp_path):
     assert np.abs(ref - affine_only)[inner].max() > 20
     # Linear-twice vs linear-once: small, not the size of the dropped warp.
     assert np.abs(got - ref)[inner].max() < 5
+
+
+def test_static_warp_after_per_volume_affine_keeps_its_own_grid(tmp_path):
+    """afni_proc order: '... volreg.aff12.1D(per-volume) blip_WARP' onto a smaller master.
+
+    A static run AFTER a time-dependent transform used to be pre-collapsed onto the
+    master grid, then read per frame at the moved positions with clamping at the
+    master's border -- the same bounding-box loss as an affine-then-warp chain. Each
+    frame must match the one-volume chain run with that frame's matrix.
+    """
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.processing.affine import save_matrix_1D, voxel_matrix_to_dicom
+    from fastfuncstuff.processing.io import load_image, save_warp_field
+    from fastfuncstuff.processing.nwarpforge import nwarpforge
+
+    cpu = torch.device("cpu")
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    aff[:3, 3] = -40.0
+    n = 40
+    zz, yy, xx = torch.meshgrid(*(torch.arange(n, dtype=torch.float32),) * 3, indexing="ij")
+    vol = 100 + 50 * torch.sin(xx / 3.0) + 20 * torch.cos(yy / 5.0)
+    sp = tmp_path / "src.nii.gz"
+    nib.save(nib.Nifti1Image(torch.stack([vol, vol]).permute(3, 2, 1, 0).numpy(), aff), sp)
+    _, sinfo = load_image(sp, device=cpu)
+    mp = tmp_path / "master.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((n, n // 2, n), np.float32), aff), mp)
+
+    blob = torch.exp(-(((xx - 20) / 5) ** 2 + ((yy - 28) / 4) ** 2 + ((zz - 20) / 5) ** 2))
+    wp = tmp_path / "blip_WARP.nii.gz"
+    save_warp_field(3.0 * blob, torch.zeros_like(blob), torch.zeros_like(blob), wp,
+                    header_info=sinfo, units="mm")  # fmt: skip
+
+    rows = []
+    for t, shift in enumerate((12.0, 11.0)):
+        m = torch.eye(4)
+        m[1, 3] = shift
+        one = tmp_path / f"m{t}.aff12.1D"
+        save_matrix_1D(voxel_matrix_to_dicom(m, aff, aff), one)
+        rows.append(np.loadtxt(one).reshape(-1))
+    motion = tmp_path / "motion.aff12.1D"
+    np.savetxt(motion, np.stack(rows))
+
+    out = tmp_path / "series.nii.gz"
+    nwarpforge(str(sp), [str(motion), str(wp)], str(out), master_path=str(mp),
+               interp="linear", device=cpu, verb=0, auto_pad=False)  # fmt: skip
+    got = np.asarray(nib.load(out).dataobj)
+    inner = (slice(3, -3), slice(3, -3), slice(3, -3))
+    for t in range(2):
+        ref_p = tmp_path / f"ref{t}.nii.gz"
+        nwarpforge(f"{sp}[{t}]", [str(tmp_path / f"m{t}.aff12.1D"), str(wp)], str(ref_p),
+                   master_path=str(mp), interp="linear", device=cpu, verb=0,
+                   auto_pad=False)  # fmt: skip
+        ref = np.asarray(nib.load(ref_p).dataobj).squeeze()
+        np.testing.assert_allclose(got[..., t][inner], ref[inner], atol=1e-2)

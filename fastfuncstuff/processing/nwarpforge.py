@@ -1207,6 +1207,16 @@ def reduce_chain(
     def flush() -> None:
         if not run:
             return
+        if reduced:
+            # Only the LEADING run is read at the output grid points. A run after a
+            # time-dependent transform is read at positions that transform reached
+            # (afni_proc's 'volreg.aff12.1D blip_WARP': raw-EPI space), which can
+            # lie outside the output box; collapsed onto that box it would be
+            # clamped at its border. Kept raw, compose_chain reads each warp on its
+            # own grid -- one field sample per frame, the same cost as before.
+            reduced.extend(run)
+            run.clear()
+            return
         reduced.append(
             compose_chain(
                 run,

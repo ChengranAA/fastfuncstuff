@@ -76,3 +76,28 @@ def test_cuda_conditioning_preserves_full_fp32_under_tf32():
     got = _residualize_reml_search_data(design.cuda(), data.cuda())
     assert torch.get_float32_matmul_precision() == "high"
     torch.testing.assert_close(got.cpu(), expected, rtol=0, atol=5e-4)
+
+
+@pytest.mark.gpu
+def test_full_fp32_matmul_survives_mixed_tf32_api_state():
+    """The getter raises once legacy allow_tf32 follows set_float32_matmul_precision.
+
+    ffs_reml reaches that state on CUDA, so the conditioning step crashed there
+    while passing on CPU and MPS.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("mixed TF32 API state is a CUDA-backend condition")
+    from fastfuncstuff.utils import full_fp32_matmul
+
+    prev_mm = torch.backends.cuda.matmul.allow_tf32
+    prev_cudnn = torch.backends.cudnn.allow_tf32
+    try:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        with full_fp32_matmul():
+            assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_mm
+        torch.backends.cudnn.allow_tf32 = prev_cudnn
+        torch.set_float32_matmul_precision("highest")

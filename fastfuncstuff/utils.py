@@ -638,16 +638,25 @@ def full_fp32_matmul() -> Generator[None]:
     rebuild, a batch -- inherited it: measured 0.7 median / 70 max intensity
     difference against the CPU on a T1->MNI chain. Also usable as a decorator.
     """
-    prev = torch.get_float32_matmul_precision()
+    try:
+        prev = torch.get_float32_matmul_precision()
+    except RuntimeError:
+        # Once any code toggles the legacy allow_tf32 flags after
+        # set_float32_matmul_precision() (the ICA and warp paths do), the getter
+        # refuses to answer.  The legacy flags below still carry the state, so
+        # leave the global setting alone rather than fail a REML search for it.
+        prev = None
     prev_mm = torch.backends.cuda.matmul.allow_tf32
     prev_cudnn = torch.backends.cudnn.allow_tf32
-    torch.set_float32_matmul_precision("highest")
+    if prev is not None:
+        torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     try:
         yield
     finally:
-        torch.set_float32_matmul_precision(prev)
+        if prev is not None:
+            torch.set_float32_matmul_precision(prev)
         torch.backends.cuda.matmul.allow_tf32 = prev_mm
         torch.backends.cudnn.allow_tf32 = prev_cudnn
 

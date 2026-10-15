@@ -66,6 +66,14 @@ from fastfuncstuff.viewer.modes.base import (
 )
 
 IMAGE_FILTER = "Images (*.nii *.nii.gz *.nii.zst *.HEAD);;All (*)"
+#: Parameters held until GO (unless ``live``): the ones that read files or
+#: refit. Adding a file and then another must not start a read in between.
+#: The look -- shift, stretch, hue, gamma, spread, chroma, window, mask -- is
+#: a repaint and always applies at once.
+GATED = frozenset(
+    {"files", "basis", "signal", "fit_on", "floor", "red", "green", "blue", "te", "weights"}
+    | {"stats", "radius", "lightness"}
+)
 STATS_FIXED = ("core", "brain", "slice", "crosshair")
 LIGHT_FIXED = ("basis", "channel 1")
 
@@ -91,6 +99,9 @@ class RGBMode(Mode):
         self._source: ColourSource | None = None
         self._message = ""
         super().__init__()
+        #: What GO last applied of the gated parameters. ``params`` is what the
+        #: panel shows; prepare and compute read this.
+        self._applied: dict[str, object] = {k: self.params[k] for k in GATED}
 
     # -- declaration -----------------------------------------------------
     def controls(self) -> tuple[Control, ...]:
@@ -108,6 +119,22 @@ class RGBMode(Mode):
                 "echoes, INV1/INV2/UNI, a T1 and a T2. Untick to leave one out. AFNI "
                 "selectors pick sub-bricks: run.nii[1], or run.nii[0..$(3)] for every "
                 "third volume (interleaved echoes).",
+            ),
+            BoolControl(
+                name="live",
+                label="live",
+                default=False,
+                span=THIRD,
+                newline=True,
+                help="Apply channel and fit changes as you make them. Off: they wait "
+                "for GO, so a list can be built without a read starting after each "
+                "file. The look (shifts, stretches, hue, gamma, ...) is always live.",
+            ),
+            ActionControl(
+                name="go",
+                label="go",
+                span=THIRD,
+                help="Apply the channel list and fit settings: read what is new, refit.",
             ),
             # -- fit -----------------------------------------------------
             ChoiceControl(
@@ -418,10 +445,20 @@ class RGBMode(Mode):
         return self.session.state.layers.find(str(choice).split(" ", 1)[0])
 
     def _entries(self) -> list[str]:
-        return PathListControl.enabled(self.params.get("files"))
+        return PathListControl.enabled(self._p.get("files"))
+
+    @property
+    def _p(self) -> dict[str, object]:
+        """The parameters in force: the look as set, the gated ones as last applied."""
+        return {**self.params, **self._applied}
+
+    @property
+    def pending(self) -> bool:
+        """Whether the panel holds channel or fit changes GO has not applied."""
+        return any(self.params.get(k) != self._applied.get(k) for k in GATED)
 
     def _spec(self) -> ChromaSpec:
-        p = self.params
+        p = self._p
         return ChromaSpec(
             basis=str(p["basis"]),
             signal=str(p["signal"]),
@@ -445,7 +482,7 @@ class RGBMode(Mode):
         return ("axis 1", "axis 2", "axis 3")
 
     def _look(self) -> Look:
-        p = self.params
+        p = self._p
         space = resolve_space(str(p["space"]), str(p["basis"]))
         return Look(
             space=space,
@@ -465,7 +502,7 @@ class RGBMode(Mode):
 
     def _stats_mask(self) -> np.ndarray | None:
         """The stats region as a mask on the channels' grid, or None for core/brain."""
-        stats = str(self.params["stats"])
+        stats = str(self._p["stats"])
         chans = self._chans
         if stats in ("core", "brain") or chans is None or self.session is None:
             return None
@@ -482,7 +519,7 @@ class RGBMode(Mode):
             vox = np.sqrt((np.asarray(chans.affine)[:3, :3] ** 2).sum(0))
             grids = np.meshgrid(*(np.arange(s) for s in chans.shape), indexing="ij")
             dist2 = sum(((g - c) * v) ** 2 for g, c, v in zip(grids, ijk, vox, strict=True))
-            return (dist2 <= float(self.params["radius"]) ** 2) & brain
+            return (dist2 <= float(self._p["radius"]) ** 2) & brain
         layer = self._layer_of(stats)
         if layer is None:
             raise ValueError(f"no layer {stats.split(' ', 1)[0]} to take stats from")
@@ -493,7 +530,7 @@ class RGBMode(Mode):
 
     def _light_ref(self) -> torch.Tensor | None:
         """A loaded layer resampled onto the channels' grid, for lightness."""
-        choice = str(self.params["lightness"])
+        choice = str(self._p["lightness"])
         if choice in LIGHT_FIXED or self._chans is None or self.session is None:
             return None
         layer = self._layer_of(choice)
@@ -557,6 +594,12 @@ class RGBMode(Mode):
         if self._chans is not None and entries == self._loaded_for:
             self._dirty = False
             return True
+        if len(entries) < 2:
+            # Nothing to do yet, not a failure: the list is still being built.
+            self._chans = None
+            self._message = f"{len(entries)} channel ticked; add files and press GO"
+            self._dirty = False
+            return False
         if progress is not None:
             progress(0.1, f"reading {len(entries)} channels")
         loaded = {str(ly.path): ly.key for ly in self.session.state.layers if not ly.colour}
@@ -568,10 +611,12 @@ class RGBMode(Mode):
                 device=self.session.display_device,
             )
         except (OSError, ValueError, KeyError) as exc:
+            # Raised, not returned: the worker reports a raise in the status
+            # bar, while a quiet False left a progress bar and then nothing.
             self._chans = None
-            self._message = str(exc)
+            self._message = f"\u26a0 {exc}"
             self._dirty = False
-            return False
+            raise ValueError(str(exc)) from exc
         self._loaded_for = entries
         self._fit = self._source = None
         self._fit_key = None
@@ -583,7 +628,7 @@ class RGBMode(Mode):
     def compute(self) -> ComputedOverlay | None:
         if self._chans is None:
             return None
-        p = self.params
+        p = self._p
         moving_stats = str(p["stats"]) in ("slice", "crosshair")
         fit_key = (
             self._spec(),
@@ -611,8 +656,8 @@ class RGBMode(Mode):
             self._source = self._fit.with_look(
                 look, masked=bool(p["masked"]), window=int(p["window"])
             )
-        except ValueError as exc:
-            self._message = str(exc)
+        except (ValueError, RuntimeError) as exc:
+            self._message = f"\u26a0 {exc}"
             return None
         self._message = self._source.describe()
         return ComputedOverlay(
@@ -623,20 +668,39 @@ class RGBMode(Mode):
         )
 
     def set_param(self, name: str, value) -> Aspect:
+        if self.params.get(name) == value:
+            return Aspect.NOTHING
+        self.params[name] = value
+        if name == "live":
+            return self._apply() if value else Aspect.GRAPH
+        if name in GATED and not self.params["live"]:
+            return Aspect.GRAPH  # held for GO; the status line says so
+        if name in GATED:
+            return self._apply()
         # GRAPH: the crosshair traces are drawn in the new coordinates.
-        return super().set_param(name, value) | Aspect.GRAPH
+        return self.refresh() | Aspect.GRAPH
+
+    def _apply(self) -> Aspect:
+        """Make the panel's gated settings the ones in force; read new files if any."""
+        files_changed = self.params["files"] != self._applied.get("files")
+        self._applied = {k: self.params[k] for k in GATED}
+        if files_changed:
+            self.invalidate()
+        return self.refresh() | Aspect.GRAPH | Aspect.LAYERS
 
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:
         if not dirty & (Aspect.CROSSHAIR | Aspect.TIME):
             return Aspect.NOTHING
         out = Aspect.GRAPH
         # A lens: stats read around the crosshair follow it.
-        if dirty & Aspect.CROSSHAIR and str(self.params["stats"]) in ("slice", "crosshair"):
+        if dirty & Aspect.CROSSHAIR and str(self._p["stats"]) in ("slice", "crosshair"):
             out |= self.refresh()
         return out
 
     # -- actions -----------------------------------------------------------
     def action(self, name: str, progress: ProgressFn | None = None) -> Aspect:
+        if name == "go":
+            return self._apply()
         if name in ("siblings", "add_input"):
             current = PathListControl.parse(self.params.get("files"))
             have = {p for p, _ in current}
@@ -769,6 +833,8 @@ class RGBMode(Mode):
     def status(self) -> str:
         if self._preparing:
             return "rgb: reading channels…"
+        if self.pending:
+            return "rgb: changes pending \u2014 press GO (or tick live)"
         n = len(self._entries())
         if self._chans is None:
             return f"rgb: {self._message or f'{n} channels ticked; add files to the list'}"

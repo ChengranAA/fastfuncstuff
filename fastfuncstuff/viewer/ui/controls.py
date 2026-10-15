@@ -328,6 +328,14 @@ class ControlPanel(QtWidgets.QWidget):
 
     # -- widgets -------------------------------------------------------
     def _build(self, spec: Control, value: object) -> QtWidgets.QWidget | None:
+        if isinstance(spec, ActionControl):
+            # A button among the parameters, beside the thing it acts on --
+            # GO next to the list it applies -- rather than in the grid below.
+            button = QtWidgets.QPushButton(spec.label.upper())
+            button.clicked.connect(
+                lambda _=False, n=spec.name: (self.flush_now(), self.action_requested.emit(n))
+            )
+            return button
         if isinstance(spec, BoolControl):
             return self._build_bool(spec, value)
         if isinstance(spec, PathListControl):

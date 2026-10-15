@@ -201,6 +201,7 @@ def _rgb(session):
 
 def _enter(session, paths, **params):
     session.do(SetMode("rgb"))
+    session.do(SetModeParam("live", "1"))
     session.do(SetModeParam("files", _files(paths)))
     for k, v in params.items():
         session.do(SetModeParam(k, str(v)))
@@ -215,7 +216,60 @@ def test_entering_prefills_the_inputs_siblings_as_an_editable_list(tmp_path, ses
     files = PathListControl.parse(session.mode.params["files"])
     assert [p for p, _ in files] == [str(p) for p in paths]
     assert all(on for _, on in files)
+    # A starting point, not a read: nothing happens until GO.
+    assert not any(ly.colour for ly in session.state.layers)
+    assert "GO" in session.mode.status()
+    session.do(ModeAction("go"))
     assert _rgb(session).n_volumes == 1
+
+
+def test_building_the_list_reads_nothing_until_go(tmp_path, session):
+    """Adding one file, then another, must not start a read in between."""
+    paths = _write_echoes(tmp_path, _head()[0])
+    session.do(SetMode("rgb"))
+    session.do(SetModeParam("files", _files(paths[:2])))
+    session.do(SetModeParam("files", _files(paths)))
+    session.do(SetModeParam("basis", "te"))
+    assert session.mode._chans is None
+    assert not any(ly.colour for ly in session.state.layers)
+    session.do(ModeAction("go"))
+    assert session.colour_sources[_rgb(session).key].spec.basis == "te"
+    # The look is never held: it is a repaint.
+    before = session.colour_sources[_rgb(session).key]
+    session.do(SetModeParam("hue", "45"))
+    assert session.colour_sources[_rgb(session).key] is not before
+
+
+def test_entering_with_nothing_to_read_does_not_fail(session):
+    session.do(SetMode("rgb"))
+    assert "add files" in session.mode.status() or "GO" in session.mode.status()
+
+
+def test_a_one_volume_channel_on_another_grid_is_resampled(tmp_path, session):
+    """A T1 beside EPI-space maps: different grid, still a channel."""
+    echoes, _ = _head()
+    paths = _write_echoes(tmp_path, echoes)[:2]
+    fine = np.kron(echoes[2][..., 0], np.ones((2, 2, 2), np.float32))
+    t1 = tmp_path / "t1_fine.nii.gz"
+    aff = np.diag([1.0, 1.0, 1.0, 1.0])
+    aff[:3, 3] = -0.5
+    nib.save(nib.Nifti1Image(fine, aff), str(t1))
+    layer = _enter(session, [*paths, t1], basis="pick", signal="raw")
+    chans = session.colour_sources[layer.key].chans
+    assert 2 in chans.fixed and chans.fixed[2].shape == SHAPE
+    np.testing.assert_allclose(chans.fixed[2][12, 12, 8].item(), echoes[2][12, 12, 8, 0], rtol=0.05)
+
+
+def test_a_time_series_on_another_grid_says_which(tmp_path, session):
+    echoes, _ = _head(n_time=3)
+    paths = _write_echoes(tmp_path, echoes)
+    odd = tmp_path / "odd_run.nii.gz"
+    nib.save(nib.Nifti1Image(echoes[0][:20], np.diag([2.0, 2.0, 2.0, 1.0])), str(odd))
+    session.do(SetMode("rgb"))
+    session.do(SetModeParam("files", _files([paths[0], odd])))
+    with pytest.raises(ValueError, match="odd_run"):
+        session.do(ModeAction("go"))
+    assert "\u26a0" in session.mode.status()
 
 
 def test_any_files_any_names_and_a_skipped_channel(tmp_path, session):
@@ -228,6 +282,7 @@ def test_any_files_any_names_and_a_skipped_channel(tmp_path, session):
         nib.save(nib.Nifti1Image(data[..., 0], aff), str(tmp_path / name))
         paths.append(tmp_path / name)
     session.do(SetMode("rgb"))
+    session.do(SetModeParam("live", "1"))
     session.do(SetModeParam("files", _files(paths, [True, False, True])))
     session.do(SetModeParam("basis", "pick"))
     layer = _rgb(session)
@@ -288,6 +343,7 @@ def test_stats_and_lightness_from_another_layer(tmp_path, session):
     nib.save(nib.Nifti1Image(roi, np.diag([2.0, 2.0, 2.0, 1.0])), str(roi_path))
     rk = session.load(roi_path)
     session.do(SetMode("rgb"))
+    session.do(SetModeParam("live", "1"))
     session.do(SetModeParam("files", _files(paths)))
     choice = next(c for c in session.mode.controls() if c.name == "stats").choices
     pick = next(c for c in choice if c.startswith(rk))

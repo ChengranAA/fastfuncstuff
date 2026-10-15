@@ -50,7 +50,7 @@ from fastfuncstuff.viewer.colormap import available_colormaps
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.layers import AlphaMode, SignMode
 from fastfuncstuff.viewer.modes import registry
-from fastfuncstuff.viewer.modes.base import OverlayKind
+from fastfuncstuff.viewer.modes.base import ActionControl, OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.slicing import voxel_value
 from fastfuncstuff.viewer.state import Plane, grid_res_choices
@@ -1705,7 +1705,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         that appeared are queued for the worker.
         """
         before = set(self.session.state.viewports.ids)
-        if not any(a.name == name for a in self.session.mode.actions()):
+        mode = self.session.mode
+        inline = (c for c in mode.controls() if isinstance(c, ActionControl))
+        if not any(a.name == name for a in (*mode.actions(), *inline)):
             return  # a trace window's key for an action this mode does not have
         # Asked before the action is dispatched, so a mode declares a button
         # once and decides for itself whether pressing it acts or asks first.

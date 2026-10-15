@@ -102,6 +102,29 @@ def distinct_names(names: list[str]) -> tuple[str, ...]:
     return tuple(cut)
 
 
+def _resample_onto(
+    vol: np.ndarray,
+    affine: np.ndarray,
+    shape: tuple[int, ...],
+    target_affine: np.ndarray,
+    device: torch.device,
+) -> Tensor:
+    """One volume onto another grid, trilinear, through millimetres, on ``device``."""
+    from fastfuncstuff.viewer.slicing import sample_volume
+
+    src = torch.as_tensor(np.nan_to_num(vol), device=device)
+    m = np.linalg.inv(np.asarray(affine, float)) @ np.asarray(target_affine, float)
+    mt = torch.as_tensor(m, dtype=torch.float32, device=device)
+    axes = [torch.arange(int(s), device=device, dtype=torch.float32) for s in shape[:3]]
+    out = torch.empty(tuple(int(s) for s in shape[:3]), device=device)
+    # A slab at a time, so a fine target never holds every voxel's coordinates.
+    for k in range(out.shape[2]):
+        ii, jj = torch.meshgrid(axes[0], axes[1], indexing="ij")
+        ijk = torch.stack([ii, jj, torch.full_like(ii, float(k))], -1)
+        out[:, :, k] = sample_volume(src, ijk @ mt[:3, :3].T + mt[:3, 3], mode="bilinear")
+    return out
+
+
 def _erode(mask: Tensor, n: int) -> Tensor:
     """Peel ``n`` voxels off a mask (26-neighbour), on its device."""
     out = mask.float()[None, None]
@@ -132,6 +155,9 @@ class ChannelSet:
     eps: float
     store: VolumeStore = field(repr=False)
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+    #: One-volume channels from another grid, resampled onto this one once at
+    #: load: a T1 or a UNI beside EPI-space maps. By channel index.
+    fixed: dict[int, Tensor] = field(default_factory=dict, repr=False)
 
     @property
     def n(self) -> int:
@@ -171,6 +197,8 @@ class ChannelSet:
             return None
 
     def _volume(self, c: int, t: int) -> Tensor:
+        if c in self.fixed:
+            return self.fixed[c]
         res = self.store.get(self.keys[c])
         t = max(0, min(t, self.frames[c] - 1))
         arr = res.array[..., t] if res.array is not None else self.store.preview(self.keys[c], t)
@@ -193,8 +221,36 @@ class ChannelSet:
                 vols.append(torch.nan_to_num(series.index_select(-1, idx).mean(-1)))
         return torch.stack(vols)
 
+    def voxel(self, ijk: tuple[int, int, int], t: int, window: int = 1) -> Tensor:
+        """(N,) channels at one voxel and time, window-averaged -- without a volume.
+
+        What the readout and the crosshair panel ask on every move; building
+        the N full volumes for it pegged the CPU.
+        """
+        i, j, k = ijk
+        half = (max(int(window), 1) - 1) // 2
+        out = []
+        for c in range(self.n):
+            if c in self.fixed:
+                out.append(float(self.fixed[c][i, j, k]))
+                continue
+            lo = max(t - half, 0) if self.frames[c] > 1 else 0
+            hi = min(t + half, self.frames[c] - 1) if self.frames[c] > 1 else 0
+            res = self.store.get(self.keys[c])
+            if res.array is not None:
+                v = np.asarray(res.array[i, j, k, lo : hi + 1], dtype=np.float64)
+            else:
+                v = np.array(
+                    [
+                        np.asarray(self.store.preview(self.keys[c], u))[i, j, k]
+                        for u in range(lo, hi + 1)
+                    ]
+                )
+            out.append(float(np.nan_to_num(v).mean()))
+        return torch.tensor(out, dtype=torch.float32, device=self.device)
+
     def mean_of(self, c: int) -> Tensor:
-        if self.frames[c] <= 1:
+        if self.frames[c] <= 1 or c in self.fixed:
             return self._volume(c, 0)
         series = self._series(c)
         if series is not None:
@@ -230,9 +286,20 @@ def load_channels(
         shapes.append(tuple(int(v) for v in info.shape[:3]))
         frames.append(int(info.n_volumes))
         affines.append(np.asarray(read_info(Path(_strip_selector(entry))).affine, dtype=float))
-    if len(set(shapes)) > 1:
-        detail = ", ".join(f"{short_name(e)} {s}" for e, s in zip(entries, shapes, strict=True))
-        raise ValueError(f"channels must share a grid: {detail}")
+    ref_shape, ref_affine = shapes[0], affines[0]
+    off_grid = [
+        c
+        for c in range(len(entries))
+        if shapes[c] != ref_shape or not np.allclose(affines[c], ref_affine, atol=1e-3)
+    ]
+    moving = [c for c in off_grid if frames[c] > 1]
+    if moving:
+        names = ", ".join(short_name(entries[c]) for c in moving)
+        raise ValueError(
+            f"{names}: a time series on a different grid from {short_name(entries[0])}. "
+            "Put a channel on that grid first, or regrid it -- one-volume channels "
+            "are resampled automatically, runs are not."
+        )
     timed = {f for f in frames if f > 1}
     if len(timed) > 1:
         raise ValueError(f"time-series channels differ in length: {sorted(timed)} frames")
@@ -252,6 +319,14 @@ def load_channels(
         store=store,
         device=device,
     )
+    for c in off_grid:
+        chans.fixed[c] = _resample_onto(
+            np.asarray(store.ensure_ram(keys[c])[..., 0], dtype=np.float32),
+            affines[c],
+            ref_shape,
+            ref_affine,
+            device,
+        )
     chans.means = torch.stack([chans.mean_of(c) for c in range(chans.n)])
     # One mask from the first channel for every channel: per-channel masks
     # disagree at the edge, and the disagreement is a coloured fringe.
@@ -380,7 +455,7 @@ class ColourSource:
         nx, ny, nz = self.chans.shape
         if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
             return None
-        raw = self.chans.raw(t, self.window)[:, i, j, k]
+        raw = self.chans.voxel((i, j, k), t, self.window)
         mean = self.chans.means[:, i, j, k] if self.spec.signal == "psc" else None
         x = transform(raw, self.spec.signal, eps=self.chans.eps, mean=mean)
         u = self.map.unit(self.map.coords(x.reshape(-1, 1)), self.look)[:, 0]

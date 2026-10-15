@@ -528,6 +528,7 @@ class DepthWindow(QtWidgets.QWidget):
             vp.depth_source,
             vp.radius,
             vp.depth_roi_layer,
+            self._roi_generation(vp.depth_roi_layer),
             st.surface_annot,
             tuple(sorted(surfaces.version.items())),
         )
@@ -592,6 +593,13 @@ class DepthWindow(QtWidgets.QWidget):
         self.time_plot.setVisible(self.time_plot.data is not None)
         self.plot.update()
         self.time_plot.update()
+
+    def _roi_generation(self, key: str) -> int | None:
+        """The ROI layer's data version: a painted layer changes in place."""
+        try:
+            return self.session.store.get(key).generation if key else None
+        except KeyError:
+            return None
 
     def _region_name(self, vp: Viewport) -> str:
         st = self.session.state

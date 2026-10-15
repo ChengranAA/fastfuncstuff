@@ -16,6 +16,7 @@ matrix, a mask) -- with three things of its own:
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +34,9 @@ if TYPE_CHECKING:
 
 #: Strokes kept for undo, per layer.
 UNDO_DEPTH = 200
+#: New store generations for painted layers, far from the store's own count so
+#: the two can never coincide.
+_GENERATIONS = itertools.count(1 << 40)
 
 
 @dataclass
@@ -165,6 +169,7 @@ class Painter:
         history = self._history.setdefault(key, [])
         history.append(_Stroke(flat, before[first]))
         del history[:-UNDO_DEPTH]
+        self._changed(key)
         return int(flat.size)
 
     def undo(self, key: str) -> bool:
@@ -176,6 +181,7 @@ class Painter:
         vol = self.session.store.get(key).array[..., 0]  # type: ignore[index]
         now = vol.reshape(-1)[stroke.index].copy()
         vol.reshape(-1)[stroke.index] = stroke.before
+        self._changed(key)
         counts = self._counts.setdefault(key, {})
         for values, sign in ((now, -1), (stroke.before, 1)):
             for v, n in zip(*np.unique(values.astype(np.int64), return_counts=True), strict=True):
@@ -195,6 +201,19 @@ class Painter:
                 continue
             idx = torch.as_tensor(flat, device=tensor.device)
             tensor.view(-1)[idx] = float(value)
+        self._roi_changed(key)
+
+    def _changed(self, key: str) -> None:
+        """A finished stroke or an undo: tell everything that caches the layer.
+
+        In-place painting keeps the 2-D views current dab by dab. What caches
+        by the store's generation -- the 3-D window's textures, a sampler, a
+        depth window's region -- or by key -- a mask made from this layer --
+        learns of a stroke here, once, at its end rather than every dab.
+        """
+        self.session.store.get(key).generation = next(_GENERATIONS)
+        for k in [k for k in self.session._source_masks if k[0] == key]:
+            del self.session._source_masks[k]
         self._roi_changed(key)
 
     def _roi_changed(self, key: str) -> None:

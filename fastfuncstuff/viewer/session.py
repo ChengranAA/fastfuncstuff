@@ -1969,10 +1969,13 @@ class ViewerSession:
                 volume = self.volume(key, 0)
             except (KeyError, FileNotFoundError, ValueError):
                 return None
+            # A painted layer's own table, so a region's swatch in a list is
+            # the colour it is painted in, and its name the one it was given.
+            names = dict(self.painter.tables[key]) if self.painter.owns(key) else None
             built = rois_from_labels(
                 volume,
                 name=layer.name,
-                names=self._label_table(res),
+                names=names if names is not None else self._label_table(res),
                 source=f"file:{key}",
             )
         self._roi_sets[key] = built

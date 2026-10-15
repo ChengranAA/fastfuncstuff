@@ -87,7 +87,9 @@ class InstaPCAMode(Mode):
                 name="mask",
                 label="mask",
                 filter="NIfTI (*.nii *.nii.gz *.nii.zst);;All (*)",
-                help="A mask on the run's grid. Empty means AFNI's automask of the run.",
+                help="A mask file on the run's grid, or the key of a loaded layer (a "
+                "painted ROI, an atlas: nonzero is inside; any grid). Empty means AFNI's "
+                "automask of the run.",
             ),
             IntControl(
                 name="polort",
@@ -178,9 +180,15 @@ class InstaPCAMode(Mode):
             self._dirty = False
             return False
         mask_text = str(self.params.get("mask") or "").strip()
+        mask_layer = (
+            self.session.state.layers.find(mask_text.split(" ", 1)[0]) if mask_text else None
+        )
         polort = int(self.params.get("polort", 2))
         n_comp = int(self.params.get("n_components") or 20)
-        identity = (layer.key, mask_text, polort)
+        # A layer used as the mask can be painted after the fact: its data
+        # version is part of what the decomposition was made from.
+        mask_version = self.session.store.get(mask_layer.key).generation if mask_layer else 0
+        identity = (layer.key, f"{mask_text}@{mask_version}", polort)
         # Coming back into the mode re-marks it dirty; the decomposition it
         # left is still the right one unless what it was made from changed.
         if self._result is not None and identity == self._identity and n_comp == self._n_requested:
@@ -189,13 +197,22 @@ class InstaPCAMode(Mode):
         data = self.session.store.ensure_ram(layer.key)
         tr = float(self.session.store.get(layer.key).info.tr or 0.0)
         try:
-            mask = engine.read_mask(mask_text, data.shape[:3]) if mask_text else None
+            if mask_layer is not None:
+                mask = self.session.mask_from_layer(mask_layer.key, layer)
+            else:
+                mask = engine.read_mask(mask_text, data.shape[:3]) if mask_text else None
             result = engine.decompose(
                 data,
                 affine=np.asarray(layer.affine, dtype=float),
                 tr=tr,
                 mask=mask,
-                mask_source=Path(mask_text).name if mask_text else "automask",
+                mask_source=(
+                    mask_layer.name
+                    if mask_layer
+                    else Path(mask_text).name
+                    if mask_text
+                    else "automask"
+                ),
                 polort=polort,
                 n_components=n_comp,
                 device=self.session.store.device,

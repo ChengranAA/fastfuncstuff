@@ -235,3 +235,72 @@ def test_label_counts_track_painting_erasing_and_undo(session):
     assert session.painter.counts(key) == truth()
     session.do(PaintUndo(key))
     assert session.painter.counts(key) == truth()
+
+
+# ---------------------------------------------------------------------------
+# painted layers wherever ROIs are taken
+# ---------------------------------------------------------------------------
+
+
+def test_a_painted_mask_follows_later_strokes(session):
+    key = _stroke(session, [(10, 10, 8)])
+    like = session.state.layers.base
+    first = session.mask_from_layer(key, like).sum()
+    _stroke(session, [(20, 20, 8)])
+    assert session.mask_from_layer(key, like).sum() > first
+
+
+def test_strokes_and_undo_give_the_layer_a_new_generation(session):
+    key = _stroke(session, [(10, 10, 8)])
+    g1 = session.store.get(key).generation
+    _stroke(session, [(12, 12, 8)])
+    g2 = session.store.get(key).generation
+    session.do(PaintUndo(key))
+    assert len({g1, g2, session.store.get(key).generation}) == 3
+
+
+def test_region_lists_show_the_painted_colour_and_name(session):
+    session.do(SetModeParam("value", "3"))
+    session.do(SetModeParam("label_name", "caudate"))
+    key = _stroke(session, [(10, 10, 8)])
+    rois = session.roi_set(key)
+    roi = next(r for r in rois if r.index == 3)
+    assert roi.name == "caudate"
+    painted = (session.roi_palette(key, CPU)[3] * 255).round().to(torch.uint8).tolist()
+    assert list(roi.color) == painted
+
+
+def test_instapca_decomposes_inside_a_painted_mask(tmp_path):
+    from fastfuncstuff.viewer.vocab import SetMode
+
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    rng = np.random.default_rng(1)
+    run = tmp_path / "run.nii.gz"
+    img = nib.Nifti1Image(100 + rng.normal(0, 1, (20, 20, 12, 40)).astype(np.float32), aff)
+    img.header["pixdim"][4] = 2.0
+    nib.save(img, str(run))
+    s = ViewerSession(device=CPU)
+    try:
+        s.load(run)
+        s.do(SetMode("paint"))
+        s.do(SetModeParam("radius", "4"))
+        key = _stroke(s, [(10, 10, 6)])
+        painted = int((_labels(s, key) > 0).sum())
+        s.do(SetMode("instapca"))
+        s.do(SetModeParam("mask", key))
+        s.do(SetModeParam("n_components", "3"))
+        assert int(s.mode._result.mask.sum()) == painted
+    finally:
+        s.close()
+
+
+def test_a_painted_layer_is_a_matrix_window_roi_source(session):
+    from fastfuncstuff.viewer.viewports import ViewKind
+
+    _stroke(session, [(8, 8, 8)])
+    session.do(SetModeParam("value", "2"))
+    key = _stroke(session, [(20, 20, 8)])
+    vid = session.state.viewports.open(ViewKind.MATRIX, Plane.AXIAL).id
+    rois = session.matrix_rois(session.state.viewports.get(vid))
+    assert rois is not None and rois.indices == (1, 2)
+    assert session.state.layers.get(key) in session.roi_layers()

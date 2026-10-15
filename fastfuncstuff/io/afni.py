@@ -473,10 +473,18 @@ def _afni_as_nifti(head: Path) -> nib.Nifti1Image:
 
     afni = nib.load(str(head))
     assert isinstance(afni, AFNIImage)
-    img = nib.Nifti1Image(afni.get_fdata(dtype=np.float32), afni.affine)
-    zooms = afni.header.get_zooms()
-    img.header.set_zooms(zooms[: img.ndim] + (1.0,) * max(0, img.ndim - len(zooms)))
+    info = afni.header.info
+    data = afni.get_fdata(dtype=np.float32)
+    img = nib.Nifti1Image(data, afni.affine)
+    zooms = tuple(afni.header.get_zooms()[:3])
+    if data.ndim == 4:
+        # A bucket (no time axis) keeps its bricks in plain 4-D, not AFNI's
+        # (x,y,z,1,n): every non-AFNI reader, and every [i] selector, expects 4-D.
+        # Its step is 0 rather than a 1 s TR it never had.
+        zooms += (float(afni.header.get_zooms()[3]) if "TAXIS_NUMS" in info else 0.0,)
+    img.header.set_zooms(zooms)
     img.header.set_xyzt_units("mm", "sec")
+    _afni_atrs_to_extension(img.header, info, head, n_bricks=int(np.prod(data.shape[3:])))
     # NIfTI's xform code is the nearest thing to AFNI's view: scanner for +orig,
     # a template for +tlrc (MNI when the header says so, else Talairach).
     code = 1
@@ -486,6 +494,34 @@ def _afni_as_nifti(head: Path) -> nib.Nifti1Image:
     img.set_qform(afni.affine, code=code)
     img.set_sform(afni.affine, code=code)
     return img
+
+
+def _afni_atrs_to_extension(header: Any, info: dict, head: Path, n_bricks: int) -> None:
+    """The HEAD attributes that describe the data, as AFNI's NIfTI extension.
+
+    What AFNI itself carries when it writes a NIfTI: brick labels, stat types and
+    DOF (thresholding, p-values), history and the template space. The FDR/MDF
+    curves are left behind on purpose -- they describe this grid's voxel
+    distribution and go stale on any resample; ``3drefit -addFDR`` rebuilds them.
+    """
+    if info.get("HISTORY_NOTE"):
+        set_afni_atr(header, "HISTORY_NOTE", str(info["HISTORY_NOTE"]))
+    labels = [s for s in str(info.get("BRICK_LABS", "")).split("~")]
+    if len(labels) == n_bricks and any(labels):
+        _set_afni_brick_labels(header, labels)
+    aux = [float(v) for v in np.atleast_1d(info.get("BRICK_STATAUX", []))]
+    stataux: dict[int, tuple[int, tuple[float, ...]]] = {}
+    i = 0
+    while i + 3 <= len(aux):
+        n_par = int(aux[i + 2])
+        stataux[int(aux[i])] = (int(aux[i + 1]), tuple(aux[i + 3 : i + 3 + n_par]))
+        i += 3 + n_par
+    if stataux:
+        _set_afni_brick_stataux(header, stataux, n_bricks)
+    view = {"+orig": 0, "+acpc": 1, "+tlrc": 2}.get(
+        head.name[-len("+orig.HEAD") : -len(".HEAD")], 0
+    )
+    set_afni_space_info(header, view=view, space=str(info.get("TEMPLATE_SPACE", "ORIG")))
 
 
 def _load_zst_via_tempfile(filepath: Path, zstd_threads: int | None) -> nib.Nifti1Image:
@@ -3657,7 +3693,7 @@ def save_nifti(
 
     # Per-sub-brick stat tagging so AFNI can threshold + FDR the sub-bricks.
     if brick_stataux is not None:
-        n_sub = data.shape[3] if data.ndim == 4 else 1
+        n_sub = int(np.prod(data.shape[3:]))
         _set_afni_brick_stataux(header, brick_stataux, n_sub)
 
     # Nothing said what space this map is in, but something read its grid. The

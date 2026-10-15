@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from fastfuncstuff.stats.cluster_gpu import neighbor_min_torch as neighbor_min_torch
 from fastfuncstuff.triton_key import install_triton_key_cache
 
 # Triton hashes its whole installation on the first kernel launch of every
@@ -60,16 +61,6 @@ def neighbor_min(lab: Tensor, adj_t: Tensor, big: int) -> Tensor:
     grid = (triton.cdiv(n_act, block),)
     _neighbor_min_kernel[grid](lab, adj_t, out, n_act, big, n_k=n_k, BLOCK=block)
     return out
-
-
-def neighbor_min_torch(lab: Tensor, adj_t: Tensor, big: int) -> Tensor:
-    """Reference implementation; the CPU path and the Triton correctness gate."""
-    m = lab
-    for k in range(adj_t.shape[0]):
-        nb = adj_t[k]
-        ok = nb >= 0
-        m = torch.minimum(m, torch.where(ok, lab[nb.clamp(min=0).long()], big))
-    return m
 
 
 @triton.jit

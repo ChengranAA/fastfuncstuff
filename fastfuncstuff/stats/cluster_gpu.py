@@ -74,6 +74,16 @@ def build_neighbor_table(
     return torch.from_numpy(out).to(device)
 
 
+def neighbor_min_torch(lab: Tensor, adj_t: Tensor, big: int) -> Tensor:
+    """Reference implementation without an optional Triton dependency."""
+    m = lab
+    for k in range(adj_t.shape[0]):
+        nb = adj_t[k]
+        ok = nb >= 0
+        m = torch.minimum(m, torch.where(ok, lab[nb.clamp(min=0).long()], big))
+    return m
+
+
 def _neighbor_min(lab: Tensor, adj_t: Tensor, big: int) -> Tensor:
     """Fused where available; the torch form is the fallback and the gate."""
     if lab.is_cuda:
@@ -83,8 +93,6 @@ def _neighbor_min(lab: Tensor, adj_t: Tensor, big: int) -> Tensor:
             return neighbor_min(lab, adj_t, big)
         except ImportError:
             pass
-    from fastfuncstuff.stats.cluster_gpu_triton import neighbor_min_torch
-
     return neighbor_min_torch(lab, adj_t, big)
 
 

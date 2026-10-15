@@ -8,6 +8,8 @@ itself.  Most tests run the torch fallback on CPU so they need no card.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -65,6 +67,16 @@ def test_matches_the_union_find_exactly():
     want = _cpu_reference(mask, fields, tcrits)
     for key in want:
         np.testing.assert_array_equal(got[key].cpu().numpy(), want[key], err_msg=str(key))
+
+
+def test_cpu_clustering_without_triton(monkeypatch):
+    monkeypatch.setitem(sys.modules, "triton", None)
+    monkeypatch.setitem(sys.modules, "fastfuncstuff.stats.cluster_gpu_triton", None)
+    mask, fields, tcrits, device = _setup(n_vol=2)
+    got = _run_batched(mask, fields, tcrits, device)
+    want = _cpu_reference(mask, fields, tcrits)
+    for key in want:
+        np.testing.assert_array_equal(got[key].numpy(), want[key], err_msg=str(key))
 
 
 def test_matches_union_find_on_a_percolating_threshold():

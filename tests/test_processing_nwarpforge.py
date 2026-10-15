@@ -786,3 +786,70 @@ class TestWarpMmRoundtrip:
         assert np.allclose(arr[..., 0], 6.0, atol=1e-3)
         assert np.allclose(arr[..., 1], 3.0, atol=1e-3)
         assert np.allclose(arr[..., 2], 1.5, atol=1e-3)
+
+
+def test_warp_after_affine_is_sampled_on_its_own_grid_not_the_masters(tmp_path):
+    """'MATRIX WARP' where the WARP lives in source space and the master is smaller.
+
+    The affine carries master points to source positions OUTSIDE the master's box.
+    The warp must be read there from its own grid; resampling it onto the master
+    first clamped those reads to the master's border and silently dropped the warp
+    (subject->MNI: a frontal pole the warp had pulled in came back out 10 mm).
+    Reference: warp the source on its own grid, then apply the matrix alone --
+    the same transform, interpolated twice.
+    """
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.processing.affine import save_matrix_1D
+    from fastfuncstuff.processing.io import load_image, save_warp_field
+    from fastfuncstuff.processing.nwarpforge import nwarpforge
+
+    cpu = torch.device("cpu")
+    src_aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    src_aff[:3, 3] = -40.0
+    n = 40
+    zz, yy, xx = torch.meshgrid(*(torch.arange(n, dtype=torch.float32),) * 3, indexing="ij")
+    src = 100 + 50 * torch.sin(xx / 3.0) + 20 * torch.cos(yy / 5.0)
+    sp = tmp_path / "src.nii.gz"
+    nib.save(nib.Nifti1Image(src.permute(2, 1, 0).numpy(), src_aff), sp)
+    _, sinfo = load_image(sp, device=cpu)
+
+    # Master: the same 2 mm lattice but only y in [-40, 0) mm -- source y >= 0 is outside.
+    mst_aff = src_aff.copy()
+    mp = tmp_path / "master.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((n, n // 2, n), np.float32), mst_aff), mp)
+
+    # Warp on the source grid: a 3-voxel x shove in a blob at source y ~ +16 mm.
+    blob = torch.exp(-(((xx - 20) / 5) ** 2 + ((yy - 28) / 4) ** 2 + ((zz - 20) / 5) ** 2))
+    wp = tmp_path / "w_WARP.nii.gz"
+    save_warp_field(3.0 * blob, torch.zeros_like(blob), torch.zeros_like(blob), wp,
+                    header_info=sinfo, units="mm")  # fmt: skip
+
+    # base->source: +24 mm in y (DICOM y is -RAS y, so -24 in the aff12's frame).
+    m = torch.eye(4)
+    m[1, 3] = 12.0  # voxels
+    from fastfuncstuff.processing.affine import voxel_matrix_to_dicom
+
+    ap = tmp_path / "m.aff12.1D"
+    save_matrix_1D(voxel_matrix_to_dicom(m, mst_aff, src_aff), ap)
+
+    chain = tmp_path / "chain.nii.gz"
+    nwarpforge(str(sp), [str(ap), str(wp)], str(chain), master_path=str(mp),
+               interp="linear", device=cpu, verb=0, auto_pad=False)  # fmt: skip
+    own = tmp_path / "own.nii.gz"
+    nwarpforge(str(sp), [str(wp)], str(own), master_path=str(sp),
+               interp="linear", device=cpu, verb=0, auto_pad=False)  # fmt: skip
+    two = tmp_path / "two.nii.gz"
+    nwarpforge(str(own), [str(ap)], str(two), master_path=str(mp),
+               interp="linear", device=cpu, verb=0, auto_pad=False)  # fmt: skip
+
+    got = np.asarray(nib.load(chain).dataobj)
+    ref = np.asarray(nib.load(two).dataobj)
+    plain = tmp_path / "plain.nii.gz"
+    nwarpforge(str(sp), [str(ap)], str(plain), master_path=str(mp),
+               interp="linear", device=cpu, verb=0, auto_pad=False)  # fmt: skip
+    affine_only = np.asarray(nib.load(plain).dataobj)
+    inner = (slice(3, -3), slice(3, -3), slice(3, -3))
+    # The warp must have done something here, or the test proves nothing.
+    assert np.abs(ref - affine_only)[inner].max() > 20
+    # Linear-twice vs linear-once: small, not the size of the dropped warp.
+    assert np.abs(got - ref)[inner].max() < 5

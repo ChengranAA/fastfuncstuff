@@ -1109,6 +1109,33 @@ def compose_chain(
             # already prepared to the output grid (units="voxels") is reused
             # as-is; an mm warp is resampled to output-grid voxel units now.
             frame_warp = xform.at_time(time_idx) if isinstance(xform, TimeVaryingWarp) else xform
+            if result_warp is not None and frame_warp.units != "voxels":
+                # Read this warp on its OWN grid, at the positions the chain so far
+                # has reached. Those can lie outside the output box (an affine to a
+                # warp in source space: 'subj2mni.aff12.1D subj_WARP' with an MNI
+                # master), and resampling the warp onto the output grid first
+                # clamped every such read to the box's border -- the warp silently
+                # vanished there.
+                reached = grid_plan.coords.clone()
+                reached[0].add_(result_warp.xd.reshape(-1))
+                reached[1].add_(result_warp.yd.reshape(-1))
+                reached[2].add_(result_warp.zd.reshape(-1))
+                at_reached = prepare_warp_for_grid(
+                    frame_warp,
+                    output_shape,
+                    output_affine,
+                    device,
+                    verb=verb,
+                    interp=interp,
+                    grid_plan=VoxelGridPlan(shape=grid_plan.shape, coords=reached, points=True),
+                )
+                result_warp = NonlinearWarp(
+                    xd=result_warp.xd + at_reached.xd,
+                    yd=result_warp.yd + at_reached.yd,
+                    zd=result_warp.zd + at_reached.zd,
+                    header_info=result_warp.header_info,
+                )
+                continue
             if isinstance(frame_warp, NonlinearWarp) and frame_warp.units == "voxels":
                 prepared = frame_warp
             else:

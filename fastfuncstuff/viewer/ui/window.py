@@ -274,6 +274,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         manager.mode_action_requested.connect(
             lambda name, c=ctl: self._on(c, self._mode_action, name)
         )
+        manager.painted.connect(lambda d, c=ctl: self._on(c, self.refresh, Aspect(d)))
         manager.play_requested.connect(lambda c=ctl: self._on(c, self._toggle_play))
         manager.rows_selected.connect(
             lambda vid, a, b, c=ctl: self._on(c, self._carpet_rows_to_layer, vid, a, b)
@@ -2623,9 +2624,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 # "37" is not what you want to know when you are pointing at
                 # the thalamus, and it is the one readout that has to survive
                 # being outside every region -- hence "--", not "0".
-                rois = self.session.roi_set(layer.key)
-                found = rois.at(st.crosshair) if rois is not None else None
-                parts.append(f"{layer.name}={found.name if found else '--'}")
+                parts.append(f"{layer.name}={self.session.region_name(layer, val)}")
                 continue
             # Only where the header actually named something: appending "#0" to
             # every 3-D anatomy would be noise dressed as information.

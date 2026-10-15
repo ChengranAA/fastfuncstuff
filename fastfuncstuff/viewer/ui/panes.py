@@ -93,6 +93,12 @@ class ImagePane(QtWidgets.QWidget):
     edit_pressed = QtCore.Signal(float, float)
     edit_dragged = QtCore.Signal(float, float)
     edit_released = QtCore.Signal()
+    #: Painting (the PAINT mode): fractional (row, col), and whether it erases.
+    paint_pressed = QtCore.Signal(float, float, bool)
+    paint_dragged = QtCore.Signal(float, float)
+    paint_released = QtCore.Signal()
+    #: Ctrl+wheel while painting: grow (+1) or shrink (-1) the brush.
+    brush_stepped = QtCore.Signal(int)
 
     #: The rotation ring's radius as a fraction of the drawn image's short side,
     #: and how close to it (widget pixels) a press counts as grabbing it.
@@ -145,6 +151,9 @@ class ImagePane(QtWidgets.QWidget):
         self._stroke_pts: list[tuple[float, float]] = []
         #: The selected vertex on this slice, per surface: (row, col, surface).
         self._marks: list[tuple[float, float, str]] = []
+        #: The PAINT mode is on: left drag paints, right drag erases.
+        self.painting = False
+        self._paint_drag = False
         #: ``(row, col, radius rows, radius cols, rgb, label)`` in image pixels.
         self._regions: list[tuple[float, float, float, float, tuple, str]] = []
         self._highlight = np.zeros((0, 2))
@@ -684,6 +693,8 @@ class ImagePane(QtWidgets.QWidget):
 
     # -- input ---------------------------------------------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self.painting and self._paint_press(event):
+            return
         if event.button() == QtCore.Qt.MouseButton.RightButton:
             # macOS turns a physical ctrl+click into a right-button press (and
             # reports ctrl as Meta), so the gesture the status line asks for
@@ -733,7 +744,35 @@ class ImagePane(QtWidgets.QWidget):
         else:
             self.picked.emit(*idx)
 
+    def _paint_press(self, event: QtGui.QMouseEvent) -> bool:
+        """Left paints, right erases; shift, ctrl and middle keep their meanings."""
+        mods = event.modifiers()
+        plain = not mods & (
+            QtCore.Qt.KeyboardModifier.ShiftModifier
+            | QtCore.Qt.KeyboardModifier.ControlModifier
+            | QtCore.Qt.KeyboardModifier.MetaModifier
+        )
+        button = event.button()
+        if not plain or button not in (
+            QtCore.Qt.MouseButton.LeftButton,
+            QtCore.Qt.MouseButton.RightButton,
+        ):
+            return False
+        frac = self._to_fraction(event.position())
+        if frac is None:
+            return True
+        self._paint_drag = True
+        self.paint_pressed.emit(*frac, button == QtCore.Qt.MouseButton.RightButton)
+        return True
+
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self._paint_drag:
+            self._hover = event.position()
+            frac = self._to_fraction(event.position())
+            if frac is not None:
+                self.paint_dragged.emit(*frac)
+            self.update()
+            return
         if self._drag_from is not None:
             delta = event.position() - self._drag_from
             self._drag_from = event.position()
@@ -773,6 +812,10 @@ class ImagePane(QtWidgets.QWidget):
             self.picked.emit(*idx)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self._paint_drag:
+            self._paint_drag = False
+            self.paint_released.emit()
+            return
         if self._drag_from is not None:
             self._drag_from = None
             self._drag_kind = ""
@@ -797,6 +840,10 @@ class ImagePane(QtWidgets.QWidget):
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802 (Qt)
         delta = event.angleDelta().y()
+        ctrl = event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier
+        if delta and self.painting and ctrl:
+            self.brush_stepped.emit(1 if delta > 0 else -1)
+            return
         if delta:
             self.stepped.emit(1 if delta > 0 else -1)
 

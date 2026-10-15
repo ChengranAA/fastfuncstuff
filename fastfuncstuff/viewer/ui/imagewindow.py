@@ -78,6 +78,8 @@ class ImageWindow(QtWidgets.QWidget):
     #: A surface drag moved vertices without touching any image; every image
     #: window should redraw its outlines (and nothing else).
     surfaces_previewed = QtCore.Signal()
+    #: Voxels were painted mid-drag; the int is the Aspect to redraw.
+    painted = QtCore.Signal(int)
     #: `c c`: centre every window on the crosshair, not just this one.
     centre_all_requested = QtCore.Signal()
 
@@ -250,6 +252,10 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.zoomed.connect(self._zoom_by)
         self.pane.slid.connect(self._slide)
         self.pane.turned.connect(self._turn)
+        self.pane.paint_pressed.connect(self._paint_press)
+        self.pane.paint_dragged.connect(self._paint_drag)
+        self.pane.paint_released.connect(self._paint_release)
+        self.pane.brush_stepped.connect(self._paint_resize)
         self.pane.edit_pressed.connect(self._edit_press)
         self.pane.edit_dragged.connect(self._edit_drag)
         self.pane.edit_released.connect(self._edit_release)
@@ -477,7 +483,12 @@ class ImageWindow(QtWidgets.QWidget):
                     self._toggle_snap,
                     group="surface",
                 ),
-                Binding("ctrl+z", "undo the last surface edit", self._undo_edit, group="surface"),
+                Binding(
+                    "ctrl+z",
+                    "undo the last paint stroke / surface edit",
+                    self._undo_edit,
+                    group="surface",
+                ),
                 Binding("Escape", "cancel the drag", self._cancel_edit, group="surface"),
                 Binding("drag the ring", "turn the moving image", None, group="align mode"),
                 Binding(
@@ -1151,7 +1162,65 @@ class ImageWindow(QtWidgets.QWidget):
             self._dispatch(SetSurfaceBrush(r, 0.0, smooth, search, sign))
         self._sync_brush()
 
+    def _paint_mode(self):
+        mode = self.session.mode
+        return mode if mode.name == "paint" else None
+
+    def _sync_paint(self) -> bool:
+        """Put the pane into painting, with the brush outline, when PAINT is the mode."""
+        mode = self._paint_mode()
+        self.pane.painting = mode is not None
+        if mode is None:
+            return False
+        state = self.session.state
+        vp = self._viewport()
+        if state.grid is None or vp is None:
+            return True
+        layout = plane_layout(state.grid.affine, vp.plane)
+        cols = np.linalg.norm(state.grid.affine[:3, [layout.row, layout.col]], axis=0)
+        r = float(mode.params["radius"])
+        label = int(mode.params["value"])
+        self.pane.set_brush(
+            r / float(cols.mean()), f"PAINT {label}  r={r:g} mm  {mode.params['brush']}"
+        )
+        return True
+
+    def _paint_press(self, row: float, col: float, erase: bool) -> None:
+        mode, vp = self._paint_mode(), self._viewport()
+        mm = self._press_point_mm(row, col)
+        if mode is None or vp is None or mm is None:
+            return
+        dirty = mode.begin(mm, vp.plane, erase=erase, dispatch=self._dispatch)
+        self.painted.emit(int(dirty))
+
+    def _paint_drag(self, row: float, col: float) -> None:
+        mode = self._paint_mode()
+        mm = self._press_point_mm(row, col)
+        if mode is None or mm is None or not mode.painting:
+            return
+        dirty = mode.extend(mm)
+        if dirty:
+            self.painted.emit(int(dirty))
+
+    def _paint_release(self) -> None:
+        mode = self._paint_mode()
+        if mode is not None:
+            self.painted.emit(int(mode.end()))
+
+    def _paint_resize(self, step: int) -> None:
+        from fastfuncstuff.viewer.modes.paint import RADIUS_MAX, RADIUS_MIN
+        from fastfuncstuff.viewer.vocab import SetModeParam
+
+        mode = self._paint_mode()
+        if mode is None:
+            return
+        r = float(mode.params["radius"]) * (1.15 if step > 0 else 1 / 1.15)
+        self._dispatch(SetModeParam("radius", f"{min(max(r, RADIUS_MIN), RADIUS_MAX):.2f}"))
+        self._sync_paint()
+
     def _sync_brush(self, note: str = "") -> None:
+        if self._sync_paint():
+            return
         state = self.session.state
         r, snap, *_ = state.surface_brush
         mode = "snap" if snap >= 1 else ("hand" if snap <= 0 else f"snap {snap:.0%}")
@@ -1634,6 +1703,14 @@ class ImageWindow(QtWidgets.QWidget):
             self.surfaces_previewed.emit()
 
     def _undo_edit(self) -> None:
+        mode = self._paint_mode()
+        if mode is not None:
+            from fastfuncstuff.viewer.vocab import PaintUndo
+
+            key = mode.target()
+            if key is not None:
+                self._dispatch(PaintUndo(key))
+            return
         self._dispatch(UndoSurfaceEdit())
 
     def redraw_outlines(self) -> None:

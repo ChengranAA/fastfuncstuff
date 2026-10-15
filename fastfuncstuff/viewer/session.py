@@ -23,6 +23,7 @@ from fastfuncstuff.viewer.design import Design, Provenance, RegressorTrace, run_
 from fastfuncstuff.viewer.layers import Layer, SignMode
 from fastfuncstuff.viewer.modes import Mode, registry
 from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
+from fastfuncstuff.viewer.paintlayer import Painter
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
 from fastfuncstuff.viewer.rois import RoiSet, looks_like_labels, rois_from_frames, rois_from_labels
 from fastfuncstuff.viewer.state import Plane, ViewerState
@@ -252,6 +253,8 @@ class ViewerSession:
         self.clock: Callable[[], float] = time.monotonic
         self._last_move = float("-inf")
         self.store = store or VolumeStore(device=device)
+        #: Painted ROI layers: label tables, strokes, undo (viewer.paintlayer).
+        self.painter = Painter(self)
         #: What each colour layer draws from, by layer key (viewer.chromalayer).
         #: Kept copies share their source with the live layer they froze.
         self.colour_sources: dict = {}
@@ -1086,9 +1089,8 @@ class ViewerSession:
             if volume is None:
                 continue
             if layer.roi:
-                rois = self.roi_set(layer.key)
-                found = rois.at(st.crosshair) if rois is not None else None
-                lines.append(f"{prefix}{found.name if found else '--'}")
+                value = voxel_value(volume, st.grid, layer.affine, st.crosshair)
+                lines.append(f"{prefix}{self.region_name(layer, value)}")
                 continue
             value = voxel_value(volume, st.grid, layer.affine, st.crosshair)
             parts = [f"{_brick_name(layer, layer.volume_index)}{_fmt(value)}"]
@@ -1677,6 +1679,7 @@ class ViewerSession:
             return
         self.invalidate(key)
         self.colour_sources.pop(key, None)
+        self.painter.tables.pop(key, None)
         for stale in [k for k in self._threshold_scales if k[0] == key]:
             del self._threshold_scales[stale]
         for stale in [k for k in self._source_masks if k[0] == key]:
@@ -1992,6 +1995,20 @@ class ViewerSession:
         except OSError:
             return {}
 
+    def region_name(self, layer: Layer, value: float | None) -> str:
+        """The region an ROI layer has at the crosshair, ``--`` outside every one.
+
+        One answer for every readout. A painted layer names it from its label
+        table and the value under the crosshair; a loaded one from its region
+        set. Not the region set for a painted layer: every dab invalidates
+        it, and rebuilding it is a scan of the whole volume per brush move.
+        """
+        if self.painter.owns(layer.key):
+            return "--" if value is None else self.painter.name_at(layer.key, value)
+        rois = self.roi_set(layer.key)
+        found = rois.at(self.state.crosshair) if rois is not None else None
+        return found.name if found else "--"
+
     def roi_palette(self, key: str, device: torch.device | None = None) -> torch.Tensor | None:
         """``(max label + 1, 3)`` colours in ``[0, 1]``, for the renderer.
 
@@ -1999,14 +2016,20 @@ class ViewerSession:
         screen is the same one the ROI list shows beside the region's name --
         there is no second palette to fall out of step.
         """
-        rois = self.roi_set(key)
-        if rois is None or not len(rois):
-            return None
         where = device or self.display_device
         cache_key = (key, str(where))
         hit = self._roi_palettes.get(cache_key)
         if hit is not None:
             return hit
+        if self.painter.owns(key):
+            # By value from the layer's table: no scan of the volume, so a
+            # newly painted label has its colour on the first dab.
+            built = self.painter.palette(key, where)
+            self._roi_palettes[cache_key] = built
+            return built
+        rois = self.roi_set(key)
+        if rois is None or not len(rois):
+            return None
         built = torch.as_tensor(rois.palette(), dtype=torch.float32, device=where) / 255.0
         self._roi_palettes[cache_key] = built
         return built
@@ -2284,6 +2307,8 @@ class ViewerSession:
         layer = self.state.layers.get(key)
         if layer.colour:
             return self.colour_sources[key].save(path)
+        if self.painter.owns(key):
+            return self.painter.save(key, path)
         data = np.asarray(self.store.ensure_ram(key), dtype=np.float32)
         if data.ndim == 4 and data.shape[3] == 1:
             data = data[..., 0]

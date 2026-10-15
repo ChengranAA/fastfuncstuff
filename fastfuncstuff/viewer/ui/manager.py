@@ -82,6 +82,8 @@ class WindowManager(QtCore.QObject):
     rows_selected = QtCore.Signal(str, int, int)
     #: A window's key asked the active mode for an action, by name.
     mode_action_requested = QtCore.Signal(str)
+    #: An image window painted voxels mid-drag; the int is the Aspect.
+    painted = QtCore.Signal(int)
     #: A 3-D window's ANIMATE: play / pause time (the controller owns the player).
     play_requested = QtCore.Signal()
 
@@ -142,6 +144,7 @@ class WindowManager(QtCore.QObject):
         if viewport.is_image:
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.action_requested.connect(self.mode_action_requested)
+            win.painted.connect(self.painted)
             win.surfaces_previewed.connect(self._redraw_outlines)
             win.centre_all_requested.connect(self.centre_on_crosshair)
         elif viewport.is_chedi:

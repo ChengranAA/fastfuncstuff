@@ -103,6 +103,51 @@ class Denoise(Command):
 
 @command
 @dataclass(frozen=True)
+class NewPaintLayer(Command):
+    """An empty label layer on the display grid, to paint into."""
+
+    name = "NEW_PAINT_LAYER"
+    aspects = Aspect.LAYERS | Aspect.SLICES
+    major = True
+    key: str
+    label: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class PaintStroke(Command):
+    """One stroke of the paint brush: ``value`` (0 erases) at each centre, in mm.
+
+    Recorded once per stroke, after the fact (the window paints as the mouse
+    moves), with every brush centre the stroke passed through.
+    """
+
+    name = "PAINT_STROKE"
+    aspects = Aspect.SLICES
+    # Major so a run of strokes is never collapsed into its last one.
+    major = True
+    key: str
+    value: int
+    radius: float
+    brush: str
+    plane: str
+    overwrite: bool
+    points: str
+
+
+@command
+@dataclass(frozen=True)
+class PaintUndo(Command):
+    """Undo the last stroke on a painted layer."""
+
+    name = "PAINT_UNDO"
+    aspects = Aspect.SLICES
+    major = True
+    key: str
+
+
+@command
+@dataclass(frozen=True)
 class SetTheme(Command):
     """Switch the interface palette. ``dark`` or ``light``."""
 
@@ -2169,6 +2214,40 @@ def install(
             polort=int(cmd.polort),
             keep_mean=bool(cmd.keep_mean),
         )
+
+    @bus.handle(NewPaintLayer.name)
+    def _new_paint_layer(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, NewPaintLayer)
+        if session is None:
+            raise RuntimeError("NEW_PAINT_LAYER needs a session")
+        session.painter.new_layer(cmd.key, cmd.label)
+        return NewPaintLayer.aspects
+
+    @bus.handle(PaintStroke.name)
+    def _paint_stroke(cmd: Command, st: ViewerState) -> Aspect:
+        from fastfuncstuff.viewer.paint import decode_points
+
+        assert isinstance(cmd, PaintStroke)
+        if session is None:
+            raise RuntimeError("PAINT_STROKE needs a session")
+        session.painter.apply(
+            cmd.key,
+            int(cmd.value),
+            decode_points(cmd.points),
+            radius_mm=float(cmd.radius),
+            brush=cmd.brush,
+            plane=Plane(cmd.plane),
+            overwrite=bool(cmd.overwrite),
+        )
+        session.painter.close_stroke(cmd.key)
+        return PaintStroke.aspects
+
+    @bus.handle(PaintUndo.name)
+    def _paint_undo(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, PaintUndo)
+        if session is None:
+            raise RuntimeError("PAINT_UNDO needs a session")
+        return PaintUndo.aspects if session.painter.undo(cmd.key) else Aspect.NOTHING
 
     @bus.handle(SetTheme.name)
     def _set_theme(cmd: Command, st: ViewerState) -> Aspect:

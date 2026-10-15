@@ -1695,7 +1695,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _mode_param_changed(self, name: str, value: str) -> None:
         self._dispatch(SetModeParam(name, value))
-        self._prepare_then_refresh()
+        # The dispatch already recomputed and repainted unless slow work is
+        # now pending; refreshing again unconditionally redrew every window a
+        # second time on every slider tick.
+        if self.session.mode.needs_prepare:
+            self._prepare_then_refresh()
 
     def _mode_action(self, name: str) -> None:
         """Press a mode's button, then finish whatever slow work it started.

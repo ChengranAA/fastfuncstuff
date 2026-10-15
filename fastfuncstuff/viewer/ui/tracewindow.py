@@ -134,15 +134,20 @@ class PlotView(QtWidgets.QWidget):
 
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
         for i, (values, x) in enumerate(zip(series, axes, strict=True)):
-            path = QtGui.QPainterPath()
             step = max(1, int(values.size / max(plot.width() * 2, 1)))
-            for n, j in enumerate(range(0, values.size, step)):
-                pt = to_px(float(x[j]), float(values[j]) if np.isfinite(values[j]) else lo)
-                path.lineTo(pt) if n else path.moveTo(pt)
+            # Vectorised: point by point in Python this was most of the paint.
+            xv = np.asarray(x[::step], np.float64)
+            yv = np.asarray(values[::step], np.float64)
+            yv = np.where(np.isfinite(yv), yv, lo)
+            px = plot.left() + (xv - x0) * (plot.width() / (x1 - x0))
+            py = plot.bottom() - (yv - lo) * (plot.height() / (hi - lo))
+            poly = QtGui.QPolygonF(
+                [QtCore.QPointF(a, b) for a, b in zip(px.tolist(), py.tolist(), strict=True)]
+            )
             pen = QtGui.QPen(self._colour(c, i, len(traces)))
             pen.setWidthF(1.4)
             p.setPen(pen)
-            p.drawPath(path)
+            p.drawPolyline(poly)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
 
         longest = max(v.size for v in series)

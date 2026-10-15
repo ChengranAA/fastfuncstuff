@@ -1072,15 +1072,18 @@ class ViewerSession:
         overlays = [ly for i, ly in enumerate(st.layers) if ly.visible and (i > 0 or ly.colour)]
         lines: list[str] = []
         for layer in reversed(overlays):
-            volume = self.display_volume(layer.key)
-            if volume is None:
-                continue
             prefix = f"{_short(layer.name)}  " if len(overlays) > 1 else ""
             if layer.colour:
+                # Before display_volume: for a colour layer that is a whole
+                # volume of the scalar stand-in, built and copied to the host
+                # on every frame just to be ignored here.
                 source = self.colour_sources.get(layer.key)
                 if source is not None:
                     ijk = self.layer_voxel(layer.affine, st.crosshair)
                     lines.append(ValueLine(prefix, source.readout(ijk, self.layer_time(layer))))
+                continue
+            volume = self.display_volume(layer.key)
+            if volume is None:
                 continue
             if layer.roi:
                 rois = self.roi_set(layer.key)
@@ -1574,6 +1577,10 @@ class ViewerSession:
         n = int(colour.n_frames)
         shape = tuple(int(v) for v in colour.chans.shape)
         existing = self.state.layers.find_by_source(source)
+        if existing is not None and self.colour_sources.get(existing.key) is colour:
+            # The same source again (a refresh that changed nothing): re-adopting
+            # would mint a new generation and make every window re-upload.
+            return existing.key
         key = existing.key if existing is not None else self.state.layers.mint_key("M")
         self.colour_sources[key] = colour
         self.store.adopt_lazy(key, shape, n, colour.lightness_volume, name=overlay.name)

@@ -373,17 +373,18 @@ class GridGraph(QtWidgets.QWidget):
             # thirty pixels costs the whole paint and shows nothing -- the
             # y-range still comes from every sample, so the envelope is honest.
             xs, ys = _decimate(values, inner.width())
-            path = QtGui.QPainterPath()
-            for i, (t, v) in enumerate(zip(xs, ys, strict=True)):
-                x = inner.left() + (t / max(nt - 1, 1)) * inner.width()
-                y = inner.bottom() - (float(v) - lo) / span * inner.height()
-                pt = QtCore.QPointF(x, y)
-                path.moveTo(pt) if i == 0 else path.lineTo(pt)
+            # The arithmetic in numpy, one polyline per trace: per point in
+            # Python it was most of a repaint once a mode added a few traces.
+            px = inner.left() + xs.astype(np.float64) * (inner.width() / max(nt - 1, 1))
+            py = inner.bottom() - (np.asarray(ys, np.float64) - lo) * (inner.height() / span)
+            poly = QtGui.QPolygonF(
+                [QtCore.QPointF(x, y) for x, y in zip(px.tolist(), py.tolist(), strict=True)]
+            )
             colour = self._colors.get(ident) or QtGui.QColor.fromRgbF(*c.series[si % len(c.series)])
             pen = QtGui.QPen(colour)
             pen.setWidthF(1.6 if cell.is_centre else 1.0)
             p.setPen(pen)
-            p.drawPath(path)
+            p.drawPolyline(poly)
 
         # The time cursor belongs to a time-domain trace; a spectrum has no
         # "current time point", and with every time course ticked off there is

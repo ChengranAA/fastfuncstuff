@@ -25,6 +25,7 @@ from fastfuncstuff.viewer.modes.instapca import InstaPCAMode  # noqa: E402
 # imported here or it will not appear in the mode selector.
 from fastfuncstuff.viewer.modes.plain import PlainMode  # noqa: E402
 from fastfuncstuff.viewer.modes.preproc import PreprocMode  # noqa: E402
+from fastfuncstuff.viewer.modes.tcorr import TCorrMode  # noqa: E402
 
 __all__ = [
     "AlignMode",
@@ -44,6 +45,7 @@ __all__ = [
     "OverlayKind",
     "PlainMode",
     "PreprocMode",
+    "TCorrMode",
     "Trace",
     "mode",
     "registry",

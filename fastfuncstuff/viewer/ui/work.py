@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
+import traceback
 from collections.abc import Callable
 
 from PySide6 import QtCore, QtWidgets
@@ -90,6 +92,11 @@ class _Task(QtCore.QRunnable):
                 finally:
                     writer.flush()
         except Exception as exc:  # surfaced in the status bar, never swallowed
+            # And in full on the terminal: the status bar holds one line for
+            # eight seconds, and "quantile()" alone says nothing about where.
+            # sys.__stderr__, because stdout is redirected into the log above.
+            print(f"[ffs_viewer] job failed: {type(exc).__name__}: {exc}", file=sys.__stderr__)
+            traceback.print_exc(file=sys.__stderr__)
             self.signals.finished.emit(False, f"{type(exc).__name__}: {exc}")
             return
         self.signals.finished.emit(bool(ok), "")

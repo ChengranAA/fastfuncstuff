@@ -1380,3 +1380,19 @@ def parabolic_peak_offset(
 def _prefers_cuda_batching(device: torch.device) -> bool:
     """Whether measured CUDA-only batching specializations should be selected."""
     return device.type == "cuda"
+
+
+def quantiles(v: torch.Tensor, qs: tuple[float, ...] | list[float]) -> list[float]:
+    """Quantiles of a tensor (flattened, nearest rank), with no size ceiling.
+
+    ``torch.quantile`` refuses inputs beyond 2**24 elements ("input tensor is
+    too large"), which an unmasked warp field on a padded grid or a
+    whole-head anatomical exceeds. Sorting has no such limit and is a few
+    milliseconds on the GPU at that size.
+    """
+    s, _ = v.float().flatten().sort()
+    n = s.numel()
+    if n == 0:
+        raise ValueError("quantiles of an empty tensor")
+    idx = torch.tensor([min(n - 1, max(0, int(round(q * (n - 1))))) for q in qs], device=s.device)
+    return s[idx].tolist()

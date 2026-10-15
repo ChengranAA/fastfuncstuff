@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from ..utils import quantiles
 from .formwarp import FOLD_GUARD_FLOOR
 from .optiwarp import jacobian_determinant
 from .penalty import _central_diff_batched
@@ -117,19 +118,6 @@ class WarpQC:
         return asdict(self)
 
 
-def _quantiles(v: Tensor, qs: tuple[float, ...]) -> list[float]:
-    """Quantiles of a flat tensor, with no size ceiling.
-
-    ``torch.quantile`` refuses inputs beyond ~16M elements, which an unmasked
-    warp field on a padded grid exceeds (a 193^3 base pads to 17M). Sorting has
-    no such limit and is a few milliseconds on the GPU at this size.
-    """
-    s, _ = v.float().flatten().sort()
-    n = s.numel()
-    idx = torch.tensor([min(n - 1, max(0, int(round(q * (n - 1))))) for q in qs], device=s.device)
-    return s[idx].tolist()
-
-
 def _second_derivative_energy(d: Tensor) -> Tensor:
     """Mean squared second derivative of one displacement component.
 
@@ -189,8 +177,8 @@ def warp_regularity(
     if n == 0:
         raise ValueError("warp_regularity: mask selected no voxels")
 
-    j01, j50, j99 = _quantiles(jac_v, (0.01, 0.5, 0.99))
-    (d99,) = _quantiles(disp_v, (0.99,))
+    j01, j50, j99 = quantiles(jac_v, (0.01, 0.5, 0.99))
+    (d99,) = quantiles(disp_v, (0.99,))
 
     # Bending energy is a property of the field, not of the mask, and the second
     # differences need neighbours — so it is computed on the whole grid.

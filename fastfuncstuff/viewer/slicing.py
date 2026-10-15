@@ -13,6 +13,7 @@ effectively cannot.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -233,7 +234,18 @@ def ras_axes(affine: np.ndarray) -> dict[str, tuple[int, int]]:
 
 
 def plane_layout(affine: np.ndarray, plane: Plane) -> PlaneLayout:
-    """Lay a plane out so anatomy is where a radiologist expects it."""
+    """Lay a plane out so anatomy is where a radiologist expects it.
+
+    Cached by the affine's rotation: a repaint asks ~40 times with the same
+    one, and the answer is a frozen dataclass nobody can change.
+    """
+    rot = np.ascontiguousarray(np.asarray(affine, dtype=np.float64)[:3, :3])
+    return _plane_layout(rot.tobytes(), plane)
+
+
+@functools.lru_cache(maxsize=256)
+def _plane_layout(rot_bytes: bytes, plane: Plane) -> PlaneLayout:
+    affine = np.frombuffer(rot_bytes, dtype=np.float64).reshape(3, 3)
     axes = ras_axes(affine)
     normal, up, right = _PLANE_CONVENTION[plane]
 
@@ -320,10 +332,25 @@ def display_to_layer(
     Composes ``inv(layer_affine) @ grid_affine`` once and applies it as a single
     matrix, rather than going through millimetres per voxel.
     """
-    m = np.linalg.inv(np.asarray(layer_affine, float)) @ np.asarray(grid_affine, float)
-    mat = torch.as_tensor(m, dtype=display_ijk.dtype, device=display_ijk.device)
+    mat = torch.tensor(
+        _grid_to_layer(
+            np.asarray(grid_affine, float).tobytes(), np.asarray(layer_affine, float).tobytes()
+        ),
+        dtype=display_ijk.dtype,
+        device=display_ijk.device,
+    )
     rot, shift = mat[:3, :3], mat[:3, 3]
     return display_ijk @ rot.T + shift
+
+
+@functools.lru_cache(maxsize=256)
+def _grid_to_layer(grid_bytes: bytes, layer_bytes: bytes) -> np.ndarray:
+    """``inv(layer) @ grid`` for two 4x4 affines, keyed by their bytes."""
+    grid = np.frombuffer(grid_bytes, dtype=np.float64).reshape(4, 4)
+    layer = np.frombuffer(layer_bytes, dtype=np.float64).reshape(4, 4)
+    out = np.linalg.inv(layer) @ grid
+    out.setflags(write=False)
+    return out
 
 
 def sample_volume(

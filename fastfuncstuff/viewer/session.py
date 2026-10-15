@@ -1880,19 +1880,50 @@ class ViewerSession:
         if hit is not None:
             return hit
 
-        try:
-            arr = self.shown_volume(key, idx)
-        except (KeyError, FileNotFoundError, ValueError):
-            return None
-        tensor = torch.as_tensor(np.ascontiguousarray(arr), dtype=torch.float32).to(
-            self.display_device
-        )
+        tensor = self._device_frame(res, layer, idx)
+        if tensor is None:
+            try:
+                arr = self.shown_volume(key, idx)
+            except (KeyError, FileNotFoundError, ValueError):
+                return None
+            tensor = torch.as_tensor(np.ascontiguousarray(arr), dtype=torch.float32).to(
+                self.display_device
+            )
         # One sub-brick per layer is enough: panes share it, and holding more
         # would quietly duplicate what the residency store already owns.
         for stale in [k for k in self._volume_cache if k[0] == key]:
             del self._volume_cache[stale]
         self._volume_cache[cache_key] = tensor
         return tensor
+
+    def _device_frame(self, res: Resident, layer: Layer, idx: int) -> torch.Tensor | None:
+        """Frame ``idx`` of a resident run, sliced on the device; None for the host path.
+
+        A frame out of a host array stored (X, Y, Z, T) is a strided gather
+        plus an upload -- ~10 ms a step on a 100x100x72 run, most of scrubbing
+        time. Promoted, it is a slice. The store's promote keeps its own
+        budget and evicts by recency, so this asks rather than claims: the
+        host path stays for a run not yet in RAM, a time view (detrend / PSC
+        is computed on the host), a display on another device (Metal repaints
+        on the CPU), or a card without room.
+        """
+        if (
+            res.info.n_volumes < 2
+            or res.array is None
+            or res.provider is not None
+            or layer.time_detrend >= 0
+            or layer.time_psc
+            or self.store.device.type != self.display_device.type
+            # On the CPU a "promoted" copy saves nothing and is still charged
+            # to the store's budget, which would evict other data for it.
+            or self.store.device.type == "cpu"
+        ):
+            return None
+        try:
+            series = self.store.promote(layer.key)
+        except (RuntimeError, MemoryError):
+            return None
+        return series[..., idx].contiguous()
 
     def invalidate(self, key: str | None = None) -> None:
         """Drop cached device volumes for one layer, or all of them."""

@@ -300,6 +300,13 @@ class WindowManager(QtCore.QObject):
                 if dirty & (Aspect.CROSSHAIR | Aspect.SLICES | Aspect.LAYERS | Aspect.TIME):
                     self._heavy(win, dirty, moving, scrolling)
             elif graphs:
+                # A threshold or a colour map reaches a graph only through its
+                # tint; an untinted one has nothing new to draw (4 ms a tick of
+                # a threshold drag).
+                tint_only = not dirty & ~(Aspect.THRESHOLD | Aspect.COLORMAP)
+                viewport = self.session.state.viewports.find(win.vid)
+                if tint_only and isinstance(win, GraphWindow) and not (viewport and viewport.tint):
+                    continue
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
                 win.refresh()

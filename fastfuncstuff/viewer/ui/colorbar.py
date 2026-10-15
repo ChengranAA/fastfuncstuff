@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 
+import numpy as np
 import torch
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -79,7 +80,20 @@ class ColorBar(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Expanding
         )
 
+    def _state(self) -> tuple:
+        return (
+            self._lut_name,
+            self._reverse,
+            self._lo,
+            self._hi,
+            self._threshold,
+            self._sign,
+            self._panes,
+            self._alpha,
+        )
+
     def configure(self, layer) -> None:
+        before = self._state()
         self._lut_name = layer.colormap
         self._reverse = bool(layer.colormap_reversed)
         self._lo = float(layer.range_lo if layer.range_lo is not None else 0.0)
@@ -90,7 +104,36 @@ class ColorBar(QtWidgets.QWidget):
         self._sign = layer.sign_mode
         self._panes = int(layer.n_panes)
         self._alpha = layer.alpha_mode
-        self.update()
+        # Configured on every refresh -- a time step, a crosshair move -- and
+        # a repaint for a bar that has not changed was 4 ms of each one.
+        if self._state() != before:
+            self.update()
+
+    def _gradient(self, h: int) -> QtGui.QImage | None:
+        """The bar's colours as an image, rebuilt only when they change."""
+        key = (*self._state(), h)
+        if getattr(self, "_gradient_key", None) == key:
+            return self._gradient_image
+        try:
+            lut = build_lut(self._lut_name, 256, device=torch.device("cpu"), reverse=self._reverse)
+        except KeyError:
+            return None
+        values = torch.linspace(self._hi, self._lo, h)
+        rgb = apply_colormap(
+            values, lut=lut, lo=self._lo, hi=self._hi, sign_mode=self._sign, n_panes=self._panes
+        )
+        if self._threshold > 0:
+            fade = 0.28 if self._alpha is AlphaMode.OFF else 0.55
+            cut = values.abs() < self._threshold
+            rgb = torch.where(cut[:, None], rgb * fade, rgb)
+        row = (rgb.clamp(0, 1) * 255).round().to(torch.uint8).numpy()
+        width = BAR_WIDTH - 2
+        img = np.ascontiguousarray(np.repeat(row[:, None, :], width, axis=1))
+        self._gradient_image = QtGui.QImage(
+            img.data, width, h, 3 * width, QtGui.QImage.Format.Format_RGB888
+        ).copy()
+        self._gradient_key = key
+        return self._gradient_image
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
         p = QtGui.QPainter(self)
@@ -98,30 +141,11 @@ class ColorBar(QtWidgets.QWidget):
         p.fillRect(self.rect(), QtGui.QColor(c.bg))
         h = max(self.height() - 2, 1)
         bar = QtCore.QRect(1, 1, BAR_WIDTH - 2, h)
-        try:
-            lut = build_lut(self._lut_name, 256, device=torch.device("cpu"), reverse=self._reverse)
-        except KeyError:
+        gradient = self._gradient(h)
+        if gradient is None:
             p.end()
             return
-
-        values = torch.linspace(self._hi, self._lo, h)
-        rgb = apply_colormap(
-            values,
-            lut=lut,
-            lo=self._lo,
-            hi=self._hi,
-            sign_mode=self._sign,
-            n_panes=self._panes,
-        )
-        for y in range(h):
-            r, g, b = (float(c) for c in rgb[y])
-            if self._threshold > 0 and abs(float(values[y])) < self._threshold:
-                fade = 0.28 if self._alpha is AlphaMode.OFF else 0.55
-                r, g, b = r * fade, g * fade, b * fade
-            p.fillRect(
-                QtCore.QRect(bar.x(), bar.y() + y, bar.width(), 1),
-                QtGui.QColor.fromRgbF(r, g, b),
-            )
+        p.drawImage(bar.topLeft(), gradient)
 
         p.setPen(QtGui.QPen(QtGui.QColor(c.edge)))
         p.setBrush(QtCore.Qt.BrushStyle.NoBrush)

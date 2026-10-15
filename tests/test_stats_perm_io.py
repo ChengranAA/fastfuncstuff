@@ -306,3 +306,56 @@ class TestPermCLIOptionalMask:
         rc = main()
         assert rc in (0, None)
         assert (tmp_path / "nomask_stats.nii").exists()
+
+
+# ---------------------------------------------------------------------------
+# ffs_perm CLI: -index picks one volume from each group-mode input
+# ---------------------------------------------------------------------------
+
+
+class TestPermCLIIndex:
+    """-index N on 4D group inputs must equal feeding their Nth volumes as 3D files."""
+
+    def _run(self, monkeypatch, tmp_path, name, *extra):
+        from fastfuncstuff.cli.ffs_perm import main
+
+        argv = ["ffs_perm", *extra, "-nn", "3", "-n_perms", "50", "-verb", "0"]
+        argv += ["-device", "cpu", "-no_refit", "-prefix", str(tmp_path / f"{name}.nii")]
+        monkeypatch.setattr("sys.argv", argv)
+        main()
+        return np.asarray(_nib().load(str(tmp_path / f"{name}_stats.nii")).dataobj)
+
+    def _subjects(self, tmp_path, n=6):
+        nib = _nib()
+        rng = np.random.default_rng(1)
+        four_d, three_d = [], []
+        for s in range(n):
+            data = rng.normal(size=(5, 5, 3, 4)).astype(np.float32)
+            data[1:3, 1:3, :, 1] += 2.0  # effect only in volume 1
+            p4 = tmp_path / f"sub{s}_4d.nii.gz"
+            p3 = tmp_path / f"sub{s}_v1.nii.gz"
+            nib.save(nib.Nifti1Image(data, np.eye(4)), str(p4))
+            nib.save(nib.Nifti1Image(data[..., 1], np.eye(4)), str(p3))
+            four_d.append(str(p4))
+            three_d.append(str(p3))
+        return four_d, three_d
+
+    def test_index_matches_preextracted_volumes(self, tmp_path, monkeypatch):
+        four_d, three_d = self._subjects(tmp_path)
+        got = self._run(monkeypatch, tmp_path, "idx", "-input_a", *four_d, "-index", "1")
+        ref = self._run(monkeypatch, tmp_path, "ref", "-input_a", *three_d)
+        np.testing.assert_array_equal(got, ref)
+
+    def test_index_out_of_range_names_the_file(self, tmp_path, monkeypatch):
+        four_d, _ = self._subjects(tmp_path, n=2)
+        with pytest.raises(ValueError, match="-index 9 on .*sub0_4d"):
+            self._run(monkeypatch, tmp_path, "bad", "-input_a", *four_d, "-index", "9")
+
+    def test_index_rejected_with_events_input(self, tmp_path, monkeypatch):
+        four_d, _ = self._subjects(tmp_path, n=1)
+        with pytest.raises(SystemExit, match="group mode"):
+            self._run(monkeypatch, tmp_path, "ev", "-input", four_d[0], "-index", "0")
+
+
+def _nib():
+    return pytest.importorskip("nibabel")

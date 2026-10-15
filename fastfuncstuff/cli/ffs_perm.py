@@ -41,6 +41,7 @@ try:
         spinner,
     )
     from fastfuncstuff.io.afni import load_afni_mask, load_nifti, save_nifti
+    from fastfuncstuff.io.headers import parse_subbrick_selector
     from fastfuncstuff.stats.cluster import (
         DEFAULT_NN,
         DEFAULT_SIDED,
@@ -107,6 +108,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="(Group/2-file mode) 4D inputs for group B. If omitted, "
         "-input-a alone is a 1-sample test against zero.",
+    )
+    inp.add_argument(
+        "-index",
+        type=int,
+        default=None,
+        metavar="N",
+        help="(Group/2-file mode) Take only volume N (0-based) from every "
+        "-input-a/-input-b file, so a glob of 4D per-subject outputs "
+        "(e.g. -input-a sub-*/betas.nii.gz -index 3) tests their 4th "
+        "sub-brick.  Same as appending [N] to each path.",
     )
     inp.add_argument(
         "-events",
@@ -318,12 +329,24 @@ def _resolve_selection(args, events):
     raise SystemExit(f"-test takes 1 or 2 labels (got {len(labels)}).")
 
 
-def _stack_inputs(paths: list[str]) -> tuple[np.ndarray, object]:
-    """Concatenate 4D inputs along the trial axis."""
+def _stack_inputs(paths: list[str], index: int | None = None) -> tuple[np.ndarray, object]:
+    """Concatenate 4D inputs along the trial axis.
+
+    ``index`` keeps only that volume of each file, via load_nifti's own
+    ``[N]`` sub-brick selector.
+    """
     arrs = []
     img0 = None
     for p in paths:
-        d, im = _load_4d(p)
+        if index is not None:
+            if parse_subbrick_selector(p)[1] is not None:
+                raise ValueError(f"{p} already carries a [..] selector; drop it or -index")
+            try:
+                d, im = _load_4d(f"{p}[{index}]")
+            except ValueError as exc:
+                raise ValueError(f"-index {index} on {p}: {exc}") from exc
+        else:
+            d, im = _load_4d(p)
         if img0 is None:
             img0 = im
             shape3d = d.shape[:3]
@@ -524,6 +547,12 @@ def main() -> None:
             "Use either -input (events mode) or -input-a/-input-b (group mode), not both."
         )
 
+    if args.index is not None:
+        if args.input is not None:
+            raise SystemExit("-index applies to -input-a/-input-b (group mode), not -input.")
+        if args.index < 0:
+            raise SystemExit(f"-index must be >= 0 (got {args.index}).")
+
     test_kind: str
 
     if args.input is not None:
@@ -576,7 +605,7 @@ def main() -> None:
             raise SystemExit("Specify -input or -input-a.")
         import types
 
-        data_a, _ = _stack_inputs(args.input_a)
+        data_a, _ = _stack_inputs(args.input_a, args.index)
         if args.input_b is None:
             data4d = data_a
             test_kind = "one"
@@ -587,7 +616,7 @@ def main() -> None:
                 label="mean",
             )
         else:
-            data_b, _ = _stack_inputs(args.input_b)
+            data_b, _ = _stack_inputs(args.input_b, args.index)
             data4d = np.concatenate([data_a, data_b], axis=3)
             n_a = data_a.shape[3]
             n_b = data_b.shape[3]

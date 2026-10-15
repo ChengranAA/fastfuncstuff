@@ -951,3 +951,79 @@ def test_subbrick_selector_still_reads_a_plain_4d_series(tmp_path):
     assert load_nifti(f"{p}[3]").shape == (4, 5, 6, 1)
     assert np.allclose(np.asarray(load_nifti(f"{p}[3]").dataobj), 3)
     assert load_nifti(f"{p}[2..4]").shape == (4, 5, 6, 3)
+
+
+def _write_afni(path_stem: Path, data: np.ndarray, gz: bool = False) -> Path:
+    """Hand-write a tiny +orig dataset: RAI, 2 mm, scaled shorts, TR 2 s.
+
+    RAI (AFNI's default) is the orientation that flips x and y relative to RAS,
+    so the loader's affine is checked against a sign convention, not identity.
+    ``data`` is (x, y, z, t); each brick is stored as short with factor 0.5.
+    """
+    import gzip
+
+    nx, ny, nz, nt = data.shape
+    attrs = [
+        ("integer", "DATASET_RANK", [3, nt, 0, 0, 0, 0, 0, 0]),
+        ("integer", "DATASET_DIMENSIONS", [nx, ny, nz, 0, 0]),
+        ("integer", "BRICK_TYPES", [1] * nt),
+        ("float", "BRICK_FLOAT_FACS", [0.5] * nt),
+        ("integer", "ORIENT_SPECIFIC", [0, 3, 4]),
+        ("float", "ORIGIN", [10.0, 20.0, -30.0]),
+        ("float", "DELTA", [2.0, 2.0, 2.0]),
+        # ijk -> DICOM (RAI) mm; nibabel reads the affine from this, as AFNI does
+        ("float", "IJK_TO_DICOM_REAL", [2.0, 0, 0, 10.0, 0, 2.0, 0, 20.0, 0, 0, 2.0, -30.0]),
+        ("integer", "SCENE_DATA", [0, 2, 0, -999, -999, -999, -999, -999]),
+        ("integer", "TAXIS_NUMS", [nt, 0, 77002, -999, -999, -999, -999, -999]),
+        ("float", "TAXIS_FLOATS", [0.0, 2.0, 0.0, 0.0, 0.0, -999999.0, -999999.0, -999999.0]),
+        ("string", "TYPESTRING", "3DIM_HEAD_ANAT"),
+        ("string", "BYTEORDER_STRING", "LSB_FIRST"),
+    ]
+    lines = []
+    for kind, name, val in attrs:
+        if kind == "string":
+            lines.append(
+                f"type = string-attribute\nname = {name}\ncount = {len(val) + 1}\n'{val}~\n"
+            )
+        else:
+            body = " ".join(str(v) for v in val)
+            lines.append(f"type = {kind}-attribute\nname = {name}\ncount = {len(val)}\n {body}\n")
+    head = path_stem.with_name(path_stem.name + "+orig.HEAD")
+    head.write_text("\n".join(lines))
+    raw = np.round(data / 0.5).astype("<i2").transpose(3, 2, 1, 0).tobytes()
+    brik = path_stem.with_name(path_stem.name + "+orig.BRIK")
+    if gz:
+        with gzip.open(f"{brik}.gz", "wb") as f:
+            f.write(raw)
+    else:
+        brik.write_bytes(raw)
+    return head
+
+
+@pytest.mark.parametrize("gz", [False, True])
+@pytest.mark.parametrize("spelling", ["+orig.HEAD", "+orig.BRIK", "+orig", "+orig."])
+def test_load_image_reads_afni_natively(tmp_path, gz, spelling):
+    """HEAD/BRIK(.gz) load through the same load_image as NIfTI: values (with
+    the brick factor applied), RAS affine, TR, and every name AFNI accepts."""
+    import torch
+
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.processing.io import load_image
+
+    rng = np.random.default_rng(0)
+    data = rng.integers(-200, 200, size=(5, 4, 3, 2)).astype(np.float32) * 0.5
+    _write_afni(tmp_path / "dset", data, gz=gz)
+    path = str(tmp_path / "dset") + (
+        spelling + ".gz" if gz and spelling == "+orig.BRIK" else spelling
+    )
+
+    vol, info = load_image(path, device=torch.device("cpu"))
+    # load_image is (t, z, y, x)
+    np.testing.assert_array_equal(vol.numpy(), data.transpose(3, 2, 1, 0))
+    expected = np.array(
+        [[-2.0, 0, 0, -10.0], [0, -2.0, 0, -20.0], [0, 0, 2.0, -30.0], [0, 0, 0, 1]]
+    )
+    np.testing.assert_allclose(info["affine"], expected)
+    assert float(load_nifti(path).header.get_zooms()[3]) == pytest.approx(2.0)
+    one, _ = load_image(path + "[1]", device=torch.device("cpu"))
+    np.testing.assert_array_equal(one.numpy(), data[..., 1].transpose(2, 1, 0))

@@ -404,7 +404,7 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
     """
     # Parse sub-brick selector before resolving the path
     clean_path, indices = parse_subbrick_selector(str(filepath))
-    filepath = Path(clean_path)
+    filepath = Path(_afni_head_path(clean_path))
 
     if not filepath.exists():
         raise FileNotFoundError(f"File not found: {filepath}")
@@ -424,6 +424,8 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         from fastfuncstuff.io.gifti import gifti_as_nifti
 
         img_out = gifti_as_nifti(filepath)
+    elif filepath.name.endswith(".HEAD"):
+        img_out = _afni_as_nifti(filepath)
     elif str(filepath).lower().endswith((".mgz", ".mgh")):
         # FreeSurfer volumes: same voxels and scanner affine, as a NIfTI, so
         # everything downstream of this function is unchanged.
@@ -443,6 +445,47 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
     _record_grid_space(img_out)
 
     return _apply_selector_to_image(img_out, indices)
+
+
+def _afni_head_path(path: str) -> str:
+    """Any spelling of an AFNI dataset -> its .HEAD; anything else unchanged.
+
+    AFNI accepts ``dset+orig``, ``dset+orig.``, ``.HEAD``, ``.BRIK`` and
+    ``.BRIK.gz`` for the same dataset; nibabel wants the header.
+    """
+    m = re.match(r"^(.*\+(?:orig|acpc|tlrc))(?:\.|\.HEAD|\.BRIK|\.BRIK\.gz)?$", path)
+    return f"{m.group(1)}.HEAD" if m else path
+
+
+def _afni_as_nifti(head: Path) -> nib.Nifti1Image:
+    """An AFNI HEAD/BRIK(.gz) as a NIfTI, same voxels and RAS affine.
+
+    nibabel's AFNI reader does the work (RAI->RAS, per-brick float factors, a
+    gzipped BRIK); converting here keeps this function's NIfTI-only contract, so
+    nothing downstream needs to know the file was AFNI. Bricks of mixed datum
+    are the one thing it refuses -- 3dcalc -datum float them first.
+    """
+    if Path(str(head)[: -len(".HEAD")] + ".BRIK.gz").exists():
+        from fastfuncstuff.io.fastgzip import install
+
+        install(resolve_cpu_threads()[0])
+    from nibabel.brikhead import AFNIImage
+
+    afni = nib.load(str(head))
+    assert isinstance(afni, AFNIImage)
+    img = nib.Nifti1Image(afni.get_fdata(dtype=np.float32), afni.affine)
+    zooms = afni.header.get_zooms()
+    img.header.set_zooms(zooms[: img.ndim] + (1.0,) * max(0, img.ndim - len(zooms)))
+    img.header.set_xyzt_units("mm", "sec")
+    # NIfTI's xform code is the nearest thing to AFNI's view: scanner for +orig,
+    # a template for +tlrc (MNI when the header says so, else Talairach).
+    code = 1
+    if str(head).endswith("+tlrc.HEAD"):
+        space = str(afni.header.info.get("TEMPLATE_SPACE", ""))
+        code = 4 if "MNI" in space.upper() else 3
+    img.set_qform(afni.affine, code=code)
+    img.set_sform(afni.affine, code=code)
+    return img
 
 
 def _load_zst_via_tempfile(filepath: Path, zstd_threads: int | None) -> nib.Nifti1Image:

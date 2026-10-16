@@ -381,6 +381,7 @@ class TissueFollowingSampler:
         )
         self._coords: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
         self._valid: dict[int, Tensor] = {}
+        self._delta: dict[int, Tensor] = {}
         self._srcs: dict[int, tuple[Tensor, ...]] = {}
         self._warped: dict[int, list[Tensor]] = {}
 
@@ -427,6 +428,7 @@ class TissueFollowingSampler:
             if fc not in fcs:
                 del self._coords[fc]
                 self._valid.pop(fc, None)
+                self._delta.pop(fc, None)
                 self._srcs.pop(fc, None)
                 self._warped.pop(fc, None)
         for fc in fcs:
@@ -461,6 +463,20 @@ class TissueFollowingSampler:
                 & (sz <= nz - 0.5)
             ).to(sx.dtype)
             self._valid[fc] = found
+        return found
+
+    def _delta_of(self, f: int) -> Tensor:
+        """Acquisition offset of the scanner slice frame ``f``'s pose lands in.
+
+        Once per frame, not once per (frame, window) pair: each frame is a tap of
+        ~11 output frames, and recomputing its offsets each time was 11 full-grid
+        lookups a frame for the same answer.
+        """
+        fc = self._clamp(f)
+        found = self._delta.get(fc)
+        if found is None:
+            found = interp_slice_times(self._coords[fc][2], self.slice_times)
+            self._delta[fc] = found
         return found
 
     def _tap(self, f: int) -> list[Tensor]:
@@ -500,9 +516,7 @@ class TissueFollowingSampler:
 
         # Per-tap acquisition offset, and the nominal (uniform) grid: the output
         # frame's own offset, which is exactly the frozen path's time grid.
-        delta = {
-            f: interp_slice_times(self._coords[self._clamp(f)][2], self.slice_times) for f in frames
-        }
+        delta = {f: self._delta_of(f) for f in frames}
         delta_ref = delta[frame_idx]
         weights = {
             f: temporal_kernel_weights(

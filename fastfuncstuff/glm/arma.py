@@ -1589,6 +1589,26 @@ def precompute_reml_grid(
     return precomputed
 
 
+def _unique_rows_2col(
+    x: torch.Tensor, *, return_inverse: bool = False
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """``torch.unique(x, dim=0)`` for an ``(n, 2)`` table, 20x faster.
+
+    ``unique(dim=0)`` sorts whole rows generically: 1.1 s for the 500k ``(a, b)``
+    pairs of a real REML run, 4.7 s at 2M voxels, and it is paid once per HRF in
+    per-voxel HRF mode.  The pairs sit on a small grid, so ranking each column with
+    a 1-D unique and sorting one integer key gives the same rows in the same
+    (lexicographic) order, with the same inverse indices.
+    """
+    if x.ndim != 2 or x.shape[1] != 2 or x.shape[0] == 0 or bool(torch.isnan(x).any()):
+        return torch.unique(x, dim=0, return_inverse=return_inverse)
+    ua, ia = torch.unique(x[:, 0], return_inverse=True)
+    ub, ib = torch.unique(x[:, 1], return_inverse=True)
+    key_unique, inverse = torch.unique(ia * len(ub) + ib, return_inverse=True)
+    rows = torch.stack([ua[key_unique // len(ub)], ub[key_unique % len(ub)]], dim=1)
+    return (rows, inverse) if return_inverse else rows
+
+
 @torch.inference_mode()
 def _residualize_reml_search_data(X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
     """Remove fitted signal before low-precision REML energy differences.
@@ -3346,7 +3366,7 @@ def _fit_dsort_gls_pass(
     # populated by the main (no-dsort) GLS fit that always precedes this pass.
     assert results.arma_params is not None
     ab_cpu = results.arma_params.cpu().contiguous()
-    unique_pairs, inverse_indices = torch.unique(ab_cpu, dim=0, return_inverse=True)
+    unique_pairs, inverse_indices = _unique_rows_2col(ab_cpu, return_inverse=True)
     sort_keys, sort_perm = torch.sort(inverse_indices, stable=True)
     group_starts = torch.cat(
         [
@@ -4361,7 +4381,7 @@ def fit_glm_arma11(
             if verbose:
                 print("Building Cholesky cache from precomputed parameters...")
 
-            unique_params = torch.unique(precomputed_arma_params, dim=0)
+            unique_params = _unique_rows_2col(precomputed_arma_params)
             precomputed_grid = {}
 
             # Free GPU memory before building cache (critical for large datasets!)
@@ -4733,7 +4753,7 @@ def fit_glm_arma11(
         # set, and we pay it once per HRF in per-voxel HRF mode. torch.unique
         # does it in one tensor op.
         ab_cpu = results.arma_params.cpu().contiguous()
-        unique_pairs, inverse_indices = torch.unique(ab_cpu, dim=0, return_inverse=True)
+        unique_pairs, inverse_indices = _unique_rows_2col(ab_cpu, return_inverse=True)
         # Sort voxel indices by group to find per-group slice boundaries fast.
         sort_keys, sort_perm = torch.sort(inverse_indices, stable=True)
         # Group boundaries: where the group id changes.

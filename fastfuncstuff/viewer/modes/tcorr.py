@@ -223,9 +223,21 @@ class TCorrMode(Mode):
         from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox, gaussian3d_batched
 
         sigma = fwhm_mm_to_sigma_vox(fwhm, self._zooms)
-        out = torch.empty(arr.shape, dtype=torch.float32)
         n_t = arr.shape[3]
         step(0.4 + 0.4 * k / n, f"blur {fwhm:g} mm, file {k + 1}")
+        if arr.flags.f_contiguous and not arr.flags.c_contiguous:
+            # A nibabel array: a block of volumes is already a contiguous (t, z, y, x)
+            # array, so blur it in that order and keep the result F-ordered -- the
+            # layout paired_voxel_correlation streams fastest.  Moving t to the front
+            # of an F-ordered array instead is a full transpose on the host.
+            out_tzyx = torch.empty(arr.shape[::-1], dtype=torch.float32)
+            src = torch.from_numpy(arr).permute(3, 2, 1, 0)
+            for t0 in range(0, n_t, _BLUR_BLOCK):
+                t1 = min(n_t, t0 + _BLUR_BLOCK)
+                blurred = gaussian3d_batched(src[t0:t1].to(device), sigma[::-1])
+                out_tzyx[t0:t1].copy_(blurred)
+            return out_tzyx.permute(3, 2, 1, 0)
+        out = torch.empty(arr.shape, dtype=torch.float32)
         for t0 in range(0, n_t, _BLUR_BLOCK):
             t1 = min(n_t, t0 + _BLUR_BLOCK)
             block = torch.from_numpy(np.ascontiguousarray(np.moveaxis(arr[..., t0:t1], 3, 0)))

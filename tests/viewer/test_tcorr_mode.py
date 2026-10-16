@@ -110,3 +110,18 @@ def test_mismatched_files_say_so_instead_of_drawing(session, files, tmp_path):
     _go(session, [paths[0], odd])
     assert _map(session) is None
     assert "differ" in session.mode.status()
+
+
+def test_blur_of_an_f_ordered_file_matches_the_c_ordered_one(session, files):
+    """nibabel hands back F-order; that path blurs in (t, z, y, x) order and must agree."""
+    _, paths = files
+    _go(session, paths[:2])
+    mode = session.mode
+    arr = mode._arrays[paths[0]]
+    assert arr.flags.f_contiguous  # what load_nifti gives, so the fast path is the live one
+    noop = lambda *_: None  # noqa: E731
+    f_out = mode._blurred(arr, 6.0, CPU, noop, 0, 1)
+    c_out = mode._blurred(np.ascontiguousarray(arr), 6.0, CPU, noop, 0, 1)
+    assert f_out.shape == c_out.shape == arr.shape
+    # Axes blurred in the opposite order: float32 rounding only (values ~100).
+    torch.testing.assert_close(f_out, c_out, atol=0, rtol=2e-6)

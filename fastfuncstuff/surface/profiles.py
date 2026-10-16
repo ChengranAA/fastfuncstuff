@@ -225,10 +225,23 @@ def sample_depths(
     pts = w[:, None, :] + rho[..., None] * (p - w)[:, None, :]  # (V, K, 3)
     inv = np.linalg.inv(np.asarray(affine, np.float64))
     ijk = pts @ inv[:3, :3].T + inv[:3, 3]
-    vol = np.asarray(volume, np.float32)
+    vol = np.asarray(volume)
     four_d = vol.ndim == 4
     if not four_d:
         vol = vol[..., None]
+    # Only the box the samples fall in, plus the voxel past each edge that the
+    # interpolation reads (and at least two voxels a side, so an out-of-volume
+    # sample is still zero-padded rather than clamped).  A depth-window disc is a
+    # few hundred voxels; copying and uploading the whole 0.7 mm head for it was
+    # 135 of the 160 ms every crosshair move cost.
+    full = np.array(vol.shape[:3])
+    if (full >= 2).all() and ijk.size:
+        flat = ijk.reshape(-1, 3)
+        lo = np.clip(np.floor(flat.min(axis=0)).astype(np.int64), 0, full - 2)
+        hi = np.clip(np.floor(flat.max(axis=0)).astype(np.int64) + 2, lo + 2, full)
+        vol = vol[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]]
+        ijk = ijk - lo
+    vol = np.asarray(vol, np.float32)
     shape = np.array(vol.shape[:3], np.float64)
     # grid_sample's (x, y, z) index (W, H, D); the array is (X, Y, Z), taken
     # as (D, H, W) -- so the grid is (k, j, i), normalised to [-1, 1] at the

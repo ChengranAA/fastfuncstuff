@@ -234,9 +234,12 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     out_dir = _out_dir(ctx)
     out_dir.mkdir(parents=True, exist_ok=True)
     pe = _pe_axis(ctx, task, run)
+    # -no_movie: the flow movie is QC, not part of the correction, and rendering it
+    # (HSV flow colouring plus encode) was ~10% of the profiled run.  The speed
+    # number should mean "correcting one real run".
     flags = (
         f"-pe_dir {pe} -backend {params['backend']} -refine {int(params['refine'])}"
-        f"{ctx.ffs_device_flag()}"
+        f" -no_movie{ctx.ffs_device_flag()}"
     )
     elapsed, _ = run_timed(
         f"ffs_locomoco "
@@ -256,7 +259,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"ffs_locomoco "
         f"-input {_synth_input_path(ctx, task, run)} "
         f"-prefix {_synth_stem(ctx, task, run)} "
-        f"-no_movie -no_warp " + flags,
+        f"-no_warp " + flags,
         label=f"ffs_locomoco synthetic ({SYNTH_FRAMES}f x {SYNTH_SLICES}sl)",
         cwd=out_dir,
         verbose=ctx.verbose,

@@ -300,36 +300,38 @@ def _clusterstat(
     """
     cluster_ids = np.unique(labels)
     K = len(cluster_ids)
+    n_total = len(labels)
+
+    # Every statistic is a block sum of ``mat`` over a pair of clusters, so form them
+    # all at once with a one-hot membership matrix.  This was a Python loop over
+    # cluster pairs doing np.ix_ + mean: 776k calls and ~34 s of a 79 s ffs_ica
+    # -icasso run, since compute_rindex calls it once per candidate cluster count.
+    member = (labels[:, None] == cluster_ids[None, :]).astype(np.float64)  # (N, K)
+    sizes = member.sum(axis=0).astype(int)
+    m = np.asarray(mat, dtype=np.float64)
+    block = member.T @ m @ member  # (K, K): sum over rows in cluster i, cols in cluster j
+    diag_sum = member.T @ np.diagonal(m)  # (K,): sum of mat[a, a] over cluster i
+    row_sum = member.T @ m.sum(axis=1)  # (K,): sum over cluster i's rows, all columns
 
     internal_avg = np.full(K, np.nan)
+    pairs = sizes * (sizes - 1)
+    ok = pairs > 0
+    internal_avg[ok] = (np.diagonal(block)[ok] - diag_sum[ok]) / pairs[ok]
+
     external_avg = np.full(K, np.nan)
-    between_avg = np.full((K, K), np.nan)
-    sizes = np.zeros(K, dtype=int)
+    if K > 1:
+        outside = sizes * (n_total - sizes)
+        ok = outside > 0
+        external_avg[ok] = (row_sum[ok] - np.diagonal(block)[ok]) / outside[ok]
 
-    for i, ci in enumerate(cluster_ids):
-        mi = labels == ci
-        ni = mi.sum()
-        sizes[i] = ni
-
-        # Intra: off-diagonal entries of sub-matrix
-        S_in = mat[np.ix_(mi, mi)]
-        if ni > 1:
-            mask_offdiag = ~np.eye(ni, dtype=bool)
-            internal_avg[i] = S_in[mask_offdiag].mean()
-
-        # External: members of ci vs non-members
-        if K > 1:
-            S_out = mat[np.ix_(mi, ~mi)]
-            external_avg[i] = S_out.mean() if S_out.size > 0 else np.nan
-
-    # Between-cluster averages (upper triangle, then symmetrise)
-    between_avg[:] = 0.0
-    for i in range(K):
-        mi = labels == cluster_ids[i]
-        for j in range(i + 1, K):
-            mj = labels == cluster_ids[j]
-            vals = mat[np.ix_(mi, mj)]
-            between_avg[i, j] = vals.mean() if vals.size > 0 else 0.0
+    # Between-cluster averages: upper triangle, then symmetrised.
+    denom = np.outer(sizes, sizes).astype(np.float64)
+    between_avg = np.zeros((K, K))
+    upper = np.triu_indices(K, k=1)
+    nonempty = denom[upper] > 0
+    between_avg[upper] = np.where(
+        nonempty, block[upper] / np.where(nonempty, denom[upper], 1.0), 0.0
+    )
     between_avg = between_avg + between_avg.T
     np.fill_diagonal(between_avg, np.inf)
 

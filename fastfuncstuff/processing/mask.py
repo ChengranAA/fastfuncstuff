@@ -21,6 +21,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff.unique import sorted_unique
+
 # ---------------------------------------------------------------------------
 # Clip-level estimation (matches THD_cliplevel)
 # ---------------------------------------------------------------------------
@@ -162,7 +164,7 @@ def _flood_fill_6conn_labelled(seed: Tensor, allowed: Tensor) -> Tensor:
     labels, _ = ndimage.label(
         allowed.numpy() > 0.5, structure=ndimage.generate_binary_structure(3, 1)
     )
-    reached = numpy.unique(labels[entry.numpy()])
+    reached = sorted_unique(labels[entry.numpy()])
     reached = reached[reached != 0]
     return torch.from_numpy(numpy.isin(labels, reached)).to(seed.device)
 
@@ -531,7 +533,7 @@ def _afni_fillin_completely(mask: numpy.ndarray, nside: int) -> numpy.ndarray:
             flat = out.reshape(-1)
             filled = numpy.flatnonzero(flat & ~before)
             continue
-        cand = numpy.unique(numpy.concatenate([filled, (filled[:, None] + reach).ravel()]))
+        cand = sorted_unique(numpy.concatenate([filled, (filled[:, None] + reach).ravel()]))
         cand = cand[(cand >= 0) & (cand < flat.size)]
         # Inside the core (never within nside of an edge), and still unset.
         z, rem = numpy.divmod(cand, stride[0])

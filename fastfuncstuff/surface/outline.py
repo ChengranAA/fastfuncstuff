@@ -15,6 +15,8 @@ import numpy as np
 from scipy import sparse
 from scipy.sparse.csgraph import connected_components, dijkstra
 
+from fastfuncstuff.unique import sorted_unique
+
 from .smooth import mesh_edges
 
 __all__ = ["fill_outline", "is_closed", "trace_path"]
@@ -24,7 +26,7 @@ def is_closed(faces: np.ndarray) -> bool:
     """Every edge shared by exactly two faces: a closed surface (FreeSurfer's are)."""
     f = np.asarray(faces, np.int64)
     e = np.sort(np.r_[f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], axis=1)
-    _, counts = np.unique(e, axis=0, return_counts=True)
+    _, counts = sorted_unique(e, axis=0, return_counts=True)
     return bool(np.all(counts == 2))
 
 

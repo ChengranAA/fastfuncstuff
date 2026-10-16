@@ -32,6 +32,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import get_device, to_tensor
 
 
@@ -912,7 +913,7 @@ def estimate_noise_parameters_from_data(
 
     # Up to 1000 voxels, spread evenly across the mask. Taking the first 1000
     # took one edge of the volume -- without a mask, the corner of the FOV.
-    sampled = np.unique(np.linspace(0, n_voxels - 1, min(n_voxels, 1000)).round().astype(int))
+    sampled = sorted_unique(np.linspace(0, n_voxels - 1, min(n_voxels, 1000)).round().astype(int))
     for v in sampled:
         resid_v = residuals[:, int(v)]
 

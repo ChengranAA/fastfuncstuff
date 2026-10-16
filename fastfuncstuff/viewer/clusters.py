@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.viewer.layers import SignMode
 
 #: How a layer's sign mode is clustered. ``BOTH`` is bi-sided -- the positive
@@ -302,7 +303,7 @@ def _measure_all(
     peak_mag = np.zeros(n + 1)
     np.maximum.at(peak_mag, lab, magnitude)
     reach = np.flatnonzero(magnitude == peak_mag[lab])
-    firsts = reach[np.unique(lab[reach], return_index=True)[1]]
+    firsts = reach[sorted_unique(lab[reach], return_index=True)[1]]
     coords = np.stack([axis[firsts] for axis in ijk], 1).astype(np.float64)
 
     # Everything per cluster as arrays first, then one plain-Python pass to build

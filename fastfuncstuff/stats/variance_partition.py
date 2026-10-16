@@ -60,6 +60,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import get_device, pinv_f64
 
 # Off-diagonal Gram mass above this fraction of the diagonal means the bands are no longer
@@ -198,7 +199,7 @@ def build_factor_design(
     code_cols: list[Tensor] = []
     for name in names:
         labels = np.asarray(factor_codes[name])
-        uniq, idx = np.unique(labels, return_inverse=True)
+        uniq, idx = sorted_unique(labels, return_inverse=True)
         levels.append(list(uniq))
         code_cols.append(torch.as_tensor(idx, dtype=torch.int64))
     codes = torch.stack(code_cols, dim=1)
@@ -301,7 +302,7 @@ def build_repeat_folds(
     becomes per (cell, run), which is the leak that actually inflates prediction.
     """
     repeat = np.asarray(repeat)
-    uniq = np.unique(repeat)
+    uniq = sorted_unique(repeat)
     folds = []
     for r in uniq:
         test = np.flatnonzero(repeat == r)
@@ -320,7 +321,7 @@ def build_repeat_folds(
         )
         leaks = []
         for fi, (train, test) in enumerate(folds):
-            shared = np.intersect1d(np.unique(keys[train]), np.unique(keys[test]))
+            shared = np.intersect1d(sorted_unique(keys[train]), sorted_unique(keys[test]))
             if shared.size:
                 entry: dict = {"fold": fi, "n_leaks": int(shared.size)}
                 if cell is None:
@@ -357,13 +358,15 @@ def detect_run_nesting(
     if run is None:
         return {}
     run_s = np.asarray(run).astype(str)
-    uniq_runs = np.unique(run_s)
+    uniq_runs = sorted_unique(run_s)
     out: dict[str, dict[str, int]] = {}
     for name, labels in factor_codes.items():
         lab = np.asarray(labels).astype(str)
-        if any(np.unique(lab[run_s == r]).size > 1 for r in uniq_runs):
+        if any(sorted_unique(lab[run_s == r]).size > 1 for r in uniq_runs):
             continue
-        out[name] = {str(lv): int(np.unique(run_s[lab == lv]).size) for lv in np.unique(lab)}
+        out[name] = {
+            str(lv): int(sorted_unique(run_s[lab == lv]).size) for lv in sorted_unique(lab)
+        }
     return out
 
 
@@ -1677,7 +1680,7 @@ def _reduced_fit_cells(y: Tensor, ops: _CellOps, bands: tuple[int, ...]) -> Tens
 
 def _within_block_permutation(blocks: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     perm = np.arange(blocks.shape[0])
-    for b in np.unique(blocks):
+    for b in sorted_unique(blocks):
         idx = np.flatnonzero(blocks == b)
         perm[idx] = rng.permutation(idx)
     return perm
@@ -1717,7 +1720,7 @@ def build_run_exchange(run: np.ndarray, within_run_labels: np.ndarray) -> _RunEx
     """Match trial slots across runs so whole runs can be swapped. See :class:`_RunExchange`."""
     run_s = np.asarray(run).astype(str)
     lab = np.asarray(within_run_labels).astype(str)
-    runs = [str(r) for r in np.unique(run_s)]
+    runs = [str(r) for r in sorted_unique(run_s)]
     run_index = {r: i for i, r in enumerate(runs)}
 
     key_of_trial = np.empty(len(run_s), dtype=object)
@@ -1952,7 +1955,7 @@ def permutation_test(
         observed=observed,
         n_perms=n_perms,
         diagnostics={
-            "n_blocks": int(np.unique(blocks).size),
+            "n_blocks": int(sorted_unique(blocks).size),
             "blocked_by_run": run is not None,
             "balanced": design.balanced,
             "max_offdiag_gram": design.max_offdiag,
@@ -2293,7 +2296,7 @@ def build_roi_weights(
         flat = atlas.reshape(-1)
         if mask is not None:
             flat = flat[mask.reshape(-1)]
-        ids = [int(v) for v in np.unique(flat) if v != 0]
+        ids = [int(v) for v in sorted_unique(flat) if v != 0]
         if not ids:
             raise ValueError("atlas contains no non-zero labels")
         lookup = {v: i for i, v in enumerate(ids)}

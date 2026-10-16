@@ -44,6 +44,7 @@ from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
 from fastfuncstuff.design.spec import load_spec, resolve_contrast
 from fastfuncstuff.glm.arma import build_arma11_covariance
 from fastfuncstuff.io.afni import carry_afni_atrs, load_nifti, read_afni_design_matrix
+from fastfuncstuff.unique import sorted_unique
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -367,7 +368,7 @@ def _bin_index(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np
     # Round to 3 dp so floating-point jitter doesn't fragment bins.
     ar = np.round(a, 3)
     br = np.round(b, 3)
-    unique_ab, inverse = np.unique(
+    unique_ab, inverse = sorted_unique(
         np.stack([ar, br], axis=1)[valid],
         axis=0,
         return_inverse=True,
@@ -459,7 +460,7 @@ def _check_is_rvar(rvar_path: str, stats_path: str, labels: list[str], rvar) -> 
         return 1
 
     pairs = np.stack([np.round(a[in_range], 3), np.round(b[in_range], 3)], 1)
-    n_pairs = len(np.unique(pairs, axis=0))
+    n_pairs = len(sorted_unique(pairs, axis=0))
     n_in = int(in_range.sum())
     # A grid repeats itself: distinct pairs stay flat as voxels grow. A
     # continuous map has nearly one pair per voxel. The ratio arm only kicks in

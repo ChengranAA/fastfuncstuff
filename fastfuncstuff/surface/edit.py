@@ -47,6 +47,7 @@ from fastfuncstuff.surface.mesh import (
     vertex_normals,
 )
 from fastfuncstuff.surface.sampling import VolumeSampler
+from fastfuncstuff.unique import sorted_unique
 
 
 @dataclass(frozen=True)
@@ -188,7 +189,7 @@ class SurfaceEdit:
         # vertices those faces use -- reindexed locally so a mouse move never
         # copies the whole hemisphere.
         faces = topo.faces[topo.faces_of(self.ids)]
-        used, local = np.unique(faces, return_inverse=True)
+        used, local = sorted_unique(faces, return_inverse=True)
         self._fold_faces = local.reshape(faces.shape)
         self._fold_verts = vertices[used]
         self._fold_slot = np.searchsorted(used, self.ids)
@@ -490,7 +491,7 @@ class StrokeEdit(SurfaceEdit):
         from scipy.sparse.csgraph import dijkstra
 
         vertices = np.asarray(vertices, np.float64)
-        seeds = np.unique(np.asarray(seeds, np.int64))
+        seeds = sorted_unique(np.asarray(seeds, np.int64))
         if seeds.size == 0:
             raise ValueError("a stroke needs at least one vertex to move")
         stroke = np.asarray(stroke, np.float64)
@@ -600,7 +601,7 @@ class HighlightEdit(StrokeEdit):
         from scipy.sparse.csgraph import dijkstra
 
         vertices = np.asarray(vertices, np.float64)
-        seeds = np.unique(np.asarray(seeds, np.int64))
+        seeds = sorted_unique(np.asarray(seeds, np.int64))
         if seeds.size == 0:
             raise ValueError("nothing is highlighted")
         graph = topo.edge_graph(vertices)

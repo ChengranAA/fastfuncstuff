@@ -24,6 +24,8 @@ import numpy as np
 from scipy.interpolate import PchipInterpolator
 from scipy.optimize import minimize
 
+from fastfuncstuff.unique import sorted_unique
+
 
 def depth_bin_centres(K: int) -> np.ndarray:
     """Midpoints of K equal depth bins on [0, 1]. WM at 0, CSF at 1."""
@@ -215,7 +217,7 @@ def estimate_depth_psf(
 
     # The same profiles at the same depths but *without* voxel averaging: the
     # unblurred reference the blur has to explain.
-    uniq_depth, first = np.unique(flat_hi, return_index=True)
+    uniq_depth, first = sorted_unique(flat_hi, return_index=True)
     truth = np.stack(
         [
             np.interp(dist, uniq_depth, profiles[first, j], left=np.nan, right=np.nan)

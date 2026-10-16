@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.memory import get_available_memory, get_memory_config
+from fastfuncstuff.unique import sorted_unique
 
 
 def _voxel_chunk(n_voxels: int, bytes_per_vox: int, device: torch.device) -> int:
@@ -134,7 +135,7 @@ def generate_label_swaps(
         return out
 
     blocks = np.asarray(blocks)
-    block_ids = np.unique(blocks)
+    block_ids = sorted_unique(blocks)
     block_idx = [np.where(blocks == b)[0] for b in block_ids]
     for p in range(1, n_perms):
         row = g.copy()
@@ -158,7 +159,7 @@ def count_unique_label_perms(group: np.ndarray, blocks: np.ndarray | None) -> in
     if blocks is None:
         return int(comb(g.shape[0], int(g.sum())))
     total = 1
-    for b in np.unique(blocks):
+    for b in sorted_unique(blocks):
         idx = np.where(blocks == b)[0]
         total *= comb(idx.size, int(g[idx].sum()))
     return total

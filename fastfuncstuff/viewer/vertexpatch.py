@@ -24,6 +24,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from fastfuncstuff.unique import sorted_unique
+
 __all__ = ["VertexPatch", "hex_layout", "vertex_patch"]
 
 
@@ -96,7 +98,7 @@ def vertex_patch(
     patch_faces = faces[inside[faces].all(1)]
     e = np.concatenate([patch_faces[:, [0, 1]], patch_faces[:, [1, 2]], patch_faces[:, [2, 0]]])
     key = np.sort(e, axis=1)
-    uniq, count = np.unique(key, axis=0, return_counts=True)
+    uniq, count = sorted_unique(key, axis=0, return_counts=True)
     outline = uniq[count == 1]
     edges = row[uniq]
 

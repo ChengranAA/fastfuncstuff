@@ -35,6 +35,7 @@ from scipy.spatial.distance import squareform
 from tqdm.auto import tqdm
 
 from fastfuncstuff.memory import get_available_memory
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import get_device, to_tensor
 
 from .ica import create_ica
@@ -233,7 +234,7 @@ def compute_cluster_quality(
         extra : (n_clusters,) mean extra-cluster similarity.
         size : (n_clusters,) int, cluster size.
     """
-    cluster_ids = np.unique(labels)
+    cluster_ids = sorted_unique(labels)
     n_clusters = len(cluster_ids)
     iq = np.full(n_clusters, np.nan)
     intra = np.full(n_clusters, np.nan)
@@ -298,7 +299,7 @@ def _clusterstat(
         external.avg : (K,) mean extra-cluster value.
         between.avg : (K, K) mean between-cluster value (diagonal = Inf).
     """
-    cluster_ids = np.unique(labels)
+    cluster_ids = sorted_unique(labels)
     K = len(cluster_ids)
     n_total = len(labels)
 
@@ -382,7 +383,7 @@ def compute_rindex(
 
         # A finer hierarchy cut cannot merge an existing singleton. Every
         # remaining R-index is therefore undefined; leave its NaN in place.
-        _, counts = np.unique(labels, return_counts=True)
+        _, counts = sorted_unique(labels, return_counts=True)
         if (counts == 1).any():
             break
 
@@ -421,7 +422,7 @@ def select_centrotypes(
     centrotype_indices : (n_clusters,) global indices into the
         concatenated component array.
     """
-    cluster_ids = np.unique(labels)
+    cluster_ids = sorted_unique(labels)
     centrotype_indices = np.empty(len(cluster_ids), dtype=int)
 
     for idx, cid in enumerate(cluster_ids):

@@ -23,6 +23,7 @@ import numpy as np
 
 from fastfuncstuff.io.freesurfer import Hemisphere
 from fastfuncstuff.surface.profiles import equivolume_fraction
+from fastfuncstuff.unique import sorted_unique
 
 #: Shapes a hemisphere can be drawn as, in the order the window offers them.
 #: ``mid`` is half-way between white and pial (pycortex's "fiducial"); ``flat``
@@ -116,7 +117,7 @@ def layout_offsets(
     used: dict[str, np.ndarray] = {}
     for h, p in positions.items():
         if faces is not None and h in faces and faces[h].size:
-            used[h] = p[np.unique(faces[h])]
+            used[h] = p[sorted_unique(faces[h])]
         else:
             used[h] = p
     out: dict[str, np.ndarray] = {}

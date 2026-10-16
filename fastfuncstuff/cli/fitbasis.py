@@ -77,6 +77,7 @@ import torch
 from tqdm.auto import tqdm
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.unique import sorted_unique
 
 try:
     from fastfuncstuff.cli_utils import (
@@ -1988,7 +1989,7 @@ def _run_shift_mode(
             except (FileNotFoundError, ValueError) as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
-            n_used = int(np.unique(imported_index).size)
+            n_used = int(sorted_unique(imported_index).size)
             print(
                 f"  Shape source: {shape_source} — {shapes.shape[0]} curves, "
                 f"assignment IMPORTED from {args.hrf_index} "
@@ -2589,7 +2590,7 @@ def main() -> int:
             )
             return 1
         lab_v = (atlas[mask] if mask is not None else atlas.reshape(-1)).astype(np.int64)
-        parcel_labels = [int(x) for x in np.unique(lab_v) if x > 0]
+        parcel_labels = [int(x) for x in sorted_unique(lab_v) if x > 0]
         if not parcel_labels:
             print("ERROR: -atlas contains no positive labels inside the mask.", file=sys.stderr)
             return 1

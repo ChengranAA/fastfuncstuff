@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.io.afni import load_nifti
+from fastfuncstuff.unique import sorted_unique
 
 from .tools import apply_high_pass_fft, apply_polort_projection
 
@@ -105,7 +106,7 @@ def expand_mask_file(mask_path: str, shape3d: tuple[int, int, int]) -> list[tupl
     rounded = np.rint(pos_vals)
     is_integer_like = np.all(np.abs(pos_vals - rounded) < 1e-5)
     unique_labels = (
-        np.unique(rounded.astype(np.int32)) if is_integer_like else np.array([], dtype=np.int32)
+        sorted_unique(rounded.astype(np.int32)) if is_integer_like else np.array([], dtype=np.int32)
     )
 
     if is_integer_like and unique_labels.size > 1:
@@ -188,7 +189,7 @@ def prepare_depth_mask(
         )
 
     rounded = np.rint(np.where(np.isfinite(data), data, 0.0)).astype(np.int32)
-    labels = [int(v) for v in np.unique(rounded) if int(v) > 0]
+    labels = [int(v) for v in sorted_unique(rounded) if int(v) > 0]
 
     depth_selectors: dict[int, np.ndarray] = {}
     for lbl in labels:

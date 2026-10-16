@@ -13,6 +13,8 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.csgraph import dijkstra
 
+from fastfuncstuff.unique import sorted_unique
+
 
 @dataclass
 class MeshTopology:
@@ -30,8 +32,8 @@ class MeshTopology:
         nv = int(faces.max()) + 1 if n_vertices is None else int(n_vertices)
         e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
         e.sort(axis=1)
-        # 1-D keys: np.unique(axis=0) on ~850k rows is ~10x slower.
-        key = np.unique(e[:, 0] * nv + e[:, 1])
+        # 1-D keys: sorted_unique(axis=0) on ~850k rows is ~10x slower.
+        key = sorted_unique(e[:, 0] * nv + e[:, 1])
         edges = np.stack([key // nv, key % nv], axis=1)
         owner = np.repeat(np.arange(faces.shape[0]), 3)
         verts = faces.ravel()
@@ -48,7 +50,7 @@ class MeshTopology:
             return np.zeros(0, np.int64)
         starts, stops = self.vf_ptr[vertices], self.vf_ptr[vertices + 1]
         idx = np.concatenate([self.vf_index[a:b] for a, b in zip(starts, stops, strict=True)])
-        return np.unique(idx)
+        return sorted_unique(idx)
 
     def adjacency(self) -> sp.csr_matrix:
         """Vertex-to-vertex adjacency, 0/1 CSR; built once, the connectivity never changes."""
@@ -120,7 +122,7 @@ def local_height(
     ids = np.asarray(ids, np.int64)
     reach = _rings(topo, ids, rings)
     # The first difference is needed on the neighbours as well.
-    around = np.unique(np.r_[ids, reach.indices])
+    around = sorted_unique(np.r_[ids, reach.indices])
     ring = _rings(topo, around, rings)
     counts = np.maximum(np.asarray(ring.sum(axis=1)).ravel(), 1)
     mean = np.asarray(ring @ v) / counts[:, None]

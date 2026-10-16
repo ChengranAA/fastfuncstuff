@@ -66,6 +66,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import get_device, linalg_lstsq, parabolic_peak_offset
 
 AMP_RIDGE_DEFAULT = 1e-3
@@ -1280,7 +1281,7 @@ def xval_shifted_hrf(
             else:
                 groups = [
                     (shapes[si], np.flatnonzero(fold_shape_idx == si))
-                    for si in np.unique(fold_shape_idx)
+                    for si in sorted_unique(fold_shape_idx)
                 ]
             # Per-voxel design columns are gathered, so the prediction step
             # costs (nv, n_cond, T) float64 -- 6 GB for a 219k-voxel shape
@@ -1658,7 +1659,7 @@ def fit_shifted_hrf_per_voxel_shape(
     all_converged = True
     last_moved = 0.0
 
-    used = np.unique(shape_index)
+    used = sorted_unique(shape_index)
     for si in tqdm(
         used,
         total=used.size,

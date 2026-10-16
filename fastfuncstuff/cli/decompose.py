@@ -94,6 +94,7 @@ from fastfuncstuff.decomposition.io import save_decomposition_results
 from fastfuncstuff.decomposition.pca import PCA
 from fastfuncstuff.decomposition.tools import parse_num_comps_spec
 from fastfuncstuff.io.afni import get_tr_from_file, load_fmri_data
+from fastfuncstuff.unique import sorted_unique
 
 
 def parse_args():
@@ -707,7 +708,7 @@ def main():
                     f.write("\n# Cluster Size Distribution (optimal n_components):\n")
                     f.write(f"# Expected cluster size: {args.n_runs} (one component per ICA run)\n")
                     cluster_sizes = cluster_quality["size"]
-                    unique_sizes = sorted(np.unique(cluster_sizes))
+                    unique_sizes = sorted(sorted_unique(cluster_sizes))
                     f.write("# Size | Count | Percent\n")
                     f.write("# -----|-------|--------\n")
                     for size in unique_sizes:
@@ -891,7 +892,7 @@ def main():
                 f.write("\n# Cluster Size Distribution:\n")
                 f.write(f"# Expected cluster size: {args.n_runs} (one component per ICA run)\n")
                 cluster_sizes = cluster_quality["size"]
-                unique_sizes = sorted(np.unique(cluster_sizes))
+                unique_sizes = sorted(sorted_unique(cluster_sizes))
                 f.write("# Size | Count | Percent\n")
                 f.write("# -----|-------|--------\n")
                 for size in unique_sizes:

@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.unique import sorted_unique
 
 try:
     from fastfuncstuff.cli_utils import add_device_arg, parse_prefix, setup_device
@@ -886,7 +887,7 @@ def main() -> int:
         if merged:
             notes.append(f"{merged} merged on whitespace")
         note = f", {'; '.join(notes)}" if notes else ""
-        print(f"   • {name}: {len(np.unique(factor_codes[name]))} levels{note}")
+        print(f"   • {name}: {len(sorted_unique(factor_codes[name]))} levels{note}")
     print(f"   • run: {'yes' if run is not None else 'absent'}")
     print(f"   • session: {'yes' if session is not None else 'absent'}")
     print(f"   • repeat: {'yes' if repeat is not None else 'derived from cell order'}")

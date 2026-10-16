@@ -25,6 +25,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.io.labels import LabelEntry
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.viewer.paint import brush_voxels
 from fastfuncstuff.viewer.rois import roi_color
 from fastfuncstuff.viewer.state import Plane
@@ -137,7 +138,7 @@ class Painter:
         ]
         if not idx_sets:
             return 0
-        pts = np.unique(np.concatenate(idx_sets), axis=0)
+        pts = sorted_unique(np.concatenate(idx_sets), axis=0)
         flat = np.ravel_multi_index(pts.T, layer.shape)
         current = vol.reshape(-1)[flat]
         change = current != value
@@ -165,7 +166,7 @@ class Painter:
         # First change of a voxel within the stroke is its true "before".
         flat = np.concatenate([p[0] for p in parts])
         before = np.concatenate([p[1] for p in parts])
-        flat, first = np.unique(flat, return_index=True)
+        flat, first = sorted_unique(flat, return_index=True)
         history = self._history.setdefault(key, [])
         history.append(_Stroke(flat, before[first]))
         del history[:-UNDO_DEPTH]
@@ -184,7 +185,9 @@ class Painter:
         self._changed(key)
         counts = self._counts.setdefault(key, {})
         for values, sign in ((now, -1), (stroke.before, 1)):
-            for v, n in zip(*np.unique(values.astype(np.int64), return_counts=True), strict=True):
+            for v, n in zip(
+                *sorted_unique(values.astype(np.int64), return_counts=True), strict=True
+            ):
                 if v > 0:
                     counts[int(v)] = counts.get(int(v), 0) + sign * int(n)
         self.session.invalidate(key)
@@ -246,7 +249,7 @@ class Painter:
 
     def _count(self, key: str, before: np.ndarray, value: int) -> None:
         counts = self._counts.setdefault(key, {})
-        for v, n in zip(*np.unique(before.astype(np.int64), return_counts=True), strict=True):
+        for v, n in zip(*sorted_unique(before.astype(np.int64), return_counts=True), strict=True):
             if v > 0:
                 counts[int(v)] = counts.get(int(v), 0) - int(n)
         if value > 0:

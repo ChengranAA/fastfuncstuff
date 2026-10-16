@@ -27,6 +27,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import quantiles
 from fastfuncstuff.viewer.chroma import (
     ChromaMap,
@@ -639,7 +640,7 @@ def fit_source(
     mean = chans.means if spec.signal == "psc" else None
     if dynamic:
         n = chans.n_frames
-        frames = np.unique(np.linspace(0, n - 1, min(PSC_FRAMES, n)).round().astype(int))
+        frames = sorted_unique(np.linspace(0, n - 1, min(PSC_FRAMES, n)).round().astype(int))
         # Single frames whatever the window: z-scoring averaged frames would
         # stretch the averaged noise straight back up to full colour. Against
         # one frame's variability, averaging fades noise toward grey and

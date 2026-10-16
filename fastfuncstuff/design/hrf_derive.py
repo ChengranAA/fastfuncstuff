@@ -124,6 +124,8 @@ from scipy.interpolate import BSpline, PchipInterpolator
 from scipy.optimize import curve_fit
 from scipy.stats import gamma as _gamma
 
+from fastfuncstuff.unique import sorted_unique
+
 # ----------------------------------------------------------------------------
 # Voxel selection
 # ----------------------------------------------------------------------------
@@ -1257,7 +1259,7 @@ def build_pc_basis_design_per_run(
             # onset vector with each PC sampled at TR -- a shifted add per distinct
             # onset instead of a np.convolve per PC.
             idx = np.round((onset_times - microtime_offset) / tr).astype(int)
-            idx = np.unique(idx[(idx >= 0) & (idx < n_run_tp)])
+            idx = sorted_unique(idx[(idx >= 0) & (idx < n_run_tp)])
             for j in idx:
                 m = min(n_lags, n_run_tp - int(j))
                 block[j : j + m] += pc_at_tr[:, :m].T

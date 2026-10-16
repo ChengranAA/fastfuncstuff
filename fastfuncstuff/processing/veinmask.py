@@ -25,6 +25,7 @@ import torch
 from torch import Tensor
 
 from fastfuncstuff.stats.smooth3d import _gaussian_kernel_1d, blur_axis
+from fastfuncstuff.unique import sorted_unique
 
 
 def masked_blur(x: Tensor, weight: Tensor, sigma_vox: tuple[float, float, float]) -> Tensor:
@@ -308,6 +309,6 @@ def ridge_follow_mask(
     cand = seeds | (region & (ratio < grow) & ridge & (thin > t_grow))
     lab, n = ndimage.label(cand.cpu().numpy(), np.ones((3, 3, 3), bool))
     keep = np.zeros(n + 1, bool)
-    keep[np.unique(lab[seeds.cpu().numpy()])] = True
+    keep[sorted_unique(lab[seeds.cpu().numpy()])] = True
     keep[0] = False
     return torch.from_numpy(keep[lab]).to(ratio.device)

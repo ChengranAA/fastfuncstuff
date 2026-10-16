@@ -54,6 +54,7 @@ import torch
 from scipy.interpolate import PchipInterpolator
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.unique import sorted_unique
 
 try:
     from fastfuncstuff.cli_utils import (
@@ -1322,7 +1323,7 @@ def write_qc_artifacts(
         # Span the library rather than take the first N: adjacent entries are
         # near-duplicates under an ordered manifold and would overlay.
         n_show = min(12, n_entries)
-        idx = np.unique(np.linspace(0, n_entries - 1, n_show).astype(int))
+        idx = sorted_unique(np.linspace(0, n_entries - 1, n_show).astype(int))
         ncol = 4
         nrow = int(np.ceil(len(idx) / ncol))
         fig, axes = plt.subplots(

@@ -40,6 +40,8 @@ import numpy as np
 from scipy import sparse
 from scipy.sparse import linalg as spla
 
+from fastfuncstuff.unique import sorted_unique
+
 from .mesh import vertex_areas
 
 __all__ = [
@@ -59,7 +61,7 @@ def mesh_edges(faces: np.ndarray) -> np.ndarray:
     """Unique undirected edges (E, 2), smaller index first."""
     f = np.asarray(faces, np.int64)
     e = np.r_[f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]
-    return np.unique(np.sort(e, axis=1), axis=0)
+    return sorted_unique(np.sort(e, axis=1), axis=0)
 
 
 def cotan_laplacian(

@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from fastfuncstuff.unique import sorted_unique
+
 
 @dataclass
 class MeshBundle:
@@ -75,20 +77,20 @@ def is_spherical(positions: np.ndarray, centre: np.ndarray, tolerance: float = 0
 
 def neighbours(faces: np.ndarray, v: int) -> np.ndarray:
     around = faces[np.any(faces == v, axis=1)]
-    return np.setdiff1d(np.unique(around), [v])
+    return np.setdiff1d(sorted_unique(around), [v])
 
 
 def check_manifold(faces: np.ndarray, n_vertices: int) -> None:
     """Raise unless every edge has exactly two triangles and the surface is genus 0."""
     e = np.sort(np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1)
     # 1-D keys: unique(axis=0) on ~850k rows is most of an edit's time.
-    _, counts = np.unique(e[:, 0].astype(np.int64) * n_vertices + e[:, 1], return_counts=True)
+    _, counts = sorted_unique(e[:, 0].astype(np.int64) * n_vertices + e[:, 1], return_counts=True)
     if not np.all(counts == 2):
         raise ValueError("not a closed 2-manifold: an edge has other than two triangles")
     euler = n_vertices - counts.size + faces.shape[0]
     if euler != 2:
         raise ValueError(f"Euler characteristic {euler}, not 2: no longer a sphere topology")
-    if np.unique(faces).size != n_vertices:
+    if sorted_unique(faces).size != n_vertices:
         raise ValueError("a vertex belongs to no triangle")
 
 

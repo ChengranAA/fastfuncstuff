@@ -125,6 +125,7 @@ from fastfuncstuff.io.headers import (
 from fastfuncstuff.io.headers import (
     read_nifti_header as read_nifti_header,
 )
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.utils import (
     get_device,
     io_progress_suppressed,
@@ -2113,7 +2114,7 @@ def read_censor_1d(
             f"Censor file {filepath} must be a single column; got shape {values.shape}"
         )
 
-    uniq = set(np.unique(values).tolist())
+    uniq = set(sorted_unique(values).tolist())
     if not uniq <= {0.0, 1.0}:
         raise ValueError(
             f"Censor file {filepath} must contain only 0 and 1; found values {sorted(uniq)}"

@@ -26,6 +26,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from fastfuncstuff.unique import sorted_unique
+
 
 def session_feature_matrix(
     stats, *, switch_stats=None, include=("occupancy", "lifetime")
@@ -154,7 +156,7 @@ def loso_classification(x: np.ndarray, labels) -> ClassificationResult:
     n = x.shape[0]
     if n != labels.shape[0]:
         raise ValueError("x and labels must share the session axis")
-    classes = np.unique(labels)
+    classes = sorted_unique(labels)
     pred = np.empty(n, dtype=labels.dtype)
     for i in range(n):
         tr = np.arange(n) != i

@@ -34,6 +34,7 @@ import torch
 
 from fastfuncstuff.design.hrf import get_canonical_hrf
 from fastfuncstuff.design.matrices import convolve_hrf
+from fastfuncstuff.unique import sorted_unique
 
 _BASELINE = -1  # label for timepoints before the first event / unmodelled rest
 
@@ -158,8 +159,8 @@ def _normalized_mutual_info(x: np.ndarray, y: np.ndarray) -> float:
     n = x.size
     if n == 0:
         return 0.0
-    xs = np.unique(x)
-    ys = np.unique(y)
+    xs = sorted_unique(x)
+    ys = sorted_unique(y)
     if xs.size < 2 or ys.size < 2:
         return 0.0
     xi = {v: i for i, v in enumerate(xs)}

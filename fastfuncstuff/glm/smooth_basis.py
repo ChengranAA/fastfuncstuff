@@ -35,6 +35,7 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.glm.xval import cod_from_ss_residual
 from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.unique import sorted_unique
 
 #: log10 lambda grid.  lambda is relative (penalty scaled to the Gram trace),
 #: so the same grid spans "no smoothing" to "straight lines" for any design.
@@ -765,7 +766,7 @@ def fit_smooth_arma(
     pen_idx = torch.zeros(n_vox, dtype=torch.long)
     xval_r2 = torch.zeros(n_vox, dtype=torch.float32) if xval else None
     for k in tqdm(
-        np.unique(which), desc="  ARMA bins", unit="bin", leave=True, disable=not verbose
+        sorted_unique(which), desc="  ARMA bins", unit="bin", leave=True, disable=not verbose
     ):
         idx = torch.as_tensor(np.nonzero(which == k)[0])
         a, b = float(grid[k, 0]), float(grid[k, 1])
@@ -998,7 +999,7 @@ def fit_smooth_per_run(
         # Back to the grid values the pooled fit whitened with (float32 on the way out).
         arma_np = np.round(arma.detach().cpu().double().numpy(), 2)
     keys = np.column_stack([pen_idx.numpy(), arma_np])
-    uniq, which = np.unique(keys, axis=0, return_inverse=True)
+    uniq, which = sorted_unique(keys, axis=0, return_inverse=True)
     which = which.reshape(-1)
     pooled_lam64 = pooled_lam.detach().cpu().double()
     if lambda_mode == "global":

@@ -27,6 +27,8 @@ import warnings
 
 import numpy as np
 
+from fastfuncstuff.unique import sorted_unique
+
 # Above this many parcels the per-state DxD covariance BSDS estimates gets large
 # and the factor-analysis parameter-efficiency argument starts to erode.
 _MANY_PARCELS = 400
@@ -70,7 +72,7 @@ def aggregate_by_labels(
     Returns ``(parcel_ids, ts (D, N))`` with ``parcel_ids`` sorted ascending.
     """
     labels_v = np.asarray(labels_v)
-    ids = np.array(sorted(int(u) for u in np.unique(labels_v) if u > 0))
+    ids = np.array(sorted(int(u) for u in sorted_unique(labels_v) if u > 0))
     if ids.size == 0:
         raise ValueError("no positive labels found; nothing to parcellate")
     _check_parcel_count(ids.size)

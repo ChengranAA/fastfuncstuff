@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.viewer import align
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus, command
 from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
@@ -722,7 +723,7 @@ class SetSurfaceTool(Command):
 
 def encode_ids(ids) -> str:
     """Vertex ids as ranges, ``"3-9,12,40-41"``: a painted patch is mostly runs."""
-    ids = np.unique(np.asarray(ids, np.int64))
+    ids = sorted_unique(np.asarray(ids, np.int64))
     if not ids.size:
         return ""
     breaks = np.flatnonzero(np.diff(ids) != 1)

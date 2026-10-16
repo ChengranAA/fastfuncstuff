@@ -32,6 +32,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.io.labels import LabelEntry
+from fastfuncstuff.unique import sorted_unique
 
 #: Above this many distinct values a 3-D integer volume is far more likely to
 #: be an anatomy stored as int16 than a parcellation. Schaefer's largest is
@@ -171,7 +172,7 @@ def looks_like_labels(volume: np.ndarray) -> bool:
         return False
     if not np.array_equal(finite, np.round(finite)):
         return False
-    distinct = np.unique(finite)
+    distinct = sorted_unique(finite)
     positive = distinct[distinct > 0]
     if not 0 < positive.size <= MAX_AUTO_LABELS:
         return False

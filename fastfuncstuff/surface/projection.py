@@ -25,6 +25,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import sparse
 
+from fastfuncstuff.unique import sorted_unique
+
 from .mesh import vertex_areas
 from .profiles import equivolume_fraction
 
@@ -150,7 +152,7 @@ def build_sampling(
             np.cross(corner[:, 1] - corner[:, 0], corner[:, 2] - corner[:, 0]), axis=1
         )
         level = np.clip(np.ceil(np.sqrt(fa / voxel_face)), 1, max_level).astype(np.int64)
-        for lv in np.unique(level):
+        for lv in sorted_unique(level):
             fsel = np.flatnonzero(level == lv)
             bary, share = _lattice(int(lv))
             pts = np.einsum("sc,fcx->fsx", bary, corner[fsel]).reshape(-1, 3)

@@ -23,6 +23,7 @@ from collections.abc import Callable
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.viewer.chedi import (
     MAX_CLUSTERS,
     PROFILE_OFFSETS,
@@ -1098,7 +1099,7 @@ class ChediWindow(QtWidgets.QWidget):
         # One int64 key per edge: a row-wise unique sorts lexicographically,
         # 5x slower, and this runs on every re-centre.
         n = np.int64(h.n_vertices)
-        key = np.unique(edges[:, 0].astype(np.int64) * n + edges[:, 1])
+        key = sorted_unique(edges[:, 0].astype(np.int64) * n + edges[:, 1])
         edges = np.stack([key // n, key % n], axis=1)
         rc = p.to_pixels(uv[edges])  # (E, 2, 2) as (row, col)
         self.canvas.mesh = _segment_path(rc[..., ::-1])

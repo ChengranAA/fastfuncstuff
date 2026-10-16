@@ -30,6 +30,7 @@ from fastfuncstuff.surface.edit import EditResult, SnapParams, SurfaceEdit
 from fastfuncstuff.surface.geometry import SliceIndex, apply_affine
 from fastfuncstuff.surface.mesh import MeshTopology, geodesic_ball, vertex_normals
 from fastfuncstuff.surface.sampling import VolumeSampler
+from fastfuncstuff.unique import sorted_unique
 from fastfuncstuff.viewer.meshlist import COMPARE_RGB, KINDS, MeshEntry
 from fastfuncstuff.viewer.slicing import PlaneView
 
@@ -1284,7 +1285,7 @@ class SurfaceStore:
         path = contour_path(edges, a, b)
         if path is None:
             raise ValueError("the stroke must start and end on the same outline")
-        return np.unique(index.faces[faces[path]])
+        return sorted_unique(index.faces[faces[path]])
 
     def apply_stroke(
         self,

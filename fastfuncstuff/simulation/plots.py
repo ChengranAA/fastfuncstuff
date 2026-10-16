@@ -16,6 +16,8 @@ from typing import Any
 
 import numpy as np
 
+from fastfuncstuff.unique import sorted_unique
+
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 CATEGORICAL = [
     "#2a78d6",
@@ -1088,7 +1090,7 @@ def plot_single_trials(
 
     def centred(v):
         v = np.asarray(v, dtype=float).copy()
-        for q in np.unique(cond):
+        for q in sorted_unique(cond):
             if np.isfinite(v[cond == q]).any():  # LSA can be all-nan: not estimable
                 v[cond == q] -= np.nanmean(v[cond == q])
         return v
@@ -1662,7 +1664,7 @@ def plot_isi(
     every = [realized_gaps(r)[0] for r in realizations]
     pooled = [np.concatenate([g for gaps in every for g in gaps[i]] or [np.zeros(0)])
               for i in range(len(names))]  # fmt: skip
-    values = np.unique(np.round(np.concatenate(pooled), 3))
+    values = sorted_unique(np.round(np.concatenate(pooled), 3))
     discrete = 0 < len(values) <= 12
     if discrete:
         # Bin edges between the distinct values: bars sit on the values themselves.

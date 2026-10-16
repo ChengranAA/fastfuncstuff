@@ -28,6 +28,7 @@ from fastfuncstuff.design.matrices import (
     make_fir_design,
     make_tent_design,
 )
+from fastfuncstuff.unique import sorted_unique
 
 
 def spm_canonical_hrf(tr: float = 1.0, duration: float = 32.0) -> np.ndarray:
@@ -621,7 +622,7 @@ def good_list_from_censor(
         raise ValueError(f"keep_mask must be 1-D, got shape {arr.shape}")
     # Heuristic: if values are only 0/1 (or bool), treat as mask. Otherwise
     # treat as an already-resolved list of indices.
-    if arr.dtype == bool or set(np.unique(arr).tolist()).issubset({0, 1}):
+    if arr.dtype == bool or set(sorted_unique(arr).tolist()).issubset({0, 1}):
         n_row_full = int(arr.size)
         good = [i for i, v in enumerate(arr.tolist()) if v]
         return good, n_row_full

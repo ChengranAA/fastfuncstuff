@@ -282,23 +282,33 @@ def _measure_all(
     lab = lab.astype(np.int64)
     values = volume.reshape(-1)[where].astype(np.float64)
     magnitude = np.abs(values)
-    coords = np.stack(np.unravel_index(where, shape), 1).astype(np.float64)
+    ijk = np.unravel_index(where, shape)
 
     counts = np.bincount(lab, minlength=n + 1)
     sums = np.bincount(lab, weights=values, minlength=n + 1)
     mass = np.bincount(lab, weights=magnitude, minlength=n + 1)
     com = np.stack(
-        [np.bincount(lab, weights=coords[:, a] * magnitude, minlength=n + 1) for a in range(3)], 1
+        [
+            np.bincount(lab, weights=ijk[a].astype(np.float64) * magnitude, minlength=n + 1)
+            for a in range(3)
+        ],
+        1,
     )
-    # Sorting by label, then by descending magnitude, puts each cluster's peak
-    # first in its run -- the same argmax the per-cluster version took.
-    order = np.lexsort((-magnitude, lab))
-    firsts = order[np.searchsorted(lab[order], np.arange(1, n + 1))]
+    # Each cluster's peak: its largest magnitude, the first voxel (in volume
+    # order) that has it -- the argmax a per-cluster loop would take.  A per-label
+    # maximum and a pick among the voxels that reach it, rather than a lexsort of
+    # every suprathreshold voxel: at a loose threshold that is most of the brain
+    # (1.6M voxels) and the sort was most of a ~400 ms threshold tick.
+    peak_mag = np.zeros(n + 1)
+    np.maximum.at(peak_mag, lab, magnitude)
+    reach = np.flatnonzero(magnitude == peak_mag[lab])
+    firsts = reach[np.unique(lab[reach], return_index=True)[1]]
+    coords = np.stack([axis[firsts] for axis in ijk], 1).astype(np.float64)
 
     # Everything per cluster as arrays first, then one plain-Python pass to build
     # the rows: at a loose threshold there are thousands of clusters, and two
     # tiny affine products each were ~25 ms of the tick.
-    peaks_ijk = coords[firsts]
+    peaks_ijk = coords
     centres = com[1:] / np.maximum(mass[1:], 1e-12)[:, None]
     peaks_xyz, centres_xyz = _to_mm(peaks_ijk, affine), _to_mm(centres, affine)
     out = []

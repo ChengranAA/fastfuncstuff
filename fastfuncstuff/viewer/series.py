@@ -22,6 +22,7 @@ No Qt, no session, no windows.
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable
 
 import numpy as np
@@ -43,8 +44,33 @@ def automask_from_series(data: np.ndarray, *, device: torch.device | None = None
     """
     from fastfuncstuff.processing.mask import automask
 
+    # Remembered per run: the carpet, the matrix, InstaPCA/ICA and InstaGLM each
+    # ask again on every build, and on a 4.2M-voxel x 246 run the temporal mean
+    # plus AFNI's clip/erode/fill-in is 2.7 s of a 2.9 s carpet.  Keyed on the
+    # array object itself (the store hands back the same one until it evicts,
+    # and never writes into a loaded run), guarded by its buffer and layout.
+    sig = (
+        tuple(data.shape),
+        data.dtype.str,
+        data.strides,
+        data.__array_interface__["data"][0],
+        str(device),
+    )
+    hit = _SERIES_MASKS.get(id(data))
+    if hit is not None and hit[0]() is data and hit[1] == sig:
+        return hit[2].copy()
     mean = torch.as_tensor(np.asarray(data, dtype=np.float32).mean(axis=3))
-    return automask(mean, dilate_extra=1, device=device).cpu().numpy().astype(bool)
+    mask = automask(mean, dilate_extra=1, device=device).cpu().numpy().astype(bool)
+    try:
+        key = id(data)
+        ref = weakref.ref(data, lambda _gone, k=key: _SERIES_MASKS.pop(k, None))
+    except TypeError:  # not weak-referenceable; just don't remember it
+        return mask
+    _SERIES_MASKS[key] = (ref, sig, mask)
+    return mask.copy()
+
+
+_SERIES_MASKS: dict[int, tuple[weakref.ref, tuple, np.ndarray]] = {}
 
 
 def normalize_rows(flat: torch.Tensor, how: str) -> tuple[torch.Tensor, str, float]:

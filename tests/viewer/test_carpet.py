@@ -322,3 +322,29 @@ def test_the_coherent_band_is_what_you_select_at_the_top_of_a_sorted_carpet():
     )
     selected = carpet.mask_of_rows(0, int(band.sum()) - 1)
     assert (selected & band).sum() / band.sum() > 0.8
+
+
+def test_automask_is_remembered_per_run_and_forgotten_with_it(monkeypatch):
+    import gc
+
+    import fastfuncstuff.processing.mask as mask_mod
+    from fastfuncstuff.viewer import series
+
+    data = _run()[0]
+    calls = []
+    real = mask_mod.automask
+    monkeypatch.setattr(mask_mod, "automask", lambda *a, **k: calls.append(1) or real(*a, **k))
+    first = series.automask_from_series(data, device=CPU)
+    again = series.automask_from_series(data, device=CPU)
+    assert len(calls) == 1 and np.array_equal(first, again)
+    again[...] = False  # a caller's copy: scribbling on it must not reach the cache
+    assert np.array_equal(series.automask_from_series(data, device=CPU), first)
+
+    other = data.copy()  # same values, another run: computed afresh
+    series.automask_from_series(other, device=CPU)
+    assert len(calls) == 2
+
+    key = id(data)
+    del data
+    gc.collect()
+    assert key not in series._SERIES_MASKS

@@ -24,6 +24,8 @@ block, the colouring arithmetic -- is in :mod:`viewer.surface3d`.
 
 from __future__ import annotations
 
+import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib import resources
@@ -54,7 +56,7 @@ from PySide6.QtGui import QRhiShaderResourceBinding as Binding
 from fastfuncstuff.io.freesurfer import available_annotations, available_volume_atlases
 from fastfuncstuff.surface.mesh import MeshTopology, vertex_normals
 from fastfuncstuff.viewer import surface3d as s3
-from fastfuncstuff.viewer.commands import Aspect, Command
+from fastfuncstuff.viewer.commands import Aspect, Command, timing_threshold_ms
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding as Key
 from fastfuncstuff.viewer.ui.shortcuts import (
@@ -80,6 +82,9 @@ _STAGE = Binding.StageFlag
 _ATTRS = ("posA", "posB", "nrmA", "nrmB", "white", "pial", "curv", "vcolor", "areas", "mark")
 #: Bytes per vertex and vertex format of each attribute; Float3 unless listed.
 _STRIDE = {"curv": 4, "vcolor": 4, "areas": 8, "mark": 4}
+
+
+_SLOW_FRAME_MS = timing_threshold_ms()
 
 
 def _shader(name: str) -> QShader:
@@ -759,6 +764,23 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self.update()
 
     def render(self, cb: QRhiCommandBuffer) -> None:
+        if _SLOW_FRAME_MS is None:
+            self._render_frame(cb)
+            return
+        t0 = time.perf_counter()
+        self._render_frame(cb)
+        ms = (time.perf_counter() - t0) * 1000.0
+        # The first frame carries the uploads (and an RHI initialize); after that
+        # only the slow ones, or an animation would flood the log.
+        first = not getattr(self, "_framed", False)
+        self._framed = True
+        if first or ms >= _SLOW_FRAME_MS:
+            print(
+                f"[gpu] SurfaceCanvas {'first ' if first else ''}frame: {ms:.1f} ms",
+                file=sys.stderr,
+            )
+
+    def _render_frame(self, cb: QRhiCommandBuffer) -> None:
         rhi = self.rhi()
         if shiboken6.getCppPointer(rhi)[0] != getattr(self, "_rhi_ptr", None):
             self.initialize(cb)

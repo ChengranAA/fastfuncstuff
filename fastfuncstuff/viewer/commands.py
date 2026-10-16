@@ -220,6 +220,18 @@ Handler = Callable[[Command, Any], Aspect]
 Listener = Callable[[Command, Aspect], None]
 
 
+def timing_threshold_ms() -> float | None:
+    """``FFS_VIEWER_TIMING``: None when off, else the slow-event cut in ms (default 30).
+
+    One reading for every timer in the viewer -- commands, window redraws, window
+    opens, 3-D frames -- so ``=100`` quiets them all alike.
+    """
+    raw = os.environ.get("FFS_VIEWER_TIMING", "")
+    if not raw:
+        return None
+    return float(raw) if raw.replace(".", "", 1).isdigit() and float(raw) > 1 else 30.0
+
+
 class CommandBus:
     """Dispatches commands against a state object and records what it applied.
 
@@ -240,9 +252,9 @@ class CommandBus:
         # table at exit.  The redraw hook in ui/manager.py only covers four window types;
         # this covers everything the user can do, which is what "the viewer feels slow"
         # needs to be turned into a number.  A plain bool test when off.
-        raw = os.environ.get("FFS_VIEWER_TIMING", "")
-        self._timing: dict[str, list[tuple[float, float]]] | None = {} if raw else None
-        self._slow_ms = float(raw) if raw.replace(".", "", 1).isdigit() and float(raw) > 1 else 30.0
+        slow = timing_threshold_ms()
+        self._timing: dict[str, list[tuple[float, float]]] | None = {} if slow is not None else None
+        self._slow_ms = 30.0 if slow is None else slow
         if self._timing is not None:
             atexit.register(self.print_timing)
 

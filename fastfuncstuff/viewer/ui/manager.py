@@ -128,6 +128,8 @@ class WindowManager(QtCore.QObject):
             win.deleteLater()
         for vid, viewport in wanted.items():
             win = self.windows.get(vid)
+            opened = win is None
+            t0 = time.perf_counter()
             if win is None:
                 win = self._build(viewport)
                 self.windows[vid] = win
@@ -137,6 +139,11 @@ class WindowManager(QtCore.QObject):
                     self._place_new(win)
                 win.show()
             win.apply(viewport)
+            if opened and self._timing:
+                # Build, show and first fill: what a window costs before its first
+                # paint -- the 3-D window's mesh setup lands here, not in a redraw.
+                ms = (time.perf_counter() - t0) * 1000.0
+                print(f"[open] {type(win).__name__} {vid}: {ms:.1f} ms", file=sys.stderr)
             if self.label:
                 win.setWindowTitle(f"[{self.label}] {viewport.title}")
 

@@ -803,10 +803,11 @@ def _resolve_task_design(args, magnitude_file: str):
     count inside the library.
     """
     from fastfuncstuff.cli.task_events import task_design_from_events
-    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.headers import read_nifti_header
     from fastfuncstuff.stats.task_coupling import default_polort
 
-    hdr = load_nifti(magnitude_file).header
+    # The header alone: load_nifti decodes a whole .nii.zst to hand it back.
+    hdr = read_nifti_header(magnitude_file)
     n_t = int(hdr.get_data_shape()[3])
     tr = args.tr if args.tr is not None else float(hdr["pixdim"][4])
     if tr <= 0:

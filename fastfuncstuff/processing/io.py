@@ -231,7 +231,7 @@ def save_image(
     # Extract header from header_info to preserve TR, xyzt_units, etc.
     header = header_info.get("header") if header_info is not None else None
     save_nifti(
-        arr.astype(np.float32),
+        arr.astype(np.float32, copy=False),
         output_path=path,
         affine=affine,
         header=header,

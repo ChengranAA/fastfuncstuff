@@ -557,17 +557,26 @@ def load_time_varying_warp(
         raise ValueError(f"Expected 5D (nx,ny,nz,T,3) warp, got shape {data.shape}: {path}")
 
     # (nx, ny, nz, T, c) -> per-component (T, nz, ny, nx); negate x/y to go
-    # DICOM mm -> NIfTI mm (matches load_warp units="mm").
-    def _comp(c: int, sign: float) -> Tensor:
-        arr = np.ascontiguousarray(data[..., c].transpose(3, 2, 1, 0)) * sign
-        t = torch.from_numpy(arr)
+    # DICOM mm -> NIfTI mm (matches load_warp units="mm").  Negated in place and
+    # kept as views of the one decoded array: a T-frame field is the largest
+    # thing in a run (8 GB for 176 frames at 0.8 mm), and a copy per component
+    # beside the decoded original doubled the load's peak.
+    if not data.flags.writeable:
+        data = data.copy(order="K")
+    data[..., :2] *= -1.0
+
+    def _comp(c: int) -> Tensor:
+        view = data[..., c].transpose(3, 2, 1, 0)
+        if not (view.flags.c_contiguous or view.flags.f_contiguous):
+            view = np.ascontiguousarray(view)
+        t = torch.from_numpy(view)
         return t.to(device) if device is not None else t
 
     header_info = {"affine": img.affine.copy(), "header": img.header.copy()}
     warp = TimeVaryingWarp(
-        xd=_comp(0, -1.0),
-        yd=_comp(1, -1.0),
-        zd=_comp(2, 1.0),
+        xd=_comp(0),
+        yd=_comp(1),
+        zd=_comp(2),
         header_info=header_info,
         units="nifti_mm",
     )
@@ -1762,8 +1771,12 @@ def _phase_spacetime_channels(
     ``(magnitude, phase)``. ``no_neg`` is applied only to a true magnitude channel;
     real/imag/cos/sin legitimately go negative and must never be clamped.
     """
-    cos_p = torch.cos(phase_series)
-    sin_p = torch.sin(phase_series)
+    # cos/sin only where a mode uses them: each is a full 4-D series, and
+    # computing both up front cost "direct" two discarded copies (5 GB on a
+    # 0.8 mm 176-frame run).
+    if phase_warp in ("complex", "split", "circular"):
+        cos_p = torch.cos(phase_series)
+        sin_p = torch.sin(phase_series)
     if phase_warp == "complex":
         # Magnitude derived from the warped complex parts (can blur across wraps).
         channels = [mag_series * cos_p, mag_series * sin_p]
@@ -1803,6 +1816,49 @@ def _phase_spacetime_channels(
             f"Unknown phase_warp: {phase_warp!r}. Use 'complex', 'split', 'direct', or 'circular'."
         )
     return channels, no_neg, recombine
+
+
+class _FrameSink:
+    """Finished frames, written straight into one preallocated host buffer.
+
+    A list of per-frame host tensors stacked at the end held the series twice
+    at the moment of the stack (2 x 4.4 GB for a 176-frame 0.8 mm run, twice
+    more with phase).  Frames go into their slot as they arrive instead.
+    With ``keep_on_device`` (per-vertex reductions of surface points, which are
+    small) frames stay where they are and are stacked once at the end, as before:
+    a copy per frame would be a sync per frame.
+    """
+
+    def __init__(self, n: int, *, keep_on_device: bool = False) -> None:
+        self.n = max(int(n), 1)
+        self.keep_on_device = keep_on_device
+        self.buf: Tensor | None = None
+        self.small: list[Tensor] = []
+        self.k = 0
+
+    def __len__(self) -> int:
+        return self.k + len(self.small)
+
+    def append(self, vol: Tensor) -> None:
+        if self.keep_on_device:
+            self.small.append(vol)
+            return
+        if self.buf is None:
+            self.buf = torch.empty((self.n, *vol.shape), dtype=vol.dtype, device="cpu")
+        self.buf[self.k].copy_(vol)
+        self.k += 1
+
+    def extend(self, vols) -> None:
+        for v in vols:
+            self.append(v)
+
+    def result(self, *, stack: bool) -> Tensor:
+        if self.buf is None:
+            if not self.small:
+                raise ValueError("no frames were produced")
+            return torch.stack(self.small) if stack else self.small[0]
+        out = self.buf[: self.k]
+        return out if stack else out[0]
 
 
 @full_fp32_matmul()
@@ -2343,8 +2399,10 @@ def nwarpforge(
     else:
         t_start, t_end = 0, nt
 
-    output_volumes = []
-    phase_volumes: list[Tensor] = []
+    n_frames_out = (t_end - t_start) if is_4d else 1
+    reduced_points = point_plan is not None and point_reducer is not None
+    output_volumes = _FrameSink(n_frames_out, keep_on_device=reduced_points)
+    phase_volumes = _FrameSink(n_frames_out)
 
     # Accumulate finished volumes on the HOST. The caller stacks the whole series at
     # the end, so holding every warped frame on the GPU grows without bound (doubly
@@ -2358,7 +2416,8 @@ def nwarpforge(
             # and copy once at the end. A copy per frame is a sync per frame, which
             # serialises the CPU's launches for frame t+1 behind the GPU's frame t.
             return point_reducer(vol.reshape(-1))
-        return vol.to("cpu")
+        # The sink copies a full frame into its host buffer.
+        return vol
 
     # Affine-only fast path: a chain with no nonlinear warp is a pure per-frame
     # 4x4 map. Composing it as matrices + a single batched resample is far
@@ -2384,18 +2443,20 @@ def nwarpforge(
     if affine_only:
         if verb >= 1:
             print("nwarpforge: affine-only chain -> batched affine fast path (no field build)")
-        output_volumes = _apply_affine_chain_batched(
-            transforms,
-            source,
-            is_4d,
-            t_start,
-            t_end,
-            source_header["affine"],
-            output_affine,
-            output_shape,
-            interp,
-            no_neg,
-            device,
+        output_volumes.extend(
+            _apply_affine_chain_batched(
+                transforms,
+                source,
+                is_4d,
+                t_start,
+                t_end,
+                source_header["affine"],
+                output_affine,
+                output_shape,
+                interp,
+                no_neg,
+                device,
+            )
         )
 
     # Geometry is invariant across a 4-D series. Keep one compact homogeneous
@@ -2757,10 +2818,17 @@ def nwarpforge(
             )
         output_volumes.append(_stash(_apply_jac(warped, composed)))
 
-    if is_4d or len(output_volumes) > 1:
-        output = torch.stack(output_volumes)
-    else:
-        output = output_volumes[0]
+    output = output_volumes.result(stack=is_4d or len(output_volumes) > 1)
+    phase_frames = (
+        phase_volumes.result(stack=len(phase_volumes) > 1) if len(phase_volumes) else None
+    )
+    # The inputs are done with: the source and phase series, their complex
+    # channels, the warps (a time-varying one is T x a frame) and the sampler's
+    # window.  Free them before the save, which makes its own transient copies.
+    source = phase_data = st_channels = follow_sampler = None  # noqa: F841
+    transforms = reduced = static_composed = None  # noqa: F841
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     if point_plan is not None:
         if point_reducer is not None:
@@ -2872,11 +2940,8 @@ def nwarpforge(
         save_first_last(output, prefix, header_info=output_header, verb=verb)
 
     # Save warped phase if requested
-    if phase_volumes:
+    if phase_frames is not None:
         assert phase_prefix is not None  # set earlier when phase_path was set
-        if len(phase_volumes) > 1:
-            phase_output = torch.stack(phase_volumes)
-        else:
-            phase_output = phase_volumes[0]
+        phase_output = phase_frames
         with progress_context(f"Writing phase {phase_prefix}"):
             save_image(phase_output, phase_prefix, header_info=output_header)

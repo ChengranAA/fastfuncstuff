@@ -979,3 +979,51 @@ def test_grid_plan_matches_a_bare_cuda_device():
     aff = np.eye(4)
     plan = make_warp_apply_plan((6, 7, 8), aff, aff, device)
     assert plan.grid.coords.device.type == "cuda"
+
+
+def test_time_range_is_inclusive_as_the_help_says(tmp_path):
+    """-time_range 1,3 is frames 1, 2 and 3 (AFNI's [1..3]), not 1 and 2."""
+    from fastfuncstuff.cli.nwarp import main
+
+    rng = np.random.default_rng(0)
+    data = rng.random((8, 8, 8, 6)).astype(np.float32) + 1.0
+    src = tmp_path / "src.nii"
+    nib.Nifti1Image(data, _diag_affine(2.0)).to_filename(str(src))
+    aff = tmp_path / "id.aff12.1D"
+    _write_aff1d(aff, [_IDENT12])
+    out = tmp_path / "out.nii"
+    main(
+        [
+            "-source",
+            str(src),
+            "-nwarp",
+            str(aff),
+            "-prefix",
+            str(out),
+            "-time_range",
+            "1,3",
+            "-interp",
+            "linear",
+            "-device",
+            "cpu",
+            "-quiet",
+        ]
+    )
+    got = np.asarray(nib.load(str(out)).dataobj)
+    assert got.shape == (8, 8, 8, 3)
+    np.testing.assert_allclose(got, data[..., 1:4], atol=1e-5)
+
+
+def test_time_varying_warp_loads_dicom_mm_as_nifti_mm_per_component(tmp_path):
+    from fastfuncstuff.processing.nwarpforge import load_time_varying_warp
+
+    rng = np.random.default_rng(1)
+    w = rng.normal(size=(5, 4, 3, 7, 3)).astype(np.float32)  # (nx, ny, nz, T, 3), DICOM mm
+    path = tmp_path / "tv.nii"
+    nib.Nifti1Image(w, _diag_affine(2.0)).to_filename(str(path))
+    tv = load_time_varying_warp(path)
+    for comp in (tv.xd, tv.yd, tv.zd):
+        assert tuple(comp.shape) == (7, 3, 4, 5)
+    np.testing.assert_array_equal(tv.xd.numpy(), -w[..., 0].transpose(3, 2, 1, 0))
+    np.testing.assert_array_equal(tv.yd.numpy(), -w[..., 1].transpose(3, 2, 1, 0))
+    np.testing.assert_array_equal(tv.zd.numpy(), w[..., 2].transpose(3, 2, 1, 0))

@@ -25,7 +25,7 @@ import time
 import torch
 from torch import Tensor
 
-from fastfuncstuff.utils import linalg_device
+from fastfuncstuff.utils import linalg_device, prefer_cpu_row_convolution
 
 from . import interp as _interp
 from .interp import _cubic_kernel, _heptic_kernel, _quintic_kernel
@@ -686,9 +686,7 @@ def _get_shear_interp(device: torch.device):
     and recompiles every call -- interp._get_gather_contract has the full story).
     """
     if device.type == "cpu":
-        # Eager row-conv already beats the compiled tap loop here, and needs no
-        # inductor C++ toolchain (whose CPU codegen broke under torch 2.12).
-        return _interp_1d_rowconv
+        return _interp_1d_rowconv if prefer_cpu_row_convolution() else _interp_1d_along
     if not _shear_compile_allowed(device):
         return _interp_1d_along
     dt = device.type

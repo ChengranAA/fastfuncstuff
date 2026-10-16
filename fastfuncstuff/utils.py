@@ -244,6 +244,19 @@ _MPS_KEEP_OPS: frozenset[str] = frozenset(
 )
 
 
+def prefer_cpu_row_convolution() -> bool:
+    """Whether per-row FIR convolution has a suitable CPU execution backend.
+
+    M4 Max / torch 2.14: without oneDNN, eight-thread grouped convolution
+    took 12.51s versus 0.86s for gather in a real-data motion estimate.
+    Row convolution still won at one thread; preserve that route and enabled
+    oneDNN rather than changing global thread counts around an operation.
+    """
+    return torch.get_num_threads() == 1 or (
+        torch.backends.mkldnn.is_available() and bool(torch.backends.mkldnn.enabled)
+    )
+
+
 def cpu_if_mps(device: torch.device, op: str) -> torch.device:
     """Where to run *op*: the CPU when MPS would break or lose, else *device*.
 

@@ -308,3 +308,38 @@ def test_single_axis_rotation_shears_like_its_neighbour(setp):
     inner = (slice(6, -6),) * 3
     err = (out - ref)[inner].pow(2).mean().sqrt() / vol[inner].std()
     assert err < 0.01
+
+
+@pytest.mark.parametrize(
+    "threads,available,enabled,use_rowconv",
+    [
+        (1, False, True, True),
+        (8, False, True, False),
+        (8, True, False, False),
+        (8, True, True, True),
+    ],
+)
+def test_cpu_shear_dispatch_avoids_threaded_generic_groups(
+    monkeypatch, threads, available, enabled, use_rowconv
+):
+    from fastfuncstuff.processing import shear
+
+    monkeypatch.setattr(torch, "get_num_threads", lambda: threads)
+    monkeypatch.setattr(torch.backends.mkldnn, "is_available", lambda: available)
+    monkeypatch.setattr(torch.backends.mkldnn, "enabled", enabled)
+    expected = shear._interp_1d_rowconv if use_rowconv else shear._interp_1d_along
+    assert shear._get_shear_interp(torch.device("cpu")) is expected
+
+
+@pytest.mark.parametrize("mode", ["heptic", "wsinc5"])
+def test_cpu_shear_backends_agree_on_resampled_volume(monkeypatch, mode):
+    from fastfuncstuff.processing import shear
+
+    vol = _make_volume(seed=73)
+    matrix = _rigid_matrix(0.5, -0.3, 0.2, 1.0, -0.7, 0.4)
+    outputs = []
+    for use_rowconv in (False, True):
+        monkeypatch.setattr(shear, "prefer_cpu_row_convolution", lambda: use_rowconv)
+        outputs.append(shear.shear_resample(vol, matrix, vol.shape, mode))
+    assert all(out is not None for out in outputs)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=2e-6)

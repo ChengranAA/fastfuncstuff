@@ -38,57 +38,81 @@ def rotate_to_ica(
     fun: str = "logcosh",
     device: torch.device | None = None,
 ) -> Decomposition:
-    """Spatial ICA of ``pca``'s components: same span, rotated to independence."""
+    """Spatial ICA of ``pca``'s components: same span, rotated to independence.
+
+    Every ``(V, K)`` pass runs on ``device`` in float32 with float64 accumulators for the
+    reductions.  At V = 4.2M voxels the host float64 version spent ~3 s of a 4.7 s call in
+    numpy (centre, std, transpose copy, ``W @ z``, ``corr @ D W^T``, cubes, ``argsort``,
+    ``astype`` -- each a pass over ~1 GB) around a FastICA that is itself on the GPU.
+    """
     from fastfuncstuff.decomposition.ica import fastica_batch
 
-    corr = np.asarray(pca.correlation, dtype=np.float64)  # (V, K): P, the projections
-    n_vox, k = corr.shape
+    dev = device or torch.device("cpu")
+    n_vox, k = pca.correlation.shape
     if k < 2:
         raise ValueError("ICA needs at least two dimensions")
+    f64 = torch.float64
+
+    corr = torch.as_tensor(np.ascontiguousarray(pca.correlation), dtype=torch.float32).to(dev)
     # Whitened spatial components: each projection column at unit variance.
-    centred = corr - corr.mean(0)
-    d = centred.std(0)
-    d = np.where(d > 0, d, 1.0)
-    z = (centred / d).T  # (K, V)
+    centred = corr - corr.mean(0, dtype=f64).float()
+    d = (centred.square().sum(0, dtype=f64) / n_vox).sqrt()  # population std, as numpy's
+    d = torch.where(d > 0, d, torch.ones_like(d))
+    z = (centred / d.float()).T.contiguous()  # (K, V)
+    del centred
     # K rows of V samples: at K = 30 and V ~ 2e5 the FastICA iterations are
     # real arithmetic, so they go where the decomposition went.
-    x = torch.as_tensor(z, dtype=torch.float32, device=device or torch.device("cpu"))
-    w, _, converged = fastica_batch(x, 1, k, fun=fun, max_iter=max_iter, tol=1e-4, base_seed=seed)
-    W = w[0].double().cpu().numpy()  # (K, K), orthogonal unmixing
-    s = W @ z  # (K, V) spatial sources
+    w, _, converged = fastica_batch(z, 1, k, fun=fun, max_iter=max_iter, tol=1e-4, base_seed=seed)
+    W = w[0].to(f64)  # (K, K), orthogonal unmixing
+    s_src = W.float() @ z  # (K, V) spatial sources
+    del z
 
     # The time courses: A = u D W^T. ``pca.timecourses`` is u * sqrt(T) (unit
     # std, sign-fixed); the constant and the signs cancel in normalisation.
-    tc = np.asarray(pca.timecourses, dtype=np.float64) @ np.diag(d) @ W.T  # (T, K)
+    d_np = d.cpu().numpy()
+    W_np = W.cpu().numpy()
+    tc = np.asarray(pca.timecourses, dtype=np.float64) @ np.diag(d_np) @ W_np.T  # (T, K)
     # Each voxel's correlation with each IC time course: P D W^T over |a|.
-    proj = corr @ np.diag(d) @ W.T  # (V, K)
+    mix = torch.as_tensor(np.diag(d_np) @ W_np.T, dtype=torch.float32, device=dev)
     norms = np.linalg.norm(tc, axis=0)
     norms = np.where(norms > 0, norms, 1.0)
-    ic_corr = proj / (norms / np.sqrt(tc.shape[0]))[None, :]
+    inv_norm = torch.as_tensor(
+        np.sqrt(tc.shape[0]) / norms, dtype=torch.float32, device=dev
+    )  # 1 / (|a| / sqrt(T))
+    ic_corr = (corr @ mix) * inv_norm  # (V, K)
+    del corr
     # The sign convention InstaPCA and MELODIC share: heavy tail positive.
-    flip = np.where(np.sum(s**3, axis=1) < 0, -1.0, 1.0)
-    s *= flip[:, None]
-    tc *= flip[None, :]
-    ic_corr *= flip[None, :]
+    flip_np = np.where(s_src.pow(3).sum(1, dtype=f64).cpu().numpy() < 0, -1.0, 1.0)
+    flip = torch.as_tensor(flip_np, dtype=torch.float32, device=dev)
+    s_src = s_src * flip[:, None]
+    tc *= flip_np[None, :]
+    ic_corr = ic_corr * flip[None, :]
     tc = (tc - tc.mean(0)) / np.where(tc.std(0) > 0, tc.std(0), 1.0)
 
     # Ordered by how much of the prepared variance each explains, as PCs are.
-    energy = (ic_corr**2).sum(0)
-    order = np.argsort(-energy)
+    energy = ic_corr.square().sum(0, dtype=f64).cpu().numpy()
+    order_np = np.argsort(-energy)
     total = float(pca.explained.sum()) if pca.explained.size else 1.0
-    explained = energy[order] / max(energy.sum(), 1e-30) * total
+    explained = energy[order_np] / max(energy.sum(), 1e-30) * total
+    order = torch.as_tensor(order_np, device=dev)
 
-    zmap = s[order].T
-    zmap = (zmap - zmap.mean(0)) / np.where(zmap.std(0) > 0, zmap.std(0), 1.0)
-    corr_out = ic_corr[:, order].astype(np.float32)
-    scale = pca.scale if pca.scale is not None else np.zeros(n_vox, np.float32)
+    zmap = s_src[order].T  # (V, K)
+    z_mean = zmap.mean(0, dtype=f64).float()
+    z_std = ((zmap - z_mean).square().sum(0, dtype=f64) / n_vox).sqrt()
+    zmap = (zmap - z_mean) / torch.where(z_std > 0, z_std, torch.ones_like(z_std)).float()
+    corr_out = ic_corr[:, order]
+    scale = (
+        torch.as_tensor(pca.scale, dtype=torch.float32, device=dev)
+        if pca.scale is not None
+        else torch.zeros(n_vox, dtype=torch.float32, device=dev)
+    )
     return replace(
         pca,
-        timecourses=tc[:, order],
-        correlation=corr_out,
-        amplitude=(corr_out * scale[:, None]).astype(np.float32),
+        timecourses=tc[:, order_np],
+        correlation=corr_out.cpu().numpy(),
+        amplitude=(corr_out * scale[:, None]).cpu().numpy(),
         explained=np.asarray(explained, dtype=np.float64),
-        zmap=zmap.astype(np.float32),
+        zmap=zmap.cpu().numpy(),
         kind="IC",
         # Usual when some kept dimensions are noise: a Gaussian direction has
         # no preferred rotation. Said, not hidden -- fewer dims or another seed.

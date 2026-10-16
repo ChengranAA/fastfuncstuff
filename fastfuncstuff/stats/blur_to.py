@@ -170,13 +170,26 @@ class MaskedGaussian:
         per_t = 5 * int(np.prod(self.shape)) * 4
         chunk = max(1, min(n_t, int(get_available_memory(self.device) // per_t)))
         idx = self._idx.cpu().numpy()
+        n_vox, n_in = x.shape[0], idx.size
+        # Upload each (V, k) column block as it lies and transpose on the device, and
+        # bring back only the in-mask rows already in (V, k) order: a host ``.T`` of
+        # every block and the transposed write-back were ~12 of the 12.7 s of a
+        # 4.2M-voxel x 246 blur.  On CUDA both directions go through page-locked
+        # buffers reused across blocks; a download into fresh pageable memory ran
+        # at 1.5 GB/s.
+        pinned = self.device.type == "cuda"
+        stage_in = torch.empty(n_vox * chunk, dtype=torch.float32, pin_memory=pinned)
+        stage_out = torch.empty(n_in * chunk, dtype=torch.float32, pin_memory=pinned)
         for t0 in range(0, n_t, chunk):
             t1 = min(n_t, t0 + chunk)
-            block = torch.as_tensor(
-                np.ascontiguousarray(x[:, t0:t1].T, np.float32), device=self.device
-            ).reshape(t1 - t0, *self.shape)
+            k = t1 - t0
+            rows = stage_in[: n_vox * k].view(n_vox, k)
+            np.copyto(rows.numpy(), x[:, t0:t1], casting="same_kind")
+            block = rows.to(self.device).T.reshape(k, *self.shape)
             sm = self._blur(block * self._m, self._sigma) / self._denom
-            out[idx, t0:t1] = sm.reshape(t1 - t0, -1)[:, self._idx].T.cpu().numpy()
+            back = stage_out[: n_in * k].view(n_in, k)
+            back.copy_(sm.reshape(k, -1)[:, self._idx].T)
+            out[idx, t0:t1] = back.numpy()
             del block, sm
         return out
 
@@ -338,10 +351,9 @@ class AdaptiveDiffusion:
 
         k = x.shape[1]
         vol = torch.zeros((k, *self.shape), device=self.device)
-        vol.reshape(k, -1)[:, self._idx] = torch.as_tensor(
-            np.ascontiguousarray(np.asarray(x)[self._idx.cpu().numpy()].T, np.float32),
-            device=self.device,
-        )
+        # The in-mask rows as they lie, (V_in, k), transposed on the device.
+        rows = np.ascontiguousarray(np.asarray(x)[self._idx.cpu().numpy()], np.float32)
+        vol.reshape(k, -1)[:, self._idx] = torch.as_tensor(rows).to(self.device).T
         return vol
 
     def __call__(self, data: np.ndarray) -> np.ndarray:
@@ -358,7 +370,10 @@ class AdaptiveDiffusion:
             u = self._volumes(x[:, t0 : t0 + chunk])
             for dt, d in self.steps:
                 u = self.step(u, dt, d)
-            out[idx, t0 : t0 + chunk] = u.reshape(u.shape[0], -1)[:, self._idx].T.cpu().numpy()
+            # Back in (V_in, k) order on the device, so the host write is row copies.
+            out[idx, t0 : t0 + chunk] = (
+                u.reshape(u.shape[0], -1)[:, self._idx].T.contiguous().cpu().numpy()
+            )
         return out
 
 

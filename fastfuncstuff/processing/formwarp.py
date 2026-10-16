@@ -441,14 +441,51 @@ def _pad_linear1(vol: Tensor) -> Tensor:
 
     Chosen so a central difference taken across the pad reproduces the one-sided
     difference ``penalty.py:_central_diff_batched`` uses at a face: with the pad set to
-    ``2*v0 - v1``, ``0.5*(v1 - pad) == v1 - v0``.
+    ``2*v0 - v1``, ``0.5*(v1 - pad) == v1 - v0``. Singleton axes
+    are constant, matching the dense derivative's zero on those axes.
     """
     for dim in (-3, -2, -1):
         n = vol.shape[dim]
-        lo = 2.0 * vol.narrow(dim, 0, 1) - vol.narrow(dim, 1, 1)
-        hi = 2.0 * vol.narrow(dim, n - 1, 1) - vol.narrow(dim, n - 2, 1)
+        if n == 1:
+            lo = hi = vol.narrow(dim, 0, 1)
+        else:
+            lo = 2.0 * vol.narrow(dim, 0, 1) - vol.narrow(dim, 1, 1)
+            hi = 2.0 * vol.narrow(dim, n - 1, 1) - vol.narrow(dim, n - 2, 1)
         vol = torch.cat((lo, vol, hi), dim=dim)
     return vol
+
+
+def _gather_linear1_patches(vol: Tensor, centres: Tensor) -> Tensor:
+    """Gather 3x3x3 patches with exactly the sequential linear-pad arithmetic.
+
+    The eight source values per patch sample are tiny compared with padding full
+    fields for ~100 offenders. Evaluate z, then y, then x extrapolation: expanding
+    a corner into one weighted sum would reassociate rounding. A singleton axis
+    is constant, matching the zero derivative in the dense penalty primitive.
+    """
+    step = torch.arange(-1, 2, device=centres.device)
+    offsets = torch.stack(torch.meshgrid(step, step, step, indexing="ij"), dim=-1)
+    neighbours = centres[:, None, :] + offsets.reshape(1, 27, 3)
+    indices = []
+    outside = []
+    for axis, n in enumerate(vol.shape):
+        coord = neighbours[..., axis]
+        edge = coord.clamp(0, n - 1)
+        other = torch.where(coord < 0, 1, n - 2).clamp(0, n - 1)
+        indices.append(torch.stack((edge, other), dim=-1))
+        outside.append(((coord < 0) | (coord >= n)) & (n > 1))
+    z, y, x = indices
+    values = vol[z[..., :, None, None], y[..., None, :, None], x[..., None, None, :]]
+    values = torch.where(
+        outside[0][..., None, None],
+        2.0 * values[..., 0, :, :] - values[..., 1, :, :],
+        values[..., 0, :, :],
+    )
+    values = torch.where(
+        outside[1][..., None], 2.0 * values[..., 0, :] - values[..., 1, :], values[..., 0, :]
+    )
+    values = torch.where(outside[2], 2.0 * values[..., 0] - values[..., 1], values[..., 0])
+    return values.reshape(-1, 3, 3, 3)
 
 
 def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
@@ -483,13 +520,7 @@ def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
     # voxel gets the same one-sided difference the dense path gives it. Clamping instead
     # (replicate padding) halves the derivative there, and on a field whose extremes sit
     # at the edges that is most of the penalty.
-    padded = [_pad_linear1(f) for f in fields]
-    pz, py, px = padded[0].shape
-    step = torch.tensor([0, 1, 2], device=owing.device)
-    off = torch.stack(torch.meshgrid(step, step, step, indexing="ij"), dim=-1).reshape(-1, 3)
-    nbr = owing[:, None, :] + off[None, :, :]
-    flat = (nbr[..., 0] * py + nbr[..., 1]) * px + nbr[..., 2]
-    patches = [f.reshape(-1)[flat].reshape(-1, 3, 3, 3) for f in padded]
+    patches = [_gather_linear1_patches(f, owing) for f in fields]
 
     # Same formulas as the dense path, on (N, 3, 3, 3): only the centre voxel of each
     # patch has a true central difference, and the centre is the one we asked about.

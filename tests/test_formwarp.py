@@ -969,3 +969,94 @@ def test_sparse_region_pads_clips_and_reports_emptiness():
     flag.zero_()
     flag[0, 10, 11] = True  # clipped at both ends
     assert _sparse_region(flag, 3) == (slice(0, 4), slice(7, 11), slice(8, 12))
+
+
+@pytest.mark.parametrize(
+    "shape", [(5, 6, 7), (2, 2, 2), (1, 5, 6), (4, 1, 6), (4, 5, 1), (1, 1, 1)]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_direct_fold_patches_match_padded_gather(shape, dtype):
+    from fastfuncstuff.processing.formwarp import _gather_linear1_patches, _pad_linear1
+
+    g = torch.Generator().manual_seed(419)
+    source = torch.randn(shape, generator=g, dtype=dtype)
+    # Every centre includes every face/edge/corner, plus the interior.
+    centres = torch.cartesian_prod(*(torch.arange(n) for n in shape))
+    actual = _gather_linear1_patches(source, centres)
+    pad = _pad_linear1(source)
+    step = torch.arange(3)
+    offsets = torch.stack(torch.meshgrid(step, step, step, indexing="ij"), -1).reshape(27, 3)
+    neighbours = centres[:, None, :] + offsets
+    expected = pad[neighbours[..., 0], neighbours[..., 1], neighbours[..., 2]].reshape(-1, 3, 3, 3)
+    bits = torch.int32 if dtype == torch.float32 else torch.int64
+    assert torch.equal(actual.view(bits), expected.view(bits))
+    # The independent singleton-axis expectation is constant, not a zero-filled halo.
+    for axis, n in enumerate(shape):
+        if n == 1:
+            torch.testing.assert_close(
+                actual.select(axis + 1, 0), actual.select(axis + 1, 2), rtol=0, atol=0
+            )
+
+
+def test_direct_fold_patch_gradients_match_padding():
+    from fastfuncstuff.processing.formwarp import _gather_linear1_patches, _pad_linear1
+
+    g = torch.Generator().manual_seed(832)
+    source = torch.randn(5, 6, 7, generator=g, dtype=torch.float64)
+    centres = torch.tensor([[0, 0, 0], [4, 5, 6], [0, 3, 4], [2, 0, 6], [2, 3, 4]])
+    weights = torch.randn(5, 3, 3, 3, generator=g, dtype=torch.float64)
+    direct = source.clone().requires_grad_()
+    padded = source.clone().requires_grad_()
+    actual = _gather_linear1_patches(direct, centres)
+    full = _pad_linear1(padded)
+    step = torch.arange(3)
+    offsets = torch.stack(torch.meshgrid(step, step, step, indexing="ij"), -1).reshape(27, 3)
+    nbr = centres[:, None, :] + offsets
+    expected = full[nbr[..., 0], nbr[..., 1], nbr[..., 2]].reshape(-1, 3, 3, 3)
+    a = torch.autograd.grad((actual * weights).sum(), direct)[0]
+    b = torch.autograd.grad((expected * weights).sum(), padded)[0]
+    torch.testing.assert_close(a, b, rtol=1e-14, atol=1e-14)
+
+
+def test_direct_fold_patches_handle_strided_and_empty_inputs():
+    from fastfuncstuff.processing.formwarp import _gather_linear1_patches, _pad_linear1
+
+    source = torch.randn(6, 5, 4, generator=torch.Generator().manual_seed(71)).transpose(0, 2)
+    centres = torch.tensor([[0, 0, 0], [3, 4, 5], [1, 2, 3]])
+    pad = _pad_linear1(source)
+    step = torch.arange(3)
+    off = torch.stack(torch.meshgrid(step, step, step, indexing="ij"), -1).reshape(27, 3)
+    nbr = centres[:, None] + off
+    expected = pad[nbr[..., 0], nbr[..., 1], nbr[..., 2]].reshape(-1, 3, 3, 3)
+    actual = _gather_linear1_patches(source, centres)
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+    assert _gather_linear1_patches(source, centres[:0]).shape == (0, 3, 3, 3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_direct_fold_penalty_matches_previous_padded_path(monkeypatch, dtype):
+    import fastfuncstuff.processing.formwarp as fw
+
+    g = torch.Generator().manual_seed(19)
+    source = [torch.randn(5, 6, 7, generator=g, dtype=dtype) * 2 for _ in range(3)]
+    direct = [f.clone().requires_grad_() for f in source]
+    padded = [f.clone().requires_grad_() for f in source]
+    actual = fw._fold_penalty(tuple(direct), SynConfig())
+
+    def padded_gather(field, centres):
+        full = fw._pad_linear1(field)
+        step = torch.arange(3, device=centres.device)
+        off = torch.stack(torch.meshgrid(step, step, step, indexing="ij"), -1).reshape(27, 3)
+        nbr = centres[:, None] + off
+        return full[nbr[..., 0], nbr[..., 1], nbr[..., 2]].reshape(-1, 3, 3, 3)
+
+    monkeypatch.setattr(fw, "_gather_linear1_patches", padded_gather)
+    expected = fw._fold_penalty(tuple(padded), SynConfig())
+    assert actual.item() > 0
+    bits = torch.int32 if dtype == torch.float32 else torch.int64
+    assert torch.equal(actual.view(bits), expected.view(bits))
+    grad_a = torch.autograd.grad(actual, direct)
+    grad_b = torch.autograd.grad(expected, padded)
+    tolerance = 1e-6 if dtype == torch.float32 else 1e-12
+    for a, b in zip(grad_a, grad_b, strict=True):
+        torch.testing.assert_close(a, b, atol=tolerance, rtol=tolerance)

@@ -181,6 +181,22 @@ class TestGaussianBlur3D:
         )
         assert blurred.shape == data.shape
 
+    @pytest.mark.parametrize("order", ["C", "F"])
+    def test_streaming_in_slabs_is_exact(self, monkeypatch, order):
+        """Many small slabs (with a halo, for C order) give the one-slab result bit for bit."""
+        import fastfuncstuff.memory as memory
+
+        rng = np.random.default_rng(1)
+        data = np.asarray(rng.standard_normal((23, 9, 7, 5)), dtype=np.float32, order=order)
+        kw = dict(
+            fwhm_mm=5.0, voxel_sizes=(1.0, 1.2, 2.0), device=torch.device("cpu"), verbose=False
+        )
+        whole = gaussian_blur_3d(data, **kw)
+        slab = data.nbytes // (data.shape[0] if order == "C" else data.shape[3])
+        # Room for a 2-wide slab plus the x kernel's halo (radius 9 at sigma 2.1).
+        monkeypatch.setattr(memory, "get_available_memory", lambda device: 3 * slab * (2 + 2 * 9))
+        np.testing.assert_array_equal(gaussian_blur_3d(data, **kw), whole)
+
 
 class TestGenerateSyntheticRuns:
     def test_all_synthetic(self):

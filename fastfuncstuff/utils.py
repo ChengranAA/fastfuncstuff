@@ -998,16 +998,34 @@ def gaussian_blur_3d(
         kernel_sizes = [len(k) if k is not None else 1 for k in kernels]
         print(f"  Kernel sizes: {kernel_sizes[0]} × {kernel_sizes[1]} × {kernel_sizes[2]} voxels")
 
+    # Stream slabs along whichever axis is slowest in memory, so each slab is
+    # one contiguous span of both the input and the output: it uploads with no
+    # host gather and lands with no strided write-back.  Cutting a C-ordered
+    # (x, y, z, t) run along t -- the old way -- spent ~4 of 6 s of a 4.2M-voxel
+    # x 246 blur in those two host copies and a download into fresh memory.
+    # Cutting along x needs a halo of the x kernel's radius, whose outputs are
+    # discarded; the result is the same bit for bit.
+    if data.flags.c_contiguous:
+        axis_cut = 0
+    elif data.flags.f_contiguous:
+        axis_cut = 3
+    else:
+        data = np.ascontiguousarray(data)
+        axis_cut = 0
     data_blurred = np.empty_like(data)
-    vol_bytes = nx * ny * nz * 4
-    # The block on the device plus the two arrays each axis pass ping-pongs.
-    chunk = max(1, min(nt, get_available_memory(device) // max(3 * vol_bytes, 1)))
-    starts = range(0, nt, chunk)
-    for t0 in tqdm(
+    k_cut = kernels[axis_cut] if axis_cut < 3 else None
+    halo = (len(k_cut) - 1) // 2 if k_cut is not None else 0
+    n_cut = data.shape[axis_cut]
+    slab_bytes = data.nbytes // max(n_cut, 1)
+    # The slab on the device plus the two arrays each axis pass ping-pongs.
+    chunk = max(1, min(n_cut, get_available_memory(device) // max(3 * slab_bytes, 1) - 2 * halo))
+    starts = range(0, n_cut, chunk)
+    for a0 in tqdm(
         starts, desc="  Blurring", unit="block", leave=True, disable=not verbose or len(starts) < 2
     ):
-        t1 = min(t0 + chunk, nt)
-        block = data[..., t0:t1]
+        a1 = min(a0 + chunk, n_cut)
+        h0, h1 = max(0, a0 - halo), min(n_cut, a1 + halo)
+        block = data[h0:h1] if axis_cut == 0 else data[..., h0:h1]
         if not block.flags.writeable:
             # torch refuses to wrap read-only memory (a memmap, a nibabel
             # proxy); a copy in the same layout is cheaper than a warning.
@@ -1016,7 +1034,9 @@ def gaussian_blur_3d(
         for axis, k in enumerate(kernels):
             if k is not None:
                 vol = blur_axis(vol, k, axis)
-        data_blurred[..., t0:t1] = vol.cpu().numpy()
+        vol = vol.narrow(axis_cut, a0 - h0, a1 - a0)
+        dest = data_blurred[a0:a1] if axis_cut == 0 else data_blurred[..., a0:a1]
+        torch.from_numpy(dest).copy_(vol)
         del vol
 
     if verbose:

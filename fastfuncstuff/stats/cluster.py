@@ -134,20 +134,13 @@ def _cluster_extent_mass_one(
             n_lab = int(lab.max())
             if n_lab == 0:
                 continue
-            sizes = np.bincount(lab.ravel(), minlength=n_lab + 1)[1:]
-            masses = np.bincount(
-                lab.ravel(),
-                weights=stat_for_mass.ravel(),
-                minlength=n_lab + 1,
-            )[1:]
+            where, lab_at, sizes, masses = _label_sizes_masses(lab, stat_for_mass, n_lab)
             all_sizes.append(sizes)
             all_masses.append(masses)
-            # Splice into combined label map with offset
-            mask_nonzero = lab > 0
             # Widened before the offset: cc3d returns uint16 when it can, and
             # NumPy 2 keeps the narrow type, so past 65535 total the negative
             # tail's labels wrapped onto the positive tail's.
-            combined_labels[mask_nonzero] = lab[mask_nonzero].astype(np.int32) + offset
+            combined_labels.reshape(-1)[where] = lab_at.astype(np.int32) + offset
             offset += n_lab
         if not all_sizes:
             empty = np.zeros(0, dtype=np.int64)
@@ -166,14 +159,33 @@ def _cluster_extent_mass_one(
         empty = np.zeros(0, dtype=np.int64)
         return 0, 0.0, labels.astype(np.int32), empty, empty.astype(np.float64)
 
-    sizes = np.bincount(labels.ravel(), minlength=n_labels + 1)[1:]
-    stat_for_mass = stat3d if sidedness == "1-sided" else np.abs(stat3d)
-    masses = np.bincount(
-        labels.ravel(),
-        weights=stat_for_mass.ravel(),
-        minlength=n_labels + 1,
-    )[1:]
+    _, _, sizes, masses = _label_sizes_masses(
+        labels, stat3d, n_labels, absolute=sidedness != "1-sided"
+    )
     return int(sizes.max()), float(masses.max()), labels.astype(np.int32), sizes, masses
+
+
+def _label_sizes_masses(
+    labels: np.ndarray, stat3d: np.ndarray, n_labels: int, *, absolute: bool = False
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """``(where, labels[where], sizes, masses)`` over the labelled voxels only.
+
+    A suprathreshold map is typically ~1% of the volume, so counting over the
+    nonzero voxels rather than the whole grid saves two full-volume weighted
+    bincounts (and an ``abs`` pass) per call -- ~40 ms of a 4.2M-voxel
+    clusterize, paid on every threshold tick and every null permutation.  The
+    nonzero voxels are visited in the same ascending order, so the float sums
+    are the full-grid ones bit for bit.
+    """
+    flat = labels.reshape(-1)
+    where = np.flatnonzero(flat)
+    lab_at = flat[where]
+    weights = stat3d.reshape(-1)[where]
+    if absolute:
+        weights = np.abs(weights)
+    sizes = np.bincount(lab_at, minlength=n_labels + 1)[1:]
+    masses = np.bincount(lab_at, weights=weights, minlength=n_labels + 1)[1:]
+    return where, lab_at, sizes, masses
 
 
 # ---------------------------------------------------------------------------

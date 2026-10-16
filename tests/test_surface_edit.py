@@ -551,3 +551,29 @@ def test_geodesic_ball_matches_the_whole_mesh_search():
             want = np.flatnonzero(np.isfinite(full))
             np.testing.assert_array_equal(ids, want)
             np.testing.assert_allclose(dist, full[want], rtol=1e-12)
+
+
+def test_vertex_areas_at_equals_the_whole_mesh_pass_bit_for_bit():
+    from fastfuncstuff.surface.mesh import vertex_areas, vertex_areas_at
+
+    u, f = _sphere(3000)
+    u = u * (1 + 0.1 * np.sin(5 * u[:, :1]))  # uneven spacing, so areas differ
+    topo = MeshTopology.from_faces(f)
+    ids = np.random.default_rng(0).choice(len(u), 200, replace=False)
+    np.testing.assert_array_equal(vertex_areas_at(u, topo, ids), vertex_areas(u, f)[ids])
+
+
+@pytest.mark.parametrize("radius", [0.05, 0.2, 0.6])
+def test_geodesic_reach_equals_the_whole_mesh_search(radius):
+    from scipy.sparse.csgraph import dijkstra
+
+    from fastfuncstuff.surface.mesh import geodesic_reach
+
+    u, f = _sphere(4000)
+    topo = MeshTopology.from_faces(f)
+    rng = np.random.default_rng(1)
+    seeds = np.unique(np.r_[rng.choice(len(u), 5), np.flatnonzero(u[:, 2] > 0.97)])
+    full = dijkstra(topo.edge_graph(u), indices=seeds, limit=radius, min_only=True)
+    ids, dist = geodesic_reach(u, topo, seeds, radius)
+    np.testing.assert_array_equal(ids, np.flatnonzero(np.isfinite(full)))
+    np.testing.assert_allclose(dist, full[ids], rtol=0, atol=1e-12)

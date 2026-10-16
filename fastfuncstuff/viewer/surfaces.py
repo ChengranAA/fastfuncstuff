@@ -558,13 +558,23 @@ class SurfaceStore:
         for hemi, h in self.hemis.items():
             version = self.version.get(hemi, 0)
             cached = self._trees.get(hemi)
+            q = np.asarray(mm, np.float64)
             if cached is None or cached[0] != version:
+                # First query since an edit: a direct scan (~2 ms) rather than a
+                # KD-tree (~40 ms), since editing invalidates it after one use.
+                # The tree is built on the second query of the same version.
                 ids = np.flatnonzero(h.cortex) if h.cortex is not None else np.arange(h.n_vertices)
                 mid = 0.5 * (h.states["white"][ids] + h.states["pial"][ids])
-                cached = (version, cKDTree(mid), ids)
-                self._trees[hemi] = cached
-            _, tree, ids = cached
-            d, k = tree.query(np.asarray(mm, np.float64))  # type: ignore[attr-defined]
+                self._trees[hemi] = (version, mid, ids)
+                dist = np.linalg.norm(mid - q, axis=1)
+                k = int(np.argmin(dist))
+                d = float(dist[k])
+            else:
+                _, tree, ids = cached
+                if isinstance(tree, np.ndarray):
+                    tree = cKDTree(tree)
+                    self._trees[hemi] = (version, tree, ids)
+                d, k = tree.query(q)  # type: ignore[attr-defined]
             if d <= max_mm and (best is None or d < best[2]):
                 best = (hemi, int(ids[k]), float(d))
         return best
@@ -900,6 +910,24 @@ class SurfaceStore:
                     out[name] = hit
             return out
         raise ValueError(f"depth ROI source must be disc, annot or layer, not {source!r}")
+
+    def vertex_areas_at(self, hemi: str, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """White and pial vertex areas of ``ids`` only.
+
+        Not cached: from the faces around ``ids`` it is cheaper than the whole
+        hemisphere :meth:`vertex_areas` recomputes after every edit (137 ms on a
+        150k-vertex mesh, per DEPTH redraw while moving a highlight).
+        """
+        from fastfuncstuff.surface.mesh import vertex_areas_at
+
+        cached = self._areas.get(hemi)
+        if cached is not None and cached[0] == self.version.get(hemi, 0):
+            return cached[1][ids], cached[2][ids]
+        h, topo = self.hemis[hemi], self.topology(hemi)
+        return (
+            vertex_areas_at(h.states["white"], topo, ids),
+            vertex_areas_at(h.states["pial"], topo, ids),
+        )
 
     def vertex_areas(self, hemi: str) -> tuple[np.ndarray, np.ndarray]:
         """White and pial vertex areas (mm^2), for equivolume depth; cached per edit."""

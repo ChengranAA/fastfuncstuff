@@ -982,3 +982,21 @@ def test_the_step_sets_how_far_a_nudge_and_a_marked_move_go(tmp_path):
     finally:
         win.close()
         session.close()
+
+
+def test_nearest_vertex_scans_after_an_edit_then_builds_its_tree_and_agrees(session, tmp_path):
+    """First query of a mesh version is a direct scan, the next uses the KD-tree: same answers."""
+    from fastfuncstuff.viewer.vocab import LoadSurfaces
+
+    session.do(LoadSurfaces(str(_subject(tmp_path)), "lh"))
+    surfs = session.surfaces
+    h = surfs.hemis["lh"]
+    mid = 0.5 * (h.states["white"] + h.states["pial"])
+    rng = np.random.default_rng(0)
+    probes = mid[rng.integers(len(mid), size=20)] + rng.normal(0, 0.5, (20, 3))
+    for when in ("scan", "tree"):
+        for q in probes:
+            hemi, vertex, d = surfs.nearest_vertex(tuple(q))
+            ref = np.linalg.norm(mid - q, axis=1)
+            assert vertex == int(np.argmin(ref)) and d == pytest.approx(float(ref.min()))
+        assert (when == "scan") or not isinstance(surfs._trees["lh"][1], np.ndarray)

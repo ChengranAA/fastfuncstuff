@@ -217,6 +217,22 @@ def vertex_areas(
     return out
 
 
+def vertex_areas_at(vertices: np.ndarray, topo: MeshTopology, ids: np.ndarray) -> np.ndarray:
+    """:func:`vertex_areas` of ``ids`` only, in that order, from their incident faces.
+
+    A vertex's area depends on nothing else, and the faces are visited in the
+    same (ascending) order the full pass adds them in, so the sums are the same
+    bit for bit -- without paying for a whole hemisphere after every edit.
+    """
+    ids = np.asarray(ids, np.int64)
+    faces = topo.faces[topo.faces_of(ids)]
+    face_area = 0.5 * np.linalg.norm(face_normals(np.asarray(vertices, np.float64), faces), axis=1)
+    out = np.bincount(
+        faces.ravel(), weights=np.repeat(face_area / 3.0, 3), minlength=topo.n_vertices
+    )
+    return out[ids]
+
+
 def geodesic_ball(
     vertices: np.ndarray, topo: MeshTopology, centre: int, radius: float
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -247,11 +263,43 @@ def geodesic_ball(
     return near[inside], d[inside]
 
 
+def geodesic_reach(
+    vertices: np.ndarray, topo: MeshTopology, seeds: np.ndarray, radius: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vertices within ``radius`` mm *along the mesh* of any of ``seeds``, and that distance.
+
+    :func:`geodesic_ball` for many seeds: the same local search.  Every vertex
+    within ``radius`` of a seed lies in the seeds' bounding box grown by
+    ``radius`` (a path is never shorter than the straight line), so only that
+    box's edges are searched -- not the whole hemisphere's 450k, whose lengths
+    cost 35 ms each time a highlight moved.
+    """
+    from scipy.sparse.csgraph import dijkstra
+
+    v = np.asarray(vertices, np.float64)
+    seeds = np.asarray(seeds, np.int64)
+    reach = float(radius) * (1.0 + 1e-9) + 1e-12
+    lo = v[seeds].min(axis=0) - reach
+    hi = v[seeds].max(axis=0) + reach
+    near = np.flatnonzero(((v >= lo) & (v <= hi)).all(axis=1))
+    local = np.full(len(v), -1, np.int64)
+    local[near] = np.arange(near.size)
+    e = topo.edges
+    keep = (local[e[:, 0]] >= 0) & (local[e[:, 1]] >= 0)
+    i, j = local[e[keep, 0]], local[e[keep, 1]]
+    w = np.linalg.norm(v[near[i]] - v[near[j]], axis=1)
+    graph = sp.csr_matrix((np.r_[w, w], (np.r_[i, j], np.r_[j, i])), shape=(near.size, near.size))
+    d = dijkstra(graph, indices=local[seeds], limit=float(radius), min_only=True)
+    inside = np.flatnonzero(np.isfinite(d))
+    return near[inside], d[inside]
+
+
 __all__ = [
     "MeshTopology",
     "even_spacing",
     "face_normals",
     "geodesic_ball",
+    "geodesic_reach",
     "vertex_areas",
     "vertex_normals",
 ]

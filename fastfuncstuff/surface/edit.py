@@ -43,6 +43,7 @@ from fastfuncstuff.surface.mesh import (
     even_spacing,
     face_normals,
     geodesic_ball,
+    geodesic_reach,
     local_height,
     vertex_normals,
 )
@@ -488,8 +489,6 @@ class StrokeEdit(SurfaceEdit):
         partner: np.ndarray | None = None,
         plane_normal: np.ndarray | None = None,
     ) -> None:
-        from scipy.sparse.csgraph import dijkstra
-
         vertices = np.asarray(vertices, np.float64)
         seeds = sorted_unique(np.asarray(seeds, np.int64))
         if seeds.size == 0:
@@ -497,11 +496,9 @@ class StrokeEdit(SurfaceEdit):
         stroke = np.asarray(stroke, np.float64)
         if stroke.ndim != 2 or stroke.shape[0] < 2:
             raise ValueError("a stroke needs at least two points")
-        graph = topo.edge_graph(vertices)
-        dist = dijkstra(graph, indices=seeds, limit=float(params.radius), min_only=True)
-        ids = np.flatnonzero(np.isfinite(dist))
+        ids, dist = geodesic_reach(vertices, topo, seeds, float(params.radius))
         self.centre = int(seeds[0])
-        self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
+        self._setup(vertices, topo, ids, dist, sampler, params, role, partner)
         self.seed = np.isin(self.ids, seeds)
         start, normals = self.start[self.seed], self.normals[self.seed]
         self.disp: np.ndarray | None = None
@@ -598,17 +595,13 @@ class HighlightEdit(StrokeEdit):
         flatten_rings: int = 2,
         even: int = 0,
     ) -> None:
-        from scipy.sparse.csgraph import dijkstra
-
         vertices = np.asarray(vertices, np.float64)
         seeds = sorted_unique(np.asarray(seeds, np.int64))
         if seeds.size == 0:
             raise ValueError("nothing is highlighted")
-        graph = topo.edge_graph(vertices)
-        dist = dijkstra(graph, indices=seeds, limit=float(params.radius), min_only=True)
-        ids = np.flatnonzero(np.isfinite(dist))
+        ids, dist = geodesic_reach(vertices, topo, seeds, float(params.radius))
         self.centre = int(seeds[0])
-        self._setup(vertices, topo, ids, dist[ids], sampler, params, role, partner)
+        self._setup(vertices, topo, ids, dist, sampler, params, role, partner)
         self.seed = np.isin(self.ids, seeds)
         self.disp = None
         self.flatten = np.zeros(self.ids.size)

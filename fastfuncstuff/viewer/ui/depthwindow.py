@@ -93,8 +93,7 @@ def depth_profiles(
         w, p = h.states["white"][ids], h.states["pial"][ids]
         areas = None
         if equivolume:
-            aw, ap = session.surfaces.vertex_areas(hemi)
-            areas = (aw[ids], ap[ids])
+            areas = session.surfaces.vertex_areas_at(hemi, ids)
         parts.append(
             sample_depths(
                 w,

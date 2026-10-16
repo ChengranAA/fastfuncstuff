@@ -416,3 +416,48 @@ def test_a_handler_of_the_wrong_shape_is_refused_at_registration():
         return Aspect.NOTHING
 
     assert "SET_IJK" in bus._handlers
+
+
+def test_command_timing_is_off_unless_asked(monkeypatch, capsys):
+    from fastfuncstuff.viewer.commands import CommandBus
+
+    monkeypatch.delenv("FFS_VIEWER_TIMING", raising=False)
+    bus = CommandBus(state=None)
+    assert bus._timing is None
+    bus.print_timing()
+    assert capsys.readouterr().err == ""
+
+
+def test_command_timing_reports_slow_commands_and_a_table(monkeypatch, capsys):
+    import atexit
+    import time as _time
+
+    from fastfuncstuff.viewer.commands import Aspect, CommandBus
+
+    monkeypatch.setenv("FFS_VIEWER_TIMING", "20")  # ms threshold
+    bus = CommandBus(state=None)
+    atexit.unregister(bus.print_timing)  # keep the table out of pytest's own exit
+
+    @bus.handle("SLOW_ONE")
+    def _slow(cmd: Command, state):  # noqa: ARG001
+        _time.sleep(0.03)
+        return Aspect.NOTHING
+
+    @bus.handle("FAST_ONE")
+    def _fast(cmd: Command, state):  # noqa: ARG001
+        return Aspect.NOTHING
+
+    class _C:  # dispatch only reads .name and .aspects
+        def __init__(self, name):
+            self.name, self.aspects = name, Aspect.NOTHING
+
+    for _ in range(2):
+        bus.dispatch(_C("SLOW_ONE"))
+    for _ in range(3):
+        bus.dispatch(_C("FAST_ONE"))
+    err = capsys.readouterr().err
+    assert err.count("[cmd] SLOW_ONE") == 2 and "FAST_ONE" not in err  # only slow ones live
+    bus.print_timing()
+    table = capsys.readouterr().err
+    assert table.index("SLOW_ONE") < table.index("FAST_ONE")  # worst first
+    assert "FAST_ONE" in table

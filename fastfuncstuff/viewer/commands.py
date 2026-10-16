@@ -16,8 +16,12 @@ sessions stay human-editable and the vocabulary reads as familiar.
 
 from __future__ import annotations
 
+import atexit
 import inspect
+import os
 import shlex
+import sys
+import time
 import typing
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import MISSING, dataclass, fields, is_dataclass
@@ -231,6 +235,16 @@ class CommandBus:
         self._listeners: list[Listener] = []
         self._log: list[Command] = []
         self.recording = record
+        # FFS_VIEWER_TIMING=1 (or =<ms>): time every command -- its handler and the
+        # listeners that repaint -- print the slow ones as they happen, and a per-command
+        # table at exit.  The redraw hook in ui/manager.py only covers four window types;
+        # this covers everything the user can do, which is what "the viewer feels slow"
+        # needs to be turned into a number.  A plain bool test when off.
+        raw = os.environ.get("FFS_VIEWER_TIMING", "")
+        self._timing: dict[str, list[tuple[float, float]]] | None = {} if raw else None
+        self._slow_ms = float(raw) if raw.replace(".", "", 1).isdigit() and float(raw) > 1 else 30.0
+        if self._timing is not None:
+            atexit.register(self.print_timing)
 
     # -- registration --------------------------------------------------
     def handle(self, name: str) -> Callable[[Handler], Handler]:
@@ -282,14 +296,57 @@ class CommandBus:
         handler = self._handlers.get(cmd.name)
         if handler is None:
             raise KeyError(f"no handler registered for {cmd.name!r}")
+        t0 = time.perf_counter() if self._timing is not None else 0.0
         dirty = handler(cmd, self.state)
         if dirty is None:  # a handler that forgot to report is treated as total
             dirty = cmd.aspects
         if self.recording:
             self._log.append(cmd)
+        t1 = time.perf_counter() if self._timing is not None else 0.0
         for listener in tuple(self._listeners):
             listener(cmd, dirty)
+        if self._timing is not None:
+            self._note_timing(cmd.name, (t1 - t0) * 1000.0, (time.perf_counter() - t1) * 1000.0)
         return dirty
+
+    def _note_timing(self, name: str, handler_ms: float, listeners_ms: float) -> None:
+        assert self._timing is not None
+        self._timing.setdefault(name, []).append((handler_ms, listeners_ms))
+        if handler_ms + listeners_ms >= self._slow_ms:
+            print(
+                f"[cmd] {name}: handler {handler_ms:.1f} ms + listeners {listeners_ms:.1f} ms",
+                file=sys.stderr,
+            )
+
+    def print_timing(self) -> None:
+        """Per-command latency table (median / p95 / max of handler + listeners)."""
+        if not self._timing:
+            return
+        rows = []
+        for name, samples in self._timing.items():
+            tot = sorted(h + li for h, li in samples)
+            med = lambda xs: xs[len(xs) // 2]  # noqa: E731
+            rows.append(
+                (
+                    tot[-1],
+                    name,
+                    len(tot),
+                    med(sorted(h for h, _ in samples)),
+                    med(sorted(li for _, li in samples)),
+                    med(tot),
+                    tot[min(len(tot) - 1, int(0.95 * len(tot)))],
+                )
+            )
+        print("\n[cmd] latency by command (ms)  worst-first", file=sys.stderr)
+        print(
+            f"[cmd] {'command':24} {'n':>6} {'handler':>9} {'listeners':>10} {'median':>8} {'p95':>8} {'max':>8}",
+            file=sys.stderr,
+        )
+        for worst, name, n, h, li, med_t, p95 in sorted(rows, reverse=True):
+            print(
+                f"[cmd] {name:24} {n:>6} {h:>9.1f} {li:>10.1f} {med_t:>8.1f} {p95:>8.1f} {worst:>8.1f}",
+                file=sys.stderr,
+            )
 
     def record(self, cmd: Command) -> None:
         """Log a command whose effect has already been applied.

@@ -956,7 +956,70 @@ def _all_zero(reg: tuple[float, ...]) -> bool:
     return not any(float(r) != 0.0 for r in reg)
 
 
+_GRAPH_CACHE: dict[tuple, tuple[torch.cuda.CUDAGraph, Tensor, Tensor] | None] = {}
+_GRAPH_CACHE_MAX = 8
+
+
+def _warp_prior_grad_graphed(
+    field: Tensor, reg: tuple[float, ...], vox: tuple[float, float, float]
+) -> Tensor | None:
+    """:func:`_warp_prior_grad_taps` replayed as one captured CUDA graph, or ``None``.
+
+    The operator is ~450 tiny elementwise kernels on a small lattice and the warp
+    conjugate-gradient solve applies it ~800 times per fit, so ``ffs_segment`` was
+    launch-bound here (369k launches in a 15 s run, ~30% of it this operator). The
+    lattice shape, regularisation and spacing are constant through a fit, so capture it
+    once per key and replay: the same kernels in the same order, hence bit-identical to
+    eager. Returns ``None`` (caller falls back to eager) if capture is not possible.
+    """
+    key = (tuple(field.shape), field.dtype, field.device, tuple(reg), tuple(vox))
+    if key in _GRAPH_CACHE:
+        entry = _GRAPH_CACHE[key]
+    else:
+        entry = None
+        try:
+            if len(_GRAPH_CACHE) >= _GRAPH_CACHE_MAX:
+                _GRAPH_CACHE.pop(next(iter(_GRAPH_CACHE)))
+            static_in = field.detach().clone()
+            side = torch.cuda.Stream(device=field.device)
+            side.wait_stream(torch.cuda.current_stream(field.device))
+            with torch.cuda.stream(side):  # warm up off the capture stream
+                for _ in range(2):
+                    _warp_prior_grad_taps(static_in, reg, vox)
+            torch.cuda.current_stream(field.device).wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_out = _warp_prior_grad_taps(static_in, reg, vox)
+            entry = (graph, static_in, static_out)
+        except Exception:  # noqa: BLE001 -- any capture failure means "run eagerly"
+            entry = None
+        _GRAPH_CACHE[key] = entry
+    if entry is None:
+        return None
+    graph, static_in, static_out = entry
+    static_in.copy_(field)
+    graph.replay()
+    return static_out.clone()
+
+
 def warp_prior_grad(
+    field: Tensor, reg: tuple[float, ...], vox: tuple[float, float, float]
+) -> Tensor:
+    """``L·field`` -- SPM's ``spm_diffeo('vel2mom')``; see :func:`_warp_prior_grad_taps`.
+
+    On CUDA, with no autograd graph to preserve, the operator is replayed from a captured
+    CUDA graph (launch-bound otherwise); everywhere else it runs the tap form eagerly.
+    """
+    if _all_zero(reg):
+        return torch.zeros_like(field)
+    if field.is_cuda and not field.requires_grad:
+        out = _warp_prior_grad_graphed(field, reg, vox)
+        if out is not None:
+            return out
+    return _warp_prior_grad_taps(field, reg, vox)
+
+
+def _warp_prior_grad_taps(
     field: Tensor, reg: tuple[float, ...], vox: tuple[float, float, float]
 ) -> Tensor:
     """``L·field`` — SPM's ``spm_diffeo('vel2mom')`` on a dense field ``(gz, gy, gx, 3)``.

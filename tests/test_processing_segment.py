@@ -1606,3 +1606,39 @@ def test_separable_bias_assembly_matches_the_dense_normal_equations():
     # and Alpha must stay symmetric PSD, since the GN solve assumes it
     assert torch.allclose(alpha_sep, alpha_sep.T, atol=1e-12)
     assert torch.linalg.eigvalsh(alpha_sep).min() > -1e-9
+
+
+@pytest.mark.gpu
+def test_warp_prior_grad_graph_replay_is_the_eager_operator():
+    """The CG warp solve applies the regularisation operator ~800 times per fit and was
+    launch-bound; replaying it from a captured graph must change nothing."""
+    from fastfuncstuff.processing import segment as seg
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graphs")
+    dev = torch.device("cuda")
+    reg, vox = (0.0, 0.0, 0.1, 0.01, 0.04), (8.0, 8.0, 8.0)
+    g = torch.Generator().manual_seed(0)
+    for shape in [(12, 14, 13), (1, 1, 1), (2, 3, 4)]:
+        a = torch.randn(*shape, 3, generator=g).to(dev)
+        b = torch.randn(*shape, 3, generator=g).to(dev)
+        first = seg.warp_prior_grad(a, reg, vox)  # captures
+        second = seg.warp_prior_grad(b, reg, vox)  # replays on new data
+        assert torch.equal(first, seg._warp_prior_grad_taps(a, reg, vox))
+        assert torch.equal(second, seg._warp_prior_grad_taps(b, reg, vox))
+        if not torch.equal(
+            seg._warp_prior_grad_taps(a, reg, vox), seg._warp_prior_grad_taps(b, reg, vox)
+        ):
+            assert not torch.equal(first, second)  # replay did not overwrite the earlier result
+
+
+@pytest.mark.gpu
+def test_warp_prior_grad_keeps_autograd_when_the_field_needs_it():
+    from fastfuncstuff.processing import segment as seg
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graphs")
+    f = torch.randn(9, 10, 8, 3, device="cuda", requires_grad=True)
+    energy = seg.warp_penalty(f, (0.0, 0.0, 0.1, 0.01, 0.04), (8.0, 8.0, 8.0))
+    energy.backward()
+    assert f.grad is not None and torch.isfinite(f.grad).all()

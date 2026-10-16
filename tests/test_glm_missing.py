@@ -238,7 +238,7 @@ def test_dof_loss_map_uses_fitted_dof_not_timepoints():
 
 
 def test_censored_refit_removes_the_beta_dilution():
-    """A dead run left in dilutes beta and deflates sigma2; censoring fixes both."""
+    """A dead run left in dilutes beta; censoring recovers it."""
     rng = np.random.default_rng(3)
     design = _design()
     X = design.numpy().astype(np.float64)
@@ -276,10 +276,11 @@ def test_censored_refit_removes_the_beta_dilution():
     assert b_naive < 0.8 * b_true
     assert abs(b_fixed - b_true) < abs(b_naive - b_true)
 
-    # And the deflated noise variance is what hides it: naive sigma2 is far
-    # below truth while the censored fit recovers the right scale.
+    # The censored fit recovers the noise scale.  There is deliberately no bound
+    # on the naive sigma2: in float64 it is 0.93 of truth, not "far below" -- the
+    # dead run's own baseline columns absorb it.  This test once asserted <0.8 and
+    # passed on CUDA only because the float32 REML search was mis-conditioned.
     s_true = float(truth.sigma2[0])
-    assert float(naive.sigma2[0]) < 0.8 * s_true
     assert float(fixed.sigma2[0]) > 0.8 * s_true
 
     # The censored fit honestly reports fewer degrees of freedom.

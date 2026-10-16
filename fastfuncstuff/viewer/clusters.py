@@ -171,12 +171,12 @@ def clusterize(
     """
     from fastfuncstuff.stats.cluster import cluster_map
 
-    volume = np.nan_to_num(np.asarray(values, dtype=np.float32))
+    volume = _finite(values)
     if volume.ndim != 3:
         raise ValueError(f"clusterizing needs a 3-D volume, got shape {volume.shape}")
     if threshold <= 0:
         raise ValueError("clusterizing needs a threshold above zero")
-    cut = volume if stat is None else np.nan_to_num(np.asarray(stat, dtype=np.float32))
+    cut = volume if stat is None else _finite(stat)
     if cut.shape != volume.shape:
         raise ValueError(
             f"the threshold sub-brick is {cut.shape} and the displayed one is {volume.shape}"
@@ -216,12 +216,21 @@ def clusterize(
     renumber = np.zeros(int(labels.max()) + 1, dtype=np.int32)
     for position, label in enumerate(keep):
         renumber[label] = position + 1
-    dropped = (labels > 0) & (renumber[labels] == 0)
-    labels = renumber[labels]
+    # Over the labelled voxels only (~1% of a thresholded map): each full-grid
+    # gather or compare here was ~10 ms of every threshold tick on 4.2M voxels.
+    where = np.flatnonzero(labels)
+    new_at = renumber[labels.reshape(-1)[where]]
+    labels = np.zeros(labels.shape, dtype=np.int32)
+    labels.reshape(-1)[where] = new_at
+    dropped = np.zeros(labels.shape, dtype=bool)
+    dropped.reshape(-1)[where[new_at == 0]] = True
+    kept = new_at != 0
 
     clusters = _measure_all(
         volume,
-        labels,
+        where[kept],
+        new_at[kept],
+        labels.shape,
         len(keep),
         affine=affine,
         voxel_mm3=voxel_mm3,
@@ -231,7 +240,7 @@ def clusterize(
     )
     return ClusterTable(
         clusters=clusters,
-        labels=labels.astype(np.int32),
+        labels=labels,
         threshold=float(threshold),
         sidedness=sidedness,
         nn=int(nn),
@@ -244,9 +253,17 @@ def clusterize(
     )
 
 
+def _finite(values: np.ndarray) -> np.ndarray:
+    """``values`` as float32 with NaN/inf zeroed, copying only when there are any."""
+    out = np.asarray(values, dtype=np.float32)
+    return out if np.isfinite(out).all() else np.nan_to_num(out)
+
+
 def _measure_all(
     volume: np.ndarray,
-    labels: np.ndarray,
+    where: np.ndarray,
+    lab: np.ndarray,
+    shape: tuple[int, ...],
     n: int,
     *,
     affine: np.ndarray | None,
@@ -262,12 +279,10 @@ def _measure_all(
     """
     if n == 0:
         return ()
-    flat = labels.reshape(-1)
-    where = np.flatnonzero(flat)
-    lab = flat[where].astype(np.int64)
+    lab = lab.astype(np.int64)
     values = volume.reshape(-1)[where].astype(np.float64)
     magnitude = np.abs(values)
-    coords = np.stack(np.unravel_index(where, labels.shape), 1).astype(np.float64)
+    coords = np.stack(np.unravel_index(where, shape), 1).astype(np.float64)
 
     counts = np.bincount(lab, minlength=n + 1)
     sums = np.bincount(lab, weights=values, minlength=n + 1)
@@ -280,22 +295,26 @@ def _measure_all(
     order = np.lexsort((-magnitude, lab))
     firsts = order[np.searchsorted(lab[order], np.arange(1, n + 1))]
 
+    # Everything per cluster as arrays first, then one plain-Python pass to build
+    # the rows: at a loose threshold there are thousands of clusters, and two
+    # tiny affine products each were ~25 ms of the tick.
+    peaks_ijk = coords[firsts]
+    centres = com[1:] / np.maximum(mass[1:], 1e-12)[:, None]
+    peaks_xyz, centres_xyz = _to_mm(peaks_ijk, affine), _to_mm(centres, affine)
     out = []
     for index in range(1, n + 1):
         count = int(counts[index])
         at = int(firsts[index - 1])
-        peak_ijk = tuple(int(v) for v in coords[at])
-        centre = tuple(float(v) for v in com[index] / max(float(mass[index]), 1e-12))
         out.append(
             Cluster(
                 index=index,
                 n_voxels=count,
                 volume_mm3=float(count) * float(voxel_mm3),
                 peak=float(values[at]),
-                peak_ijk=peak_ijk,  # type: ignore[arg-type]
-                peak_xyz=_to_mm(peak_ijk, affine),
-                com_ijk=centre,  # type: ignore[arg-type]
-                com_xyz=_to_mm(centre, affine),
+                peak_ijk=tuple(int(v) for v in peaks_ijk[index - 1]),  # type: ignore[arg-type]
+                peak_xyz=tuple(peaks_xyz[index - 1]),  # type: ignore[arg-type]
+                com_ijk=tuple(centres[index - 1].tolist()),  # type: ignore[arg-type]
+                com_xyz=tuple(centres_xyz[index - 1]),  # type: ignore[arg-type]
                 mean=float(sums[index]) / max(count, 1),
                 alpha=None if alpha_of is None else alpha_of(count),
             )
@@ -303,11 +322,12 @@ def _measure_all(
     return tuple(out)
 
 
-def _to_mm(ijk, affine: np.ndarray | None) -> tuple[float, float, float]:
+def _to_mm(ijk: np.ndarray, affine: np.ndarray | None) -> list[list[float]]:
+    """``(n, 3)`` voxel coordinates to scanner mm, as plain floats."""
     if affine is None:
-        return (float(ijk[0]), float(ijk[1]), float(ijk[2]))
-    x, y, z = (np.asarray(affine, dtype=float) @ np.array([*ijk, 1.0]))[:3]
-    return (float(x), float(y), float(z))
+        return ijk.tolist()
+    a = np.asarray(affine, dtype=float)
+    return (ijk @ a[:3, :3].T + a[:3, 3]).tolist()
 
 
 def rois_from_clusters(table: ClusterTable, *, name: str = "clusters", source: str = ""):

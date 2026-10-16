@@ -2451,6 +2451,7 @@ def prewhiten_with_arma11(
         raise ValueError(f"Invalid ARMA(1,1) parameters: a={a}, b={b}")
 
     # Try GPU Cholesky (fast), fall back to CPU if OOM (safe)
+    R_gpu = None
     try:
         # Compact GPU memory before attempting allocation (minimal cost, big benefit!)
         if device.type == "cuda":
@@ -2463,11 +2464,9 @@ def prewhiten_with_arma11(
         del R_gpu
 
     except (RuntimeError, torch.cuda.OutOfMemoryError):
-        # GPU OOM - fall back to CPU (slower but safe)
-        try:
-            del L  # noqa: F821 — L may be unbound if the try failed before assignment
-        except NameError:
-            pass
+        # GPU OOM - fall back to CPU (slower but safe).  Drop the GPU copy of R
+        # first: still referenced, it is exactly what empty_cache cannot free.
+        R_gpu = None  # noqa: F841 -- rebinding releases the tensor
 
         if device.type == "cuda":
             torch.cuda.empty_cache()

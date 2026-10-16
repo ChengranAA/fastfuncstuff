@@ -3024,6 +3024,9 @@ def main() -> int:
     arma_ab: tuple[float, float] | None = None
     arma_ab_per_voxel: np.ndarray | None = None
     arma_cells: list[ARMAWhitenCell] | None = None
+    # Kept apart from ``arma_cells``, which is freed (~7 GB) before the
+    # metadata that reports it is written.
+    n_arma_cells = 0
     if args.prewhiten != "none" and extra_regs_per_run is not None:
         # The ARMA path rebuilds its own nuisance from polort when it whitens,
         # so external columns would be dropped from the whitening AND from the
@@ -3532,6 +3535,7 @@ def main() -> int:
         # amplitude reconstruction, and ``per_run_data_orig`` is
         # already cloned for -xval-r2.  Drop them now so the next
         # stage (amplitude/iresp, xval-r2) doesn't hit OOM.
+        n_arma_cells = len(arma_cells) if arma_cells is not None else 0
         arma_cells = None
         cell_packed_cache.clear()
         if device.type == "cuda":
@@ -4485,7 +4489,7 @@ def main() -> int:
         metadata["arma11_per_voxel"] = {
             "median_a": float(np.median(arma_ab_per_voxel[:, 0])),
             "median_b": float(np.median(arma_ab_per_voxel[:, 1])),
-            "n_unique_cells": int(arma_cells.__len__() if arma_cells else 0),
+            "n_unique_cells": n_arma_cells,
         }
     if cv_result is not None:
         metadata["cv"] = {

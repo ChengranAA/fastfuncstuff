@@ -237,8 +237,13 @@ class DenoiseMode(Mode):
             )
         if job["ica"] is None:
             assert nuisance is not None
-            clean = derive.denoise(
-                data, nuisance, device=job["device"], keep_mean=job["keep_mean"], progress=progress
+            clean, removed = derive.denoise(
+                data,
+                nuisance,
+                device=job["device"],
+                keep_mean=job["keep_mean"],
+                progress=progress,
+                return_removed=True,
             )
             description = nuisance.description
         else:
@@ -254,21 +259,19 @@ class DenoiseMode(Mode):
             if nuisance is not None:
                 blocks.insert(0, nuisance.columns)
                 remove.insert(0, np.ones(nuisance.n_columns, bool))
-            clean = derive.denoise_partial(
+            clean, removed = derive.denoise_partial(
                 data,
                 np.concatenate(blocks, axis=1),
                 np.concatenate(remove),
                 device=job["device"],
                 keep_mean=job["keep_mean"],
                 progress=progress,
+                return_removed=True,
             )
             ica_text = f"ICA noise {len(noise)}/{mix.shape[1]} {style}"
             description = (
                 f"{nuisance.description} + {ica_text}" if nuisance is not None else ica_text
             )
-        if progress is not None:
-            progress(1.0, "variance removed")
-        removed = derive.variance_removed(data, clean)
         self._result = (clean, removed, description)
         self._installed = False
         self._dirty = False

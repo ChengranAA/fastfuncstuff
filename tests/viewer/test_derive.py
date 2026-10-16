@@ -462,3 +462,22 @@ def test_detrending_does_not_touch_its_input():
     before = values.copy()
     detrend_trace(values, 1)
     assert np.array_equal(values, before)
+
+
+def test_return_removed_matches_the_host_variance_map():
+    """The per-chunk device map is variance_removed of the same pair, both entry points."""
+    from fastfuncstuff.viewer.derive import denoise_partial, read_nuisance, variance_removed
+
+    data = _series(nt=80, shape=(6, 5, 4)) * 10 + 500
+    data[0, 0, 0] = 7.0  # constant: nothing to remove, 0 not NaN
+    nuisance = read_nuisance(None, n_time=80, polort=3)
+    clean, removed = denoise(data, nuisance, device=CPU, return_removed=True)
+    np.testing.assert_array_equal(clean, denoise(data, nuisance, device=CPU))
+    np.testing.assert_allclose(removed, variance_removed(data, clean), atol=1e-5)
+    assert removed[0, 0, 0] == 0.0
+
+    design = np.random.default_rng(0).normal(size=(80, 3))
+    clean_p, removed_p = denoise_partial(
+        data, design, np.array([True, False, True]), device=CPU, return_removed=True
+    )
+    np.testing.assert_allclose(removed_p, variance_removed(data, clean_p), atol=1e-5)

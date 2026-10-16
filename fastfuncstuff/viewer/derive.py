@@ -238,8 +238,13 @@ def denoise(
     device: torch.device | None = None,
     keep_mean: bool = True,
     progress: ProgressFn | None = None,
-) -> np.ndarray:
+    return_removed: bool = False,
+):
     """Residualise a 4-D series against a nuisance matrix.
+
+    ``return_removed`` also returns :func:`variance_removed`'s map, taken per
+    chunk while both sides are on the device: as a host pass over the finished
+    pair it was 4 s of an 8 s APPLY on a 4.2M-voxel x 246 run.
 
     ``keep_mean`` restores each voxel's original temporal mean. Without it the
     result is mean-zero wherever the design carried a baseline, which makes a
@@ -273,14 +278,19 @@ def denoise(
         operation="denoise",
     )
 
+    removed = np.zeros(flat.shape[0], dtype=np.float32) if return_removed else None
     for start in range(0, flat.shape[0], chunk):
         stop = min(start + chunk, flat.shape[0])
         block = torch.as_tensor(flat[start:stop]).to(device)
-        out[start:stop] = project_out(block, basis, keep_mean=keep_mean).cpu().numpy()
+        cleaned = project_out(block, basis, keep_mean=keep_mean)
+        _land(cleaned, block, out, removed, start, stop)
         if progress is not None:
             progress(stop / flat.shape[0], f"projecting {nuisance.n_columns} columns")
 
-    return out.reshape(nx, ny, nz, nt)
+    clean = out.reshape(nx, ny, nz, nt)
+    if removed is not None:
+        return clean, removed.reshape(nx, ny, nz)
+    return clean
 
 
 def denoise_partial(
@@ -291,8 +301,11 @@ def denoise_partial(
     device: torch.device | None = None,
     keep_mean: bool = True,
     progress: ProgressFn | None = None,
-) -> np.ndarray:
+    return_removed: bool = False,
+):
     """Fit every column of ``design`` jointly, subtract only the ``remove`` ones.
+
+    ``return_removed`` as in :func:`denoise`.
 
     The non-aggressive ICA cleanup (``fsl_regfilt``, ICA-AROMA's default): the
     signal components stay in the fit, so variance a noise component shares
@@ -325,6 +338,7 @@ def denoise_partial(
 
     flat = np.asarray(data, dtype=np.float32).reshape(-1, nt)
     out = np.empty_like(flat)
+    removed = np.zeros(flat.shape[0], dtype=np.float32) if return_removed else None
     from fastfuncstuff.memory import estimate_chunk_size
 
     chunk = estimate_chunk_size(
@@ -341,12 +355,37 @@ def denoise_partial(
         cleaned = block - betas[:, picked] @ columns.T
         if keep_mean:
             cleaned = cleaned - cleaned.mean(-1, keepdim=True) + block.mean(-1, keepdim=True)
-        out[start:stop] = cleaned.cpu().numpy()
+        _land(cleaned, block, out, removed, start, stop)
         if progress is not None:
             progress(
                 stop / flat.shape[0], f"regressing {int(remove.sum())} of {remove.size} columns"
             )
-    return out.reshape(nx, ny, nz, nt)
+    clean = out.reshape(nx, ny, nz, nt)
+    if removed is not None:
+        return clean, removed.reshape(nx, ny, nz)
+    return clean
+
+
+def _land(
+    cleaned: torch.Tensor,
+    block: torch.Tensor,
+    out: np.ndarray,
+    removed: np.ndarray | None,
+    start: int,
+    stop: int,
+) -> None:
+    """Copy one cleaned chunk straight into ``out`` (and its variance fraction).
+
+    ``copy_`` into the destination rather than ``.cpu().numpy()`` then a host
+    copy: the second copy, into freshly faulted pages, was most of the download.
+    """
+    torch.from_numpy(out[start:stop]).copy_(cleaned)
+    if removed is None:
+        return
+    before = block.var(-1, unbiased=False)
+    after = cleaned.var(-1, unbiased=False)
+    frac = torch.where(before > 1e-12, 1.0 - after / before.clamp_min(1e-12), 0.0)
+    torch.from_numpy(removed[start:stop]).copy_(frac.clamp(0.0, 1.0))
 
 
 def variance_removed(raw: np.ndarray, clean: np.ndarray, *, block: int = 65536) -> np.ndarray:

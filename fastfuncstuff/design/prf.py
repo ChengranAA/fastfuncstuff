@@ -22,7 +22,7 @@ can validate it independently and choose an optimizer suited to their workload.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 
 import torch
@@ -517,17 +517,24 @@ def predict_prf_runwise(
         raise ValueError("exponents must contain one value per receptive field")
     if isinstance(hrf, torch.Tensor) and (hrf.ndim != 1 or hrf.numel() == 0):
         raise ValueError("hrf must be a non-empty one-dimensional tensor")
-    applier = _as_applier(hrf)
 
-    predictions = []
-    for run_index, stimulus in enumerate(stimulus_runs):
-        if stimulus.ndim != 2 or stimulus.shape[1] != n_pixels:
-            raise ValueError(
-                f"stimulus run {run_index} must have shape (time, {n_pixels}), got {tuple(stimulus.shape)}"
-            )
-        neural_drive = (stimulus @ receptive_fields.T).clamp_min(0).pow(exponents)
-        predictions.append(applier.apply(neural_drive))
-    return torch.cat(predictions, dim=0)
+    def drives():
+        for run_index, stimulus in enumerate(stimulus_runs):
+            if stimulus.ndim != 2 or stimulus.shape[1] != n_pixels:
+                raise ValueError(
+                    f"stimulus run {run_index} must have shape (time, {n_pixels}), got {tuple(stimulus.shape)}"
+                )
+            yield (stimulus @ receptive_fields.T).clamp_min(0).pow(exponents)
+
+    return _convolve_prf_drives(drives(), hrf)
+
+
+def _convolve_prf_drives(
+    neural_drives: Iterable[torch.Tensor], hrf: torch.Tensor | _HRFApplier
+) -> torch.Tensor:
+    """Apply an HRF to independent runs without mixing their boundary samples."""
+    applier = _as_applier(hrf)
+    return torch.cat([applier.apply(drive) for drive in neural_drives], dim=0)
 
 
 def _project_per_run(
@@ -1811,6 +1818,19 @@ def fit_prf_supergrid(
         normalized_data[voxel_start:voxel_end] = (projected / chunk_norm).T.to(output_device)
         data_norm[voxel_start:voxel_end] = chunk_norm.to(output_device)
 
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    candidate_chunk_size = estimate_chunk_size(
+        n_voxels=grid.n_candidates,
+        n_timepoints=n_timepoints,
+        n_regressors=n_pixels,
+        device=device,
+        operation="prf_grid",
+        min_chunk_size=1,
+        max_chunk_size=candidate_chunk_size,
+        n_trials=min(voxel_chunk_size, n_voxels),
+        use_double=data.dtype == torch.float64,
+    )
     n_candidate_chunks = (grid.n_candidates + candidate_chunk_size - 1) // candidate_chunk_size
     candidate_starts = range(0, grid.n_candidates, candidate_chunk_size)
     if verbose:
@@ -1830,9 +1850,11 @@ def fit_prf_supergrid(
         fields = gaussian_receptive_fields(candidate_parameters, stimulus_shape)
         exponents = candidate_parameters[:, 3]
 
+        # This drive is HRF-independent; retain it only for this candidate chunk.
+        neural_drives = [(run @ fields.T).clamp_min(0).pow(exponents) for run in stimuli]
         for hrf_index, hrf in enumerate(hrf_library):
             predictions = _project_per_run(
-                predict_prf_runwise(stimuli, fields, exponents, hrf), nuisance_per_run, run_starts
+                _convolve_prf_drives(neural_drives, hrf), nuisance_per_run, run_starts
             )
             prediction_norm = torch.linalg.vector_norm(predictions, dim=0).clamp_min(eps)
             normalized_predictions = predictions / prediction_norm
@@ -1887,6 +1909,8 @@ def fit_prf_supergrid(
                     best_gain[output_slice] = torch.where(
                         improved_out, gains.to(output_device), best_gain[output_slice]
                     )
+
+        del neural_drives, fields
 
     best_parameters = grid.parameters.to(output_device, dtype=data.dtype)[best_candidate]
     return PRFGridFit(

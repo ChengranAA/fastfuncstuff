@@ -1733,3 +1733,47 @@ def test_prf_canonical_matches_the_analyzeprf_reference_hrf():
     n = min(len(ours), len(reference))
     assert np.abs(ours[:n] - reference[:n]).max() < 5e-3
     assert int(np.argmax(ours)) == int(np.argmax(reference))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_hoisted_prf_drive_matches_per_hrf_predictions(dtype):
+    from fastfuncstuff.design.prf import _convolve_prf_drives, predict_prf_runwise
+
+    g = torch.Generator().manual_seed(981)
+    stimuli = [torch.rand(n, 12, generator=g, dtype=dtype) for n in (17, 11)]
+    fields = torch.rand(5, 12, generator=g, dtype=dtype)
+    exponents = torch.linspace(0.2, 1.0, 5, dtype=dtype)
+    hrfs = torch.rand(3, 7, generator=g, dtype=dtype)
+    drives = [(run @ fields.T).clamp_min(0).pow(exponents) for run in stimuli]
+    for hrf in hrfs:
+        old = predict_prf_runwise(stimuli, fields, exponents, hrf)
+        new = _convolve_prf_drives(drives, hrf)
+        torch.testing.assert_close(new, old, rtol=0, atol=0)
+
+
+def test_supergrid_drive_hoist_matches_per_hrf_fit(monkeypatch):
+    import fastfuncstuff.design.prf as prf
+
+    g = torch.Generator().manual_seed(193)
+    stimuli = [torch.rand(n, 9, generator=g) for n in (17, 13)]
+    parameters = torch.tensor([[0.0, 0.0, 1.0, 0.5], [0.5, -0.5, 1.5, 0.8], [1.0, 1.0, 0.8, 1.0]])
+    grid = PRFGrid(parameters)
+    library = torch.rand(3, 5, generator=g)
+    data = torch.rand(4, 30, generator=g)
+    kwargs = dict(
+        candidate_chunk_size=3,
+        voxel_chunk_size=2,
+        track_per_hrf=True,
+        nuisance_per_run=[torch.ones(n, 1) for n in (17, 13)],
+    )
+    new = prf.fit_prf_supergrid(data, stimuli, (3, 3), grid, library, [0, 17], **kwargs)
+    old = prf._convolve_prf_drives
+    fields = prf.gaussian_receptive_fields(parameters, (3, 3))
+
+    def unhoisted(drives, hrf):
+        return old([(run @ fields.T).clamp_min(0).pow(parameters[:, 3]) for run in stimuli], hrf)
+
+    monkeypatch.setattr(prf, "_convolve_prf_drives", unhoisted)
+    reference = prf.fit_prf_supergrid(data, stimuli, (3, 3), grid, library, [0, 17], **kwargs)
+    for name in ("candidate_index", "hrf_index", "gain", "correlation", "correlation_per_hrf"):
+        torch.testing.assert_close(getattr(new, name), getattr(reference, name), rtol=0, atol=0)

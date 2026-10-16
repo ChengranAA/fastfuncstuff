@@ -421,6 +421,17 @@ def bytes_per_voxel_hrf_xval(
     return max(prediction_bound, sufficient_stats_bound)
 
 
+def bytes_per_candidate_prf_grid(n_timepoints: int, n_pixels: int, n_voxels: int) -> int:
+    """Transient float32 bytes per super-grid candidate.
+
+    Covers Gaussian construction (three aperture buffers), retained runwise
+    neural drives, convolution/projection/normalization scratch (eight temporal
+    buffers including the drive), and voxel-by-candidate correlations. Persistent
+    input/stimulus/HRF operator storage is excluded, as in other chunk models.
+    """
+    return (3 * n_pixels + 8 * n_timepoints + n_voxels) * 4
+
+
 def bytes_per_voxel_prf(
     n_timepoints: int,
     n_pixels: int,
@@ -1590,6 +1601,8 @@ def estimate_chunk_size(
     elif operation == "warp_gram":
         # n_regressors carries the retained component count (the loadings pass).
         bytes_per_voxel = bytes_per_voxel_warp_gram(n_timepoints, n_regressors)
+    elif operation == "prf_grid":
+        bytes_per_voxel = bytes_per_candidate_prf_grid(n_timepoints, n_regressors, n_trials)
     elif operation == "prf":
         # n_regressors carries the aperture pixel count, which is what the pRF
         # refinement actually scales with (see bytes_per_voxel_prf).

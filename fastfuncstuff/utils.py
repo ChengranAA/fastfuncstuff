@@ -699,6 +699,13 @@ def configure_torch_backends(
         torch.set_float32_matmul_precision("high")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        # Our convolutions are filters (box/Gaussian smoothing, local correlation), not
+        # network layers, and PyTorch leaves cudnn.allow_tf32 ON by default -- independent
+        # of the matmul precision above.  Whether cuDNN actually picks a TF32 algorithm is
+        # its choice: torch 2.12.1 did not for these shapes, torch 2.14.1 / cuDNN 9.24 does,
+        # and the 10-bit mantissa put ~1e-3 of error into every smoothed cost term.
+        # warp.py re-enables it narrowly where it pays.
+        torch.backends.cudnn.allow_tf32 = False
     # CPU is the linalg fallback under MPS and the primary device for
     # device=cpu, so the thread count matters even on a GPU run.
     n_cpu, _source = resolve_cpu_threads(n_threads)

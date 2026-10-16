@@ -583,3 +583,19 @@ class TestLinalgLstsq:
         assert got.device.type == "mps"
         expected = torch.linalg.lstsq(a.cpu(), b.cpu()).solution
         assert torch.allclose(got.cpu(), expected, atol=1e-5)
+
+
+def test_configure_torch_backends_keeps_cudnn_convolutions_out_of_tf32():
+    """cuDNN TF32 is on by default and torch 2.14.1 actually uses it for our float32
+    filters (1e-3 errors in the optiwarp normal equations); the CLIs must switch it off."""
+    from fastfuncstuff.utils import configure_torch_backends
+
+    prev_tf32 = torch.backends.cudnn.allow_tf32
+    prev_bench = torch.backends.cudnn.benchmark
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+        configure_torch_backends(torch.device("cuda"))
+        assert torch.backends.cudnn.allow_tf32 is False
+    finally:
+        torch.backends.cudnn.allow_tf32 = prev_tf32
+        torch.backends.cudnn.benchmark = prev_bench

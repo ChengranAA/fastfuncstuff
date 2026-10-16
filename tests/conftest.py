@@ -120,3 +120,20 @@ def isolate_float32_matmul_precision():
         yield
     finally:
         torch.set_float32_matmul_precision(prev)
+
+
+@pytest.fixture(autouse=True)
+def isolate_cudnn_tf32():
+    """Run every test with cuDNN TF32 off, as the CLIs do (``configure_torch_backends``).
+
+    PyTorch leaves ``cudnn.allow_tf32`` True, and from torch 2.14.1 / cuDNN 9.24 the
+    float32 convolutions behind our smoothing and cost terms really use it, so a library
+    test that never calls ``configure_torch_backends`` would measure TF32 noise (~1e-3)
+    instead of the algorithm.  Restored afterwards so no test leaks the flag.
+    """
+    prev = torch.backends.cudnn.allow_tf32
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.allow_tf32 = prev

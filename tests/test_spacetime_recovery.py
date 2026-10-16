@@ -459,8 +459,23 @@ def test_tap_slide_correction_vanishes_without_through_plane_motion():
     )
     got = sampler.sample(nt // 2)
 
-    # Reference: plain normalised kernel average of the same tissue-following taps.
+    # Reference: plain normalised kernel average of the same tissue-following taps,
+    # with the sampler's edge rule -- a tap that samples outside the volume is not
+    # data and drops out, and a voxel is covered where frame j's own pose is.
     j, half = nt // 2, 2
+
+    def inside(sx, sy, sz):
+        nz_, ny_, nx_ = src.shape[-3:]
+        e = 1e-3  # the sampler's boundary slack
+        return (
+            (sx >= -e)
+            & (sx <= nx_ - 1 + e)
+            & (sy >= -e)
+            & (sy <= ny_ - 1 + e)
+            & (sz >= -e)
+            & (sz <= nz_ - 1 + e)
+        ).float()
+
     num = torch.zeros_like(ii)
     den = torch.zeros_like(ii)
     delta_ref = None
@@ -469,11 +484,43 @@ def test_tap_slide_correction_vanishes_without_through_plane_motion():
         delta = interp_slice_times(sz, st)
         if delta_ref is None or f == j:
             delta_ref = interp_slice_times(coords_fn(j)[2], st)
-        w = temporal_kernel_weights((j - f) + (tzero - delta) / tr, tinterp)
+        w = temporal_kernel_weights((j - f) + (tzero - delta) / tr, tinterp) * inside(sx, sy, sz)
         tap = warp_image_multi([src[f]], sx - ii, sy - jj, sz - kk, mode="wsinc5")[0]
         num = num + w * tap
         den = den + w
-    want = num / den.clamp_min(1e-8)
+    want = num / den.clamp_min(1e-8) * inside(*coords_fn(j))
 
     d = float((got - want).abs().max())
     assert d < 1e-4, f"correction fired without through-plane motion: {d:.2e}"
+
+
+def test_taps_outside_the_volume_drop_out_instead_of_reading_zero():
+    """A constant series with motion that carries edge voxels out of the volume in some
+    frames: wherever the output frame's own pose is inside, every tap that is inside
+    reads the constant, so the result must be the constant -- not a blend with the zero
+    padding (which dims a magnitude and biases a directly interpolated phase)."""
+    import torch
+
+    from fastfuncstuff.processing.spacetime import TissueFollowingSampler
+
+    dev = torch.device("cpu")
+    nt, (nx, ny, nz) = 20, (12, 10, 8)
+    src = torch.full((nt, nz, ny, nx), 0.7)
+    st = torch.tensor(_interleaved_slice_times(nz, 1.0).astype(np.float32))
+    kk, jj, ii = torch.meshgrid(
+        *[torch.arange(n, dtype=torch.float32) for n in (nz, ny, nx)], indexing="ij"
+    )
+
+    def coords_fn(f):  # +-1.5 voxel x-motion: the x edges leave the volume in some frames
+        return ii + 1.5 * np.sin(f / 2.0), jj, kk + 0.3 * np.cos(f / 3.0)
+
+    sampler = TissueFollowingSampler(
+        src, coords_fn, (nz, ny, nx), 1.0, float(st.mean()), st, dev, tinterp="wsinc5"
+    )
+    j = nt // 2
+    got = sampler.sample(j)
+    sx, sy, sz = coords_fn(j)
+    own = (sx >= 0) & (sx <= nx - 1) & (sy >= 0) & (sy <= ny - 1) & (sz >= 0) & (sz <= nz - 1)
+    assert own.any() and (~own).any()
+    np.testing.assert_allclose(got[own].numpy(), 0.7, atol=1e-5)
+    assert float(got[~own].abs().max()) == 0.0

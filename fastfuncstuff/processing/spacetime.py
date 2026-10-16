@@ -380,6 +380,7 @@ class TissueFollowingSampler:
             indexing="ij",
         )
         self._coords: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
+        self._valid: dict[int, Tensor] = {}
         self._srcs: dict[int, tuple[Tensor, ...]] = {}
         self._warped: dict[int, list[Tensor]] = {}
 
@@ -425,6 +426,7 @@ class TissueFollowingSampler:
         for fc in list(self._coords):
             if fc not in fcs:
                 del self._coords[fc]
+                self._valid.pop(fc, None)
                 self._srcs.pop(fc, None)
                 self._warped.pop(fc, None)
         for fc in fcs:
@@ -434,6 +436,33 @@ class TissueFollowingSampler:
                     self._srcs[fc] = tuple(
                         src[fc].to(self.device, dtype=torch.float32) for src in self.sources
                     )
+
+    def _inside(self, f: int) -> Tensor:
+        """Where frame ``f``'s own pose samples inside the source volume (float 0/1).
+
+        A tap that lands outside reads the zero padding, which is not data: weighted
+        in, it dims the edge of the magnitude and drags a directly interpolated phase
+        toward 0 (or past its true value, under a kernel's negative lobes).
+        """
+        fc = self._clamp(f)
+        found = self._valid.get(fc)
+        if found is None:
+            sx, sy, sz = self._coords[fc]
+            nz, ny, nx = self.sources[0].shape[-3:]
+            # A thousandth of a voxel of slack: a sample on the boundary must not
+            # flip in or out on rounding (a corner voxel reached through an
+            # oblique affine lands at -1e-6).
+            e = 1e-3
+            found = (
+                (sx >= -e)
+                & (sx <= nx - 1 + e)
+                & (sy >= -e)
+                & (sy <= ny - 1 + e)
+                & (sz >= -e)
+                & (sz <= nz - 1 + e)
+            ).to(sx.dtype)
+            self._valid[fc] = found
+        return found
 
     def _tap(self, f: int) -> list[Tensor]:
         """The source frames at ``f`` warped to the output grid through frame ``f``'s
@@ -500,7 +529,10 @@ class TissueFollowingSampler:
         wsum = torch.zeros_like(self.ii)
         for f in active:
             y = tap(f)
-            w = weights[f]
+            # Out-of-volume taps carry no data: they drop out of the sum and the
+            # weights renormalise over the rest.  Identical wherever all are inside.
+            ok = self._inside(f)
+            w = weights[f] * ok
             # Slide this tap from its true time onto the nominal grid (see class
             # docstring). shift == 0 without through-plane motion, which is what
             # makes the no-motion result identical to the frozen path.
@@ -512,9 +544,10 @@ class TissueFollowingSampler:
                 yhi = tap(hi_f) if hi_f != f else y
                 # Spacing in TR units between the two taps' TRUE acquisition times.
                 dt = (hi_f - lo_f) + (delta[hi_f] - delta[lo_f]) / self.tr
-                # Near-coincident taps carry no derivative information; leaving the
-                # tap uncorrected there is strictly better than dividing by ~0.
-                safe = dt.abs() > 1e-3
+                # Near-coincident taps carry no derivative information, and a
+                # neighbour outside the volume none at all; leaving the tap
+                # uncorrected there is strictly better than a bogus slope.
+                safe = (dt.abs() > 1e-3) & (self._inside(lo_f) > 0) & (self._inside(hi_f) > 0)
                 dt = torch.where(safe, dt, torch.ones_like(dt))
                 for c in range(len(self.sources)):
                     slope = torch.where(safe, (yhi[c] - ylo[c]) / dt, torch.zeros_like(dt))
@@ -526,10 +559,12 @@ class TissueFollowingSampler:
             for stale in [k for k in cache if k < f]:
                 del cache[stale]
 
+        # Covered where the output frame's own pose is, as on the frozen path.
+        own = self._inside(frame_idx)
         outs = [
-            (acc / wsum.clamp_min(1e-8)).clamp_min(0.0)
+            (acc / wsum.clamp_min(1e-8)).clamp_min(0.0) * own
             if self.no_neg_ch[c]
-            else acc / wsum.clamp_min(1e-8)
+            else acc / wsum.clamp_min(1e-8) * own
             for c, acc in enumerate(accs)
         ]
         return outs if self.multi else outs[0]

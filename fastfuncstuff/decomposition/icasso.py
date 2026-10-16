@@ -380,10 +380,11 @@ def compute_rindex(
     for k in range(2, max_clusters + 1):
         labels = fcluster(linkage_matrix, k, criterion="maxclust")
 
-        # Skip if any cluster has only 1 member (R-index undefined)
+        # A finer hierarchy cut cannot merge an existing singleton. Every
+        # remaining R-index is therefore undefined; leave its NaN in place.
         _, counts = np.unique(labels, return_counts=True)
-        if (counts == 1).any() or k == 1:
-            continue
+        if (counts == 1).any():
+            break
 
         stat = _clusterstat(distance, labels)
         # R-index = mean( internal.avg / min(between.avg, axis=1) )

@@ -466,14 +466,13 @@ def test_tap_slide_correction_vanishes_without_through_plane_motion():
 
     def inside(sx, sy, sz):
         nz_, ny_, nx_ = src.shape[-3:]
-        e = 1e-3  # the sampler's boundary slack
-        return (
-            (sx >= -e)
-            & (sx <= nx_ - 1 + e)
-            & (sy >= -e)
-            & (sy <= ny_ - 1 + e)
-            & (sz >= -e)
-            & (sz <= nz_ - 1 + e)
+        return (  # the resampler's coverage, which the sampler shares
+            (sx >= -0.5)
+            & (sx <= nx_ - 0.5)
+            & (sy >= -0.5)
+            & (sy <= ny_ - 0.5)
+            & (sz >= -0.5)
+            & (sz <= nz_ - 0.5)
         ).float()
 
     num = torch.zeros_like(ii)
@@ -520,7 +519,14 @@ def test_taps_outside_the_volume_drop_out_instead_of_reading_zero():
     j = nt // 2
     got = sampler.sample(j)
     sx, sy, sz = coords_fn(j)
-    own = (sx >= 0) & (sx <= nx - 1) & (sy >= 0) & (sy <= ny - 1) & (sz >= 0) & (sz <= nz - 1)
+    own = (
+        (sx >= -0.5)
+        & (sx <= nx - 0.5)
+        & (sy >= -0.5)
+        & (sy <= ny - 0.5)
+        & (sz >= -0.5)
+        & (sz <= nz - 0.5)
+    )
     assert own.any() and (~own).any()
     np.testing.assert_allclose(got[own].numpy(), 0.7, atol=1e-5)
     assert float(got[~own].abs().max()) == 0.0

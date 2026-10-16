@@ -449,17 +449,16 @@ class TissueFollowingSampler:
         if found is None:
             sx, sy, sz = self._coords[fc]
             nz, ny, nx = self.sources[0].shape[-3:]
-            # A thousandth of a voxel of slack: a sample on the boundary must not
-            # flip in or out on rounding (a corner voxel reached through an
-            # oblique affine lands at -1e-6).
-            e = 1e-3
+            # The resampler's own coverage: a sample within half a voxel of the edge
+            # reads the (clamped) edge voxel, beyond that the zero padding.  The same
+            # test here keeps slice-timing coverage identical to the other paths.
             found = (
-                (sx >= -e)
-                & (sx <= nx - 1 + e)
-                & (sy >= -e)
-                & (sy <= ny - 1 + e)
-                & (sz >= -e)
-                & (sz <= nz - 1 + e)
+                (sx >= -0.5)
+                & (sx <= nx - 0.5)
+                & (sy >= -0.5)
+                & (sy <= ny - 0.5)
+                & (sz >= -0.5)
+                & (sz <= nz - 0.5)
             ).to(sx.dtype)
             self._valid[fc] = found
         return found

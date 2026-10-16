@@ -3142,45 +3142,75 @@ def compute_vb_block_trace(
     else:
         voxel_bin = torch.zeros(n_voxels, dtype=torch.long)
 
-    # Per-bin λ and per-bin trace (sum over task blocks).
-    bin_trace_summed = np.zeros(n_bins_eff, dtype=np.float64)
-    bins_iter = range(n_bins_eff)
-    if verbose:
-        bins_iter = tqdm(
-            bins_iter,
-            total=n_bins_eff,
-            desc="  VB block-trace bins",
-            unit="bin",
-            leave=False,
-            disable=n_bins_eff <= 1,
-        )
-    for b in bins_iter:
-        mask_b = voxel_bin == b
-        if not mask_b.any():
-            continue
-        lam_b = float(lambda_t[mask_b].median().item())
-        A_b = XtX + lam_b * P  # (n_cols, n_cols)
-        # A⁻¹ via Cholesky; fall back to direct inverse on failure
-        # (only happens at λ=0 + rank-deficient X — vanishingly rare
-        # in the VB path because λ_v > 0 after the first iter).
-        try:
-            L_b = torch.linalg.cholesky(A_b)
-            eye_n = torch.eye(n_cols, dtype=A_b.dtype, device=device)
-            A_inv_b = torch.cholesky_solve(eye_n, L_b)
-        except torch.linalg.LinAlgError:
-            A_inv_b = torch.linalg.pinv(A_b)
-        # Sum trace(C⁻¹ · (A⁻¹)_block) over task blocks.
-        t_sum = 0.0
-        for c in range(n_blocks):
-            s = c * n_basis
-            block = A_inv_b[s : s + n_basis, s : s + n_basis]
-            t_sum += float((C_inv * block).sum().item())  # tr(C⁻¹ · block)
-        bin_trace_summed[b] = t_sum
-        del A_b, A_inv_b
-
-    # Broadcast per voxel: σ²_v · bin_trace_summed[bin_of_v].
+    # Keep the exact existing CPU bucket assignment and lower-median rule.
+    lambda_np = lambda_t.numpy()
     voxel_bin_np = voxel_bin.numpy()
+    active_bins = []
+    medians = []
+    for b in range(n_bins_eff):
+        values = lambda_np[voxel_bin_np == b]
+        if values.size:
+            active_bins.append(b)
+            lower = (values.size - 1) // 2
+            medians.append(np.nan if np.isnan(values).any() else np.partition(values, lower)[lower])
+    if not active_bins:
+        return np.zeros(n_voxels, dtype=np.float32)
+
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    batch_size = estimate_chunk_size(
+        n_voxels=len(active_bins),
+        n_timepoints=n_cols,
+        n_regressors=n_basis,
+        n_trials=n_blocks,
+        device=device,
+        operation="vb_block_trace",
+        min_chunk_size=1,
+        max_chunk_size=len(active_bins),
+        use_double=True,
+    )
+    bin_trace_summed = np.zeros(n_bins_eff, dtype=np.float64)
+    eye = torch.eye(n_cols, dtype=torch.float64, device=device)
+    lambdas = torch.as_tensor(np.asarray(medians), dtype=torch.float64, device=device)
+    batches = tqdm(
+        range(0, len(active_bins), batch_size),
+        desc="  VB block-trace bins",
+        leave=True,
+        disable=not verbose or len(active_bins) <= 1,
+    )
+    for start in batches:
+        end = min(start + batch_size, len(active_bins))
+        A = XtX + lambdas[start:end, None, None] * P
+        L, info = torch.linalg.cholesky_ex(A)
+        # Failed factors must not enter the solve (they can contain NaNs). Their
+        # traces are replaced by the original per-bin pinv path below.
+        safe_L = torch.where((info == 0)[:, None, None], L, eye)
+        inverse = torch.cholesky_solve(eye.expand(end - start, -1, -1), safe_L)
+        traces = _vb_block_traces(inverse, C_inv, n_blocks, n_basis)
+        # Common path: one host transfer carries both the traces and status.
+        host = torch.stack((traces, info.to(torch.float64)), dim=1).detach().cpu().numpy()
+        for local, b in enumerate(active_bins[start:end]):
+            if host[local, 1] != 0:
+                fallback = torch.linalg.pinv(A[local])
+                host[local, 0] = _vb_block_traces(fallback.unsqueeze(0), C_inv, n_blocks, n_basis)[
+                    0
+                ].item()
+            bin_trace_summed[b] = host[local, 0]
+
     return (sigma2_per_voxel.astype(np.float64) * bin_trace_summed[voxel_bin_np]).astype(np.float32)
+
+
+def _vb_block_traces(
+    inverse: torch.Tensor, C_inv: torch.Tensor, n_blocks: int, n_basis: int
+) -> torch.Tensor:
+    """Sum the weighted diagonal task blocks for each bin's inverse."""
+    n_task = n_blocks * n_basis
+    blocks = (
+        inverse[:, :n_task, :n_task]
+        .reshape(inverse.shape[0], n_blocks, n_basis, n_blocks, n_basis)
+        .diagonal(dim1=1, dim2=3)
+    )
+    return torch.einsum("ij,bijc->b", C_inv, blocks)
 
 
 def vb_update_beta_size(

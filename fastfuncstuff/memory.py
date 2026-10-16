@@ -421,6 +421,16 @@ def bytes_per_voxel_hrf_xval(
     return max(prediction_bound, sufficient_stats_bound)
 
 
+def bytes_per_bin_vb_block_trace(n_cols: int, n_blocks: int, n_basis: int) -> int:
+    """Float32-equivalent scratch for batched VB inverses and block contractions.
+
+    Five dense matrices cover precision, Cholesky, guarded factors, solve RHS
+    workspace and inverse; the selected diagonal blocks cover contraction scratch.
+    The caller requests the float64 multiplier from the shared planner.
+    """
+    return (5 * n_cols * n_cols + n_blocks * n_basis * n_basis) * 4
+
+
 def bytes_per_candidate_prf_grid(n_timepoints: int, n_pixels: int, n_voxels: int) -> int:
     """Transient float32 bytes per super-grid candidate.
 
@@ -1601,6 +1611,8 @@ def estimate_chunk_size(
     elif operation == "warp_gram":
         # n_regressors carries the retained component count (the loadings pass).
         bytes_per_voxel = bytes_per_voxel_warp_gram(n_timepoints, n_regressors)
+    elif operation == "vb_block_trace":
+        bytes_per_voxel = bytes_per_bin_vb_block_trace(n_timepoints, n_trials, n_regressors)
     elif operation == "prf_grid":
         bytes_per_voxel = bytes_per_candidate_prf_grid(n_timepoints, n_regressors, n_trials)
     elif operation == "prf":

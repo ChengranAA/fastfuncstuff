@@ -91,3 +91,57 @@ def test_blur_axis_matches_pad_and_conv_on_a_strided_array(axis, reflect):
     want = torch.nn.functional.conv1d(padded, k.view(1, 1, -1))
     want = want.reshape(*x.movedim(axis, -1).shape).movedim(-1, axis)
     torch.testing.assert_close(blur_axis(x, k, axis, reflect=reflect), want)
+
+
+_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
+
+@pytest.mark.gpu
+@_CUDA
+@pytest.mark.parametrize("reflect", [False, True])
+@pytest.mark.parametrize(
+    ("shape", "axis", "sigma"),
+    [
+        ((7, 33, 20, 70), 0, 1.3),  # wide inner: the row kernel
+        ((7, 33, 20, 70), 2, 2.2),
+        ((5, 9, 11, 13), 3, 1.0),  # contiguous axis: the along-axis kernel
+        ((5, 9, 11, 300), 3, 2.0),  # long contiguous axis: several blocks per line
+        ((3, 1, 40, 64), 1, 1.0),  # a length-1 axis
+    ],
+)
+def test_fused_blur_matches_the_shift_add_reference(shape, axis, sigma, reflect):
+    from fastfuncstuff.stats.blur_triton import blur_axis_cuda
+
+    k = _gaussian_kernel_1d(sigma, torch.float64, torch.device("cpu"))
+    r = (k.numel() - 1) // 2
+    if reflect and r >= shape[axis]:
+        pytest.skip("reflect needs radius < n")
+    x = torch.randn(shape, dtype=torch.float64)
+    ref = blur_axis(x, k, axis, reflect=reflect)  # float64 CPU shift-add
+    got = blur_axis_cuda(x.float().cuda(), k.float(), axis, reflect=reflect)
+    torch.testing.assert_close(got.double().cpu(), ref, atol=2e-6, rtol=0)
+
+
+@pytest.mark.gpu
+@_CUDA
+def test_fused_blur_zero_pads_a_kernel_longer_than_the_axis():
+    from fastfuncstuff.stats.blur_triton import blur_axis_cuda
+
+    k = _gaussian_kernel_1d(3.0, torch.float64, torch.device("cpu"))  # radius 12
+    x = torch.randn(4, 5, 66, dtype=torch.float64)
+    ref = blur_axis(x, k, 1)
+    got = blur_axis_cuda(x.float().cuda(), k.float(), 1)
+    torch.testing.assert_close(got.double().cpu(), ref, atol=2e-6, rtol=0)
+
+
+@pytest.mark.gpu
+@_CUDA
+def test_blur_axis_routes_cuda_float32_to_the_fused_kernel_but_not_autograd():
+    k = _gaussian_kernel_1d(1.5, torch.float32, torch.device("cpu"))
+    x = torch.randn(6, 30, 70, device="cuda").transpose(0, 2)  # non-contiguous input
+    ref = blur_axis(x.double(), k.double(), 1)
+    torch.testing.assert_close(blur_axis(x, k, 1).double(), ref, atol=2e-6, rtol=0)
+
+    xg = x.clone().requires_grad_(True)
+    blur_axis(xg, k, 1).sum().backward()  # the shift-add path keeps gradients
+    assert xg.grad is not None

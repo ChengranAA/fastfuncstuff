@@ -15,6 +15,7 @@ accumulation (``blur_axis``) that works on any memory layout.
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import torch
@@ -49,6 +50,34 @@ def _gaussian_kernel_1d(
     return k / k.sum()
 
 
+_fused_unavailable = False
+
+
+def _fused_blur(x: torch.Tensor):
+    """The one-pass CUDA kernel for ``x``, or None for the shift-add path.
+
+    float32 on CUDA only, and never under autograd: the kernel has no backward,
+    and CPU/MPS keep the layout-agnostic path below.  ``FFS_NO_FUSED_BLUR=1``
+    forces the shift-add path.
+    """
+    global _fused_unavailable
+    if (
+        _fused_unavailable
+        or x.device.type != "cuda"
+        or x.dtype != torch.float32
+        or (x.requires_grad and torch.is_grad_enabled())
+        or os.environ.get("FFS_NO_FUSED_BLUR")
+    ):
+        return None
+    try:
+        from fastfuncstuff.stats.blur_triton import blur_axis_cuda
+    except Exception as exc:  # pragma: no cover - Triton is optional
+        _fused_unavailable = True
+        print(f"** fused blur kernel unavailable ({exc}); using the shift-add blur")
+        return None
+    return blur_axis_cuda
+
+
 def blur_axis(
     x: torch.Tensor, kernel: torch.Tensor, axis: int, *, reflect: bool = False
 ) -> torch.Tensor:
@@ -59,15 +88,22 @@ def blur_axis(
     on a ``(x, y, z, t)`` run it costs a transpose per axis per volume; and
     oneDNN's single-channel ``conv3d`` measured 7x slower than this on CPU.
     Every op here is elementwise over whatever strides ``x`` has, so a C- or
-    F-ordered array is blurred in place of its layout, on any device.
+    F-ordered array is blurred in place of its layout, on any device.  A float32
+    CUDA tensor goes to a one-pass Triton kernel instead (``blur_triton``): one
+    read and one write per axis rather than ~3 per tap, 14x on a large run.
 
     ``reflect`` mirrors without repeating the edge sample (torch's
     ``reflect``), which needs ``radius < x.shape[axis]``; otherwise the
     border is zero-padded, as ``conv1d(padding=r)`` would.
     """
     n = x.shape[axis]
+    r = (int(kernel.numel()) - 1) // 2
+    if reflect and r >= n:
+        raise ValueError(f"reflect padding needs radius < {n}, got {r}")
+    fused = _fused_blur(x)
+    if fused is not None:
+        return fused(x, kernel, axis, reflect=reflect)
     taps = [float(w) for w in kernel.tolist()]
-    r = (len(taps) - 1) // 2
     out = x * taps[r]
     for j in range(1, r + 1):
         w = taps[r + j]
@@ -75,8 +111,6 @@ def blur_axis(
             out.narrow(axis, 0, n - j).add_(x.narrow(axis, j, n - j), alpha=w)
             out.narrow(axis, j, n - j).add_(x.narrow(axis, 0, n - j), alpha=w)
         if reflect:
-            if j >= n:
-                raise ValueError(f"reflect padding needs radius < {n}, got {r}")
             # Past the high edge, i + j lands on 2(n-1) - (i + j); past the
             # low edge, i - j lands on j - i. Both are j samples, mirrored.
             out.narrow(axis, n - j, j).add_(x.narrow(axis, n - 1 - j, j).flip(axis), alpha=w)

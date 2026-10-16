@@ -426,12 +426,15 @@ def _sample_cubic(volume: Tensor, layer_ijk: Tensor, *, fill: float = 0.0) -> Te
     weights = _catmull_rom(pts - base)  # (P, 3, 4)
     offsets = torch.arange(-1, 3, device=pts.device)
     taps = [(base[:, a].long().unsqueeze(1) + offsets).clamp(0, sizes[a] - 1) for a in range(3)]
-    flat = volume.reshape(-1).to(pts.dtype)
+    # Gathered in the volume's own dtype and promoted after: converting the whole
+    # volume first (float64 points on a float32 head) was 25M values per call to
+    # read 64 per point -- most of a 200 ms CHEDI depth step in cubic mode.
+    flat = volume.reshape(-1)
     yz = taps[1].unsqueeze(2) * sizes[2] + taps[2].unsqueeze(1)  # (P, 4, 4)
     wyz = weights[:, 1].unsqueeze(2) * weights[:, 2].unsqueeze(1)
     out = torch.zeros(pts.shape[0], dtype=pts.dtype, device=pts.device)
     for a in range(4):
-        vals = flat[taps[0][:, a, None, None] * (sizes[1] * sizes[2]) + yz]
+        vals = flat[taps[0][:, a, None, None] * (sizes[1] * sizes[2]) + yz].to(pts.dtype)
         out += weights[:, 0, a] * (vals * wyz).sum(dim=(1, 2))
     upper = torch.tensor(sizes, dtype=pts.dtype, device=pts.device) - 0.5
     inside = ((pts >= -0.5) & (pts <= upper)).all(dim=-1)

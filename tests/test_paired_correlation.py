@@ -44,6 +44,30 @@ def test_matches_numpy_on_every_pair_and_tolerates_f_order():
         np.testing.assert_allclose(r[..., p].numpy(), _reference(data[a], data[b], 2), atol=1e-5)
 
 
+@pytest.mark.parametrize("kind", ["numpy", "torch"])
+@pytest.mark.parametrize("masked", [False, True])
+def test_all_f_order_inputs_stream_by_z_slab_and_agree(monkeypatch, kind, masked):
+    """Every input F-ordered (nibabel's layout) takes the z-slab path; same r, slab by slab."""
+    import fastfuncstuff.stats.paired_correlation as pc
+
+    data = [np.asfortranarray(d) for d in _datasets()]
+    if kind == "torch":
+        data = [torch.from_numpy(d) for d in data]
+    mask = None
+    if masked:
+        mask = np.ones((7, 5, 4), bool)
+        mask[:, :, 1] = False
+        mask[2] = False
+    # One z-plane (35 voxels) per slab, so the slab bookkeeping is exercised.
+    monkeypatch.setattr(pc, "estimate_chunk_size", lambda *a, **k: 35)
+    r = paired_voxel_correlation(data, polort=2, mask=mask, device=CPU, verbose=False)
+    for p, (a, b) in enumerate(pair_list(3)):
+        ref = _reference(np.asarray(data[a]), np.asarray(data[b]), 2)
+        if mask is not None:
+            ref = np.where(mask, ref, 0.0)
+        np.testing.assert_allclose(r[..., p].numpy(), ref, atol=1e-5)
+
+
 def test_detrend_is_what_removes_shared_drift():
     rng = np.random.default_rng(1)
     drift = np.linspace(-1, 1, 80) ** 2 * 10

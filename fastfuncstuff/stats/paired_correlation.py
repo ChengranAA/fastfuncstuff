@@ -65,6 +65,14 @@ def _detrend_basis(n_t: int, polort: int, device: torch.device) -> torch.Tensor:
     return q.float().to(device)
 
 
+def _f_ordered(s) -> bool:
+    """Whether a 4-D array or tensor is laid out x-fastest (Fortran / nibabel order)."""
+    if torch.is_tensor(s):
+        st = s.stride()
+        return st[0] == 1 and st[0] <= st[1] <= st[2] <= st[3] and not s.is_contiguous()
+    return bool(s.flags.f_contiguous) and not bool(s.flags.c_contiguous)
+
+
 def paired_voxel_correlation(
     series: Sequence[np.ndarray | torch.Tensor],
     pairs: Sequence[tuple[int, int]] | None = None,
@@ -112,29 +120,60 @@ def paired_voxel_correlation(
 
     basis = _detrend_basis(n_t, polort, device)
     chunk = estimate_chunk_size(nx * ny * nz, n_t, 0, device, operation="paired_corr", n_trials=n)
-    slab = max(1, chunk // (ny * nz))
     out = torch.zeros(nx, ny, nz, len(pairs))
 
-    def _slab(s, x0: int, x1: int) -> torch.Tensor:
-        block = s[x0:x1]
+    # Slab along the slowest spatial axis in memory.  A C-ordered (x, y, z, T)
+    # array is cut along x, each slab one contiguous span.  A nibabel array is
+    # F-ordered -- x fastest, T slowest -- and an x-slab of it is a fully strided
+    # gather (0.77 s per 20 planes of a 250x246x68x246 run: 20 of the 21 s of one
+    # pair); a z-slab is T contiguous runs, copied as (T, z, y, x) at memcpy speed.
+    by_z = all(_f_ordered(s) for s in series)
+    if by_z:
+        n_cut, plane = nz, nx * ny
+    else:
+        n_cut, plane = nx, ny * nz
+    slab = max(1, chunk // plane)
+
+    def _slab(s, a0: int, a1: int) -> torch.Tensor:
+        """``(voxels, T)`` on the device, voxels in the slab's memory order."""
+        if by_z:
+            block = s[:, :, a0:a1]
+            # (T, z, y, x): every T step is one contiguous run of the source.
+            block = block.permute(3, 2, 1, 0) if torch.is_tensor(block) else block.T
+            if not torch.is_tensor(block):
+                block = torch.from_numpy(np.ascontiguousarray(block, dtype=np.float32))
+            return block.reshape(n_t, -1).to(device=device, dtype=torch.float32).T
+        block = s[a0:a1]
         if not torch.is_tensor(block):
             block = torch.from_numpy(np.ascontiguousarray(block, dtype=np.float32))
         return block.reshape(-1, n_t).to(device=device, dtype=torch.float32)
 
-    for x0 in tqdm(
-        range(0, nx, slab),
+    def _voxels(t: torch.Tensor, a0: int, a1: int) -> torch.Tensor:
+        """A ``(..., P)`` slab result as ``(x, y, z, P)``, from the slab's voxel order."""
+        if by_z:
+            return t.reshape(a1 - a0, ny, nx, -1).permute(2, 1, 0, 3)
+        return t.reshape(a1 - a0, ny, nz, -1)
+
+    def _sel(a0: int, a1: int):
+        if keep is None:
+            return None
+        k = keep[:, :, a0:a1].permute(2, 1, 0) if by_z else keep[a0:a1]
+        return k.reshape(-1).to(device)
+
+    for a0 in tqdm(
+        range(0, n_cut, slab),
         desc="voxel correlation",
         unit="slab",
         leave=True,
-        disable=not verbose or nx <= slab,
+        disable=not verbose or n_cut <= slab,
     ):
-        x1 = min(nx, x0 + slab)
-        sel = None if keep is None else keep[x0:x1].reshape(-1).to(device)
+        a1 = min(n_cut, a0 + slab)
+        sel = _sel(a0, a1)
         if sel is not None and not bool(sel.any()):
             continue
         unit = []
         for s in series:
-            x = _slab(s, x0, x1)
+            x = _slab(s, a0, a1)
             if sel is not None:
                 x = x[sel]
             scale = x.norm(dim=1, keepdim=True)
@@ -151,11 +190,13 @@ def paired_voxel_correlation(
         if fisher:
             r = torch.atanh(r.clamp(-0.999999, 0.999999))
         r = r.cpu()
-        if sel is None:
-            out[x0:x1] = r.reshape(x1 - x0, ny, nz, len(pairs))
-        else:
-            dst = torch.zeros((x1 - x0) * ny * nz, len(pairs))
+        if sel is not None:
+            dst = torch.zeros(sel.numel(), len(pairs))
             dst[sel.cpu()] = r
-            out[x0:x1] = dst.reshape(x1 - x0, ny, nz, len(pairs))
+            r = dst
+        if by_z:
+            out[:, :, a0:a1] = _voxels(r, a0, a1)
+        else:
+            out[a0:a1] = _voxels(r, a0, a1)
         del unit
     return out

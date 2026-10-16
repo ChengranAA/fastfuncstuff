@@ -182,18 +182,23 @@ def decompose(
 
         u_dev = u.to(device, torch.float32)
         corr = np.empty((n_vox, k), dtype=np.float32)
+        # eigh's sign is arbitrary. Pointing each map's heavy tail positive is the
+        # convention MELODIC uses, and it is what makes a re-run of the same data
+        # give the same picture -- and the same sign on the saved regressor.  The
+        # cube sum is taken here, per chunk on the device: as one host float64 pass
+        # over the finished (V, K) maps it was 3 of the 4 s of a 1.8M-voxel run.
+        skew = torch.zeros(k, dtype=torch.float64, device=device)
         for i in range(0, n_vox, step):
             if progress is not None:
                 progress(0.55 + 0.4 * i / n_vox, "maps")
             c = kept if kept is not None else prepared(i)[0]
-            corr[i : i + step] = (c @ u_dev).cpu().numpy()
-            del c
+            m = c @ u_dev
+            skew += m.double().pow(3).sum(0)
+            corr[i : i + step] = m.cpu().numpy()
+            del c, m
         kept = None
 
-    # eigh's sign is arbitrary. Pointing each map's heavy tail positive is the
-    # convention MELODIC uses, and it is what makes a re-run of the same data
-    # give the same picture -- and the same sign on the saved regressor.
-    flip = np.where(np.sum(corr.astype(np.float64) ** 3, axis=0) < 0, -1.0, 1.0)
+    flip = np.where(skew.cpu().numpy() < 0, -1.0, 1.0)
     corr *= flip.astype(np.float32)
     timecourses = u.cpu().numpy() * flip[None, :] * np.sqrt(n_time)
 

@@ -487,27 +487,133 @@ def _afni_fillin_once(mask: numpy.ndarray, nside: int) -> tuple[numpy.ndarray, i
     """``THD_mask_fillin_once``: fill an unset voxel with a set voxel within
     1..nside on BOTH sides along some axis. Voxels within nside of any edge are
     never considered, and fills are applied after the sweep (simultaneously)."""
-    nz, ny, nx = mask.shape
-    ns = [min((n - 1) // 2, nside) for n in (nz, ny, nx)]
+    return _afni_fillin_pass(mask, nside)
+
+
+def _afni_fillin_completely(mask: numpy.ndarray, nside: int) -> numpy.ndarray:
+    """``_afni_fillin_once`` until a pass fills nothing.
+
+    After a pass, the only voxels whose fill test can have changed are unset ones
+    within ``nside`` (along an axis) of what that pass filled -- nothing else's
+    neighbourhood changed, and whatever qualified before was filled then -- so
+    once a pass fills few voxels the next evaluates exactly those candidates by
+    indexing rather than sweeping the grid.  Same passes, same masks; on a
+    4.2M-voxel automask the dozen trailing passes that fill tens of voxels each
+    stopped costing a 30-45 ms grid sweep apiece.
+    """
+    out, n = _afni_fillin_pass(mask, nside)
+    if n == 0:
+        return out
+    shape = out.shape
+    ns = [min((m - 1) // 2, nside) for m in shape]
+    stride = (shape[1] * shape[2], shape[2], 1)
+    out = numpy.ascontiguousarray(out)
+    flat = out.reshape(-1)  # a view: writes below land in ``out``
+    filled = numpy.flatnonzero(flat & ~numpy.ascontiguousarray(mask).reshape(-1))
+    # Offsets of every voxel within nside along one axis, in flat-index units.
+    reach = numpy.array(
+        [
+            sign * d * stride[ax]
+            for ax in range(3)
+            for d in range(1, ns[ax] + 1)
+            for sign in (1, -1)
+        ],
+        dtype=numpy.int64,
+    )
+    while filled.size:
+        if filled.size * reach.size > flat.size // 16:
+            # Many fills: a grid sweep is cheaper than that many candidates.
+            before = flat.copy()
+            out, n = _afni_fillin_pass(out, nside)
+            if n == 0:
+                break
+            out = numpy.ascontiguousarray(out)
+            flat = out.reshape(-1)
+            filled = numpy.flatnonzero(flat & ~before)
+            continue
+        cand = numpy.unique(numpy.concatenate([filled, (filled[:, None] + reach).ravel()]))
+        cand = cand[(cand >= 0) & (cand < flat.size)]
+        # Inside the core (never within nside of an edge), and still unset.
+        z, rem = numpy.divmod(cand, stride[0])
+        y, x = numpy.divmod(rem, stride[1])
+        inside = (
+            (z >= ns[0])
+            & (z < shape[0] - ns[0])
+            & (y >= ns[1])
+            & (y < shape[1] - ns[1])
+            & (x >= ns[2])
+            & (x < shape[2] - ns[2])
+        )
+        cand = cand[inside]
+        cand = cand[~flat[cand]]
+        if cand.size == 0:
+            break
+        qualifies = numpy.zeros(cand.size, dtype=bool)
+        for ax in range(3):
+            if ns[ax] == 0:
+                continue
+            plus = numpy.zeros(cand.size, dtype=bool)
+            minus = numpy.zeros(cand.size, dtype=bool)
+            for d in range(1, ns[ax] + 1):
+                plus |= flat[cand + d * stride[ax]]
+                minus |= flat[cand - d * stride[ax]]
+            qualifies |= plus & minus
+        filled = cand[qualifies]
+        # Applied after the sweep, as THD_mask_fillin_once does.
+        flat[filled] = True
+    return out
+
+
+def _afni_fillin_pass(mask: numpy.ndarray, nside: int) -> tuple[numpy.ndarray, int]:
+    """One full fill-in sweep, over the mask's bounding box only.
+
+    Exact: a fill needs set voxels on both sides along an axis, so it lies inside
+    the box, and the box is read ``nside`` further (clamped at the volume edge,
+    where the full-grid sweep has nothing beyond either).
+    """
+    shape = mask.shape
+    ns = [min((n - 1) // 2, nside) for n in shape]
     if not any(ns):
         return mask, 0
-    fill = numpy.zeros_like(mask)
-    core = tuple(slice(s, n - s) for s, n in zip(ns, (nz, ny, nx), strict=True))
+    hits = [
+        numpy.flatnonzero(mask.any(axis=tuple(a for a in range(3) if a != ax))) for ax in range(3)
+    ]
+    if any(h.size == 0 for h in hits):
+        return mask, 0
+    # Where a voxel may fill: the box, inside the core (nside from every edge).
+    lo = [max(int(h[0]), s) for h, s in zip(hits, ns, strict=True)]
+    hi = [min(int(h[-1]) + 1, n - s) for h, n, s in zip(hits, shape, ns, strict=True)]
+    if any(a >= b for a, b in zip(lo, hi, strict=True)):
+        return mask, 0
+    # What it reads: nside further along each axis.  Clamped at the volume edge,
+    # where the full-grid sweep has nothing beyond either.
+    rlo = [max(0, a - s) for a, s in zip(lo, ns, strict=True)]
+    rhi = [min(n, b + s) for b, n, s in zip(hi, shape, ns, strict=True)]
+    sub = mask[tuple(slice(a, b) for a, b in zip(rlo, rhi, strict=True))]
+    fill = numpy.zeros_like(sub)
+    core = tuple(slice(a - r, b - r) for a, b, r in zip(lo, hi, rlo, strict=True))
     for axis in range(3):
-        s, n = ns[axis], mask.shape[axis]
+        s, n = ns[axis], sub.shape[axis]
         if s == 0:
             continue
-        plus = numpy.zeros_like(mask)
-        minus = numpy.zeros_like(mask)
+        plus = numpy.zeros_like(sub)
+        minus = numpy.zeros_like(sub)
         for d in range(1, s + 1):
+            if d >= n:
+                break
             src = [slice(None)] * 3
             dst = [slice(None)] * 3
             src[axis], dst[axis] = slice(d, n), slice(0, n - d)
-            plus[tuple(dst)] |= mask[tuple(src)]
-            minus[tuple(src)] |= mask[tuple(dst)]
+            plus[tuple(dst)] |= sub[tuple(src)]
+            minus[tuple(src)] |= sub[tuple(dst)]
         fill[core] |= (plus & minus)[core]
-    fill &= ~mask
-    return mask | fill, int(fill.sum())
+    fill &= ~sub
+    count = int(fill.sum())
+    if count == 0:
+        return mask, 0
+    out = mask.copy()
+    out[tuple(slice(a, b) for a, b in zip(rlo, rhi, strict=True))] |= fill
+    return out, count
 
 
 def _afni_dilate_once(mask: numpy.ndarray, nmm: int) -> numpy.ndarray:
@@ -516,10 +622,7 @@ def _afni_dilate_once(mask: numpy.ndarray, nmm: int) -> numpy.ndarray:
     ``THD_mask_fillin_completely`` closes what that opened."""
     t = torch.from_numpy(mask)
     m = (t | (~t & (_count_neighbors_18_replicate(t) >= 3))).numpy()
-    while True:
-        m, n = _afni_fillin_once(m, nmm)
-        if n == 0:
-            return m
+    return _afni_fillin_completely(m, nmm)
 
 
 def automask(
@@ -583,10 +686,7 @@ def automask(
     if nmm > 1 or jj > 0:
         for ii in range(2, nmm):
             m, _ = _afni_fillin_once(m, ii)
-        while True:
-            m, n = _afni_fillin_once(m, nmm)
-            if n == 0:
-                break
+        m = _afni_fillin_completely(m, nmm)
     m = erode(m, 1)
     m = clust(m)
     m = ~clust(~m)  # fill every hole that does not reach the volume edge

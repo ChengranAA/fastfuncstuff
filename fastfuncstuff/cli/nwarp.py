@@ -614,7 +614,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if args.time_range:
         parts = args.time_range.split(",")
         if len(parts) == 2:
-            time_range = (int(parts[0]), int(parts[1]))
+            # Inclusive, as the help (and AFNI's [a..b]) says: '0,5' is six volumes.
+            time_range = (int(parts[0]), int(parts[1]) + 1)
         else:
             time_range = (0, int(parts[0]))
 

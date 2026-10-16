@@ -625,3 +625,35 @@ def test_an_rgb_mode_layer_reaches_the_surface_in_its_own_colours(window, tmp_pa
     cells = [(15, 15, 5)]
     tint = session.overlay_colors(cells)
     assert tint is not None and tint[0] is not None
+
+
+def test_depth_keys_move_and_widen_a_window_whose_samples_follow_its_width(window):
+    from fastfuncstuff.viewer.vocab import SetSurfaceDepth
+
+    session, win = window
+
+    def state():
+        vp = session.state.viewports.get("S1")
+        return tuple(round(x, 3) for x in vp.depth), vp.samples
+
+    session.do(SetSurfaceDepth("S1", 0.5, 0.5, 1))
+    win._width_by(1)  # }  a fifth, about the same centre
+    assert state() == ((0.4, 0.6), 5)
+    win._width_by(1)  # }  a third
+    assert state() == ((0.333, 0.667), 8)
+    win.refresh(Aspect.ALL)
+    assert "0.33-0.67 (1/3)" in win.depth_label.text()
+    win._shift_depth(0.1)  # ]  the same third, deeper
+    assert state() == ((0.433, 0.767), 8)
+    win._shift_depth(0.5)  # past pial: it slides to the edge rather than shrinking
+    assert state() == ((0.667, 1.0), 8)
+    win._width_by(1)
+    win._width_by(1)  # the whole ribbon, at the shader's sample cap
+    assert state() == ((0.0, 1.0), 16)
+    win._shift_depth(0.1)  # nowhere to go
+    assert state() == ((0.0, 1.0), 16)
+    for _ in range(4):
+        win._width_by(-1)
+    assert state() == ((0.5, 0.5), 1)  # back to a single depth, at the centre
+    win._width_by(-1)
+    assert state() == ((0.5, 0.5), 1)

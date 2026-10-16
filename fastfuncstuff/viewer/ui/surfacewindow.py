@@ -1268,7 +1268,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             bar,
             "DEPTH",
             "d",
-            "How depth samples reduce: mean, median, max, min, max_abs, nzmean.\n[ ] move the depth, { } fewer / more samples.",
+            "How a depth window reduces: mean, median, max, min, max_abs, nzmean.\n[ ] move the window, { } narrower / wider.",
             self._cycle_depth_stat,
         )
         bar.addSpacing(8)
@@ -1381,11 +1381,11 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("shift+r", "show / hide the right hemisphere", lambda: self._toggle_hemi("rh"), group="hemispheres"),
                 Key(">", "split hemispheres apart", lambda: self._split_by(10.0), group="hemispheres"),
                 Key("<", "bring them back together", lambda: self._split_by(-10.0), group="hemispheres"),
-                Key("[", "sample shallower (toward white)", depth_step(-0.1), group="depth"),
-                Key("]", "sample deeper (toward pial)", depth_step(0.1), group="depth"),
-                Key("{", "fewer depth samples", lambda: self._samples_by(-1), group="depth"),
-                Key("}", "more depth samples (average white..pial)", lambda: self._samples_by(1), group="depth"),
-                Key("shift+scroll", "scroll through cortical depth", None, group="depth"),
+                Key("[", "depth window shallower (toward white)", depth_step(-0.1), group="depth"),
+                Key("]", "depth window deeper (toward pial)", depth_step(0.1), group="depth"),
+                Key("{", "narrower depth window (down to a single depth)", lambda: self._width_by(-1), group="depth"),
+                Key("}", "wider depth window: 1/5, 1/3, 1/2, whole ribbon, averaged", lambda: self._width_by(1), group="depth"),
+                Key("shift+scroll", "move the depth window through the cortex", None, group="depth"),
                 Key("e", "equivolume / equidistant depth", self._toggle_equivolume, group="depth"),
                 Key("d", "depth statistic: mean, median, max, min, max_abs, nzmean", self._cycle_depth_stat, group="depth"),
                 Key("m", "next per-vertex map (thickness, sulc, curv, parcellation)", self._cycle_map, group="view"),
@@ -1625,30 +1625,32 @@ class SurfaceWindow(QtWidgets.QWidget):
         near = min(range(3), key=lambda k: abs(presets[k] - vp.hinge))
         self._dispatch(SetSurfaceHinge(self.vid, presets[(near + 1) % 3]))
 
-    def _shift_depth(self, delta: float) -> None:
-        vp = self._viewport()
-        if vp is None:
-            return
+    def _window(self, vp: Viewport) -> tuple[float, float]:
+        """The current depth window as (centre, width); a single depth is width 0."""
         lo, hi = vp.depth
-        if vp.samples <= 1:
-            d = float(np.clip(lo + delta, 0.0, 1.0))
-            self._dispatch(SetSurfaceDepth(self.vid, round(d, 3), round(d, 3), 1))
-        else:
-            # Several samples: [ and ] slide the whole window.
-            width = hi - lo
-            lo = float(np.clip(lo + delta, 0.0, 1.0 - width))
-            self._dispatch(
-                SetSurfaceDepth(self.vid, round(lo, 3), round(lo + width, 3), vp.samples)
-            )
+        width = hi - lo if vp.samples > 1 else 0.0
+        return lo + width / 2.0, width
 
-    def _samples_by(self, delta: int) -> None:
+    def _shift_depth(self, delta: float) -> None:
+        """[ ] and shift+wheel: move the window's centre, keeping its width."""
         vp = self._viewport()
         if vp is None:
             return
-        n = int(np.clip(vp.samples + delta, 1, 16))
-        lo, hi = (0.0, 1.0) if vp.samples == 1 and n > 1 else vp.depth
-        if n == 1:
-            lo = hi = 0.5 * (lo + hi)
+        centre, width = self._window(vp)
+        (lo, hi), n = s3.depth_window(centre + delta, width)
+        self._dispatch(SetSurfaceDepth(self.vid, lo, hi, n))
+
+    def _width_by(self, step: int) -> None:
+        """{ }: narrow / widen the window about its centre (single depth .. whole ribbon).
+
+        The sample count follows the width -- one per ~0.05 of depth -- so what
+        changes is how thick a slab is averaged, not how finely a fixed slab is.
+        """
+        vp = self._viewport()
+        if vp is None:
+            return
+        centre, width = self._window(vp)
+        (lo, hi), n = s3.depth_window(centre, s3.next_depth_width(width, step))
         self._dispatch(SetSurfaceDepth(self.vid, lo, hi, n))
 
     def _cycle_sampling(self) -> None:
@@ -1979,12 +1981,10 @@ class SurfaceWindow(QtWidgets.QWidget):
 
     def _sync_header(self, vp: Viewport) -> None:
         self._sync_buttons()
-        lo, hi = vp.depth
         how = "equivol" if vp.equivolume else "linear"
+        window = s3.depth_window_label(vp.depth, vp.samples)
         self.depth_label.setText(
-            f"{how} {lo:.2f}"
-            if vp.samples <= 1
-            else f"{how} {lo:.2f}-{hi:.2f} x{vp.samples} {vp.depth_stat}"
+            f"{how} {window}" if vp.samples <= 1 else f"{how} {window} {vp.depth_stat}"
         )
         st = self.session.state
         for box, items, current in (
@@ -2034,7 +2034,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         self._dispatch(SetSurfaceDepthStat(self.vid, nxt))
         if vp.samples <= 1:
             # One sample has nothing to reduce; say so rather than do nothing.
-            self.depth_label.setText(f"{nxt} -- needs depth samples: }} adds them")
+            self.depth_label.setText(f"{nxt} -- needs a depth window: }} widens it")
 
     def _toggle_equivolume(self) -> None:
         vp = self._viewport()

@@ -689,6 +689,51 @@ def palette_texture(rgb: np.ndarray) -> np.ndarray:
     return out.reshape(rows, PALETTE_W, 4)
 
 
+#: Depth-window widths ``{`` / ``}`` step through, as fractions of the ribbon:
+#: a single depth, a fifth, a third, a half, all of it.
+DEPTH_WIDTHS = (0.0, 0.2, 1.0 / 3.0, 0.5, 1.0)
+_WIDTH_NAMES = {0.2: "1/5", 1.0 / 3.0: "1/3", 0.5: "1/2", 1.0: "full"}
+#: Spacing of the samples averaged across a window; finer adds nothing at
+#: 0.5-1 mm voxels over a 2-3 mm ribbon.
+DEPTH_SAMPLE_SPACING = 0.05
+MAX_DEPTH_SAMPLES = 16  # the shader's MAX_SAMPLES
+
+
+def depth_window(centre: float, width: float) -> tuple[tuple[float, float], int]:
+    """``(lo, hi)`` and sample count of a window ``width`` wide around ``centre``.
+
+    The window stays inside the ribbon: near white or pial it slides rather
+    than shrinks, so stepping never changes how thick a slab is averaged.
+    """
+    width = float(np.clip(width, 0.0, 1.0))
+    # A window read back from a stored (rounded) depth is a listed width off by
+    # rounding; snap it, or a third creeps by 0.001 per step.
+    near = min(DEPTH_WIDTHS, key=lambda w: abs(w - width))
+    if abs(near - width) < 0.005:
+        width = near
+    lo = float(np.clip(centre - width / 2.0, 0.0, 1.0 - width))
+    if width <= 0.0:
+        return (round(lo, 3), round(lo, 3)), 1
+    n = int(np.clip(round(width / DEPTH_SAMPLE_SPACING) + 1, 2, MAX_DEPTH_SAMPLES))
+    return (round(lo, 3), round(lo + width, 3)), n
+
+
+def next_depth_width(width: float, step: int) -> float:
+    """The width ``step`` places along :data:`DEPTH_WIDTHS` from the nearest to ``width``."""
+    near = int(np.argmin([abs(w - width) for w in DEPTH_WIDTHS]))
+    return DEPTH_WIDTHS[int(np.clip(near + step, 0, len(DEPTH_WIDTHS) - 1))]
+
+
+def depth_window_label(depth: tuple[float, float], samples: int) -> str:
+    """``"0.40"`` for a single depth, ``"0.33-0.67 (1/3)"`` for a window."""
+    lo, hi = depth
+    if samples <= 1 or hi <= lo:
+        return f"{lo:.2f}"
+    width = hi - lo
+    name = next((v for w, v in _WIDTH_NAMES.items() if abs(w - width) < 0.01), f"{width:.2f}")
+    return f"{lo:.2f}-{hi:.2f} ({name})"
+
+
 def depth_fractions(depth: tuple[float, float], samples: int) -> np.ndarray:
     """Where the shader samples between white (0) and pial (1)."""
     if samples <= 1:

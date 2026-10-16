@@ -98,8 +98,6 @@ def build_patch(
     onto the plane through the centre instead (folds are already smoothed out
     there, so a small piece of it is nearly a plane).
     """
-    from scipy.spatial import Delaunay
-
     white, pial = hemi.states["white"], hemi.states["pial"]
     mid = 0.5 * (white.astype(np.float64) + pial)
     source = "sphere" if "sphere" in hemi.states else "inflated"
@@ -141,27 +139,14 @@ def build_patch(
         sel = np.flatnonzero((dist * scale < 1.2 * np.sqrt(2.0) * half_mm) & (normals @ c > 0.2))
         uv = scale * np.stack([offset[sel] @ right, offset[sel] @ up], -1)
 
-    px = 2.0 * half_mm / size
-    centres = -half_mm + (np.arange(size) + 0.5) * px
-    gx, gy = np.meshgrid(centres, centres[::-1])
-    pts = np.stack([gx.ravel(), gy.ravel()], -1)
-    tri = Delaunay(uv)
-    simplex = tri.find_simplex(pts)
-    inside = simplex >= 0
-    s = np.where(inside, simplex, 0)
-    transform = tri.transform[s]
-    b = np.einsum("nij,nj->ni", transform[:, :2], pts - transform[:, 2])
-    weights = np.concatenate([b, 1.0 - b.sum(axis=1, keepdims=True)], axis=1)
-    corners = sel[tri.simplices[s]]
-    # Delaunay fills the convex hull; a long sliver across a concave edge of
-    # the cap is not cortex.
-    corner_uv = uv[tri.simplices]
-    edges = np.linalg.norm(corner_uv - np.roll(corner_uv, 1, axis=1), axis=-1).max(axis=1)
-    inside &= edges[s] < 4.0 * np.median(edges)
-
     member = np.zeros(hemi.n_vertices, bool)
     member[sel] = True
     faces = hemi.faces[member[hemi.faces].all(axis=1)]
+    local = np.full(hemi.n_vertices, -1, np.int64)
+    local[sel] = np.arange(sel.size)
+    tri_local, weights, inside = _rasterize(uv, local[faces], half_mm, size)
+    corners = sel[tri_local]
+
     return Patch(
         hemi=hemi.name,
         centre=int(centre),
@@ -174,6 +159,65 @@ def build_patch(
         faces=faces,
         source=source,
     )
+
+
+def _rasterize(
+    uv: np.ndarray, tris: np.ndarray, half_mm: float, size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Draw the patch's own mesh triangles, flattened to ``uv``, into a ``size``-pixel square.
+
+    Per pixel (row-major, row 0 at +``half_mm``): the triangle's three corners
+    (indices into ``uv``), their barycentric weights, and whether any triangle
+    covers it.  The mesh's own triangles rather than a Delaunay triangulation of
+    the flattened points: a pixel then interpolates exactly the cortex the mesh
+    describes, nothing fills a concave edge of the patch, and there is no
+    triangulation to rebuild per crosshair move (it was 86 of ~190 ms).  Where
+    two triangles overlap -- a fold the flattening could not open -- the pixel
+    takes the one it lies deepest inside.
+    """
+    px = 2.0 * half_mm / size
+    n_pix = size * size
+    a, b, c = uv[tris[:, 0]], uv[tris[:, 1]], uv[tris[:, 2]]
+    e1, e2 = b - a, c - a
+    det = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+    ok = np.abs(det) > 1e-12
+    tris, a, e1, e2, det = tris[ok], a[ok], e1[ok], e2[ok], det[ok]
+    corners_uv = np.stack([a, a + e1, a + e2], axis=1)
+    # Pixel centre (r, col) sits at x = -h + (col + 0.5) px, y = h - (r + 0.5) px.
+    col_lo = np.ceil((corners_uv[..., 0].min(1) + half_mm) / px - 0.5).astype(np.int64)
+    col_hi = np.floor((corners_uv[..., 0].max(1) + half_mm) / px - 0.5).astype(np.int64)
+    row_lo = np.ceil((half_mm - corners_uv[..., 1].max(1)) / px - 0.5).astype(np.int64)
+    row_hi = np.floor((half_mm - corners_uv[..., 1].min(1)) / px - 0.5).astype(np.int64)
+    col_lo, row_lo = np.maximum(col_lo, 0), np.maximum(row_lo, 0)
+    col_hi, row_hi = np.minimum(col_hi, size - 1), np.minimum(row_hi, size - 1)
+    n_c = np.maximum(col_hi - col_lo + 1, 0)
+    n_r = np.maximum(row_hi - row_lo + 1, 0)
+    count = n_c * n_r
+    face = np.repeat(np.arange(tris.shape[0]), count)
+    # Position of each (face, pixel) pair within its face's bounding box.
+    k = np.arange(face.size) - np.repeat(np.cumsum(count) - count, count)
+    row = row_lo[face] + k // n_c[face]
+    col = col_lo[face] + k % n_c[face]
+    p = np.stack([-half_mm + (col + 0.5) * px, half_mm - (row + 0.5) * px], -1) - a[face]
+    inv = 1.0 / det[face]
+    l1 = (p[:, 0] * e2[face, 1] - p[:, 1] * e2[face, 0]) * inv
+    l2 = (e1[face, 0] * p[:, 1] - e1[face, 1] * p[:, 0]) * inv
+    l0 = 1.0 - l1 - l2
+    depth = np.minimum(np.minimum(l0, l1), l2)
+    hit = depth >= -1e-9  # on a shared edge both claim it; either is the same point
+    face, row, col, depth = face[hit], row[hit], col[hit], depth[hit]
+    lam = np.stack([l0[hit], l1[hit], l2[hit]], -1)
+    pix = row * size + col
+    order = np.lexsort((-depth, pix))
+    first = order[np.r_[True, pix[order][1:] != pix[order][:-1]]] if order.size else order
+    tri_local = np.zeros((n_pix, 3), np.int64)
+    weights = np.zeros((n_pix, 3), np.float64)
+    inside = np.zeros(n_pix, bool)
+    tri_local[pix[first]] = tris[face[first]]
+    weights[pix[first]] = np.clip(lam[first], 0.0, 1.0)
+    inside[pix[first]] = True
+    weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-12)
+    return tri_local, weights, inside
 
 
 class PatchSampler:

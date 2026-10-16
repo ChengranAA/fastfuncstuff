@@ -572,3 +572,31 @@ def test_spacing_map_falls_back_to_white_once_the_topology_changes(chedi):
     assert surfaces.area_change("lh", "pial") is None
     win.refresh()
     assert win._spacing_vs == "white" and "vs white" in win.canvas.caption
+
+
+def test_rasterize_draws_the_meshs_own_triangles_and_leaves_a_concave_notch_empty():
+    from fastfuncstuff.viewer.chedi import _rasterize
+
+    # An L of unit squares, each split in two: the notch (x > 0, y > 0) has no mesh.
+    xs = np.arange(-4, 5, dtype=float)
+    uv = np.array([(x, y) for y in xs for x in xs])
+    idx = {(x, y): i for i, (x, y) in enumerate(map(tuple, uv))}
+    tris = []
+    for x in xs[:-1]:
+        for y in xs[:-1]:
+            if x >= 0 and y >= 0:
+                continue
+            a, b, c, d = idx[(x, y)], idx[(x + 1, y)], idx[(x + 1, y + 1)], idx[(x, y + 1)]
+            tris += [(a, b, c), (a, c, d)]
+    tris = np.array(tris)
+    half, size = 4.0, 64
+    tri, w, inside = _rasterize(uv, tris, half, size)
+    px = 2 * half / size
+    r, c = np.divmod(np.arange(size * size), size)
+    ctr = np.stack([-half + (c + 0.5) * px, half - (r + 0.5) * px], -1)
+    notch = (ctr[:, 0] > 0) & (ctr[:, 1] > 0)
+    assert not inside[notch].any()  # Delaunay would have filled the hull here
+    assert inside[~notch].all()
+    recon = (uv[tri[inside]] * w[inside][..., None]).sum(1)
+    np.testing.assert_allclose(recon, ctr[inside], atol=1e-9)
+    assert (w[inside] >= 0).all() and np.allclose(w[inside].sum(1), 1.0)

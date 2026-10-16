@@ -1223,6 +1223,26 @@ def build_pc_basis_design_per_run(
 
     designs: list[np.ndarray] = []
     src_lo, src_hi = float(lag_times[0]), float(lag_times[-1])
+    pcs = np.asarray(pcs, dtype=np.float64)
+
+    # Every PC shares one lag grid, so the linear-interpolation index and weight
+    # for a given lag are the same for all K of them.  Looping np.interp over the
+    # K columns repeated that lookup K times per call (280k calls and ~14 s inside
+    # one ffs_fitbasis -save-shape run, whose bank has hundreds of columns).
+    def _weights(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(i0, i1, w) so that interp(x) = pcs[:, i0] * (1 - w) + pcs[:, i1] * w."""
+        if n_lags < 2:
+            zero = np.zeros(x.shape, dtype=np.intp)
+            return zero, zero, np.zeros(x.shape)
+        i0 = np.clip(np.searchsorted(lag_times, x, side="right") - 1, 0, n_lags - 2)
+        w = (x - lag_times[i0]) / (lag_times[i0 + 1] - lag_times[i0])
+        return i0, i0 + 1, np.clip(w, 0.0, 1.0)  # np.interp holds the end values
+
+    if basis == "FIR":
+        # Resample each PC to integer-TR lags (lag_times need not start at 0 or be
+        # exactly tr-spaced); the same for every run, so once.
+        i0, i1, w = _weights(np.arange(n_lags) * tr)
+        pc_at_tr = pcs[:, i0] * (1.0 - w) + pcs[:, i1] * w  # (K, n_lags)
 
     for onset_times, n_run_tp in zip(onsets_per_run, n_timepoints_per_run, strict=False):
         block = np.zeros((n_run_tp, K), dtype=np.float64)
@@ -1233,36 +1253,27 @@ def build_pc_basis_design_per_run(
         tr_times = np.arange(n_run_tp, dtype=np.float64) * tr + microtime_offset
 
         if basis == "FIR":
-            # TR-locked path: round onsets to nearest TR, then convolve
-            # the binary onset vector with each PC sampled at TR.  We
-            # interpolate the PCs onto integer-TR lags (lag_times are
-            # already TR-spaced when basis="FIR", but they may not start
-            # at exactly 0 or be precisely tr-spaced; interpolate to be
-            # safe).
+            # TR-locked path: round onsets to nearest TR, then convolve the binary
+            # onset vector with each PC sampled at TR -- a shifted add per distinct
+            # onset instead of a np.convolve per PC.
             idx = np.round((onset_times - microtime_offset) / tr).astype(int)
-            idx = idx[(idx >= 0) & (idx < n_run_tp)]
-            onset_vec = np.zeros(n_run_tp, dtype=np.float64)
-            onset_vec[idx] = 1.0
-            # Resample each PC to integer-TR lags
-            tr_lags = np.arange(n_lags) * tr
-            for k in range(K):
-                pc_at_tr = np.interp(tr_lags, lag_times, pcs[k])
-                col = np.convolve(onset_vec, pc_at_tr)[:n_run_tp]
-                block[:, k] = col
+            idx = np.unique(idx[(idx >= 0) & (idx < n_run_tp)])
+            for j in idx:
+                m = min(n_lags, n_run_tp - int(j))
+                block[j : j + m] += pc_at_tr[:, :m].T
         else:
-            # Sub-TR onsets: for every (TR_time, onset_time) pair,
-            # evaluate PC at the relative lag (TR_time - onset_time)
-            # via linear interpolation, summed across onsets.
+            # Sub-TR onsets: for every (TR_time, onset_time) pair, evaluate PC at
+            # the relative lag (TR_time - onset_time) by linear interpolation,
+            # summed across onsets.  That sum is linear in the PCs, so accumulate
+            # the interpolation weights per (TR, lag knot) and apply them once.
             rel = tr_times[:, None] - onset_times[None, :]  # (n_run_tp, n_events)
-            # Mask: only pairs where rel ∈ [src_lo, src_hi] contribute
-            inside = (rel >= src_lo) & (rel <= src_hi)
-            for k in range(K):
-                # np.interp is 1-D; vectorize via flat-then-reshape.
-                vals = np.zeros_like(rel)
-                flat_rel = rel[inside]
-                if flat_rel.size > 0:
-                    vals[inside] = np.interp(flat_rel, lag_times, pcs[k])
-                block[:, k] = vals.sum(axis=1)
+            rows, cols = np.nonzero((rel >= src_lo) & (rel <= src_hi))
+            if rows.size:
+                i0, i1, w = _weights(rel[rows, cols])
+                size = n_run_tp * n_lags
+                acc = np.bincount(rows * n_lags + i0, weights=1.0 - w, minlength=size)
+                acc += np.bincount(rows * n_lags + i1, weights=w, minlength=size)
+                block = acc.reshape(n_run_tp, n_lags) @ pcs.T
         designs.append(block)
 
     return designs

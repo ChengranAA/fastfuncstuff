@@ -531,10 +531,28 @@ def _nifti_mm_to_voxels(
 
 def _is_time_varying_warp(path: str | Path) -> bool:
     """True if ``path`` is a 5D ``(nx, ny, nz, T, 3)`` per-frame warp (T > 1)."""
-    from fastfuncstuff.io.afni import load_nifti
-
-    shape = load_nifti(str(path)).shape
+    shape = _header_shape_affine(path)[0]
     return len(shape) == 5 and shape[-1] == 3 and shape[3] > 1
+
+
+def _header_shape_affine(path: str | Path) -> tuple[tuple[int, ...], np.ndarray, Any]:
+    """``(shape, affine, header)`` from the header alone where it can be read so.
+
+    For a ``.nii.zst`` a full ``load_nifti`` decodes the whole payload: asking a
+    176-frame time-varying warp its shape that way decoded all 8 GB (5.8 s),
+    and then the real load decoded it again.  Anything the header reader does
+    not handle (AFNI datasets, sub-brick selectors) falls back to the full load.
+    """
+    from fastfuncstuff.io.headers import read_nifti_header
+
+    try:
+        hdr = read_nifti_header(str(path))
+        return tuple(int(n) for n in hdr.get_data_shape()), np.asarray(hdr.get_best_affine()), hdr
+    except Exception:
+        from fastfuncstuff.io.afni import load_nifti
+
+        img = load_nifti(str(path))
+        return tuple(img.shape), np.asarray(img.affine), img.header
 
 
 def load_time_varying_warp(
@@ -1470,8 +1488,6 @@ def _first_nonlinear_warp_grid(
     """
     import glob as _glob
 
-    from fastfuncstuff.io.afni import load_nifti
-
     for spec in nwarp_specs:
         s = spec
         if any(c in s for c in "*?[") and not Path(s).exists():
@@ -1484,10 +1500,9 @@ def _first_nonlinear_warp_grid(
                 continue
         except ValueError:
             continue
-        img = load_nifti(str(s))
-        shp = img.shape  # (nx, ny, nz, 3) or (nx, ny, nz, T, 3)
+        shp, aff, hdr = _header_shape_affine(s)  # (nx, ny, nz, 3) or (nx, ny, nz, T, 3)
         nx, ny, nz = int(shp[0]), int(shp[1]), int(shp[2])
-        return (nz, ny, nx), compute_cardinal_affine(np.asarray(img.affine)), img.header.copy()
+        return (nz, ny, nx), compute_cardinal_affine(aff), hdr.copy()
     raise ValueError("-master WARP/NWARP requires at least one nonlinear warp dataset in -nwarp")
 
 
@@ -2297,9 +2312,7 @@ def nwarpforge(
                 print(f"    zd: [{xform.zd.min().item():.3f}, {xform.zd.max().item():.3f}]")
 
     if chain_base is not None:
-        from fastfuncstuff.io.afni import load_nifti
-
-        base_aff = np.asarray(load_nifti(chain_base).affine, dtype=np.float64)
+        base_aff = np.asarray(_header_shape_affine(chain_base)[1], dtype=np.float64)
         corr = base_frame_correction(base_aff, obliquity @ output_affine, output_affine)
         if verb >= 1:
             print(f"nwarpforge: -chain_base frame correction {np.round(corr[:3, 3], 3)} mm")

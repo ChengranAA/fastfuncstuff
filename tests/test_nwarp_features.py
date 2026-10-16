@@ -1027,3 +1027,21 @@ def test_time_varying_warp_loads_dicom_mm_as_nifti_mm_per_component(tmp_path):
     np.testing.assert_array_equal(tv.xd.numpy(), -w[..., 0].transpose(3, 2, 1, 0))
     np.testing.assert_array_equal(tv.yd.numpy(), -w[..., 1].transpose(3, 2, 1, 0))
     np.testing.assert_array_equal(tv.zd.numpy(), w[..., 2].transpose(3, 2, 1, 0))
+
+
+def test_checking_a_warps_shape_reads_only_its_header(tmp_path, monkeypatch):
+    """_is_time_varying_warp used to load_nifti the file: a full decode of a .nii.zst,
+    8 GB for a 176-frame warp, repeated by the real load right after."""
+    import fastfuncstuff.io.afni as afni
+    from fastfuncstuff.processing.nwarpforge import _is_time_varying_warp
+
+    tv = tmp_path / "tv.nii"
+    nib.Nifti1Image(np.zeros((4, 3, 2, 5, 3), np.float32), _diag_affine(2.0)).to_filename(str(tv))
+    still = tmp_path / "w.nii"
+    nib.Nifti1Image(np.zeros((4, 3, 2, 3), np.float32), _diag_affine(2.0)).to_filename(str(still))
+
+    def no_full_load(*a, **k):
+        raise AssertionError("a header question decoded the whole file")
+
+    monkeypatch.setattr(afni, "load_nifti", no_full_load)
+    assert _is_time_varying_warp(tv) and not _is_time_varying_warp(still)

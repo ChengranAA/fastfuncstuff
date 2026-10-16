@@ -15,6 +15,7 @@ Key Features
 
 from __future__ import annotations
 
+import os
 from typing import cast
 
 import numpy as np
@@ -1412,6 +1413,36 @@ def _symmetric_decorrelation_batch(W: torch.Tensor) -> torch.Tensor:
     return (U @ Vt).to(device=orig_device, dtype=orig_dtype)
 
 
+_fused_unavailable = False
+
+
+def _fused_logcosh_terms(X_white: torch.Tensor, n_components: int, fun: str):
+    """The fused Triton data pass for this fit, or None for the portable one.
+
+    Only the default contrast at up to 64 components on CUDA float32: that is where
+    one read of ``X`` beats the ~four reads of the ``(R, k, V)`` projection (2-2.7x
+    per iteration at V >= 300k); wider fits measured faster on cuBLAS.
+    """
+    global _fused_unavailable
+    if (
+        _fused_unavailable
+        or fun != "logcosh"
+        or X_white.device.type != "cuda"
+        or X_white.dtype != torch.float32
+        or os.environ.get("FFS_NO_FUSED_FASTICA")
+    ):
+        return None
+    try:
+        from fastfuncstuff.decomposition import ica_triton
+    except Exception as exc:  # pragma: no cover - Triton is optional
+        _fused_unavailable = True
+        print(f"** fused FastICA kernel unavailable ({exc}); using the portable update")
+        return None
+    if not ica_triton.fits(n_components, X_white.shape[0]):
+        return None
+    return ica_triton.logcosh_terms
+
+
 @torch.inference_mode()
 def fastica_batch(
     X_white: torch.Tensor,
@@ -1475,15 +1506,20 @@ def fastica_batch(
 
     active = torch.ones(n_restarts, dtype=torch.bool, device=device)
     n_iter = torch.zeros(n_restarts, dtype=torch.long, device=device)
+    fused = _fused_logcosh_terms(X_white, n_components, fun)
 
     pbar = tqdm(range(max_iter), desc=f"FastICA x{n_restarts}", leave=True, disable=not verbose)
     try:
         for it in pbar:
             W_old = W
-            wx = W @ X_white  # (R, k, V)
-            g_wx, g_prime_mean = _nonlinearity_batch(wx, fun)
-            W_new = (g_wx @ X_white.T) * scale - g_prime_mean * W_old
-            del g_wx
+            if fused is not None:
+                term, g_prime_mean = fused(X_white, W_old)
+                W_new = term - g_prime_mean * W_old
+            else:
+                wx = W @ X_white  # (R, k, V)
+                g_wx, g_prime_mean = _nonlinearity_batch(wx, fun)
+                W_new = (g_wx @ X_white.T) * scale - g_prime_mean * W_old
+                del g_wx
             W_new = _symmetric_decorrelation_batch(W_new)
 
             # Per-restart convergence, same criterion as the single-restart path:

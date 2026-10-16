@@ -46,6 +46,7 @@ from tqdm.auto import tqdm
 from fastfuncstuff.denoise.nordic import (
     _apply_temporal_phase_correction,
     _build_patch_starts,
+    _complex_volume,
     _compute_dd_phase,
     _compute_meanphase,
     _dd_phase_multiply_inplace,
@@ -61,7 +62,7 @@ from fastfuncstuff.memory import (
     estimate_nordic_llr_memory,
     get_available_memory,
 )
-from fastfuncstuff.utils import get_device, linalg_device, to_linalg_f64, to_tensor
+from fastfuncstuff.utils import get_device, linalg_device, to_linalg_f64
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -1076,26 +1077,18 @@ def run_sauna(
         phase_raw = phase_img.get_fdata(dtype=np.float32).astype(np.float32)
         phase_np = _phase_to_radians(phase_raw)
 
-    if cfg.magnitude_only:
-        ii_np = mag_np.astype(np.float32)
-    elif phase_np is not None:
-        ii_np = (mag_np * np.exp(1j * phase_np)).astype(np.complex64)
-    else:
-        ii_np = mag_np.astype(np.complex64)
-
-    # ABSOLUTE_SCALE normalization (same as NORDIC)
-    tempvol = np.abs(ii_np[..., 0])
+    # ABSOLUTE_SCALE normalization (same as NORDIC): |mag * exp(i*phase)| is the
+    # magnitude, so the scale comes straight from it, and the complex volume is
+    # formed on the device (see _complex_volume).
+    tempvol = mag_np[..., 0]
     nonzero = tempvol[tempvol != 0]
     if nonzero.size > 0:
         absolute_scale = float(np.min(nonzero))
     else:
         absolute_scale = 1.0
     absolute_scale = max(absolute_scale, 1e-30)
-    ii_np = ii_np / absolute_scale
 
-    dtype = torch.complex64
-    II = to_tensor(ii_np.astype(np.complex64), dtype=dtype, device=dev)
-    del ii_np
+    II = _complex_volume(mag_np, phase_np, absolute_scale, dev)
     nx, ny, nz, nt = II.shape
 
     # Kernel size

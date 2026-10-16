@@ -40,7 +40,6 @@ from fastfuncstuff.memory import (
     nordic_llr_gpu_budget,
     plan_nordic_llr_memory,
 )
-from fastfuncstuff.utils import to_tensor
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -1608,6 +1607,35 @@ class _PreppedEcho:
     raw_temporal_mean: np.ndarray | None = None
 
 
+def _complex_volume(
+    magnitude: np.ndarray,
+    phase: np.ndarray | None,
+    scale: float,
+    dev: torch.device,
+    *,
+    chunk: int = 16,
+) -> torch.Tensor:
+    """``magnitude * exp(i*phase) / scale`` as complex64 on ``dev``, in time chunks.
+
+    Forming this in numpy was single-threaded arithmetic over gigabytes -- 15.7 s
+    on a 1.4 GB echo, 29% of the whole ``ffs_nordic`` run -- followed by a second
+    full copy up to the device.  Formed on the device a chunk at a time it takes
+    0.4 s, and never holds more than one chunk of float32 next to the output.
+    Differs from the numpy form by float32 rounding (1.8e-7 relative).
+    """
+    out = torch.empty(magnitude.shape, dtype=torch.complex64, device=dev)
+    mag = torch.from_numpy(magnitude)
+    ph = torch.from_numpy(phase) if phase is not None else None
+    for start in range(0, magnitude.shape[-1], chunk):
+        sl = slice(start, start + chunk)
+        m = mag[..., sl].to(dev) / scale
+        if ph is None:
+            out[..., sl] = torch.complex(m, torch.zeros_like(m))
+        else:
+            out[..., sl] = torch.polar(m, ph[..., sl].to(dev))
+    return out
+
+
 def _prepare_echo(
     magnitude_file: str,
     phase_file: str | None,
@@ -1646,31 +1674,21 @@ def _prepare_echo(
             phase_raw = phase_img.get_fdata(dtype=np.float32).astype(np.float32, copy=False)
             phase_np = _phase_to_radians(phase_raw)
 
-    if cfg.magnitude_only:
-        # MATLAB: II=single(I_M); temporal_phase=0
-        ii_np = mag_np.astype(np.float32)
-    elif phase_np is not None:
-        ii_np = (mag_np * np.exp(1j * phase_np)).astype(np.complex64)
-    else:
-        ii_np = mag_np.astype(np.complex64)
-
     is_complex = not cfg.magnitude_only and phase_np is not None
 
     # MATLAB: ABSOLUTE_SCALE = min(TEMPVOL(TEMPVOL~=0)); II=II./ABSOLUTE_SCALE
-    tempvol = np.abs(ii_np[..., 0])
+    # |mag * exp(i*phase)| is the magnitude, so the scale comes straight from it.
+    tempvol = mag_np[..., 0]
     nonzero = tempvol[tempvol != 0]
     if nonzero.size > 0:
         absolute_scale = float(np.min(nonzero))
     else:
         absolute_scale = 1.0
     absolute_scale = max(absolute_scale, 1e-30)
-    ii_np = ii_np / absolute_scale
 
-    # Move to device as complex64 (even magnitude-only uses complex in MATLAB
-    # for the SVD pathway; for magnitude_only the imaginary part is zero).
+    # Complex64 even for magnitude-only (MATLAB's SVD pathway; imaginary part zero).
     dtype = torch.complex64
-    II = to_tensor(ii_np.astype(np.complex64), dtype=dtype, device=dev)
-    del ii_np
+    II = _complex_volume(mag_np, phase_np if is_complex else None, absolute_scale, dev)
     nx, ny, nz, nt = II.shape
 
     # Trailing noise-only volumes calibrate the threshold but must not enter

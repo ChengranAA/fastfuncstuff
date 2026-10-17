@@ -19,7 +19,11 @@ so this module does the spatial unwrap ONCE and anchors every frame to it:
    change is then followed along time instead (``temporal_path``), but only in
    voxels whose frame-to-frame steps are small, so noise cannot random-walk. The
    mean cannot speak for such a voxel, so its level is set by the anchor frames at
-   their own time points.
+   their own time points. The frame-wide field change (breathing, a breath-hold,
+   drift) is fitted per frame as a low-order polynomial on those smooth voxels, and
+   every other voxel wraps only its residual about it: a breath-hold moved the
+   whole head past half a period at TE 36 ms, wrapping a quarter of the voxels too
+   noisy to follow.
 3. **Echo ladder.** Each later echo's 2π count from the weighted through-origin fit
    of the earlier echoes' change (warpkit's temporal-consistency step, per voxel),
    then once more on the total phase: rounding the reference and the change
@@ -284,6 +288,43 @@ def _offset_free_step(u: Tensor, w: Tensor, te: Tensor) -> Tensor:
     return step
 
 
+def _time_path(c: Tensor, rough_max: float) -> tuple[Tensor, Tensor]:
+    """Follow each voxel's change ``c`` (V, t) along time: (path centred within half a
+    period of the reference by its median, smooth enough to trust)."""
+    step = _wrap(torch.diff(c, dim=1))
+    u = torch.cat([c[:, :1], c[:, :1] + torch.cumsum(step, 1)], 1)
+    u = u - TWO_PI * torch.round(u.median(1, keepdim=True).values / TWO_PI)
+    smooth = (step.abs() > _ROUGH_STEP).float().mean(1) <= rough_max
+    return u, smooth
+
+
+def _poly_basis(coords: Tensor, order: int) -> Tensor:
+    """Low-order 3-D Legendre polynomial on coordinates scaled to [-1, 1]: (V, k)."""
+    x, y, z = coords.unbind(1)
+    cols = [torch.ones_like(x)]
+    if order >= 1:
+        cols += [x, y, z]
+    if order >= 2:
+        cols += [(3 * x * x - 1) / 2, (3 * y * y - 1) / 2, (3 * z * z - 1) / 2, x * y, x * z, y * z]
+    return torch.stack(cols, 1)
+
+
+def _slab_coords(a: int, b: int, dims: tuple[int, int, int], idx: Tensor) -> Tensor:
+    """[-1, 1] coordinates of the slab voxels ``idx`` (slab = planes a..b of axis 0)."""
+    d0, d1, d2 = dims
+    g = torch.stack(
+        torch.meshgrid(
+            torch.arange(a, b, device=idx.device),
+            torch.arange(d1, device=idx.device),
+            torch.arange(d2, device=idx.device),
+            indexing="ij",
+        ),
+        -1,
+    ).reshape(-1, 3)[idx]
+    scale = torch.tensor([max(d0 - 1, 1), max(d1 - 1, 1), max(d2 - 1, 1)], device=idx.device)
+    return g.float() / scale * 2 - 1
+
+
 def _anchor_slab(
     P: Tensor,
     M: Tensor,
@@ -296,18 +337,22 @@ def _anchor_slab(
     rough_max: float,
     at_anchor: Tensor | None = None,
     anchor_times: Tensor | None = None,
+    predicted: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """One slab, voxels flattened: P, M (V, e, t). Returns (U (V,e,t), field (V,t), path (V,))."""
+    """One slab, voxels flattened: P, M (V, e, t). Returns (U (V,e,t), field (V,t), path (V,)).
+
+    ``predicted`` (V, t): the shortest echo's expected change from the frame-wide field
+    fit; voxels not followed in time wrap only their residual about it.
+    """
     ne = P.shape[1]
     D = _wrap(P - offset[:, None, None] - uref[:, :, None])
     c = D[:, 0]
     path = torch.zeros(c.shape[0], dtype=torch.bool, device=c.device)
+    if predicted is not None:
+        c = predicted + _wrap(c - predicted)
     if temporal_path and c.shape[1] > 2:
-        step = _wrap(torch.diff(c, dim=1))
-        u = torch.cat([c[:, :1], c[:, :1] + torch.cumsum(step, 1)], 1)
-        u = u - TWO_PI * torch.round(u.median(1, keepdim=True).values / TWO_PI)
+        u, smooth = _time_path(c, rough_max)
         moved = (torch.round((u - c) / TWO_PI) != 0).any(1)
-        smooth = (step.abs() > _ROUGH_STEP).float().mean(1) <= rough_max
         path = moved & smooth & inside
         if at_anchor is not None and anchor_times is not None and at_anchor.shape[1]:
             # A voxel that moves this far decoheres the temporal mean, so the
@@ -342,6 +387,56 @@ def _anchor_slab(
     return U, field * (1000.0 / TWO_PI), path
 
 
+def _predicted_change(a: int, b: int, dims, idx: Tensor, coef: Tensor) -> Tensor:
+    """The frame-wide field fit at the slab voxels ``idx``, centred on its time median."""
+    order = {1: 0, 4: 1, 10: 2}[coef.shape[0]]
+    h = _poly_basis(_slab_coords(a, b, tuple(dims), idx), order) @ coef
+    return h - h.median(1, keepdim=True).values
+
+
+def _fit_frame_field(
+    pv: np.ndarray,
+    uv: np.ndarray,
+    ofv: np.ndarray,
+    mkv: np.ndarray,
+    sx: int,
+    order: int,
+    rough_max: float,
+    device: torch.device,
+) -> Tensor:
+    """Per-frame low-order polynomial of the shortest echo's change, (k, t).
+
+    Fitted on the voxels whose change can be followed along time (smooth), so it
+    captures the frame-wide field (breathing, breath-holds, drift) even where it
+    moves by more than half a period; slab views as in :func:`unwrap_timeseries`.
+    """
+    d0, d1, d2 = pv.shape[:3]
+    nt = pv.shape[-1]
+    k = _poly_basis(torch.zeros(1, 3), order).shape[1]
+    xtx = torch.zeros(k, k, dtype=torch.float64, device=device)
+    xty = torch.zeros(k, nt, dtype=torch.float64, device=device)
+    for a in range(0, d0, sx):
+        b = min(d0, a + sx)
+        n = (b - a) * d1 * d2
+        inside = torch.from_numpy(np.ascontiguousarray(mkv[a:b] == 2)).to(device).reshape(n)
+        idx = inside.nonzero()[:, 0]
+        if idx.numel() == 0:
+            continue
+        p0 = _gather(pv[a:b, :, :, 0], (n, nt), idx)
+        c = _wrap(
+            p0
+            - _gather(ofv[a:b], (n,), idx)[:, None]
+            - _gather(uv[a:b, :, :, 0], (n,), idx)[:, None]
+        )
+        u, smooth = _time_path(c, rough_max)
+        y = (u - u.median(1, keepdim=True).values)[smooth].double()
+        x = _poly_basis(_slab_coords(a, b, (d0, d1, d2), idx[smooth]), order).double()
+        xtx += x.T @ x
+        xty += x.T @ y
+    ridge = 1e-6 * torch.trace(xtx) / k * torch.eye(k, dtype=xtx.dtype, device=device)
+    return torch.linalg.solve(xtx + ridge, xty).float()
+
+
 def unwrap_timeseries(
     phase: np.ndarray,
     mag: np.ndarray,
@@ -351,6 +446,7 @@ def unwrap_timeseries(
     temporal_path: bool = True,
     rough_max: float = 0.05,
     anchor_frames: int = 8,
+    frame_field_order: int | None = 2,
     automask_dilation: int = 3,
     return_unwrapped: bool = False,
     verbose: bool = True,
@@ -360,6 +456,10 @@ def unwrap_timeseries(
     ``mag`` matches ``phase``; ``tes`` in ms, shortest first. ``rough_max`` is the
     largest fraction of frame-to-frame steps above π/2 a voxel may have and still
     have its shortest-echo change followed in time (see the module docstring).
+    ``frame_field_order``: polynomial order of the per-frame field change fitted on
+    those smooth voxels; every other voxel wraps only its residual about it, so a
+    breath-hold that moves the whole head by more than half a period cannot wrap
+    them. None turns it off.
     """
     if phase.shape != mag.shape or phase.ndim != 5:
         raise ValueError(
@@ -404,6 +504,10 @@ def unwrap_timeseries(
     d1, d2 = pv.shape[1:3]
     sx = _slab_width(d1 * d2, ne, nt, device)
     slabs = range(0, pv.shape[0], sx)
+    dims = pv.shape[:3]
+    coef = None
+    if frame_field_order is not None and temporal_path and nt > 2:
+        coef = _fit_frame_field(pv, uv, ofv, mkv, sx, frame_field_order, rough_max, device)
     for a in tqdm(
         slabs, desc="  anchored unwrap", leave=True, disable=not verbose or len(slabs) < 2
     ):
@@ -424,6 +528,7 @@ def unwrap_timeseries(
             rough_max=rough_max,
             at_anchor=_gather(av[a:b], (n, n_anchor), idx) if n_anchor else None,
             anchor_times=t_anchor,
+            predicted=None if coef is None else _predicted_change(a, b, dims, idx, coef),
         )
         full = torch.zeros(n, nt, device=device)
         full[idx] = f

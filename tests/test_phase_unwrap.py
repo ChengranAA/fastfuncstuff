@@ -159,3 +159,33 @@ def test_cli_refuses_multiecho_without_echo_times(tmp_path):
     from fastfuncstuff.cli.phase_unwrap import main
 
     assert main(["-phase", "a", "b", "-magnitude", "c", "d", "-prefix", str(tmp_path / "o")]) == 1
+
+
+def test_breath_hold_excursion_does_not_wrap_noisy_voxels():
+    # A whole-head field step of 1.5 half-periods (a breath-hold) in the second half of
+    # the run, and a region too noisy to follow along time: those voxels can only stay
+    # right by wrapping their residual about the frame-wide field fit.
+    tes = [25.0]
+    ph, mag, field, head, _blob = _scene(tes, seed=4)
+    x, y, z, r = _head()
+    step = np.clip(np.linspace(-6, 6, NT), 0, 1) * 1.5 * 1000.0 / (2 * tes[0])
+    excursion = (1 + 0.3 * z)[..., None] * step  # smooth in space, like breathing
+    noisy = head & (x > 0.3)
+    rng = np.random.default_rng(5)
+    phase = (
+        ph
+        + (2 * np.pi * excursion * tes[0] * 1e-3)[..., None, :]
+        + np.where(noisy[..., None], rng.normal(0, 1.0, ph.shape[:3] + (NT,)), 0)[..., None, :]
+    )
+    phase = np.angle(np.exp(1j * phase)).astype(np.float32)
+    truth = field + excursion
+
+    def wrong(res):
+        d = (res.field_hz - truth) * tes[0] * 1e-3  # cycles
+        d = d - np.round(np.median(d, -1, keepdims=True))
+        return (np.abs(d) > 0.5)[noisy & (res.mask == 2)].mean()
+
+    on = unwrap_timeseries(phase, mag, tes, device=CPU, verbose=False)
+    off = unwrap_timeseries(phase, mag, tes, device=CPU, frame_field_order=None, verbose=False)
+    assert wrong(off) > 0.2
+    assert wrong(on) < 0.03

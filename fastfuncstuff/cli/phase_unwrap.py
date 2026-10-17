@@ -8,8 +8,9 @@ small field change, so this unwraps ONE reference spatially (the temporal-mean
 complex image, its 2π counts and phase offset checked against a few ROMEO'd
 frames) and anchors every frame to it, per voxel, on the GPU. Voxels whose change
 really leaves the shortest echo's unambiguous range (motion through a steep field,
-drift) are followed along time instead. Multi-echo: each later echo's 2π count
-comes from the earlier echoes' fit, and a field map in Hz is written too.
+drift) are followed along time instead, and the rest wrap only their residual
+about the frame-wide field change (breathing, breath-holds). Multi-echo: each later
+echo's 2π count comes from the earlier echoes' fit, and a field map in Hz is written.
 
 Outputs are in radians. Multi-echo phase has the phase offset (MCPC-3D-S) removed,
 like warpkit's; a single echo keeps it, like ROMEO's.
@@ -80,6 +81,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "a period of the reference (romeo -t epi's behaviour).",
     )
     parser.add_argument(
+        "-frame_field",
+        choices=["none", "0", "1", "2"],
+        default="2",
+        help="Polynomial order of the per-frame, whole-head field change (breathing, "
+        "breath-holds, drift) fitted on the voxels that can be followed in time; the "
+        "rest wrap only their residual about it. 'none' = anchor them directly.",
+    )
+    parser.add_argument(
         "-save_mask", default=None, metavar="FILE", help="Write the mask (2 core, 1 border)."
     )
     parser.add_argument(
@@ -148,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         temporal_path=not args.no_temporal_path,
         anchor_frames=args.anchor_frames,
+        frame_field_order=None if args.frame_field == "none" else int(args.frame_field),
         return_unwrapped=True,
         verbose=verbose,
     )

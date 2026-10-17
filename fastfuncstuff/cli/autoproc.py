@@ -1245,7 +1245,20 @@ def _multiecho_errors(opt: Options, subject) -> list[str]:
             "multi-echo runs without an EchoTime in every echo's sidecar: " + ", ".join(no_te)
         )
     if opt.phasereg:
-        errs.append("-phasereg with multi-echo runs is not wired yet (which echo's phase?).")
+        # Each echo is regressed across the task's runs together, so they must agree.
+        by_task: dict[str, set] = {}
+        for s in subject.sessions:
+            for r in s.bold_runs:
+                if r.phase_path is not None:
+                    by_task.setdefault(r.task, set()).add(
+                        tuple(round(t, 3) for t in r.echo_tes) if r.is_multiecho else ()
+                    )
+        mixed = [t for t, v in by_task.items() if len(v) > 1]
+        if mixed:
+            errs.append(
+                "-phasereg regresses each echo across a task's runs, so they need the same "
+                "echoes; these tasks mix echo counts or TEs: " + ", ".join(mixed)
+            )
     return errs
 
 

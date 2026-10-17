@@ -3348,9 +3348,12 @@ def test_multiecho_refuses_what_it_does_not_handle_yet():
 
     subj = Subject("X", [Session("01", [_me_run("01", "foo", "1")])])
     assert _multiecho_errors(Options(), subj) == []
-    errs = _multiecho_errors(Options(slicetiming_method="first", phasereg=True), subj)
-    assert not any("slicetiming_method first" in e for e in errs)  # wired 2026-10-18
-    assert any("-phasereg" in e for e in errs)
+    # slice timing first, -phasereg, -surface_target, 3-D -motsim: all wired 2026-10-18
+    assert _multiecho_errors(Options(slicetiming_method="first", phasereg=True), subj) == []
+    # ...but phasereg pools a task's runs echo by echo, so they must share the echoes
+    two = _me_run("01", "foo", "2", n=2)
+    mixed = Subject("X", [Session("01", [_me_run("01", "foo", "1"), two])])
+    assert any("-phasereg" in e for e in _multiecho_errors(Options(phasereg=True), mixed))
     bad = _me_run("01", "foo", "2")
     bad.echo_tes = []
     assert any(
@@ -3494,3 +3497,27 @@ def test_multiecho_surface_reads_every_echo_and_combines_per_vertex(tmp_path):
         and '-optcom "stage10s.surf.${FRAG[$k]}.native.rh.func.gii"' in s
     )
     assert s.index("stage10s.t2s.") < s.index("== stage10s: surface masks")
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_multiecho_phasereg_corrects_each_echo_then_combines(tmp_path):
+    """-phasereg with multi-echo: each echo's magnitude against its own phase, pooled
+    over the task's runs; then the corrected echoes are optimally combined into the
+    names the GLM's phasereg variant reads."""
+    runs = [_me_run("01", "foo", "1"), _me_run("01", "foo", "2")]
+    opt = Options(phase_proc=True, phasereg=True, acq_3d=False, go_to_anat=False,
+                  distortion=False, slicetiming_method="integrate")  # fmt: skip
+    s = write_script(build_plan(Subject("X", [Session("01", runs)]), opt), "wd", bids_root="/bids")
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+    stage = s[s.index("== phasereg ==") :]
+    for e in (1, 2, 3):
+        assert f'-prefix "$PHASEREG_DIR/task-foo_echo-{e}"' in stage
+        assert f"stage10.final.ses-01.task-foo.run-2.echo-{e}.part-phase.nii$FINAL_FMT" in stage
+    assert stage.count("ffs_phasereg") >= 3
+    assert "ffs_t2smap -input" in stage and "-tes 7.6 21.7 35.8" in stage
+    assert "task-foo_corrected_run-02.nii$FINAL_FMT" in stage

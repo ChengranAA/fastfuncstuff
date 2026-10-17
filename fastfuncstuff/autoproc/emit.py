@@ -4486,23 +4486,56 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
                     f"echo 'phasereg task-{task}: no events for every run, so sPR donors "
                     "are chosen on the task-included series (can remove tissue response)'"
                 )
-        body.append(f'[ -f "{_phasereg_corrected(task, len(prs))}" ] || \\')
-        pr_cmd = _ffs(
-            "ffs_phasereg",
-            [
-                f"-magnitude {mags}",
-                f"-phase {phs}",
-                f'-prefix "{d}/task-{task}"',
-                "-keep_drift",
-                *spr,
-                *select,
-                "-verb 1",
-                *extra,
-                '-device "$DEVICE"',
-            ],
-        )
-        commands.append(pr_cmd)
-        body.append(pr_cmd)
+
+        def pr_call(mags, phs, prefix, select=select):
+            return _ffs(
+                "ffs_phasereg",
+                [
+                    f"-magnitude {mags}",
+                    f"-phase {phs}",
+                    f'-prefix "{prefix}"',
+                    "-keep_drift",
+                    *spr,
+                    *select,
+                    "-verb 1",
+                    *extra,
+                    '-device "$DEVICE"',
+                ],
+            )
+
+        if prs[0].bold.is_multiecho:
+            # Each echo against its own phase (the vessel's phase and its magnitude
+            # footprint both scale with TE), then the corrected echoes are combined
+            # like the stage10 echoes were, into the names the GLM reads.
+            ne = prs[0].bold.n_echoes
+            tes = " ".join(f"{t:g}" for t in prs[0].bold.echo_tes)
+            for e in range(1, ne + 1):
+                emags = " ".join(
+                    f'"stage10.final.{_frag(pr)}.echo-{e}.nii$FINAL_FMT"' for pr in prs
+                )
+                ephs = " ".join(
+                    f'"stage10.final.{_frag(pr)}.echo-{e}.part-phase.nii$FINAL_FMT"' for pr in prs
+                )
+                stem_e = f"{d}/task-{task}_echo-{e}"
+                body.append(f'[ -f "{stem_e}_corrected_run-{len(prs):02d}.nii$FINAL_FMT" ] || \\')
+                pr_cmd = pr_call(emags, ephs, stem_e)
+                commands.append(pr_cmd)
+                body.append(pr_cmd)
+            for i in range(1, len(prs) + 1):
+                ins = " ".join(
+                    f'"{d}/task-{task}_echo-{e}_corrected_run-{i:02d}.nii$FINAL_FMT"'
+                    for e in range(1, ne + 1)
+                )
+                body.append(
+                    f'[ -f "{_phasereg_corrected(task, i)}" ] || ffs_t2smap -input {ins} '
+                    f'-tes {tes} -automask -no_qc -prefix "{d}/task-{task}_t2s_run-{i:02d}_" '
+                    f'-optcom "{_phasereg_corrected(task, i)}" -device "$DEVICE" -verb 0'
+                )
+        else:
+            body.append(f'[ -f "{_phasereg_corrected(task, len(prs))}" ] || \\')
+            pr_cmd = pr_call(mags, phs, f"{d}/task-{task}")
+            commands.append(pr_cmd)
+            body.append(pr_cmd)
         qc.append(
             f'qc_tcat "{d}/QC.task-{task}.nii.gz" "before after r2" '
             f'"stage10.final.{_frag(prs[0])}.nii$FINAL_FMT[0]" '

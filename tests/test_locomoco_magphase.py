@@ -110,7 +110,7 @@ def test_recovers_te_scaled_shift():
     tru = (w_true - w_true.mean(-1, keepdims=True))[m]
     r = np.corrcoef(est.ravel(), tru.ravel())[0, 1]
     slope = float((est * tru).sum() / (tru * tru).sum())
-    # 0.95 with a field term only; the default offset term (3+ echoes) costs ~0.005
+    # 0.95 with the default field term; the opt-in offset term costs ~0.005
     assert r > 0.93, r
     assert 0.85 < slope < 1.1, slope
 
@@ -296,9 +296,14 @@ def test_single_echo_highpass_rescues_weak_magnitude(monkeypatch):
 def test_blind_to_receiver_offset_drift():
     # A drifting phase at TE 0 is constant in radians across echoes, so in Hz it is
     # largest at echo 1 and falls as 1/TE: not echo-constant, so a flat field term
-    # alone lets it read as TE-dependent shift. With 3+ echoes the offset term removes it.
+    # alone lets it read as TE-dependent shift. With 3+ echoes the opt-in offset term
+    # removes it.
     mags, phs, w_true, head = _scene(offset_noise=0.6, mag_noise=30.0)
-    blind = _recovery_r(_run(mags, phs, refine_rounds=1, mag_nuisance="s0r2"), w_true, head)
+    blind = _recovery_r(
+        _run(mags, phs, refine_rounds=1, mag_nuisance="s0r2", phase_nuisance="flat_offset"),
+        w_true,
+        head,
+    )
     flat = _recovery_r(
         _run(mags, phs, refine_rounds=1, mag_nuisance="s0r2", phase_nuisance="flat"), w_true, head
     )

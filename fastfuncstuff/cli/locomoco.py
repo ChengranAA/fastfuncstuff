@@ -697,8 +697,10 @@ def create_parser() -> argparse.ArgumentParser:
         help="[-phase] What the PHASE may change by in place at each voxel and frame:\n"
         "  flat         a field change (the same in Hz at every echo): field-blind.\n"
         "  flat_offset  that plus a change of the receiver phase at TE 0, which in Hz falls"
-        " as 1/TE and would otherwise read as a TE-dependent shift. Needs 3+ echoes.\n"
-        "  auto         flat_offset with 3+ echoes, flat with 2.",
+        " as 1/TE and would otherwise read as a TE-dependent shift. Needs 3+ echoes;"
+        " noisier local flow (27-50% in 4 of 8 pilot runs), so opt-in: worth a try when a"
+        " run's receiver offset drifts a lot.\n"
+        "  auto         flat.",
     )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(

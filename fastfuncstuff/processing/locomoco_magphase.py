@@ -162,9 +162,12 @@ def estimate_partition_flow_magphase(
     motion/distortion resample. ``mag_nuisance`` picks what the magnitude may change by
     in place at each voxel and frame: 'none' (plain), 's0' (echo-constant), 's0r2' (plus
     proportional to TE; BOLD-blind, needs 3+ echoes). With 2+ echoes the phase gets the
-    echo-constant field term, and by default (``phase_nuisance='auto'``) with 3+ a
-    receiver-offset term too (TE1/TE in Hz): a drifting offset otherwise reads as a
-    TE-dependent shift (one 3-echo run drifted 0.08 rad). ``phase_hpf_sigma`` (voxels, required for a single echo,
+    echo-constant field term (``phase_nuisance='auto'`` = 'flat'). 'flat_offset' adds a
+    receiver-offset term (TE1/TE in Hz), opt-in: across 8 OHBM pilot runs it cut the
+    residual whole-volume shift in 6, but made the local flow 27-50% noisier in 4 and
+    split the two runs whose offset drifted most (one rescued, one worse), and the
+    phase tables plus the unwrap's head-wide offset removal already take most of what
+    it buys. ``phase_hpf_sigma`` (voxels, required for a single echo,
     optional otherwise) high-passes it inside its support first. Gauss-Newton: ``n_iters`` pull-warp updates per frame
     against the per-echo temporal-mean templates; ``refine_rounds`` rebuilds those
     templates from the corrected frames and re-solves (the uncorrected mean still
@@ -244,8 +247,7 @@ def estimate_partition_flow_magphase(
     floor = float(echo_mean[brain_np].mean()) * 1e-3
     chans = {"mag": mags, "hz": phases_hz}
     if phase_nuisance == "auto":
-        # an offset change needs a third echo to be told apart from field + shift
-        phase_nuisance = "flat_offset" if e >= 3 else ("flat" if e >= 2 else "none")
+        phase_nuisance = "flat" if e >= 2 else "none"
     kinds = {"mag": mag_nuisance, "hz": phase_nuisance}
 
     def frame(

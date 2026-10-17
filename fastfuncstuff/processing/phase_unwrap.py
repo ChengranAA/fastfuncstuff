@@ -196,23 +196,25 @@ def unwrap_reference(
     """
     ne = ref_phase.shape[3]
     se_mask = None if ne >= 2 else _single_echo_mask(ref_mag[..., 0], automask_dilation, device)
-    u, mask, offset = _romeo_volume(ref_phase, ref_mag, tes, se_mask, automask_dilation)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def romeo_or_none(pm):
+        try:
+            return _romeo_volume(pm[0], pm[1], tes, se_mask, automask_dilation)
+        except (IndexError, ValueError) as exc:  # e.g. warpkit finds no head in it
+            warnings.warn(f"anchor frame skipped, ROMEO failed: {exc}", stacklevel=2)
+            return None
+
+    # One pool for the reference and its anchors: ROMEO releases the GIL around its
+    # C++ kernel, and at 1.25 mm whole-brain one volume takes ~20 s, so running the
+    # reference first and the anchors after would double the wall time.
+    with ThreadPoolExecutor(min(len(anchors) + 1, os.cpu_count() or 1)) as ex:
+        ref_job = ex.submit(_romeo_volume, ref_phase, ref_mag, tes, se_mask, automask_dilation)
+        done = list(ex.map(romeo_or_none, anchors))
+        u, mask, offset = ref_job.result()
     inside = mask > 0
     pairs = []
-    done: list = [None] * len(anchors)
     if anchors:
-        from concurrent.futures import ThreadPoolExecutor
-
-        # romeo releases the GIL around its C++ kernel, so threads parallelise it
-        def romeo_or_none(pm):
-            try:
-                return _romeo_volume(pm[0], pm[1], tes, se_mask, automask_dilation)
-            except (IndexError, ValueError) as exc:  # e.g. warpkit finds no head in it
-                warnings.warn(f"anchor frame skipped, ROMEO failed: {exc}", stacklevel=2)
-                return None
-
-        with ThreadPoolExecutor(min(len(anchors), os.cpu_count() or 1)) as ex:
-            done = list(ex.map(romeo_or_none, anchors))
         pairs = [(a, d) for a, d in zip(anchors, done, strict=True) if d is not None]
         if ne >= 2 and pairs:
             # MCPC-3D-S on the decohered mean is biased where later echoes drop out;

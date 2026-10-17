@@ -657,3 +657,79 @@ def svd_filter_fields(
         rec = _low_rank(vals, svd_filt)
         f[flat_union] = torch.where(inside, rec, vals)
     return f.cpu().numpy()
+
+
+def remove_offset_drift(
+    unwrapped: np.ndarray,
+    mag: np.ndarray,
+    tes: Sequence[float],
+    mask: np.ndarray,
+    *,
+    device: torch.device,
+) -> np.ndarray:
+    """Remove the head-wide drift of the phase at TE 0 from ``unwrapped``, in place.
+
+    The receiver phase is static in principle, but on some runs it drifts (one 3-echo
+    run: 0.08 rad SD, head-wide). A drifting offset is constant across echoes in
+    radians, so in Hz it falls as 1/TE: it biases the field map and reads as a
+    TE-dependent partition shift downstream. Per volume, the per-voxel intercept of
+    phase vs TE (magnitude²-weighted, minus its temporal mean) is fitted over ``mask``
+    by a first-order spatial polynomial, which is subtracted from every echo. The
+    static offset (already removed by the reference) is untouched.
+
+    ``unwrapped``/``mag``: ``(x, y, z, e, t)``; needs 2+ echoes. Returns the per-volume
+    polynomial coefficients ``(4, t)`` [rad] (offset, x, y, z on [-1, 1] coordinates).
+    """
+    te = torch.as_tensor(np.asarray(tes, dtype=np.float32), device=device)
+    if te.numel() < 2:
+        raise ValueError("the offset drift needs at least two echoes")
+    shape = unwrapped.shape[:3]
+    idx = np.flatnonzero(mask)
+    nt = unwrapped.shape[-1]
+    ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float32)
+    basis = torch.from_numpy(
+        np.c_[np.ones(len(idx)), ijk / np.maximum(np.array(shape) - 1, 1) * 2 - 1].astype(
+            np.float32
+        )
+    ).to(device)
+    xtx = torch.zeros(4, 4, dtype=torch.float64, device=device)
+    xty = torch.zeros(4, nt, dtype=torch.float64, device=device)
+    flat_u = unwrapped.reshape(-1, *unwrapped.shape[3:])
+    flat_m = mag.reshape(-1, *mag.shape[3:])
+    chunk = max(1, int(2e8 // max(1, unwrapped.shape[3] * nt * 4)))
+    t_ = te[None, :, None]
+    for a in range(0, idx.size, chunk):
+        sel = idx[a : a + chunk]
+        u = torch.from_numpy(np.ascontiguousarray(flat_u[sel])).to(device)  # V, e, t
+        w = torch.from_numpy(np.ascontiguousarray(flat_m[sel])).to(device) ** 2
+        sw, st, stt = w.sum(1), (w * t_).sum(1), (w * t_ * t_).sum(1)
+        sy, sty = (w * u).sum(1), (w * t_ * u).sum(1)
+        icpt = (stt * sy - st * sty) / (sw * stt - st * st).clamp_min(1e-12)  # V, t
+        icpt = icpt - icpt.mean(1, keepdim=True)
+        b = basis[a : a + chunk]
+        xtx += (b.T @ b).double()
+        xty += (b.T @ icpt).double()
+    coef = torch.linalg.solve(xtx, xty).float()  # 4, t
+    # subtract the fitted drift from every echo, plane by plane along x (cheap, in place)
+    gx, gy, gz = (torch.linspace(-1, 1, n, device=device) for n in shape)
+    for i in range(shape[0]):
+        d = coef[0][None, None] + gx[i] * coef[1][None, None] + gy[:, None, None] * coef[2]
+        d = d + gz[None, :, None] * coef[3]  # y, z, t
+        d = d * torch.from_numpy(np.ascontiguousarray(mask[i])).to(device)[..., None]
+        unwrapped[i] -= d.cpu().numpy()[:, :, None, :]
+    return coef.cpu().numpy()
+
+
+def field_from_unwrapped(
+    unwrapped: np.ndarray, mag: np.ndarray, tes: Sequence[float], *, device: torch.device
+) -> np.ndarray:
+    """Magnitude²-weighted field through the origin [Hz], ``(x, y, z, t)``."""
+    te = torch.as_tensor(np.asarray(tes, dtype=np.float32), device=device)
+    out = np.zeros(unwrapped.shape[:3] + unwrapped.shape[4:], np.float32)
+    for i in range(unwrapped.shape[0]):
+        u = torch.from_numpy(np.ascontiguousarray(unwrapped[i])).to(device)
+        w = torch.from_numpy(np.ascontiguousarray(mag[i])).to(device) ** 2
+        t_ = te[None, None, :, None]
+        f = (w * u * t_).sum(2) / (w * t_ * t_).sum(2).clamp_min(1e-12)
+        out[i] = (f * (1000.0 / TWO_PI)).cpu().numpy()
+    return out

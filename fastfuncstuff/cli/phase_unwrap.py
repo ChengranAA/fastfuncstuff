@@ -89,6 +89,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "rest wrap only their residual about it. 'none' = anchor them directly.",
     )
     parser.add_argument(
+        "-keep_offset_drift",
+        action="store_true",
+        help="Multi-echo: keep the head-wide drift of the phase at TE 0. By default it is "
+        "fitted per volume (first-order spatial polynomial of the phase-vs-TE intercept) "
+        "and removed from every echo: a drifting receiver offset is constant across "
+        "echoes in radians, so in Hz it falls as 1/TE and biases the field map and any "
+        "TE-dependent estimate made from the phase.",
+    )
+    parser.add_argument(
         "-save_mask", default=None, metavar="FILE", help="Write the mask (2 core, 1 border)."
     )
     parser.add_argument(
@@ -203,6 +212,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     del phase
     assert res.unwrapped is not None
+    if ne >= 2 and not args.keep_offset_drift:
+        from fastfuncstuff.processing.phase_unwrap import field_from_unwrapped, remove_offset_drift
+
+        with spinner("Removing the drift of the phase at TE 0", enabled=verbose):
+            coef = remove_offset_drift(res.unwrapped, mag, tes, res.mask == 2, device=device)
+            res.field_hz = field_from_unwrapped(res.unwrapped, mag, tes, device=device)
+        if verbose:
+            print(f"  phase at TE 0: head-wide drift SD {coef[0].std():.3f} rad removed")
     if args.save_partition_shift is not None:
         from fastfuncstuff.processing.locomoco import resolve_pe_axis
         from fastfuncstuff.processing.shiftcorr import (

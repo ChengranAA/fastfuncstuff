@@ -199,3 +199,24 @@ def test_cli_partition_shift_needs_axis_and_echoes(tmp_path):
     assert main([*one, "-partition_axis", "IS", "-save_partition_shift", out]) == 1
     two = ["-phase", "a", "c", "-magnitude", "b", "d", "-echo_times", "5", "10"]
     assert main([*two, "-prefix", str(tmp_path / "o"), "-save_partition_shift", out]) == 1
+
+
+def test_remove_offset_drift_restores_the_field():
+    from fastfuncstuff.processing.phase_unwrap import field_from_unwrapped, remove_offset_drift
+
+    tes = [5.0, 12.0, 19.0]
+    ph, mag, field, head, _blob = _scene(tes)
+    drift = 0.4 * np.sin(np.linspace(0, 4, NT))  # rad, the same at every echo
+    x, _y, _z, _r = _head()
+    ph = np.angle(
+        np.exp(1j * (ph + (drift[None, None, None, :] * (1 + 0.3 * x[..., None]))[..., None, :]))
+    )
+    res = unwrap_timeseries(
+        ph.astype(np.float32), mag, tes, device=CPU, return_unwrapped=True, verbose=False
+    )
+    core = head & (res.mask == 2)
+    before = np.abs(res.field_hz - field)[core]
+    coef = remove_offset_drift(res.unwrapped, mag, tes, res.mask == 2, device=CPU)
+    after = np.abs(field_from_unwrapped(res.unwrapped, mag, tes, device=CPU) - field)[core]
+    assert np.corrcoef(coef[0], drift - drift.mean())[0, 1] > 0.99
+    assert np.median(after) < 0.3 * np.median(before)

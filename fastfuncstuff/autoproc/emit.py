@@ -3929,9 +3929,12 @@ def _stage_unwrap(plan: Plan) -> str:
         else ""
     )
     me_3d_note = ", and the per-echo partition shift + stretch for stage02" if opt.acq_3d else ""
+    me_done = ""
     if _medic_on(plan):
-        # the core/border mask MEDIC's SVD denoising of the field map needs
+        # the core/border mask MEDIC's SVD denoising of the field map needs; a work dir
+        # unwrapped before -medic lacks it, so it re-runs
         me_3d_args += f' -save_mask "{_me_unwrap_stem()}_mask.nii$FMT"'
+        me_done = ' && [ -f "${uwe}_mask.nii$FMT" ]'
 
     unwrap_opts = " ".join(_split_flags(config.DEFAULT_OPTS["unwrap"]))
     unwrap_opts = f" {unwrap_opts}" if unwrap_opts else ""
@@ -3986,7 +3989,7 @@ for k in "${{RUN_KEYS[@]}}"; do
     # Multi-echo: ONE call over every echo -- the echo ladder, the field map, the
     # removal of the head-wide drift of the phase at TE 0{me_3d_note}.
     uwe="{_me_unwrap_stem()}"
-    [ "$skip_unwrap" -eq 1 ] && [ -f "${{uwe}}_e1.nii$FMT" ] && continue
+    [ "$skip_unwrap" -eq 1 ] && [ -f "${{uwe}}_e1.nii$FMT" ]{me_done} && continue
     mags=(); phs=()
     for e in $(seq 1 "${{NECHO[$k]}}"); do
       esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"

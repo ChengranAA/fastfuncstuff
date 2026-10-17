@@ -310,9 +310,13 @@ def test_partition_shift_from_phase_returns_the_correction_apply_shift_needs():
     assert np.polyfit(w_true, w, 1)[0] == pytest.approx(1.0, abs=0.1)
     # a drifting receiver offset reads as a shift unless it is projected out too
     naive = partition_shift_from_phase(
-        unwrapped, mag, tes, mask, 2, device=torch.device("cpu"), offset_blind=False
+        unwrapped, mag, tes, mask, 2, device=torch.device("cpu"), offset="none"
     )
     assert np.abs(naive - w_true).std() > 3 * np.abs(w - w_true).std()
+    per_voxel = partition_shift_from_phase(
+        unwrapped, mag, tes, mask, 2, device=torch.device("cpu"), offset="voxel"
+    )
+    assert np.corrcoef(per_voxel, w_true)[0, 1] > 0.98
     table = shift_table_from_partition_shift(w, tes)
     assert table.shape == (n_t, 3)
     assert np.allclose(table[:, 2], w * tes[2] / tes[0])

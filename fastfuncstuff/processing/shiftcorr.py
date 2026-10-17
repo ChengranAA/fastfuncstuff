@@ -826,7 +826,7 @@ def partition_shift_from_phase(
     device: torch.device,
     dephase_cycles: float = 0.6,
     stretch: bool = False,
-    offset_blind: bool | None = None,
+    offset: str = "global",
 ) -> np.ndarray:
     """Per-volume partition shift at the FIRST echo [voxels], from unwrapped phase.
 
@@ -849,12 +849,20 @@ def partition_shift_from_phase(
     Same sign as :attr:`ShiftEstimate.applied`: :func:`shift_table_from_partition_shift`
     gives the correction to apply.
 
-    ``offset_blind`` (default: with 3+ echoes): also project out a change of the phase
-    at TE 0 (the receiver offset), which in Hz is ∝ 1/TE and otherwise reads as a
-    TE-dependent shift. In radians a field change is ∝ TE, an offset change is
-    constant and the shift's footprint is ∝ TE², so with both projected out the shift
-    is the quadratic term. Needed on runs whose offset drifts (one 3-echo run: 0.08
-    rad, vs 0.01 rad on the 5-echo run this was developed on).
+    ``offset``: how a change of the phase at TE 0 (the receiver offset) is kept out.
+    In Hz it is ∝ 1/TE, so the echo-constant term does not remove it and it otherwise
+    reads as a TE-dependent shift (one 3-echo run drifted 0.08 rad, the 5-echo run
+    this was developed on 0.01).
+
+    * ``"global"`` (default): a first-order spatial polynomial per volume, fitted
+      jointly with the shift. The drift is mostly head-wide, and its smooth shape is
+      told apart from the shift's footprint (which follows the field's texture) at the
+      cost of four numbers per volume.
+    * ``"voxel"``: a free offset per voxel and volume (3+ echoes; the shift is then the
+      quadratic term in TE). Costs one of the few degrees of freedom per voxel: with 3
+      echoes and a small shift it made the estimate markedly noisier (r with the
+      magnitude estimate 0.98 -> 0.54 on one run).
+    * ``"none"``: field term only.
 
     ``stretch``: also fit a linear change of the shift along the axis about the slab
     centre ``(n - 1) / 2`` (a breathing field's gradient changes at different rates
@@ -864,10 +872,10 @@ def partition_shift_from_phase(
     te = torch.as_tensor(np.asarray(tes, dtype=np.float32), device=device)
     if te.numel() < 2:
         raise ValueError("the echo-slope estimate needs at least two echoes")
-    if offset_blind is None:
-        offset_blind = te.numel() >= 3
-    if offset_blind and te.numel() < 3:
-        raise ValueError("an offset-blind estimate needs at least three echoes")
+    if offset not in ("none", "global", "voxel"):
+        raise ValueError(f"offset must be none/global/voxel, got {offset!r}")
+    if offset == "voxel" and te.numel() < 3:
+        raise ValueError("a per-voxel offset term needs at least three echoes")
     alpha = te / te[0]
     w = (mag.astype(np.float32, copy=False) ** 2).mean(-1) * (np.asarray(tes, np.float32) ** 2)
     # Temporal-mean field (noise-weighted over echoes) and its gradient along the axis.
@@ -875,7 +883,8 @@ def partition_shift_from_phase(
     fmean = (w * fbar).sum(-1) / np.maximum(w.sum(-1), 1e-12)
     g = np.gradient(fmean, axis=axis).astype(np.float32)
     use = mask & (np.abs(g) * float(np.max(tes)) * 1e-3 < dephase_cycles) & (np.abs(g) > 0)
-    n_basis = 2 if stretch else 1
+    n_shift = 2 if stretch else 1
+    n_basis = n_shift + (4 if offset == "global" else 0)
     num = torch.zeros(n_basis, unwrapped.shape[-1], dtype=torch.float64, device=device)
     den = torch.zeros(n_basis, n_basis, dtype=torch.float64, device=device)
     zc = (unwrapped.shape[axis] - 1) / 2.0
@@ -898,11 +907,19 @@ def partition_shift_from_phase(
         r = f - torch.from_numpy(flat_f[sel]).to(device)[..., None]
         wt = torch.from_numpy(flat_w[sel]).to(device)[..., None]  # V, e, 1
         gsel = torch.from_numpy(flat_g[sel]).to(device)
-        basis = [gsel]
+        cols = [alpha[None, :, None] * gsel[:, None, None]]  # V, e, 1
         if stretch:
-            basis.append(gsel * torch.from_numpy(zpos[sel]).to(device))
+            zsel = torch.from_numpy(zpos[sel]).to(device)
+            cols.append(alpha[None, :, None] * (gsel * zsel)[:, None, None])
+        if offset == "global":
+            ijk = np.stack(np.unravel_index(sel, unwrapped.shape[:3]), 1).astype(np.float32)
+            xyz = torch.from_numpy(ijk / np.maximum(np.array(unwrapped.shape[:3]) - 1, 1) * 2 - 1)
+            xyz = xyz.to(device)
+            inv_te = (te[0] / te)[None, :, None]
+            cols.append(inv_te.expand(sel.size, -1, 1))
+            cols += [inv_te * xyz[:, k, None, None] for k in range(3)]
 
-        if offset_blind:
+        if offset == "voxel":
             # columns [1, 1/TE] in Hz: field change and receiver-offset change
             nc = torch.stack([torch.ones_like(te), te[0] / te], 1)  # e, 2
             ntwn = torch.einsum("ec,vex,ed->vcd", nc, wt, nc)  # V, 2, 2
@@ -918,12 +935,12 @@ def partition_shift_from_phase(
                 return x - (wt * x).sum(1, keepdim=True) / wt.sum(1, keepdim=True).clamp_min(1e-12)
 
         Rp = proj(r)
-        Ap = [proj(alpha[None, :, None] * b[:, None, None]) for b in basis]
+        Ap = [proj(c) for c in cols]
         for i in range(n_basis):
             num[i] += (wt * Ap[i] * Rp).sum((0, 1)).double()
             for j in range(n_basis):
                 den[i, j] += (wt * Ap[i] * Ap[j]).sum().double()
-    coef = torch.linalg.solve(den, num).float().cpu().numpy()  # (n_basis, T)
+    coef = torch.linalg.solve(den, num).float().cpu().numpy()[:n_shift]  # (n_shift, T)
     coef = coef - coef.mean(1, keepdims=True)
     return coef.T if stretch else coef[0]
 

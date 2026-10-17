@@ -219,6 +219,26 @@ def parse_args(
         "multiple echoes each output is prefixed with eN_ (e1_, e2_, ...).",
     )
     io_group.add_argument(
+        "-phase",
+        nargs="+",
+        default=None,
+        metavar="PHASE",
+        help="UNWRAPPED phase, one series per -input echo (same grid, same order). Motion is"
+        " still estimated from the magnitude alone; each phase is resampled with exactly the"
+        " matrices its magnitude echo gets (with -me_3depi, including that echo's partition"
+        " shift -- it moves the complex image) and written next to it as phase_{output}"
+        " (phase_eN_{prefix} for multi-echo). Wrapped phase must never be interpolated, so a"
+        " wrapped or raw-scanner input is refused before the registration runs. Needs"
+        " -prefix; -phase_units hz also needs -echo_times (the wrap period is 1000/TE Hz).",
+    )
+    io_group.add_argument(
+        "-phase_units",
+        choices=("hz", "rad"),
+        default="hz",
+        help="[-phase] hz (a field map, e.g. ffs_medic -save_unwrapped_phase) or rad"
+        " (unwrapped radians, e.g. ROMEO; TE-free check, period 2 pi).",
+    )
+    io_group.add_argument(
         "-base",
         default="0",
         help="Base volume index (default: 0), or path to external 3D file. "
@@ -1249,6 +1269,7 @@ def _validate_run_args(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     _validate_shiftcorr_args(args)
+    _validate_phase_args(args)
     _validate_censor_args(args)
 
     # A bare -save_mean/-save_max/-save_min/-save_weight derives its path from
@@ -1318,6 +1339,9 @@ def _validate_shiftcorr_args(args: argparse.Namespace) -> None:
     }
     if not args.me_3depi:
         for name, flag in dependent.items():
+            # -phase in Hz reads its wrap period off -echo_times.
+            if name == "echo_times" and getattr(args, "phase", None):
+                continue
             if getattr(args, name, None) is not None:
                 print(f"Error: {flag} only applies with -me_3depi.", file=sys.stderr)
                 sys.exit(1)
@@ -1352,6 +1376,93 @@ def _validate_shiftcorr_args(args: argparse.Namespace) -> None:
     if args.shift_max <= 0:
         print("Error: -shift_max must be positive.", file=sys.stderr)
         sys.exit(1)
+
+
+def _validate_phase_args(args: argparse.Namespace) -> None:
+    """Validate -phase: one unwrapped series per echo, somewhere to write it, a wrap period."""
+    if not args.phase:
+        return
+    n_echoes = len(args.input_file or [])
+    problems = []
+    if len(args.phase) != n_echoes:
+        problems.append(f"-phase has {len(args.phase)} series for {n_echoes} -input echo(es).")
+    if args.prefix is None:
+        problems.append("-phase writes phase_{prefix}; give -prefix.")
+    if args.phase_units == "hz" and (args.echo_times is None or len(args.echo_times) != n_echoes):
+        problems.append(
+            "-phase_units hz needs -echo_times, one TE (ms) per echo: the wrap check needs "
+            "each echo's period (1000/TE Hz). Or pass radians with -phase_units rad."
+        )
+    if args.tpattern is not None:
+        problems.append(
+            "-phase with -tpattern is not wired: the space-time resample interpolates in time "
+            "too, and the phase must get exactly the magnitude's resample."
+        )
+    for msg in problems:
+        print(f"Error: {msg}", file=sys.stderr)
+    if problems:
+        sys.exit(1)
+
+
+def _check_phase_inputs(args, input_files: list[str], verb: int) -> None:
+    """Refuse wrapped / raw-scanner phase BEFORE the registration is paid for."""
+    from fastfuncstuff.processing.mask import automask
+    from fastfuncstuff.processing.phase_input import phase_input_problem, wrap_period
+
+    def mid_frame(path):
+        data, _ = _load_trimmed(path, args.skip_first, args.skip_last, 0)
+        vol = data[data.shape[0] // 2].float().cpu().numpy()
+        return vol, tuple(data.shape)
+
+    mag, mag_shape = mid_frame(input_files[0])
+    brain = automask(torch.from_numpy(mag)).numpy().astype(bool)
+    # The decisive echoes are the shortest (smoothness) and the longest (range); a
+    # middle echo can only fail the shape check, which the resample loop repeats.
+    which = sorted({0, len(args.phase) - 1})
+    vols, periods = [], []
+    for i in which:
+        vol, shape = mid_frame(args.phase[i])
+        if shape != mag_shape:
+            print(
+                f"Error: -phase {args.phase[i]} is {shape}, -input is {mag_shape}.", file=sys.stderr
+            )
+            sys.exit(1)
+        vols.append(vol)
+        te = args.echo_times[i] if args.echo_times else None
+        periods.append(wrap_period(args.phase_units, te))
+    problem = phase_input_problem(vols, periods, brain)
+    if problem:
+        print(
+            f"Error: -phase: {problem} Unwrap first (ffs_medic -save_unwrapped_phase; ROMEO for "
+            "a single echo) and check -phase_units.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if verb >= 1:
+        print(
+            f"  Phase: {len(args.phase)} unwrapped series ({args.phase_units}), wrap check passed"
+        )
+
+
+def _resample_phase(args, i, n_echoes, matrices, config, device, base_copy_idx, ref_shape, verb):
+    """Resample -phase echo ``i`` with the magnitude's exact matrices and write it."""
+    path = args.phase[i]
+    ph, hdr = _load_trimmed(path, args.skip_first, args.skip_last, verb)
+    if tuple(ph.shape) != tuple(ref_shape):
+        print(
+            f"Error: -phase {path} is {tuple(ph.shape)}, its magnitude is {tuple(ref_shape)}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if verb >= 1:
+        print(f"Resampling phase {i + 1} with {config.final_interp}: {path}")
+    aligned, _ = resample_timeseries(
+        ph, matrices, config, device, base_copy_idx=base_copy_idx, disable_pbar=verb == 0
+    )
+    tag = f"phase_e{i + 1}_" if n_echoes > 1 else "phase_"
+    out_path = parse_prefix(_sibling(args.prefix, tag)).as_file()
+    with spinner(f"Writing {out_path}", enabled=verb >= 1):
+        save_image(aligned, out_path, header_info=hdr)
 
 
 def _estimate_shiftcorr(args, input_files: list[str], device: torch.device, verb: int):
@@ -1447,6 +1558,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device, verb: int) -> 
         )
         sys.exit(1)
     reg_mean, reg_index = _parse_reg_echo(args.reg_echo, n_echoes)
+    if args.phase:
+        _check_phase_inputs(args, input_files, verb)
 
     t0 = time.time()
     if n_echoes == 1:
@@ -1668,6 +1781,19 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
         base_path = parse_prefix(args.prefix).as_file()
         _write_qc(args, result.aligned, data, base_path, header_info, verb)
 
+    if args.phase:
+        _resample_phase(
+            args,
+            0,
+            1,
+            result.matrices_vox,
+            config,
+            device,
+            base_index if base_vol is None else -1,
+            data.shape,
+            verb,
+        )
+
     _save_estimation_outputs(args, result, header_info, verb)
     _save_censor_outputs(args, result, data, input_file, device, verb)
     _save_motsim(
@@ -1820,6 +1946,13 @@ def _run_multi_echo(
             if want_qc:
                 base_path = parse_prefix(_sibling(args.prefix, f"e{echo_num}_")).as_file()
                 _write_qc(args, aligned, echo, base_path, echo_hdr, verb)
+
+            if args.phase:
+                # This echo's matrices, partition shift folded in: the shift moves the
+                # complex image, so the phase must take the identical resample.
+                _resample_phase(
+                    args, i, n_echoes, matrices, config, device, base_copy_idx, echo.shape, verb
+                )
 
             del echo, aligned
             if device.type == "cuda":

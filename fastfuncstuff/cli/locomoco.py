@@ -665,6 +665,18 @@ def create_parser() -> argparse.ArgumentParser:
         " scanner phase is refused by a wrap check.",
     )
     mp.add_argument(
+        "-phase_hpf",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="[-phase] Gaussian sigma (mm) of a mask-aware spatial high-pass applied to the"
+        " phase inside its support before the solve: removes the smooth field fluctuation,"
+        " keeps tissue-scale texture. Default: 8 mm for a SINGLE echo, where it is required"
+        " (no TE law, so nothing else stops a field change reading as shift; not field-blind"
+        " for structured field changes, e.g. at the sinuses), off with several echoes (the"
+        " per-voxel field term already handles it; set it to add both).",
+    )
+    mp.add_argument(
         "-phase_mag_nuisance",
         choices=("auto", "none", "s0", "s0r2"),
         default="auto",
@@ -4042,71 +4054,111 @@ def _notch_estimation_data(datas, args, tr):
 
 def _magphase_arg_error(args, *, dual: bool, slicewise: bool) -> str | None:
     """Why the -phase (mag+phase) solve cannot run with these flags, or None."""
-    if len(args.phase) != len(args.input):
-        return f"{len(args.phase)} phase series for {len(args.input)} magnitude -input series."
-    if len(args.input) < 2:
-        return "needs 2+ echoes (the TE law is what separates field change from shift)."
+    n = len(args.input) if isinstance(args.input, list) else 1
+    if len(args.phase) != n:
+        return f"{len(args.phase)} phase series for {n} magnitude -input series."
+    if not args.echo_times or len(args.echo_times) != n:
+        return (
+            "needs -echo_times with one TE (ms) per echo: the wrap check needs each echo's "
+            "wrap period, and -phase_units rad needs it to convert to Hz."
+        )
     if dual or slicewise:
-        return "is the 3-D partition solve only (-me_3depi with one encode axis, -pe_dir2)."
+        return "is a 3-D solve along ONE encode axis (-is_3dacq / -me_3depi, a single -pe_dir)."
     clashes = [
         (args.backend != "flow", "-backend " + args.backend),
         (args.me_interecho, "-me_interecho"),
         (args.me_flat_scaling, "-me_flat_scaling"),
         (args.me_estimate_from is not None, "-me_estimate_from"),
         (args.final_qwarp, "-final_qwarp"),
+        (args.raw_input is not None or args.moco_matrix is not None, "rotation-aware mode"),
         (_detask_pre_estimation(args), "-detask " + str(_detask_mode_name(args))),
     ]
     bad = [name for hit, name in clashes if hit]
     if bad:
         return (
-            f"not combined with {', '.join(bad)} yet (experimental: it is its own fixed-TE-law "
-            "flow solve with -backend flow)."
+            f"not combined with {', '.join(bad)} yet (experimental: it is its own flow solve, "
+            "with the TE law fixed when there are several echoes)."
         )
-    if _magphase_mag_nuisance(args) == "s0r2" and len(args.input) < 3:
+    nuis = _magphase_mag_nuisance(args)
+    if n == 1 and nuis != "none":
+        return "a single echo has no per-voxel magnitude nuisance to fit; -phase_mag_nuisance none."
+    if nuis == "s0r2" and n < 3:
         return "-phase_mag_nuisance s0r2 fits two terms per voxel and needs 3+ echoes."
+    if n == 1 and args.phase_hpf is not None and args.phase_hpf <= 0:
+        return (
+            "a single echo needs -phase_hpf > 0: without the TE law the smooth field "
+            "fluctuation is indistinguishable from displacement."
+        )
     return None
 
 
 def _magphase_mag_nuisance(args) -> str:
     if args.phase_mag_nuisance != "auto":
         return args.phase_mag_nuisance
-    return "s0r2" if len(args.input) >= 3 else "none"
+    n = len(args.input) if isinstance(args.input, list) else 1
+    return "s0r2" if n >= 3 else "none"
+
+
+def _magphase_hpf_vox(args, affine, n_echoes: int) -> float:
+    """-phase_hpf in voxels: auto = 8 mm for a single echo, off with several."""
+    import numpy as np
+
+    mm = args.phase_hpf if args.phase_hpf is not None else (8.0 if n_echoes == 1 else 0.0)
+    return mm / float(np.mean(np.linalg.norm(np.asarray(affine)[:3, :3], axis=0)))
 
 
 def _load_magphase(args, datas) -> list:
-    """Load -phase as per-echo Hz, refusing anything that is not unwrapped and co-registered."""
+    """-phase as per-echo arrays in INPUT units, refusing anything that is not an unwrapped
+    field co-registered with the magnitude. Convert with :func:`_magphase_hz`."""
     import numpy as np
     import torch
 
     from fastfuncstuff.cli_utils import spinner
     from fastfuncstuff.io.afni import load_nifti
-    from fastfuncstuff.processing.locomoco_magphase import phase_input_problem, phase_to_hz
     from fastfuncstuff.processing.mask import automask
+    from fastfuncstuff.processing.phase_input import phase_input_problem, wrap_period
 
     out = []
-    for j, (path, te) in enumerate(zip(args.phase, args.echo_times, strict=True)):
+    for j, path in enumerate(args.phase):
         with spinner(f"Loading {Path(path).name}"):
             ph = np.asarray(load_nifti(path).get_fdata(dtype=np.float32))
         if ph.shape != datas[j].shape:
             raise ValueError(f"{path} is {ph.shape}, its magnitude is {datas[j].shape}.")
-        out.append(phase_to_hz(ph, te, args.phase_units))
+        out.append(ph)
     mid = datas[0].shape[3] // 2
     vol = torch.from_numpy(np.ascontiguousarray(datas[0][..., mid].transpose(2, 1, 0)))
     brain = automask(vol.float()).numpy().transpose(2, 1, 0).astype(bool)
-    problem = phase_input_problem([hz[..., mid] for hz in out], list(args.echo_times), brain)
+    periods = [wrap_period(args.phase_units, te) for te in args.echo_times]
+    problem = phase_input_problem([p[..., mid] for p in out], periods, brain)
     if problem:
         raise ValueError(
-            f"{problem} Unwrap first (ffs_medic -save_unwrapped_phase) and check -phase_units."
+            f"{problem} Unwrap first (ffs_medic -save_unwrapped_phase, or ROMEO for a single "
+            "echo) and check -phase_units."
         )
     return out
 
 
-def _write_magphase_outputs(flow, args, pe_axis, stem, ext, affine, out_tr, device) -> None:
-    """Corrected phase (input units, each echo by its own alpha_e*w) and the phase share."""
+def _magphase_hz(args, phases) -> list:
+    from fastfuncstuff.processing.phase_input import phase_to_hz
+
+    return [
+        phase_to_hz(p, te, args.phase_units) for p, te in zip(phases, args.echo_times, strict=True)
+    ]
+
+
+def _write_magphase_outputs(
+    flow, args, fields, phases, pe_axis, stem, ext, affine, out_tr, device, *, single=False
+) -> None:
+    """Corrected phase (input units) and the per-voxel phase share of the information.
+
+    ``fields`` are each echo's FINAL field (after any -detask change), so the phase moves
+    exactly as the written magnitude did. ``phases`` are the input-unit arrays the run
+    held -- the injected copy under -inject_jitter, the file as given otherwise.
+    """
     import numpy as np
 
     from fastfuncstuff.cli_utils import spinner
-    from fastfuncstuff.io.afni import load_nifti, save_nifti
+    from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.processing.locomoco import _resample_once
 
     share_path = f"{stem}_phase_share{ext}"
@@ -4115,20 +4167,19 @@ def _write_magphase_outputs(flow, args, pe_axis, stem, ext, affine, out_tr, devi
         save_nifti(share, share_path, affine=affine)
     if args.no_corrected:
         return
-    for j, path in enumerate(args.phase):
-        # Resampled from the file as given (input units), never from the Hz copy the
-        # solve used, so the written series is one resample of what the user passed.
-        ph = np.asarray(load_nifti(path).get_fdata(dtype=np.float32))
+    for j, (ph, field) in enumerate(zip(phases, fields, strict=True)):
         corrected = _resample_once(
             ph,
-            [flow.alpha[j] * flow.w_field],
+            [field],
             [pe_axis],
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             device=device,
             desc=f"resample phase e{j + 1}",
         )
-        out_path = f"{stem}_e{j + 1}_phase_locomoco{ext}"
+        out_path = (
+            f"{stem}_phase_locomoco{ext}" if single else f"{stem}_e{j + 1}_phase_locomoco{ext}"
+        )
         with spinner(f"Writing {Path(out_path).name}"):
             save_nifti(corrected.numpy(), out_path, affine=affine, tr=out_tr)
 
@@ -4244,13 +4295,14 @@ def _run_multiecho(
         if args.final_qwarp or args.backend == "qwarp":
             print(_qwarp_detask_note(args))
 
-    phases_hz = None
+    phases_in = phases_hz = None
     if args.phase:
         try:
-            phases_hz = _load_magphase(args, datas)
+            phases_in = _load_magphase(args, datas)
         except ValueError as exc:
             print(f"❌ -phase: {exc}", file=sys.stderr)
             return 2
+        phases_hz = _magphase_hz(args, phases_in)
 
     smooth_sigma = 0.0
     hpf_sigma = 0.0
@@ -4459,10 +4511,12 @@ def _run_multiecho(
             n_iters=args.iters,
             refine_rounds=args.refine,
             mag_nuisance=_magphase_mag_nuisance(args),
+            phase_hpf_sigma=_magphase_hpf_vox(args, affine, len(datas)),
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             device=device,
         )
+        del phases_hz
         result = magphase_me_result(
             datas,
             magphase_flow,
@@ -4842,7 +4896,18 @@ def _run_multiecho(
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
     if magphase_flow is not None:
-        _write_magphase_outputs(magphase_flow, args, pe_axis, stem, ext, affine, out_tr, device)
+        _write_magphase_outputs(
+            magphase_flow,
+            args,
+            [res.pe_displacement() for res in result.per_echo],
+            phases_in,
+            pe_axis,
+            stem,
+            ext,
+            affine,
+            out_tr,
+            device,
+        )
 
     print_cli_footer("ffs_locomoco")
     return 0
@@ -5149,13 +5214,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     if args.save_echo_corr and not me_mode:
         print("   ⚠️  -save_echo_corr needs several echoes; skipped on a single-echo run.")
     if args.phase and not me_mode:
-        print(
-            "❌ -phase needs multi-echo input (-me_3depi, 2+ echoes). With one echo a field "
-            "change and a displacement both just change the phase, and nothing per voxel "
-            "tells them apart -- the separation that makes the phase useful is the TE law.",
-            file=sys.stderr,
-        )
-        return 2
+        err = _magphase_arg_error(args, dual=dual, slicewise=not args.is_3dacq)
+        if err:
+            print(f"❌ -phase: {err}", file=sys.stderr)
+            return 2
     if me_mode:
         return _run_multiecho(
             args,
@@ -5214,6 +5276,14 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # pipeline -- see ../fmri_wiki/log.md 2026-09-03.
     out_tr = float(img.header.get_zooms()[3])
 
+    phases_in = None
+    if args.phase:
+        try:
+            phases_in = _load_magphase(args, [data])
+        except ValueError as exc:
+            print(f"❌ -phase: {exc}", file=sys.stderr)
+            return 2
+
     # -inject_jitter: put a KNOWN displacement in before anything else sees the series, so
     # the estimator, the refine loop and the correction are all working on the injected
     # data exactly as they would on real motion.
@@ -5242,6 +5312,20 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         )
         print(f"   💉 injected jitter: {axis_txt}, seed {args.inject_seed}")
         print("      the corrected series will contain the injection — inspection only.")
+        if phases_in is not None:
+            # A displacement moves the complex image, so the phase gets the same field;
+            # injecting the magnitude alone would test a physically impossible scene.
+            phases_in = [
+                apply_jitter(
+                    phases_in[0],
+                    injected_fields,
+                    pe_axes,
+                    device,
+                    warp_interp=args.warp_interp,
+                    warp_radius=args.warp_radius,
+                )
+            ]
+            print("      (injected into the phase too: one displacement of the complex image)")
 
     # -detask filter/fit: the estimator sees a task-cut copy, `data` stays raw so the
     # corrected series can be re-derived from it after the solve.
@@ -5395,7 +5479,39 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # What qwarp registers: the estimator's task-cut copy unless -qwarp_uncut. The
     # output is always resampled from `data`.
     qwarp_data = est_data if _qwarp_sees_cut(args) else data
-    if rotaware:
+    magphase_flow = None
+    if phases_in is not None:
+        from fastfuncstuff.processing.locomoco_magphase import (
+            estimate_partition_flow_magphase,
+            magphase_me_result,
+        )
+
+        magphase_flow = estimate_partition_flow_magphase(
+            [data],
+            _magphase_hz(args, phases_in),
+            args.echo_times,
+            pe_axis,
+            window_sigma=float(args.window[0]),
+            n_iters=args.iters,
+            refine_rounds=args.refine,
+            mag_nuisance="none",
+            phase_hpf_sigma=_magphase_hpf_vox(args, affine, 1),
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
+            device=device,
+        )
+        result = magphase_me_result(
+            [data],
+            magphase_flow,
+            args.echo_times,
+            pe_axis,
+            slice_axis,
+            want_corrected=not args.no_corrected,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
+            device=device,
+        ).per_echo[0]
+    elif rotaware:
         if args.raw_input is None or args.moco_matrix is None:
             print(
                 "❌ rotation-aware mode needs BOTH -raw_input and -moco_matrix.",
@@ -5840,6 +5956,21 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         movie_path = f"{stem}_flow.{fmt}"
         with spinner(f"Writing {Path(movie_path).name}"):
             write_movie(frames, movie_path, args.fps, fmt)
+
+    if magphase_flow is not None:
+        _write_magphase_outputs(
+            magphase_flow,
+            args,
+            [result.pe_displacement()],
+            phases_in,
+            pe_axis,
+            stem,
+            ext,
+            affine,
+            out_tr,
+            device,
+            single=True,
+        )
 
     print_cli_footer("ffs_locomoco")
     return 0

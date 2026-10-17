@@ -9,9 +9,12 @@ from fastfuncstuff.processing.locomoco import _shift3d_axis
 from fastfuncstuff.processing.locomoco_magphase import (
     estimate_partition_flow_magphase,
     nuisance_columns,
+)
+from fastfuncstuff.processing.phase_input import (
     phase_input_problem,
     phase_to_hz,
     phase_wrap_fraction,
+    wrap_period,
 )
 
 CPU = torch.device("cpu")
@@ -28,7 +31,7 @@ def _smooth(rng, sigma, scale):
     return (v / v.std() * scale).astype(np.float32)
 
 
-def _scene(seed=0, field_noise=0.0):
+def _scene(seed=0, field_noise=0.0, field_noise_sigma=1.5, mag_noise=2.0):
     """Head blob with texture; known smooth TE-scaled shift w_true in both channels.
 
     ``field_noise`` adds an echo-constant (in Hz) field change per voxel and frame,
@@ -42,7 +45,11 @@ def _scene(seed=0, field_noise=0.0):
     field = _smooth(rng, 2.0, 15.0)  # Hz, static background + tissue texture
     w_true = np.stack([_smooth(rng, 4.0, 0.04) for _ in range(NT)], -1)  # x alpha_4 ~ 0.18 vox
     alpha = np.array(TE) / TE[0]
-    fn = np.stack([_smooth(rng, 1.5, field_noise) for _ in range(NT)], -1) if field_noise else 0.0
+    fn = (
+        np.stack([_smooth(rng, field_noise_sigma, field_noise) for _ in range(NT)], -1)
+        if field_noise
+        else 0.0
+    )
     if field_noise:
         fn = fn - fn.mean(-1, keepdims=True)
     mags, phs = [], []
@@ -55,7 +62,7 @@ def _scene(seed=0, field_noise=0.0):
             d = torch.from_numpy((-a * w_true[..., t]).astype(np.float32))[None]
             m4[..., t] = _shift3d_axis(m_tpl[None], d, PE, mode="bicubic")[0].numpy()
             p4[..., t] = _shift3d_axis(p_tpl[None], d, PE, mode="bicubic")[0].numpy()
-        m4 += rng.standard_normal(m4.shape).astype(np.float32) * 2.0
+        m4 += rng.standard_normal(m4.shape).astype(np.float32) * mag_noise
         p4 += (rng.standard_normal(p4.shape).astype(np.float32) * 0.3 + fn) * (head[..., None] > 0)
         mags.append(m4)
         phs.append(p4)
@@ -140,16 +147,24 @@ def test_wrap_guard_flags_wrapped_phase():
     te = 10.0
     period = 1000.0 / te
     wrapped = (field + period / 2) % period - period / 2
-    assert phase_wrap_fraction(field, te, mask) < 1e-3
-    assert phase_wrap_fraction(wrapped, te, mask) > 1e-2
+    assert phase_wrap_fraction(field, period, mask) < 1e-3
+    assert phase_wrap_fraction(wrapped, period, mask) > 1e-2
     # The run-level guard: the longest echo's wrapped series lives inside one period.
-    tes = [te, 3 * te]
+    periods = [wrap_period("hz", te), wrap_period("hz", 3 * te)]
     late = field * 1.0
     late_wrapped = (late + period / 6) % (period / 3) - period / 6
-    assert phase_input_problem([field, late], tes, mask) is None
-    assert "WRAPPED" in phase_input_problem([field, late_wrapped], tes, mask)
+    assert phase_input_problem([field, late], periods, mask) is None
+    assert "WRAPPED" in phase_input_problem([field, late_wrapped], periods, mask)
     raw = np.random.default_rng(2).uniform(-4096, 4096, SHAPE).astype(np.float32)
-    assert "smooth" in phase_input_problem([raw, late], tes, mask)
+    assert "smooth" in phase_input_problem([raw, late], periods, mask)
+    # Single echo: both checks on the one echo; radians are TE-free (period 2*pi).
+    assert phase_input_problem([field], periods[:1], mask) is None
+    rad = (field * 2 * np.pi * te * 1e-3).astype(np.float32)
+    assert phase_input_problem([rad], [wrap_period("rad", None)], mask) is None
+    rad_wrapped = np.angle(np.exp(1j * rad)).astype(np.float32)
+    assert "WRAPPED" in phase_input_problem([rad_wrapped], [wrap_period("rad", None)], mask)
+    with pytest.raises(ValueError, match="echo time"):
+        wrap_period("hz", None)
 
 
 def test_phase_units_and_nuisance_columns():
@@ -174,6 +189,19 @@ def _cli_args(*extra):
     return args
 
 
+def test_cli_phase_validation_single_echo():
+    from fastfuncstuff.cli.locomoco import _magphase_arg_error, _magphase_mag_nuisance, _parse
+
+    args = _parse(["-input", "a.nii", "-pe_dir2", "IS", "-phase", "p1", "-echo_times", "30"])
+    for name in ("detask_widen", "detask_fit"):
+        if not hasattr(args, name):
+            setattr(args, name, None)
+    assert _magphase_mag_nuisance(args) == "none"
+    assert _magphase_arg_error(args, dual=False, slicewise=False) is None
+    args.echo_times = None
+    assert "-echo_times" in _magphase_arg_error(args, dual=False, slicewise=False)
+
+
 def test_cli_phase_validation():
     from fastfuncstuff.cli.locomoco import _magphase_arg_error, _magphase_mag_nuisance
 
@@ -184,4 +212,65 @@ def test_cli_phase_validation():
     assert "2 phase series for 3" in _magphase_arg_error(short, dual=False, slicewise=False)
     flat = _cli_args("-phase", "p1", "p2", "p3", "-me_flat_scaling")
     assert "-me_flat_scaling" in _magphase_arg_error(flat, dual=False, slicewise=False)
-    assert "3-D partition" in _magphase_arg_error(ok, dual=True, slicewise=False)
+    assert "ONE encode axis" in _magphase_arg_error(ok, dual=True, slicewise=False)
+
+
+def test_single_echo_highpass_recovers_shift_under_smooth_field_drift():
+    # One echo: no TE law, so the phase gets the masked high-pass instead. A large smooth
+    # field drift (σ 6 vox, ~6x the shift's phase footprint) must not read as shift.
+    mags, phs, w_true, head = _scene(field_noise=6.0, field_noise_sigma=6.0)
+    run = dict(window_sigma=2.0, n_iters=4, warp_interp="bicubic", device=CPU, verbose=False)
+    hp = estimate_partition_flow_magphase(
+        mags[-1:],
+        phs[-1:],
+        TE[-1:],
+        PE,
+        mag_nuisance="none",
+        phase_hpf_sigma=3.0,
+        refine_rounds=1,
+        **run,
+    )
+    # Recovery is of echo 4's own shift, alpha 1 when it is the only echo.
+    alpha = TE[-1] / TE[0]
+    assert _recovery_r(hp, w_true * alpha, head) > 0.85
+    with pytest.raises(ValueError, match="phase_hpf_sigma"):
+        estimate_partition_flow_magphase(
+            mags[-1:], phs[-1:], TE[-1:], PE, mag_nuisance="none", **run
+        )
+    with pytest.raises(ValueError, match="nuisance"):
+        estimate_partition_flow_magphase(
+            mags[-1:], phs[-1:], TE[-1:], PE, mag_nuisance="s0", phase_hpf_sigma=3.0, **run
+        )
+
+
+def test_single_echo_highpass_rescues_weak_magnitude(monkeypatch):
+    # Where the magnitude is weak the phase must carry the estimate, and a smooth field
+    # drift then has to be high-passed out of it. (With strong magnitude the noise weights
+    # already down-weight a drifting phase, so the high-pass matters little there.)
+    import fastfuncstuff.processing.locomoco_magphase as lm
+
+    mags, phs, w_true, head = _scene(field_noise=6.0, field_noise_sigma=6.0, mag_noise=30.0)
+    run = dict(
+        window_sigma=2.0,
+        n_iters=4,
+        warp_interp="bicubic",
+        device=CPU,
+        verbose=False,
+        mag_nuisance="none",
+        phase_hpf_sigma=3.0,
+        refine_rounds=1,
+    )
+    alpha = TE[-1] / TE[0]
+    with_hp = _recovery_r(
+        estimate_partition_flow_magphase(mags[-1:], phs[-1:], TE[-1:], PE, **run),
+        w_true * alpha,
+        head,
+    )
+    monkeypatch.setattr(lm, "_masked_highpass", lambda vols, *a, **k: vols)
+    no_hp = _recovery_r(
+        estimate_partition_flow_magphase(mags[-1:], phs[-1:], TE[-1:], PE, **run),
+        w_true * alpha,
+        head,
+    )
+    assert with_hp > 0.6, with_hp
+    assert no_hp < with_hp - 0.2, (no_hp, with_hp)

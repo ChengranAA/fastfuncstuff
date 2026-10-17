@@ -21,9 +21,13 @@ the brain edge and where the I/S field gradient is steep, and applying it to the
 there made the phase worse -- i.e. it was not a displacement of the image.
 
 The phase must be UNWRAPPED and resampled with exactly the transforms the magnitude got
-(one resample, no wrapped values ever interpolated); :func:`phase_wrap_fraction` is the
-guard. Single-echo phase cannot separate a field change from a displacement, so the
-estimator requires two or more echoes.
+(one resample, no wrapped values ever interpolated); :mod:`.phase_input` is the guard.
+
+Single echo: nothing per voxel separates a field change from a displacement, so the
+phase instead gets a mask-aware spatial high-pass (``phase_hpf_sigma``), which removes
+the smooth field fluctuation and keeps tissue-scale texture. Not field-blind -- a field
+change with structure at the texture scale still reads as shift -- but on the 7T pilot
+the high-passed phase recovered injected shifts without bias (slope ~1.0).
 """
 
 from __future__ import annotations
@@ -44,65 +48,6 @@ class MagPhaseFlow:
     phase_share: torch.Tensor  # (nx,ny,nz) fraction of the pooled information from phase
     phase_valid: torch.Tensor  # (nx,ny,nz) bool, where phase entered the solve
     brain: torch.Tensor  # (nx,ny,nz) bool, the voxels whose observations were used
-
-
-def phase_to_hz(phase: np.ndarray, te_ms: float, units: str) -> np.ndarray:
-    """Unwrapped phase in ``units`` ('hz' or 'rad') as a field in Hz."""
-    if units == "hz":
-        return phase.astype(np.float32, copy=False)
-    if units == "rad":
-        return (phase / (2.0 * np.pi * te_ms * 1e-3)).astype(np.float32)
-    raise ValueError(f"unknown phase units {units!r} (hz or rad)")
-
-
-def phase_wrap_fraction(hz_vol: np.ndarray, te_ms: float, mask: np.ndarray) -> float:
-    """Fraction of in-mask neighbour steps larger than half a wrap period (``1000/TE`` Hz).
-
-    Only meaningful at good SNR: a late echo's unwrapped field is noisy enough that 10-20%
-    of its steps exceed half of its small period, wrapped or not (measured, 7T, TE 59 ms).
-    """
-    half = 0.5 * 1000.0 / te_ms
-    n_big = n_all = 0
-    for ax in range(3):
-        d = np.abs(np.diff(hz_vol, axis=ax))
-        both = np.logical_and(
-            np.take(mask, range(mask.shape[ax] - 1), axis=ax),
-            np.take(mask, range(1, mask.shape[ax]), axis=ax),
-        )
-        n_big += int((d[both] > half).sum())
-        n_all += int(both.sum())
-    return n_big / max(n_all, 1)
-
-
-def phase_input_problem(
-    hz_vols: list[np.ndarray], tes: list[float], brain: np.ndarray
-) -> str | None:
-    """Why one frame per echo of ``-phase`` (in Hz) is not an unwrapped field, or None.
-
-    Two checks, each on the echo where it is decisive:
-
-    * the LONGEST echo has the smallest wrap period. A wrapped series lives inside one
-      period, while a real field spans several there (tens of Hz across a brain at any
-      field strength vs 1000/TE_last). Radians passed as Hz land here too.
-    * the SHORTEST echo has the best SNR, so an unwrapped field is smooth there; raw
-      scanner units (e.g. Siemens +-4096) step by more than half a period almost
-      everywhere (64% measured vs 0.5% for the unwrapped field).
-    """
-    last, te_last = hz_vols[-1][brain], tes[-1]
-    lo, hi = np.percentile(last, [0.5, 99.5])
-    if hi - lo <= 1.05 * 1000.0 / te_last:
-        return (
-            f"echo {len(tes)} spans only {hi - lo:.1f} Hz inside the brain, one wrap period at "
-            f"TE {te_last:g} ms is {1000.0 / te_last:.1f} Hz: it looks WRAPPED (or radians "
-            "passed as Hz)."
-        )
-    frac = phase_wrap_fraction(hz_vols[0], tes[0], brain)
-    if frac > 0.1:
-        return (
-            f"echo 1 is not a smooth field: {100 * frac:.0f}% of in-brain neighbour steps "
-            "exceed half a wrap period. Raw scanner phase, or the wrong -phase_units?"
-        )
-    return None
 
 
 def nuisance_columns(kind: str, te: torch.Tensor) -> torch.Tensor:
@@ -152,6 +97,29 @@ def _weighted_design(
     return mx, (x * mx).sum(0)
 
 
+def _masked_highpass(
+    vols: list[np.ndarray], mask: np.ndarray, sigma: float, device: torch.device
+) -> list[np.ndarray]:
+    """``v - G(v m) / G(m)`` inside ``m``, 0 outside, per frame.
+
+    Normalising by the blurred mask keeps the smooth estimate from being dragged toward
+    the zero fill at the support edge, which would leave a ring of fake texture there;
+    filling 0 outside (the high-pass residual is ~zero-mean) avoids a step at the edge.
+    """
+    from .locomoco import _blur3d_b
+
+    m = torch.from_numpy(mask).to(device).float()
+    gm = _blur3d_b(m[None], sigma)[0].clamp_min(1e-3)
+    out = []
+    for vol in vols:
+        hp = np.empty_like(vol, dtype=np.float32)
+        for t in range(vol.shape[3]):
+            v = torch.from_numpy(np.ascontiguousarray(vol[..., t])).to(device).float() * m
+            hp[..., t] = ((v - _blur3d_b(v[None], sigma)[0] / gm) * m).cpu().numpy()
+        out.append(hp)
+    return out
+
+
 def _pe_erode(mask: np.ndarray, axis: int, n: int) -> np.ndarray:
     from scipy.ndimage import binary_erosion
 
@@ -173,6 +141,7 @@ def estimate_partition_flow_magphase(
     n_iters: int = 4,
     refine_rounds: int = 0,
     mag_nuisance: str = "s0r2",
+    phase_hpf_sigma: float = 0.0,
     warp_interp: str = "lanczos",
     warp_radius: int = 3,
     device: torch.device | None = None,
@@ -183,8 +152,9 @@ def estimate_partition_flow_magphase(
     ``mags`` / ``phases_hz``: one ``(nx, ny, nz, T)`` array per echo, same grid, same
     motion/distortion resample. ``mag_nuisance`` picks what the magnitude may change by
     in place at each voxel and frame: 'none' (plain), 's0' (echo-constant), 's0r2' (plus
-    proportional to TE; BOLD-blind, needs 3+ echoes). The phase always gets the
-    echo-constant field term. Gauss-Newton: ``n_iters`` pull-warp updates per frame
+    proportional to TE; BOLD-blind, needs 3+ echoes). With 2+ echoes the phase gets the
+    echo-constant field term; ``phase_hpf_sigma`` (voxels, required for a single echo,
+    optional otherwise) high-passes it inside its support first. Gauss-Newton: ``n_iters`` pull-warp updates per frame
     against the per-echo temporal-mean templates; ``refine_rounds`` rebuilds those
     templates from the corrected frames and re-solves (the uncorrected mean still
     carries the wiggle and biases the field low).
@@ -195,8 +165,15 @@ def estimate_partition_flow_magphase(
     if device is None:
         device = torch.device("cpu")
     e = len(mags)
-    if e < 2 or len(phases_hz) != e or len(echo_times) != e:
-        raise ValueError("mag+phase needs >= 2 echoes with one phase and one TE per magnitude.")
+    if e < 1 or len(phases_hz) != e or len(echo_times) != e:
+        raise ValueError("mag+phase needs one phase series and one TE per magnitude echo.")
+    if e == 1 and mag_nuisance != "none":
+        raise ValueError("a single echo has no per-voxel magnitude nuisance to fit; use 'none'.")
+    if e == 1 and phase_hpf_sigma <= 0:
+        raise ValueError(
+            "single-echo phase needs phase_hpf_sigma > 0: without the TE law the smooth field "
+            "fluctuation is indistinguishable from displacement."
+        )
     if mag_nuisance not in MAG_NUISANCE_CHOICES:
         raise ValueError(f"mag_nuisance must be one of {MAG_NUISANCE_CHOICES}")
     if mag_nuisance == "s0r2" and e < 3:
@@ -229,9 +206,12 @@ def estimate_partition_flow_magphase(
     valid_in_brain = torch.from_numpy(valid_np[brain_np]).to(device)
     v = int(brain.sum())
 
+    if phase_hpf_sigma > 0:
+        phases_hz = _masked_highpass(phases_hz, have & brain_np, phase_hpf_sigma, device)
+
     floor = float(echo_mean[brain_np].mean()) * 1e-3
     chans = {"mag": mags, "hz": phases_hz}
-    kinds = {"mag": mag_nuisance, "hz": "flat"}
+    kinds = {"mag": mag_nuisance, "hz": "flat" if e >= 2 else "none"}
 
     def frame(ch: str, t: int, w: torch.Tensor | None) -> torch.Tensor:
         vol = torch.stack(
@@ -315,7 +295,9 @@ def estimate_partition_flow_magphase(
     if verbose:
         ap = w_all[torch.from_numpy(brain_np)].abs()
         print(
-            f"🧲 mag+phase (experimental): {e} echoes, mag nuisance {mag_nuisance}, phase field-blind; "
+            f"🧲 mag+phase (experimental): {e} echo{'es' if e > 1 else ''}, mag nuisance {mag_nuisance}, "
+            f"phase {'field-blind' if e > 1 else 'high-passed'}"
+            f"{f' (hpf σ {phase_hpf_sigma:.2g} vox)' if phase_hpf_sigma > 0 else ''}; "
             f"phase valid in {int(valid_np.sum())}/{int(brain_np.sum())} brain voxels, "
             f"median phase share of information {float(share[torch.from_numpy(brain_np)].median()):.2f}; "
             f"|w| median {float(ap.median()):.4f} vox (echo {e}: x{float(alpha[-1]):.2f})"

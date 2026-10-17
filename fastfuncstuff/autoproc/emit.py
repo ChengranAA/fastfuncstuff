@@ -1913,10 +1913,11 @@ def _locomoco_run_vars(plan: Plan) -> str:
 
     Single echo: stage02's corrected series; the in-plane PE axis, plus the partition
     axis for 3-D EPI (a field change during the shot moves it too) in one solve.
-    Multi-echo 3-D: every echo's corrected series, the partition axis (TE-dependent:
-    echo e moves TE_e/TE1 times as far), and the unwrapped phase when processed, so the
-    estimate is the joint, field-blind magnitude+phase one; each echo gets its own warp
-    (stage10's ECHAIN). Multi-echo 2-D: echo 1 alone -- the in-plane warp moves every
+    Multi-echo 3-D: every echo's corrected series, both axes -- the partition one
+    TE-scaled (echo e moves TE_e/TE1 times as far), the in-plane one the same at every
+    echo -- and the unwrapped phase when processed, so the partition estimate is the
+    joint, field-blind magnitude+phase one; each echo gets its own warp (stage10's
+    ECHAIN). Nothing else corrects in-plane distortion frame by frame here. Multi-echo 2-D: echo 1 alone -- the in-plane warp moves every
     echo alike, and stage10 applies it to each.
     """
     pe = '-pe_dir \\"${pe:-y}\\"' + (" -pe_dir2 k" if plan.options.acq_3d else "")
@@ -1938,7 +1939,7 @@ def _locomoco_run_vars(plan: Plan) -> str:
             '  if [ "${NECHO[$k]:-1}" -gt 1 ]; then\n'
             '    lm_in=""; for e in $(seq 1 "${NECHO[$k]}"); do '
             'lm_in="$lm_in \\"e${e}_stage02.moco.${FRAG[$k]}.nii$FMT\\""; done\n'
-            '    lm_pe="-pe_dir2 k"; lm_me="-me_3depi -echo_times ${TES[$k]}"\n' + phase + "  fi"
+            '    lm_me="-me_3depi -echo_times ${TES[$k]}"\n' + phase + "  fi"
         )
     return "\n".join(out)
 

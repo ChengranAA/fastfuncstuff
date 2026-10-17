@@ -1172,10 +1172,22 @@ def resample_timeseries(
         )
         matrices_batch = matrices_vox[resample_indices].to(device=device, dtype=dtype)
 
+        # The shear decomposition (AFNI THD_rota_vol) factors volume-preserving
+        # maps; one that scales (the -me_3depi partition stretch folded in) must
+        # take the general resampler, or the near-identity shortcut silently keeps
+        # its shifts and drops the scale. det tests that whatever the voxel sizes
+        # (a rigid motion in anisotropic voxel indices is D^-1 R D: not orthogonal,
+        # det still 1).
+        det = torch.linalg.det(matrices_batch[:, :3, :3].double().cpu())
+        rigid = (det - 1).abs() < 1e-6
         use_triton = (
             config.use_shear and device.type == "cuda" and shear_resample_triton is not None
         )
-        if use_triton:
+        if config.use_shear and not bool(rigid.all()):
+            aligned_batch = apply_affine_interp_batched(
+                sources_batch, matrices_batch, config.final_interp, vol_shape, zero_outside=True
+            )
+        elif use_triton:
             # Fused Triton shears (AFNI THD_rota_vol), batched over the whole
             # chunk — ~250x the general resampler. Volumes with a degenerate
             # decomposition (valid=False, essentially never) get the general

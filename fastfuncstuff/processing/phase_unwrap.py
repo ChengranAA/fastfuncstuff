@@ -51,6 +51,8 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from ..memory import get_available_memory
+
 TWO_PI = 2.0 * np.pi
 
 # A good voxel's shortest-echo change moves far less than π/2 between frames (noise
@@ -93,8 +95,6 @@ def _slab_axis(a: np.ndarray) -> int:
 
 def _slab_width(n_plane: int, ne: int, nt: int, device: torch.device) -> int:
     """Planes per slab: phase + magnitude + ~6 working copies of (e, t) per voxel."""
-    from ..memory import get_available_memory
-
     per_plane = max(1, n_plane * ne * nt * 4 * 8)
     return max(1, int(get_available_memory(device) // per_plane))
 
@@ -107,18 +107,23 @@ def signal_frames(mag: np.ndarray) -> np.ndarray:
 
 
 def _complex_mean(
-    phase: np.ndarray, mag: np.ndarray, keep: np.ndarray, device: torch.device
+    pv: np.ndarray | Tensor, mv: np.ndarray | Tensor, keep: np.ndarray, device: torch.device
 ) -> np.ndarray:
-    ax = _slab_axis(phase)
-    out = np.empty(phase.shape[:4], np.complex64)
-    pv, mv, ov = (np.moveaxis(a, ax, 0) for a in (phase, mag, out))
-    sx = _slab_width(int(np.prod(pv.shape[1:3])), phase.shape[3], phase.shape[4], device)
+    """Temporal-mean complex image over the ``keep`` frames, in the slab views' layout."""
+    out = np.empty(tuple(pv.shape[:4]), np.complex64)
+    sx = _slab_width(int(np.prod(pv.shape[1:3])), pv.shape[3], pv.shape[4], device)
     k = torch.from_numpy(keep).to(device)
     for a in range(0, pv.shape[0], sx):
-        p = torch.from_numpy(np.ascontiguousarray(pv[a : a + sx])).to(device)
-        m = torch.from_numpy(np.ascontiguousarray(mv[a : a + sx])).to(device)
-        ov[a : a + sx] = torch.polar(m, p)[..., k].mean(-1).cpu().numpy()
+        p = _to_device(pv[a : a + sx], device)
+        m = _to_device(mv[a : a + sx], device)
+        out[a : a + sx] = torch.polar(m, p)[..., k].mean(-1).cpu().numpy()
     return out
+
+
+def _to_device(slab: np.ndarray | Tensor, device: torch.device) -> Tensor:
+    if isinstance(slab, Tensor):
+        return slab
+    return torch.from_numpy(np.ascontiguousarray(slab)).to(device)
 
 
 def _single_echo_mask(mag_mean: np.ndarray, dilation: int, device: torch.device) -> np.ndarray:
@@ -216,50 +221,74 @@ def unwrap_reference(
         ref_job = ex.submit(_romeo_volume, ref_phase, ref_mag, tes, se_mask, automask_dilation)
         done = list(ex.map(romeo_or_none, anchors))
         u, mask, offset = ref_job.result()
-    inside = mask > 0
-    pairs = []
-    if anchors:
-        pairs = [(a, d) for a, d in zip(anchors, done, strict=True) if d is not None]
-        if ne >= 2 and pairs:
-            # MCPC-3D-S on the decohered mean is biased where later echoes drop out;
-            # the frames' own offsets (circular mean) are what warpkit removes.
-            z = sum(np.exp(1j * oa) * (ma > 0) for _a, (_u, ma, oa) in pairs)
-            offset = np.where(np.abs(z) > 0, np.angle(z), offset).astype(np.float32)
-            # keep each echo's 2pi count, re-base its fraction on the new offset
-            u = u + np.angle(np.exp(1j * ((ref_phase - offset[..., None]) - u)))
+
+    # The vote is full-volume elementwise work over every anchor: on the device it
+    # is ~free, in numpy it cost more than all the ROMEO runs (single echo, 1.25 mm).
+    def dev(x):
+        return torch.from_numpy(np.ascontiguousarray(x)).to(device)
+
+    ut, off, ph_t = dev(u), dev(offset), dev(ref_phase)
+    inside_t = dev(mask > 0)
+    te_t = dev(tes.astype(np.float32))
+    pairs = [(a, d) for a, d in zip(anchors, done, strict=True) if d is not None]
+    if ne >= 2 and pairs:
+        # MCPC-3D-S on the decohered mean is biased where later echoes drop out;
+        # the frames' own offsets (circular mean) are what warpkit removes.
+        zc = torch.zeros_like(off)
+        zs = torch.zeros_like(off)
+        for _a, (_u, ma, oa) in pairs:
+            o, m = dev(oa), dev(ma > 0)
+            zc += torch.cos(o) * m
+            zs += torch.sin(o) * m
+        off = torch.where(zc * zc + zs * zs > 0, torch.atan2(zs, zc), off)
+        # keep each echo's 2pi count, re-base its fraction on the new offset
+        ut = ut + _wrap((ph_t - off[..., None]) - ut)
     if pairs:
-        ref0 = ref_phase[..., 0] - offset
-        counts = []
-        for (p, _m), (ua, ma, oa) in pairs:
-            carried = ua[..., 0] + np.angle(np.exp(1j * (ref0 - (p[..., 0] - oa))))
-            k = np.round((carried - u[..., 0]) / TWO_PI)
-            counts.append(np.where(ma > 0, k, np.nan))
-        counts = np.stack(counts, -1)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN outside every mask
-            vote = np.round(np.nanmedian(counts, -1))
+        ref0 = ph_t[..., 0] - off
+        counts = torch.stack(
+            [
+                torch.where(
+                    dev(ma > 0),
+                    torch.round(
+                        (dev(ua[..., 0]) + _wrap(ref0 - (dev(p[..., 0]) - dev(oa))) - ut[..., 0])
+                        / TWO_PI
+                    ),
+                    torch.nan,
+                )
+                for (p, _m), (ua, ma, oa) in pairs
+            ],
+            -1,
+        )
+        vote = torch.nanmedian(counts, -1).values
         agree = (counts == vote[..., None]).sum(-1) > 0.5 * len(pairs)
-        move = np.where(inside & agree & np.isfinite(vote), vote, 0.0)
+        move = torch.where(inside_t & agree & torch.isfinite(vote), vote, 0.0)
         # an echo-1 count is 1000/TE1 Hz of field: carry it to every echo, then re-ladder
-        u = u + (TWO_PI * move)[..., None] * (tes / tes[0])
-    w = ref_mag.astype(np.float32) ** 2
+        ut = ut + (TWO_PI * move)[..., None] * (te_t / te_t[0])
+        del counts
+    w = dev(ref_mag.astype(np.float32)) ** 2
     for e in range(1, ne):
-        num = (w[..., :e] * u[..., :e] * tes[:e]).sum(-1)
-        den = np.maximum((w[..., :e] * tes[:e] ** 2).sum(-1), 1e-12)
-        u[..., e] += TWO_PI * np.round((num / den * tes[e] - u[..., e]) / TWO_PI)
-    u[~inside] = 0
-    at_anchor = np.full((*mask.shape, len(anchors)), np.nan, np.float32)
+        num = (w[..., :e] * ut[..., :e] * te_t[:e]).sum(-1)
+        den = (w[..., :e] * te_t[:e] ** 2).sum(-1).clamp_min(1e-12)
+        ut[..., e] += TWO_PI * torch.round((num / den * te_t[e] - ut[..., e]) / TWO_PI)
+    ut = ut * inside_t[..., None]
+    at_anchor = torch.full((*mask.shape, len(anchors)), torch.nan, device=device)
     for i, d in enumerate(done):
         if d is not None:
             ua, ma, oa = d
-            shifted = ua[..., 0] + np.angle(np.exp(1j * (oa - offset)))
-            at_anchor[..., i] = np.where(ma > 0, shifted, np.nan)
-    return u.astype(np.float32), mask, offset, at_anchor
+            at_anchor[..., i] = torch.where(
+                dev(ma > 0), dev(ua[..., 0]) + _wrap(dev(oa) - off), torch.nan
+            )
+    return (
+        ut.float().cpu().numpy(),
+        mask,
+        off.float().cpu().numpy(),
+        at_anchor.cpu().numpy(),
+    )
 
 
-def _gather(slab: np.ndarray, shape: tuple[int, ...], idx: Tensor) -> Tensor:
-    """A host slab, flattened to voxels, on ``idx``'s device and restricted to ``idx``."""
-    return torch.from_numpy(np.ascontiguousarray(slab)).to(idx.device).reshape(shape)[idx]
+def _gather(slab: np.ndarray | Tensor, shape: tuple[int, ...], idx: Tensor) -> Tensor:
+    """A slab, flattened to voxels, on ``idx``'s device and restricted to ``idx``."""
+    return _to_device(slab, idx.device).reshape(shape)[idx]
 
 
 def _offset_free_step(u: Tensor, w: Tensor, te: Tensor) -> Tensor:
@@ -473,7 +502,14 @@ def unwrap_timeseries(
     nx, ny, nz, ne, nt = phase.shape
     t0 = time.perf_counter()
     keep = signal_frames(mag)
-    zbar = _complex_mean(phase, mag, keep, device)
+    ax = _slab_axis(phase)
+    pv: np.ndarray | Tensor = np.moveaxis(phase, ax, 0)
+    mv: np.ndarray | Tensor = np.moveaxis(mag, ax, 0)
+    # Three passes read the whole series (complex mean, frame-wide field, main);
+    # when it fits comfortably, copy it to the device once instead of three times.
+    if device.type != "cpu" and 2 * phase.size * 4 <= 0.35 * get_available_memory(device):
+        pv, mv = _to_device(pv, device), _to_device(mv, device)
+    zbar = np.moveaxis(_complex_mean(pv, mv, keep, device), 0, ax)
     good = np.flatnonzero(keep)
     picks = good[
         np.unique(np.linspace(0, good.size - 1, min(anchor_frames, good.size)).round().astype(int))
@@ -493,11 +529,8 @@ def unwrap_timeseries(
     path_map = np.zeros((nx, ny, nz), bool)
     unwrapped = np.zeros(phase.shape, np.float32) if return_unwrapped else None
     te = torch.from_numpy(te_np).to(device)
-    ax = _slab_axis(phase)
-    views = [
-        np.moveaxis(a, ax, 0) for a in (phase, mag, uref, offset, mask, field, path_map, at_anchor)
-    ]
-    pv, mv, uv, ofv, mkv, fv, pmv, av = views
+    views = [np.moveaxis(a, ax, 0) for a in (uref, offset, mask, field, path_map, at_anchor)]
+    uv, ofv, mkv, fv, pmv, av = views
     n_anchor = at_anchor.shape[-1]
     t_anchor = torch.from_numpy(picks[:n_anchor]).to(device) if n_anchor else None
     unv = np.moveaxis(unwrapped, ax, 0) if unwrapped is not None else None

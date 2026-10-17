@@ -109,6 +109,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "part of the shift is invisible to phase, so each column has zero mean.",
     )
     parser.add_argument(
+        "-save_partition_stretch",
+        default=None,
+        metavar="FILE.1D",
+        help="With -save_partition_shift: also fit a linear change of the shift along "
+        "the partition axis (about the slab centre) and write it here [voxels per "
+        "voxel], for ffs_moco -stretch_table. The shift table then holds the shift at "
+        "the slab centre.",
+    )
+    parser.add_argument(
         "-save_path_map",
         default=None,
         metavar="FILE",
@@ -143,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
             return _error("-save_partition_shift needs at least two echoes.")
         if args.partition_axis is None:
             return _error("-save_partition_shift needs -partition_axis.")
+    if args.save_partition_stretch is not None and args.save_partition_shift is None:
+        return _error("-save_partition_stretch goes with -save_partition_shift.")
     if args.partition_axis is not None:
         from fastfuncstuff.processing.locomoco import resolve_pe_axis
 
@@ -200,15 +211,27 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         with spinner("Partition shift from the phase echo-slope", enabled=verbose):
-            w = partition_shift_from_phase(
+            fit = partition_shift_from_phase(
                 res.unwrapped,
                 mag,
                 np.asarray(tes),
                 res.mask == 2,
                 resolve_pe_axis(args.partition_axis),
                 device=device,
+                stretch=args.save_partition_stretch is not None,
             )
+        w = fit[:, 0] if fit.ndim == 2 else fit
         table = shift_table_from_partition_shift(w, np.asarray(tes))
+        if fit.ndim == 2:
+            np.savetxt(
+                args.save_partition_stretch,
+                shift_table_from_partition_shift(fit[:, 1], np.asarray(tes)),
+                fmt="%12.8f",
+                header="partition stretch correction [voxels per voxel, about the slab "
+                "centre] from the phase echo-slope; rows = volumes, cols = "
+                + " ".join(f"e{e + 1}" for e in range(ne))
+                + "; zero mean",
+            )
         np.savetxt(
             args.save_partition_shift,
             table,

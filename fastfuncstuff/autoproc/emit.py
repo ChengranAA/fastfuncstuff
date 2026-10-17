@@ -1562,7 +1562,7 @@ def _stage_tshift(plan: Plan) -> str:
     # Phase must get the SAME temporal shift as its magnitude, or the two stop
     # describing the same instant. Unwrapped phase is smooth in time, so the same
     # temporal interpolation is valid on it (a wrapped phase would not be).
-    phase_cmd = ""
+    phase_cmd = pc = ""
     if _phase_on(plan):
         pc = _ffs(
             "ffs_slicetime",
@@ -1579,6 +1579,34 @@ def _stage_tshift(plan: Plan) -> str:
             f'  phout="{_unwrapped("tshift")}"\n'
             f'  [ -z "${{PHASE[$k]:-}}" ] || [ -f "$phout" ] || {{\n{pc}\n  }}\n'
         )
+    me_block = ""
+    if _any_me(plan):
+        # Every echo, and each echo's unwrapped phase, gets the same shift: echo e
+        # was read out with the same slice order, a few ms after echo 1.
+        me_cmd = cmd.replace('-input "$raw"', '-input "$mag"').replace(
+            '-prefix "$outf"', '-prefix "$eoutf"'
+        )
+        me_phase = ""
+        if _phase_on(plan):
+            me_phase = (
+                '\n      phout="' + _echo_stc_phase() + '"\n'
+                '      [ -z "${PHASE[$k]:-}" ] || [ -f "$phout" ] || '
+                + pc.replace(
+                    f'"{_phase_clean(plan)}"', '"' + _me_unwrap_stem() + '_e${e}.nii$FMT"'
+                ).strip()
+            )
+        me_block = (
+            '  if [ "${NECHO[$k]:-1}" -gt 1 ]; then\n'
+            '    for e in $(seq 1 "${NECHO[$k]}"); do\n'
+            '      esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"\n'
+            f'      eoutf="{_echo_stc_mag()}"'
+            + me_phase
+            + '\n      [ -f "$eoutf" ] && continue\n'
+            + _echo_pair_source(plan)
+            + "\n"
+            + _indent(me_cmd, 4)
+            + "\n    done\n    continue\n  fi\n"
+        )
     return f"""
 # ============================ stage01: slice timing (first) =================
 # STC applied up front (before moco); the final resample does NOT re-integrate
@@ -1587,7 +1615,7 @@ echo '== stage01: slice timing =='
 for k in "${{RUN_KEYS[@]}}"; do
   outf="stage01.tshift.${{FRAG[$k]}}.nii$FMT"
   [ -z "${{TR[$k]}}" ] && {{ echo "no TR for $k; cannot slice-time"; exit 1; }}
-{phase_cmd}  [ -f "$outf" ] && continue
+{me_block}{phase_cmd}  [ -f "$outf" ] && continue
 {_pre_stc_source(plan)}
 {cmd}
 done
@@ -1820,7 +1848,7 @@ def _moco_echo_source(plan: Plan) -> str:
     """Bash setting ``mag`` to echo $e's moco input (in the manifest's echo loop)."""
     if _medic_on(plan):
         return f'      mag="{_medic_stem()}_e${{e}}_undist.nii$FMT"'
-    return _echo_pair_source(plan, indent="      ")
+    return _echo_source(plan)
 
 
 def _moco_phase_file(plan: Plan) -> str:
@@ -1828,7 +1856,7 @@ def _moco_phase_file(plan: Plan) -> str:
     under -medic (a phase that moved differently from its magnitude is no input)."""
     if _medic_on(plan):
         return f"{_medic_stem()}_e${{e}}_phase_undist.nii$FMT"
-    return _me_unwrap_stem() + "_e$e.nii$FMT"
+    return _echo_phase_file(plan)
 
 
 def _stage_medic(plan: Plan) -> str:
@@ -1846,7 +1874,9 @@ def _stage_medic(plan: Plan) -> str:
     phase = ""
     if opt.locomoco and opt.acq_3d:
         phase = (
-            '\n  phs=(); for e in $(seq 1 "${NECHO[$k]}"); do phs+=("${uwe}_e${e}.nii$FMT"); done'
+            '\n  phs=(); for e in $(seq 1 "${NECHO[$k]}"); do '
+            'esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"; '
+            f'phs+=("{_echo_phase_file(plan)}"); done'
         )
         apply = ' -apply_phase -phase_is_unwrapped -phase "${phs[@]}"'
     else:
@@ -1866,7 +1896,7 @@ for k in "${{RUN_KEYS[@]}}"; do
   mags=()
   for e in $(seq 1 "${{NECHO[$k]}}"); do
     esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"
-{_echo_pair_source(plan, indent="    ")}
+{_echo_source(plan, indent="    ")}
     mags+=("$mag")
   done{phase}
   ffs_medic -magnitude "${{mags[@]}}" -fieldmap "${{uwe}}_fieldmap.nii$FMT" -fieldmap_mask "${{uwe}}_mask.nii$FMT" -total_readout_time "${{TRT[$k]}}" -pe_dir "${{PEDIR[$k]}}" -save_warp -warp_5d -prefix "${{ms}}.nii$FMT" -device "$DEVICE" -verb 0{apply}
@@ -3604,15 +3634,15 @@ def _final_me_jobs(plan: Plan, nwarp_flags: str) -> str:
     if _phase_on(plan):
         phase = (
             '      [ -n "${PHASE[$k]:-}" ] && pe_args=" -phase \\"'
-            + _me_unwrap_stem()
-            + '_e$e.nii$FMT\\" -phase_units rad -phase_warp direct -phase_prefix '
+            + _echo_phase_file(plan)
+            + '\\" -phase_units rad -phase_warp direct -phase_prefix '
             '\\"stage10.final.${FRAG[$k]}.echo-$e.part-phase.nii$FINAL_FMT\\""\n'
         )
     return (
         '  if [ "${NECHO[$k]:-1}" -gt 1 ]; then\n'
         '    for e in $(seq 1 "${NECHO[$k]}"); do\n'
         '      esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"\n'
-        + _echo_pair_source(plan)
+        + _echo_source(plan)
         + '\n      eoutf="stage10.final.${FRAG[$k]}.echo-$e.nii$FINAL_FMT"; pe_args=""; em=""\n'
         + phase
         + '      [ "$e" -eq 1 ] && em=" -save_mean \\"$meanf\\""\n'
@@ -3953,6 +3983,34 @@ def _echo_pair_source(plan: Plan, indent: str = "      ") -> str:
         f'{indent}  mag="${{mag}}[0..$last]"; ph="${{ph}}[0..$last]"\n'
         f"{indent}fi"
     )
+
+
+def _stc_first(plan: Plan) -> bool:
+    return plan.options.slicetiming_method == "first"
+
+
+def _echo_stc_mag() -> str:
+    """Echo $e's up-front-slice-timed magnitude (echo 1 keeps the single-echo name)."""
+    return "stage01.tshift.${FRAG[$k]}${esfx}.nii$FMT"
+
+
+def _echo_stc_phase() -> str:
+    return "stage01.tshift.${FRAG[$k]}${esfx}.part-phase.nii$FMT"
+
+
+def _echo_source(plan: Plan, indent: str = "      ") -> str:
+    """Bash setting ``mag`` to echo $e's series as moco and the final resample see it:
+    the slice-timed echo when slice timing ran up front, else the NORDIC / raw pair."""
+    if _stc_first(plan):
+        return f'{indent}mag="{_echo_stc_mag()}"'
+    return _echo_pair_source(plan, indent)
+
+
+def _echo_phase_file(plan: Plan) -> str:
+    """Echo $e's unwrapped phase as the final resample sees it (esfx set)."""
+    if _stc_first(plan):
+        return _echo_stc_phase()
+    return _me_unwrap_stem() + "_e${e}.nii$FMT"
 
 
 def _mask_epi() -> str:
@@ -4874,8 +4932,8 @@ def write_script(
         _qc_helper(plan, script_stem),
         _stage_nordic(plan),
         _stage_unwrap(plan),
-        _stage_medic(plan),
         _stage_tshift(plan),
+        _stage_medic(plan),
         _stage_moco(plan, script_stem),
         _stage_locomoco(plan, script_stem),
         _stage_blip(plan, script_stem),

@@ -1244,11 +1244,6 @@ def _multiecho_errors(opt: Options, subject) -> list[str]:
         errs.append(
             "multi-echo runs without an EchoTime in every echo's sidecar: " + ", ".join(no_te)
         )
-    if opt.slicetiming_method == "first":
-        errs.append(
-            "-slicetiming_method first is single-echo for now; multi-echo runs integrate "
-            "slice timing into the final resample (the default)."
-        )
     if opt.surface_target:
         errs.append("-surface_target with multi-echo runs is not wired yet.")
     if opt.phasereg:

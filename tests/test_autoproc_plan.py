@@ -3349,7 +3349,7 @@ def test_multiecho_refuses_what_it_does_not_handle_yet():
     subj = Subject("X", [Session("01", [_me_run("01", "foo", "1")])])
     assert _multiecho_errors(Options(), subj) == []
     errs = _multiecho_errors(Options(slicetiming_method="first", phasereg=True), subj)
-    assert any("slicetiming_method first" in e for e in errs)
+    assert not any("slicetiming_method first" in e for e in errs)  # wired 2026-10-18
     assert any("-phasereg" in e for e in errs)
     bad = _me_run("01", "foo", "2")
     bad.echo_tes = []
@@ -3414,3 +3414,35 @@ def test_medic_refuses_what_it_cannot_build():
     se = _run("01", "foo", "2")
     errs = _medic_errors(Options(medic=True, phase_proc=True), Subject("X", [Session("01", [se])]))
     assert any("not multi-echo" in e for e in errs)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+@pytest.mark.parametrize("medic", [False, True])
+def test_multiecho_slice_timing_first_shifts_every_echo_and_its_phase(tmp_path, medic):
+    """-slicetiming_method first with multi-echo: every echo and its unwrapped phase get
+    the shift; MEDIC (after it) undistorts the shifted echoes; stage10 resamples the
+    shifted echo e, with its shifted phase, and integrates no timing."""
+    r = _me_run("01", "foo", "1")
+    r.json["TotalReadoutTime"] = 0.03
+    r.json["SliceTiming"] = [0.0, 0.5, 1.0, 1.5]
+    opt = Options(
+        phase_proc=True, medic=medic, acq_3d=False, go_to_anat=False, distortion=False,
+        slicetiming_method="first",
+    )  # fmt: skip
+    s = write_script(build_plan(Subject("X", [Session("01", [r])]), opt), "wd", bids_root="/bids")
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+    shifted = 'mag="stage01.tshift.${FRAG[$k]}${esfx}.nii$FMT"'
+    assert 'eoutf="stage01.tshift.${FRAG[$k]}${esfx}.nii$FMT"' in s
+    assert '-input "stage00.unwrap.${FRAG[$k]}.part-phase_e${e}.nii$FMT"' in s
+    final = s[s.index("stage10.final.${FRAG[$k]}.echo-$e") - 400 :]
+    assert shifted in final
+    assert '-phase \\"stage01.tshift.${FRAG[$k]}${esfx}.part-phase.nii$FMT\\"' in final
+    if medic:
+        assert s.index("stage01: slice timing") < s.index("stage01: MEDIC")
+        medic_stage = s[s.index("stage01: MEDIC") : s.index("stage02: moco")]
+        assert shifted in medic_stage

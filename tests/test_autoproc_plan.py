@@ -3461,3 +3461,36 @@ def test_multiecho_3d_motsim_rides_the_echo1_registration():
     s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
     line = next(ln for ln in s.splitlines() if "-1Dmatrix_save" in ln and "mocobatch" in ln)
     assert "-motsim both,12" in line and "$me_args" in line
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_multiecho_surface_reads_every_echo_and_combines_per_vertex(tmp_path):
+    """-surface_target with multi-echo: each echo's stage10 job reads the surface
+    through that echo's chain (still one interpolation); ffs_t2smap combines per
+    vertex into the run's own surface name, which the masks and the GLM read."""
+    r = _me_run("01", "foo", "1")
+    subj = Subject("X", [Session("01", [r])])
+    opt = Options(go_to_anat=True, anat_path="/data/sub-X_T1w.nii.gz", acq_3d=True,
+                  phase_proc=True, locomoco=True, distortion=False, slicetiming_method="none",
+                  surface_target=["native"], fs_subject="/fs/sub-X")  # fmt: skip
+    from fastfuncstuff.cli.autoproc import _multiecho_errors
+
+    assert _multiecho_errors(opt, subj) == []
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+    surf = {ln.split("=", 1)[0]: ln for ln in s.splitlines() if ln.startswith("SURFCHAIN[")}
+    assert "SURFCHAIN['01:foo:1|3']" in surf
+    assert "_e3_warp" in surf["SURFCHAIN['01:foo:1|3']"]  # echo 3's own locomoco warp
+    assert '-surf_prefix \\"stage10s.surf.${FRAG[$k]}.echo-$e\\"' in s
+    assert '-surf_nwarp \\"${SURFCHAIN[$k|$e]}\\"' in s
+    assert "$pe_args$sa" in s
+    assert (
+        '-optcom "stage10s.surf.${FRAG[$k]}.native.lh.func.gii"' in s
+        and '-optcom "stage10s.surf.${FRAG[$k]}.native.rh.func.gii"' in s
+    )
+    assert s.index("stage10s.t2s.") < s.index("== stage10s: surface masks")

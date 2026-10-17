@@ -1244,8 +1244,6 @@ def _multiecho_errors(opt: Options, subject) -> list[str]:
         errs.append(
             "multi-echo runs without an EchoTime in every echo's sidecar: " + ", ".join(no_te)
         )
-    if opt.surface_target:
-        errs.append("-surface_target with multi-echo runs is not wired yet.")
     if opt.phasereg:
         errs.append("-phasereg with multi-echo runs is not wired yet (which echo's phase?).")
     return errs

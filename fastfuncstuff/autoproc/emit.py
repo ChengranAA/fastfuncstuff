@@ -1403,6 +1403,16 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
                 tokens=[t for t in pr.warp_chain if t not in _MNI_TOKENS],
             )
             lines.append(f'SURFCHAIN[{q(k)}]="{" ".join(surf)}"')
+            if b.is_multiecho:
+                for e in range(1, b.n_echoes + 1):
+                    surf = chain_files(
+                        pr,
+                        ".nii$FMT",
+                        plan.options,
+                        tokens=[t for t in pr.warp_chain if t not in _MNI_TOKENS],
+                        echo=e,
+                    )
+                    lines.append(f'SURFCHAIN[{q(f"{k}|{e}")}]="{" ".join(surf)}"')
         # Jacobian modulation for the fieldmap link, wherever that chain is
         # applied to data (stage07, stage10). Empty for a run with no fmap.
         jac = _jac_spec(pr)
@@ -3645,16 +3655,52 @@ def _final_me_jobs(plan: Plan, nwarp_flags: str) -> str:
         + _echo_source(plan)
         + '\n      eoutf="stage10.final.${FRAG[$k]}.echo-$e.nii$FINAL_FMT"; pe_args=""; em=""\n'
         + phase
+        + _me_surface_args(plan)
         + '      [ "$e" -eq 1 ] && em=" -save_mean \\"$meanf\\""\n'
         '      printf \'%s\\n\' "-source \\"$mag\\" -nwarp \\"${ECHAIN[$k|$e]}\\"'
         '${JAC[$k]:+ -jac \\"${JAC[$k]}\\"} -master stage10.warpmaster.nii$FMT '
         '-chain_base \\"$MASTER\\" -dxyz \\"$FINAL_DXYZ\\" '
         + nwarp_flags
-        + ' $st_str$em -prefix \\"$eoutf\\"$pe_args" >> "$nwarpbatch"\n'
+        + ' $st_str$em -prefix \\"$eoutf\\"$pe_args$sa" >> "$nwarpbatch"\n'
         "    done\n"
         "    continue\n"
         "  fi\n"
     )
+
+
+def _me_surface_args(plan: Plan) -> str:
+    """Bash setting ``sa``: echo $e's surface read in its stage10 job (its own chain, an
+    .echo-N prefix); the geometry and QC are written once, by echo 1."""
+    if not plan.options.surface_target:
+        return '      sa=""\n'
+    full = (
+        _surface_args(plan)
+        .replace('stage10s.surf.${FRAG[$k]}\\"', 'stage10s.surf.${FRAG[$k]}.echo-$e\\"')
+        .replace("${SURFCHAIN[$k]}", "${SURFCHAIN[$k|$e]}")
+    )
+    lean = full.replace(" -surf_geom_prefix stage10s.surf", "").replace(" -surf_qc", "")
+    return f'      sa="{lean}"; [ "$e" -eq 1 ] && sa="{full}"\n'
+
+
+def _me_surface_combine(plan: Plan) -> str:
+    """Per vertex, the same optimal combination as the volume, into the run's own
+    surface names; mask and mean are echo 1's (as the volume QC mean is)."""
+    from fastfuncstuff.processing.surface_projection import space_name
+
+    if not plan.options.surface_target:
+        return ""
+    out = []
+    for space in dict.fromkeys(space_name(m) for m in plan.options.surface_target):
+        for hemi in ("lh", "rh"):
+            tail = f"{space}.{hemi}"
+            out += [
+                f'  sins=(); for e in $(seq 1 "${{NECHO[$k]}}"); do sins+=("stage10s.surf.${{FRAG[$k]}}.echo-$e.{tail}.func.gii"); done',
+                f'  ffs_t2smap -input "${{sins[@]}}" -tes ${{TES[$k]}} -no_qc -prefix "stage10s.t2s.${{FRAG[$k]}}.{tail}_" -optcom "stage10s.surf.${{FRAG[$k]}}.{tail}.func.gii" -device "$DEVICE" -verb 0',
+                "  for w in mask mean; do "
+                f'ln -sf "stage10s.surf.${{FRAG[$k]}}.echo-1.{tail}.$w.shape.gii" '
+                f'"stage10s.surf.${{FRAG[$k]}}.{tail}.$w.shape.gii"; done',
+            ]
+    return "\n".join(out) + "\n"
 
 
 def _final_me_combine(plan: Plan) -> str:
@@ -3663,7 +3709,8 @@ def _final_me_combine(plan: Plan) -> str:
     T2*/S0 fit, T2*-weighted combination; maps kept as stage10.t2s.<frag>_*)."""
     if not _any_me(plan):
         return ""
-    return """# Multi-echo: combine each run's warped echoes (optimal combination, T2*-weighted)
+    return (
+        """# Multi-echo: combine each run's warped echoes (optimal combination, T2*-weighted)
 # into stage10.final.<frag> -- the series every later stage reads. The per-echo
 # finals and the T2*/S0 maps (stage10.t2s.<frag>_*) stay beside it.
 for k in "${RUN_KEYS[@]}"; do
@@ -3672,8 +3719,11 @@ for k in "${RUN_KEYS[@]}"; do
   [ "$skip_final" -eq 1 ] && [ -f "$outf" ] && continue
   ins=(); for e in $(seq 1 "${NECHO[$k]}"); do ins+=("stage10.final.${FRAG[$k]}.echo-$e.nii$FINAL_FMT"); done
   ffs_t2smap -input "${ins[@]}" -tes ${TES[$k]} -automask -no_qc -prefix "stage10.t2s.${FRAG[$k]}_" -optcom "$outf" -device "$DEVICE" -verb 0
-done
 """
+        + _me_surface_combine(plan)
+        + """done
+"""
+    )
 
 
 _MNI_TOKENS = ("mni_nl", "mni_lin")

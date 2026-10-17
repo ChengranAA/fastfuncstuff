@@ -3356,3 +3356,61 @@ def test_multiecho_refuses_what_it_does_not_handle_yet():
     assert any(
         "EchoTime" in e for e in _multiecho_errors(Options(), Subject("X", [Session("01", [bad])]))
     )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+@pytest.mark.parametrize("acq_3d", [True, False])
+def test_medic_reuses_the_unwrap_field_and_sits_rightmost_in_every_chain(tmp_path, acq_3d):
+    """-medic: ffs_medic starts from the unwrap stage's field map (and mask) rather than
+    a second estimate; moco reads its undistorted echoes (and, for 3-D locomoco, the
+    phase undistorted with them); the time-varying warp is the rightmost link of every
+    echo's chain, so stage10 still resamples once from the raw series. 3-D locomoco
+    then solves the partition axis only, and the SBRef is not the moco base."""
+    r = _me_run("01", "foo", "1")
+    r.json["TotalReadoutTime"] = 0.0312
+    r.sbref_path = Path("/bids/sub-X/ses-01/func/sub-X_ses-01_task-foo_run-1_sbref.nii.gz")
+    subj = Subject("X", [Session("01", [r])])
+    opt = Options(
+        phase_proc=True, medic=True, locomoco=True, acq_3d=acq_3d, go_to_anat=False,
+        slicetiming_method="none" if acq_3d else "integrate",
+    )  # fmt: skip
+    plan = build_plan(subj, opt)
+    assert plan.runs[0].warp_chain[-2:] == ["moco", "medic"]
+    assert not plan.use_sbref
+    s = write_script(plan, "wd", bids_root="/bids")
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+    assert "TRT[01:foo:1]=0.0312" in s and "\nSBREF[" not in s
+    assert '-save_mask "stage00.unwrap.${FRAG[$k]}.part-phase_mask.nii$FMT"' in s
+    assert '-fieldmap "${uwe}_fieldmap.nii$FMT" -fieldmap_mask "${uwe}_mask.nii$FMT"' in s
+    assert s.index("stage01: MEDIC") < s.index("stage02: moco")
+    assert 'raw="stage01.medic.${FRAG[$k]}_e1_undist.nii$FMT"' in s
+    medic_warp = "stage01.medic.ses-01.task-foo.run-1_warp.nii$FMT"
+    ech = [ln for ln in s.splitlines() if ln.startswith("ECHAIN[")]
+    assert len(ech) == 3 and all(ln.rstrip("'\"").endswith(medic_warp) for ln in ech)
+    if acq_3d:
+        assert 'mag="stage01.medic.${FRAG[$k]}_e${e}_undist.nii$FMT"' in s
+        assert "-apply_phase -phase_is_unwrapped" in s
+        assert "stage01.medic.${FRAG[$k]}_e${e}_phase_undist.nii$FMT" in s
+        assert 'lm_pe="-pe_dir2 k"' in s
+    else:
+        assert "-apply_phase" not in s and 'lm_pe="-pe_dir2 k"' not in s
+
+
+def test_medic_refuses_what_it_cannot_build():
+    from fastfuncstuff.cli.autoproc import _medic_errors
+
+    r = _me_run("01", "foo", "1")
+    subj = Subject("X", [Session("01", [r])])
+    assert any("-phase_proc" in e for e in _medic_errors(Options(medic=True), subj))
+    errs = _medic_errors(Options(medic=True, phase_proc=True), subj)
+    assert any("TotalReadoutTime" in e for e in errs)  # not guessed
+    r.json["TotalReadoutTime"] = 0.03
+    assert _medic_errors(Options(medic=True, phase_proc=True), subj) == []
+    se = _run("01", "foo", "2")
+    errs = _medic_errors(Options(medic=True, phase_proc=True), Subject("X", [Session("01", [se])]))
+    assert any("not multi-echo" in e for e in errs)

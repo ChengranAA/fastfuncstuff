@@ -443,6 +443,19 @@ def build_parser() -> argparse.ArgumentParser:
         "-no_phase_drift.",
     )
     g.add_argument(
+        "-medic",
+        action="store_true",
+        help="with -phase_proc and multi-echo runs: frame-wise distortion correction "
+        "(MEDIC) from the per-frame field map the unwrap stage already computes "
+        "(ffs_medic -fieldmap, SVD-denoised) -> stage01.medic.*: the undistorted echoes "
+        "moco reads, and a time-varying warp rightmost in every echo's chain, so stage10 "
+        "still resamples once from the raw series. It IS the distortion correction: "
+        "fieldmaps are not used, the SBRef is not the moco base (it has no per-frame "
+        "field), and 3-D multi-echo locomoco solves the partition axis only (MEDIC owns "
+        "in-plane). Needs TotalReadoutTime and PhaseEncodingDirection in every run's "
+        "sidecar.",
+    )
+    g.add_argument(
         "-no_phase_drift",
         "-no-phase-drift",
         action="store_true",
@@ -1245,6 +1258,26 @@ def _multiecho_errors(opt: Options, subject) -> list[str]:
     return errs
 
 
+def _medic_errors(opt: Options, subject) -> list[str]:
+    """-medic needs, for every run, what the frame-wise field and its warp are made of:
+    multi-echo phase, the readout time and the PE direction. Nothing is guessed."""
+    if not opt.medic:
+        return []
+    if not opt.phase_proc:
+        return ["-medic needs -phase_proc: its field map comes from the unwrap stage."]
+    errs = []
+    for r in (r for s in subject.sessions for r in s.bold_runs):
+        name = f"{r.session or '-'}/{r.task}/{r.run or '-'}"
+        if not r.is_multiecho or any(p is None for p in r.echo_phases):
+            errs.append(f"-medic: {name} is not multi-echo with a phase for every echo.")
+            continue
+        if r.json.get("TotalReadoutTime") is None:
+            errs.append(f"-medic: {name} has no TotalReadoutTime in its sidecar.")
+        if not r.pe_dir:
+            errs.append(f"-medic: {name} has no PhaseEncodingDirection in its sidecar.")
+    return errs
+
+
 def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[str], list[str]]:
     """Return (errors, warnings). Non-empty errors ⇒ do not write the script."""
     errors: list[str] = []
@@ -1432,6 +1465,12 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 "sidecar. Pass -TR SECONDS (volume TR) or -slicetiming_method none."
             )
     errors += _multiecho_errors(opt, subject)
+    errors += _medic_errors(opt, subject)
+    if opt.medic and any(s.fmaps for s in subject.sessions):
+        warnings.append(
+            "-medic: the session fieldmaps are not used -- the per-frame field corrects "
+            "the distortion, and a fieldmap would correct it twice."
+        )
     if opt.phase_proc:
         # Phase is carried per run, wherever a run has one: a session can mix
         # gradient-echo runs (with phase) and spin-echo runs (without).
@@ -1534,7 +1573,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                     + (" ..." if len(missing) > 4 else "")
                     + ". Falling back to grandmean."
                 )
-        elif not any(s.fmaps for s in subject.sessions) or not opt.distortion:
+        elif not any(s.fmaps for s in subject.sessions) or not opt.distortion or opt.medic:
             warnings.append(
                 f"-anat_source {opt.anat_source} needs fieldmaps; falling back to grandmean "
                 "(ffs_segment is what recovers the distortion in that case)."
@@ -2377,6 +2416,7 @@ def main(argv: list[str] | None = None) -> int:
         want_nordic=eff(args.want_nordic, "want_nordic"),
         phase_proc=args.phase_proc,
         phase_drift=not args.no_phase_drift,
+        medic=args.medic,
         phasereg=args.phasereg,
         phasereg_opts=args.phasereg_opts,
         phasereg_veins=args.phasereg_veins,

@@ -48,6 +48,10 @@ class Options:
     # chain at the final resample. Nothing between those two points touches it.
     phase_proc: bool = False
     phase_drift: bool = True  # -phase_proc: ffs_phasedrift after the unwrap
+    # MEDIC (multi-echo, -phase_proc): the per-frame field map from the unwrap stage is
+    # the distortion correction -- moco reads the undistorted echoes, the chain carries
+    # the time-varying warp, and fieldmaps are not used.
+    medic: bool = False
     # Phase regression after stage10, into phasereg_NN/ (and a GLM on its output).
     phasereg: bool = False
     phasereg_opts: str = ""
@@ -341,6 +345,8 @@ _CHAIN_ORDER = (
     "wxrun_lin",
     "locomoco",
     "moco",
+    # MEDIC acts on the raw frame, before moco: moco was estimated on its output.
+    "medic",
 )
 
 
@@ -434,6 +440,10 @@ def run_average_chain(pr: PlanRun) -> list[str]:
     Both tokens are time-varying, so applying them to a 3-D image does not even
     pose the intended question: ffs_nwarp resolves a time-varying transform at
     frame 0, and there is nothing special about the first volume's pose.
+
+    ``medic`` stays, although it is time-varying too: these images are in the raw,
+    distorted space, and most of a frame's distortion is the static field, so its
+    frame-0 warp undistorts them far better than leaving them distorted would.
     """
     return [tok for tok in pr.warp_chain if tok not in ("moco", "locomoco")]
 
@@ -713,6 +723,7 @@ def build_warp_chain(pr: PlanRun, opt: Options, multi_session: bool) -> list[str
         "wxrun_nl": (has_fmap or not pr.is_ref_run) and opt.xrun_nonlin,
         "locomoco": opt.locomoco,
         "moco": True,
+        "medic": opt.medic and pr.bold.is_multiecho and pr.bold.phase_path is not None,
     }
     toks = [tok for tok in _CHAIN_ORDER if include.get(tok, False)]
     return _apply_in_source_swaps(toks, opt)
@@ -759,7 +770,9 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
         ref_fmap = _resolve_ref_fmap(sess.fmaps, opt)
         # -distortion off (e.g. bare_bones): treat as no fmaps → no blip/xfmap,
         # xrun falls back to first-run anchoring.
-        has_fmaps = bool(sess.fmaps) and opt.distortion
+        # -medic: the per-frame field IS the distortion correction, so a fieldmap would
+        # correct the same distortion twice.
+        has_fmaps = bool(sess.fmaps) and opt.distortion and not opt.medic
         # First run of the session anchors xrun when there are no fmaps. Identity
         # is the BoldRun itself, not its `run` entity: a session whose runs are
         # distinguished by TASK (task-bar1/bar2/... with no run- entity) has
@@ -803,7 +816,11 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
                 # Only ``-moco_ref sbref`` makes the SBRef the post-moco space; any
                 # other base leaves it an unregistered image with no transform of
                 # its own, so the lane is off.
-                use_sbref=(bold.sbref_path is not None and opt.moco_ref == "sbref"),
+                # -medic: no per-frame field exists for the SBRef, so it cannot share
+                # the undistorted space moco works in.
+                use_sbref=(
+                    bold.sbref_path is not None and opt.moco_ref == "sbref" and not opt.medic
+                ),
             )
             pr.warp_chain = build_warp_chain(pr, opt, multi_session)
             runs.append(pr)

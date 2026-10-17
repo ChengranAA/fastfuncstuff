@@ -690,6 +690,16 @@ def create_parser() -> argparse.ArgumentParser:
         " carries the estimate. Needs 3+ echoes.\n"
         "  auto  s0r2 with 3+ echoes, none with 2.",
     )
+    mp.add_argument(
+        "-phase_field_nuisance",
+        choices=("auto", "flat", "flat_offset"),
+        default="auto",
+        help="[-phase] What the PHASE may change by in place at each voxel and frame:\n"
+        "  flat         a field change (the same in Hz at every echo): field-blind.\n"
+        "  flat_offset  that plus a change of the receiver phase at TE 0, which in Hz falls"
+        " as 1/TE and would otherwise read as a TE-dependent shift. Needs 3+ echoes.\n"
+        "  auto         flat_offset with 3+ echoes, flat with 2.",
+    )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
         "-backend",
@@ -4084,6 +4094,10 @@ def _magphase_arg_error(args, *, dual: bool, slicewise: bool) -> str | None:
         return "a single echo has no per-voxel magnitude nuisance to fit; -phase_mag_nuisance none."
     if nuis == "s0r2" and n < 3:
         return "-phase_mag_nuisance s0r2 fits two terms per voxel and needs 3+ echoes."
+    if args.phase_field_nuisance == "flat_offset" and n < 3:
+        return "-phase_field_nuisance flat_offset fits two terms per voxel and needs 3+ echoes."
+    if n == 1 and args.phase_field_nuisance != "auto":
+        return "a single echo has no per-voxel field term; leave -phase_field_nuisance at auto."
     if n == 1 and args.phase_hpf is not None and args.phase_hpf <= 0:
         return (
             "a single echo needs -phase_hpf > 0: without the TE law the smooth field "
@@ -4511,6 +4525,7 @@ def _run_multiecho(
             n_iters=args.iters,
             refine_rounds=args.refine,
             mag_nuisance=_magphase_mag_nuisance(args),
+            phase_nuisance=args.phase_field_nuisance,
             phase_hpf_sigma=_magphase_hpf_vox(args, affine, len(datas)),
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,

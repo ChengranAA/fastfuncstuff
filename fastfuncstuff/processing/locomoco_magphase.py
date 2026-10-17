@@ -51,12 +51,15 @@ class MagPhaseFlow:
 
 
 def nuisance_columns(kind: str, te: torch.Tensor) -> torch.Tensor:
-    """Per-echo nuisance design ``(E, q)``: 'flat' / 's0' = 1, 'r2' adds TE (scaled)."""
+    """Per-echo nuisance design ``(E, q)``: 'flat' / 's0' = 1, 'r2' adds TE (scaled),
+    'flat_offset' adds TE1/TE (a receiver-phase change at TE 0, seen in Hz)."""
     cols = []
-    if kind in ("flat", "s0", "s0r2"):
+    if kind in ("flat", "flat_offset", "s0", "s0r2"):
         cols.append(torch.ones_like(te))
     if kind == "s0r2":
         cols.append(te / te.mean())
+    if kind == "flat_offset":
+        cols.append(te[0] / te)
     if not cols:
         return torch.zeros(te.numel(), 0)
     return torch.stack(cols, 1)
@@ -141,6 +144,7 @@ def estimate_partition_flow_magphase(
     n_iters: int = 4,
     refine_rounds: int = 0,
     mag_nuisance: str = "s0r2",
+    phase_nuisance: str = "auto",
     phase_hpf_sigma: float = 0.0,
     warp_interp: str = "lanczos",
     warp_radius: int = 3,
@@ -153,7 +157,9 @@ def estimate_partition_flow_magphase(
     motion/distortion resample. ``mag_nuisance`` picks what the magnitude may change by
     in place at each voxel and frame: 'none' (plain), 's0' (echo-constant), 's0r2' (plus
     proportional to TE; BOLD-blind, needs 3+ echoes). With 2+ echoes the phase gets the
-    echo-constant field term; ``phase_hpf_sigma`` (voxels, required for a single echo,
+    echo-constant field term, and by default (``phase_nuisance='auto'``) with 3+ a
+    receiver-offset term too (TE1/TE in Hz): a drifting offset otherwise reads as a
+    TE-dependent shift (one 3-echo run drifted 0.08 rad). ``phase_hpf_sigma`` (voxels, required for a single echo,
     optional otherwise) high-passes it inside its support first. Gauss-Newton: ``n_iters`` pull-warp updates per frame
     against the per-echo temporal-mean templates; ``refine_rounds`` rebuilds those
     templates from the corrected frames and re-solves (the uncorrected mean still
@@ -169,6 +175,14 @@ def estimate_partition_flow_magphase(
         raise ValueError("mag+phase needs one phase series and one TE per magnitude echo.")
     if e == 1 and mag_nuisance != "none":
         raise ValueError("a single echo has no per-voxel magnitude nuisance to fit; use 'none'.")
+    if phase_nuisance not in ("auto", "none", "flat", "flat_offset"):
+        raise ValueError(
+            f"phase_nuisance must be auto/none/flat/flat_offset, got {phase_nuisance!r}"
+        )
+    if phase_nuisance == "flat_offset" and e < 3:
+        raise ValueError(
+            "phase_nuisance 'flat_offset' fits two terms per voxel and needs 3+ echoes."
+        )
     if e == 1 and phase_hpf_sigma <= 0:
         raise ValueError(
             "single-echo phase needs phase_hpf_sigma > 0: without the TE law the smooth field "
@@ -211,7 +225,10 @@ def estimate_partition_flow_magphase(
 
     floor = float(echo_mean[brain_np].mean()) * 1e-3
     chans = {"mag": mags, "hz": phases_hz}
-    kinds = {"mag": mag_nuisance, "hz": "flat" if e >= 2 else "none"}
+    if phase_nuisance == "auto":
+        # an offset change needs a third echo to be told apart from field + shift
+        phase_nuisance = "flat_offset" if e >= 3 else ("flat" if e >= 2 else "none")
+    kinds = {"mag": mag_nuisance, "hz": phase_nuisance}
 
     def frame(ch: str, t: int, w: torch.Tensor | None) -> torch.Tensor:
         vol = torch.stack(

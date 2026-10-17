@@ -31,11 +31,13 @@ def _smooth(rng, sigma, scale):
     return (v / v.std() * scale).astype(np.float32)
 
 
-def _scene(seed=0, field_noise=0.0, field_noise_sigma=1.5, mag_noise=2.0):
+def _scene(seed=0, field_noise=0.0, field_noise_sigma=1.5, mag_noise=2.0, offset_noise=0.0):
     """Head blob with texture; known smooth TE-scaled shift w_true in both channels.
 
     ``field_noise`` adds an echo-constant (in Hz) field change per voxel and frame,
-    zero-mean over time -- what the phase's flat nuisance must ignore.
+    zero-mean over time -- what the phase's flat nuisance must ignore. ``offset_noise``
+    (rad) adds a change of the receiver phase at TE 0, the same in RADIANS at every echo
+    (so it falls as 1/TE in Hz) -- what the offset term must ignore.
     """
     rng = np.random.default_rng(seed)
     g = np.stack(np.meshgrid(*[np.linspace(-1, 1, n) for n in SHAPE], indexing="ij"))
@@ -52,6 +54,13 @@ def _scene(seed=0, field_noise=0.0, field_noise_sigma=1.5, mag_noise=2.0):
     )
     if field_noise:
         fn = fn - fn.mean(-1, keepdims=True)
+    off = (
+        np.stack([_smooth(rng, field_noise_sigma, offset_noise) for _ in range(NT)], -1)
+        if offset_noise
+        else 0.0
+    )
+    if offset_noise:
+        off = off - off.mean(-1, keepdims=True)
     mags, phs = [], []
     for te, a in zip(TE, alpha, strict=True):
         m_tpl = torch.from_numpy(s0 * np.exp(-te * r2))
@@ -63,7 +72,8 @@ def _scene(seed=0, field_noise=0.0, field_noise_sigma=1.5, mag_noise=2.0):
             m4[..., t] = _shift3d_axis(m_tpl[None], d, PE, mode="bicubic")[0].numpy()
             p4[..., t] = _shift3d_axis(p_tpl[None], d, PE, mode="bicubic")[0].numpy()
         m4 += rng.standard_normal(m4.shape).astype(np.float32) * mag_noise
-        p4 += (rng.standard_normal(p4.shape).astype(np.float32) * 0.3 + fn) * (head[..., None] > 0)
+        noise = rng.standard_normal(p4.shape).astype(np.float32) * 0.3
+        p4 += (noise + fn + off / (2 * np.pi * te * 1e-3)) * (head[..., None] > 0)
         mags.append(m4)
         phs.append(p4)
     return mags, phs, w_true, head > 0
@@ -100,7 +110,8 @@ def test_recovers_te_scaled_shift():
     tru = (w_true - w_true.mean(-1, keepdims=True))[m]
     r = np.corrcoef(est.ravel(), tru.ravel())[0, 1]
     slope = float((est * tru).sum() / (tru * tru).sum())
-    assert r > 0.95, r
+    # 0.95 with a field term only; the default offset term (3+ echoes) costs ~0.005
+    assert r > 0.93, r
     assert 0.85 < slope < 1.1, slope
 
 
@@ -117,14 +128,14 @@ def test_blind_to_echo_constant_field_change(monkeypatch):
     # footprint. The phase's per-voxel flat nuisance must shrug it off; without that
     # term the same solve reads the field change as shift.
     mags, phs, w_true, head = _scene(field_noise=6.0)
-    blind = _recovery_r(_run(mags, phs, refine_rounds=1), w_true, head)
+    blind = _recovery_r(_run(mags, phs, refine_rounds=1, phase_nuisance="flat"), w_true, head)
     import fastfuncstuff.processing.locomoco_magphase as lm
 
     orig = lm.nuisance_columns
     monkeypatch.setattr(
         lm, "nuisance_columns", lambda k, te: orig("none" if k == "flat" else k, te)
     )
-    naive = _recovery_r(_run(mags, phs, refine_rounds=1), w_true, head)
+    naive = _recovery_r(_run(mags, phs, refine_rounds=1, phase_nuisance="flat"), w_true, head)
     assert blind > 0.93, blind
     assert naive < blind - 0.2, (naive, blind)
 
@@ -213,6 +224,12 @@ def test_cli_phase_validation():
     flat = _cli_args("-phase", "p1", "p2", "p3", "-me_flat_scaling")
     assert "-me_flat_scaling" in _magphase_arg_error(flat, dual=False, slicewise=False)
     assert "ONE encode axis" in _magphase_arg_error(ok, dual=True, slicewise=False)
+    two = _cli_args("-phase", "p1", "p2", "p3", "-phase_field_nuisance", "flat_offset")
+    two.input = two.input[:2]
+    two.phase = two.phase[:2]
+    two.echo_times = two.echo_times[:2]
+    two.phase_mag_nuisance = "none"
+    assert "flat_offset" in _magphase_arg_error(two, dual=False, slicewise=False)
 
 
 def test_single_echo_highpass_recovers_shift_under_smooth_field_drift():
@@ -274,3 +291,16 @@ def test_single_echo_highpass_rescues_weak_magnitude(monkeypatch):
     )
     assert with_hp > 0.6, with_hp
     assert no_hp < with_hp - 0.2, (no_hp, with_hp)
+
+
+def test_blind_to_receiver_offset_drift():
+    # A drifting phase at TE 0 is constant in radians across echoes, so in Hz it is
+    # largest at echo 1 and falls as 1/TE: not echo-constant, so a flat field term
+    # alone lets it read as TE-dependent shift. With 3+ echoes the offset term removes it.
+    mags, phs, w_true, head = _scene(offset_noise=0.6, mag_noise=30.0)
+    blind = _recovery_r(_run(mags, phs, refine_rounds=1, mag_nuisance="s0r2"), w_true, head)
+    flat = _recovery_r(
+        _run(mags, phs, refine_rounds=1, mag_nuisance="s0r2", phase_nuisance="flat"), w_true, head
+    )
+    assert blind > 0.85, blind
+    assert flat < blind - 0.15, (flat, blind)

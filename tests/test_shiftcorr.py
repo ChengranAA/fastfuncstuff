@@ -294,19 +294,25 @@ def test_partition_shift_from_phase_returns_the_correction_apply_shift_needs():
     w_true = 0.3 * np.sin(np.linspace(0, 12, n_t))  # correction at TE1, voxels
     w_true -= w_true.mean()
     common = 2.0 * np.cos(np.linspace(0, 5, n_t))  # breathing: same Hz at every echo
+    offset = 0.15 * np.sin(np.linspace(0, 3, n_t))  # receiver phase at TE 0, rad
     fld = torch.from_numpy(np.repeat(field.transpose(2, 1, 0)[None], n_t, 0).astype(np.float32))
     unwrapped = np.zeros((nx, ny, nz, len(tes), n_t), np.float32)
     for e, te in enumerate(tes):
         # observed = original pushed by MINUS the correction (so the correction restores it)
         moved = apply_shift(fld, -w_true * te / tes[0], axis=2).numpy().transpose(3, 2, 1, 0)
         f_e = moved + common[None, None, None, :]
-        unwrapped[..., e, :] = 2 * np.pi * f_e * te * 1e-3 + rng.normal(0, 0.02, f_e.shape)
+        unwrapped[..., e, :] = 2 * np.pi * f_e * te * 1e-3 + offset + rng.normal(0, 0.02, f_e.shape)
     mag = np.ones_like(unwrapped)
     mask = np.zeros((nx, ny, nz), bool)
     mask[3:-3, 3:-3, 4:-4] = True  # clear of the shift's replicate-padded edge
     w = partition_shift_from_phase(unwrapped, mag, tes, mask, 2, device=torch.device("cpu"))
     assert np.corrcoef(w, w_true)[0, 1] > 0.99
     assert np.polyfit(w_true, w, 1)[0] == pytest.approx(1.0, abs=0.1)
+    # a drifting receiver offset reads as a shift unless it is projected out too
+    naive = partition_shift_from_phase(
+        unwrapped, mag, tes, mask, 2, device=torch.device("cpu"), offset_blind=False
+    )
+    assert np.abs(naive - w_true).std() > 3 * np.abs(w - w_true).std()
     table = shift_table_from_partition_shift(w, tes)
     assert table.shape == (n_t, 3)
     assert np.allclose(table[:, 2], w * tes[2] / tes[0])

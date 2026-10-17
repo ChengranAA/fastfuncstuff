@@ -48,6 +48,10 @@ class MagPhaseFlow:
     phase_share: torch.Tensor  # (nx,ny,nz) fraction of the pooled information from phase
     phase_valid: torch.Tensor  # (nx,ny,nz) bool, where phase entered the solve
     brain: torch.Tensor  # (nx,ny,nz) bool, the voxels whose observations were used
+    # In-plane PE displacement (nx,ny,nz,T), the SAME at every echo (the readout spans
+    # the same time at every echo), when an in-plane axis was solved too; else None.
+    u_field: torch.Tensor | None = None
+    inplane_axis: int | None = None
 
 
 def nuisance_columns(kind: str, te: torch.Tensor) -> torch.Tensor:
@@ -148,6 +152,7 @@ def estimate_partition_flow_magphase(
     phase_hpf_sigma: float = 0.0,
     warp_interp: str = "lanczos",
     warp_radius: int = 3,
+    inplane_axis: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MagPhaseFlow:
@@ -164,6 +169,15 @@ def estimate_partition_flow_magphase(
     against the per-echo temporal-mean templates; ``refine_rounds`` rebuilds those
     templates from the corrected frames and re-solves (the uncorrected mean still
     carries the wiggle and biases the field low).
+
+    ``inplane_axis``: also solve the in-plane phase-encode displacement ``u``, the same
+    at every echo (the readout spans the same time at every echo). Its footprint is NOT
+    TE-scaled, so the per-voxel nuisances that make ``w`` field- and BOLD-blind remove
+    it entirely: in log-magnitude it is d(log S0) - TE d(R2*), inside the s0r2 span; in
+    Hz it is echo-constant, the flat field term. ``u`` therefore comes from brightness
+    constancy on the un-projected log-magnitude (as plain locomoco's in-plane estimate
+    does), ``w`` from the joint projected solve, alternating per iteration (the two
+    axes' derivatives are only weakly coupled). Returned as ``u_field``.
     """
     from .locomoco import _blur3d_b, _shift3d_axis
     from .mask import automask
@@ -216,6 +230,10 @@ def estimate_partition_flow_magphase(
         have &= np.count_nonzero(np.isfinite(p) & (p != 0), axis=3) >= 0.99 * nt
     reach = (warp_radius if warp_interp == "lanczos" else 2) + 1
     valid_np = _pe_erode(have & brain_np, pe_axis, reach)
+    if inplane_axis is not None:
+        if inplane_axis == pe_axis:
+            raise ValueError("the in-plane axis must differ from the partition axis.")
+        valid_np = _pe_erode(valid_np, inplane_axis, reach)
     brain = torch.from_numpy(brain_np).to(device)
     valid_in_brain = torch.from_numpy(valid_np[brain_np]).to(device)
     v = int(brain.sum())
@@ -230,7 +248,9 @@ def estimate_partition_flow_magphase(
         phase_nuisance = "flat_offset" if e >= 3 else ("flat" if e >= 2 else "none")
     kinds = {"mag": mag_nuisance, "hz": phase_nuisance}
 
-    def frame(ch: str, t: int, w: torch.Tensor | None) -> torch.Tensor:
+    def frame(
+        ch: str, t: int, w: torch.Tensor | None, u: torch.Tensor | None = None
+    ) -> torch.Tensor:
         vol = torch.stack(
             [torch.from_numpy(np.ascontiguousarray(a[..., t])) for a in chans[ch]]
         ).to(device)
@@ -238,19 +258,31 @@ def estimate_partition_flow_magphase(
             vol = _shift3d_axis(
                 vol, alpha_d * w[None], pe_axis, mode=warp_interp, radius=warp_radius
             )
+        if u is not None and inplane_axis is not None:
+            # same displacement at every echo; small, so the two 1-D pulls compose
+            vol = _shift3d_axis(
+                vol,
+                u[None].expand(e, -1, -1, -1),
+                inplane_axis,
+                mode=warp_interp,
+                radius=warp_radius,
+            )
         if ch == "mag":
             vol = torch.log(vol.clamp_min(floor))
         return vol
 
-    def deriv(vol: torch.Tensor) -> torch.Tensor:
-        return (torch.roll(vol, -1, pe_axis + 1) - torch.roll(vol, 1, pe_axis + 1)) / 2
+    def deriv(vol: torch.Tensor, axis: int = pe_axis) -> torch.Tensor:
+        return (torch.roll(vol, -1, axis + 1) - torch.roll(vol, 1, axis + 1)) / 2
 
-    def templates(w_all: torch.Tensor | None) -> dict[str, torch.Tensor]:
+    def templates(
+        w_all: torch.Tensor | None, u_all: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
         acc = {ch: torch.zeros(e, nx, ny, nz, device=device) for ch in chans}
         for t in range(nt):
             wt = None if w_all is None else w_all[..., t].to(device)
+            ut = None if u_all is None else u_all[..., t].to(device)
             for ch in chans:
-                acc[ch] += frame(ch, t, wt)
+                acc[ch] += frame(ch, t, wt, ut)
         return {ch: a / nt for ch, a in acc.items()}
 
     # Noise weights: temporal variance of each observation's frame-to-frame change once
@@ -272,6 +304,18 @@ def estimate_partition_flow_magphase(
         if ch == "hz":
             wt = wt * valid_in_brain[None]
         weights[ch] = wt
+    w_raw = None
+    if inplane_axis is not None:
+        # u's evidence: the log-magnitude with no projection, noise-weighted by its own
+        # frame-to-frame variance.
+        acc = torch.zeros(e, v, device=device)
+        prev = frame("mag", 0, None)[:, brain]
+        for t in range(1, nt):
+            cur = frame("mag", t, None)[:, brain]
+            acc += (cur - prev) ** 2
+            prev = cur
+        var = acc / (2 * max(nt - 1, 1))
+        w_raw = 1.0 / var.clamp_min(float(var.median()) * 1e-3)
 
     def to_vol(vals: torch.Tensor) -> torch.Tensor:
         out = torch.zeros(nx, ny, nz, device=device)
@@ -279,17 +323,28 @@ def estimate_partition_flow_magphase(
         return out
 
     w_all = torch.zeros(nx, ny, nz, nt)
+    u_all = torch.zeros(nx, ny, nz, nt) if inplane_axis is not None else None
     share = None
+
+    def blur(vals: torch.Tensor) -> torch.Tensor:
+        return _blur3d_b(to_vol(vals)[None], window_sigma)[0]
+
     for rnd in range(refine_rounds + 1):
-        tpl = templates(None if rnd == 0 else w_all)
-        mx, sxx_tot, info = {}, torch.zeros(v, device=device), {}
+        tpl = templates(None if rnd == 0 else w_all, None if rnd == 0 else u_all)
+        mx, info = {}, {}
+        sww = torch.zeros(v, device=device)
         for ch in chans:
             x = -alpha.to(device)[:, None] * deriv(tpl[ch])[:, brain]
-            mx[ch], sxx = _weighted_design(x, weights[ch], nuisance_columns(kinds[ch], te), device)
-            info[ch] = _blur3d_b(to_vol(sxx)[None], window_sigma)[0]
-            sxx_tot += sxx
-        g_sxx = _blur3d_b(to_vol(sxx_tot)[None], window_sigma)[0]
-        lam = float(g_sxx[brain].median()) * 1e-3
+            mx[ch], s_ = _weighted_design(x, weights[ch], nuisance_columns(kinds[ch], te), device)
+            info[ch] = blur(s_)
+            sww += s_
+        g_ww = blur(sww)
+        lam = float(g_ww[brain].median()) * 1e-3
+        if inplane_axis is not None and w_raw is not None:
+            xu = -deriv(tpl["mag"], inplane_axis)[:, brain]
+            mxu = w_raw * xu
+            g_uu = blur((xu * mxu).sum(0))
+            lam_u = float(g_uu[brain].median()) * 1e-3
         share = (info["hz"] / (info["hz"] + info["mag"]).clamp_min(1e-30)).cpu()
         tpl_b = {ch: tpl[ch][:, brain] for ch in chans}
         desc = (
@@ -299,15 +354,21 @@ def estimate_partition_flow_magphase(
             range(nt), desc=desc, unit="frame", leave=True, disable=nt < 3 or not verbose
         ):
             w = w_all[..., t].to(device)
+            u = u_all[..., t].to(device) if u_all is not None else None
             for _ in range(n_iters):
-                sxy = torch.zeros(v, device=device)
+                syw = torch.zeros(v, device=device)
                 for ch in chans:
-                    y = frame(ch, t, w)[:, brain] - tpl_b[ch]
-                    sxy += (mx[ch] * y).sum(0)
+                    y = frame(ch, t, w, u)[:, brain] - tpl_b[ch]
+                    syw += (mx[ch] * y).sum(0)
                 # The pooled ratio decays smoothly to 0 outside the brain (sxy -> 0 while
                 # lam stays), so the field needs no hard mask edge.
-                w = w + _blur3d_b(to_vol(sxy)[None], window_sigma)[0] / (g_sxx + lam)
+                w = w + blur(syw) / (g_ww + lam)
+                if u is not None:
+                    y = frame("mag", t, w, u)[:, brain] - tpl_b["mag"]
+                    u = u + blur((mxu * y).sum(0)) / (g_uu + lam_u)
             w_all[..., t] = w.cpu()
+            if u_all is not None and u is not None:
+                u_all[..., t] = u.cpu()
 
     if verbose:
         ap = w_all[torch.from_numpy(brain_np)].abs()
@@ -325,6 +386,8 @@ def estimate_partition_flow_magphase(
         phase_share=share,
         phase_valid=torch.from_numpy(valid_np),
         brain=torch.from_numpy(brain_np),
+        u_field=u_all,
+        inplane_axis=inplane_axis,
     )
 
 
@@ -350,6 +413,10 @@ def magphase_me_result(
     if device is None:
         device = torch.device("cpu")
     nx, ny, nz, nt = (int(s) for s in datas[0].shape)
+    if flow.u_field is not None and flow.inplane_axis is not None:
+        return _magphase_dual_result(
+            datas, flow, echo_times, pe_axis, want_corrected, warp_interp, warp_radius, device
+        )
     disp_slice = slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
     a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
     perm4 = [3, disp_slice, a0, a1]
@@ -392,5 +459,65 @@ def magphase_me_result(
         echo_times=torch.tensor([float(t) for t in echo_times]),
         w_field=flow.w_field,
         pe_axis=pe_axis,
+        linearity_r2=1.0,
+    )
+
+
+def _magphase_dual_result(
+    datas, flow, echo_times, part_axis, want_corrected, warp_interp, warp_radius, device
+):
+    """The two-axis result: in-plane ``u`` (primary, the same at every echo) and the
+    TE-scaled partition ``alpha_e w`` (``pe_axis2``), in the dual layout the output code
+    writes (u on ``a1``, v on ``a0``, the undisplaced axis as the slice)."""
+    from .locomoco import LocomocoResult, MultiEchoLocomocoResult, _resample_once
+
+    assert flow.u_field is not None and flow.inplane_axis is not None
+    nx, ny, nz, nt = (int(s) for s in datas[0].shape)
+    ip = flow.inplane_axis
+    disp_slice = next(a for a in (0, 1, 2) if a not in (ip, part_axis))
+    a0, a1 = sorted((ip, part_axis))
+    perm4 = [3, disp_slice, a0, a1]
+    u_canon_ip = flow.u_field.permute(perm4).contiguous()
+    per_echo = []
+    for j, data in enumerate(datas):
+        part = flow.alpha[j] * flow.w_field
+        corrected = (
+            _resample_once(
+                data,
+                [part, flow.u_field],
+                [part_axis, ip],
+                warp_interp=warp_interp,
+                warp_radius=warp_radius,
+                device=device,
+                desc=f"resample e{j + 1}",
+            )
+            if want_corrected
+            else None
+        )
+        part_canon = part.permute(perm4).contiguous()
+        on_a1 = {ip: u_canon_ip, part_axis: part_canon}
+        per_echo.append(
+            LocomocoResult(
+                u_canon=on_a1[a1],
+                v_canon=on_a1[a0],
+                corrected_canon=torch.zeros_like(part_canon),
+                perm=perm4,
+                pe_flow_is_u=ip == a1,
+                pe_axis=ip,
+                slice_axis=disp_slice,
+                orig_shape=(nx, ny, nz, nt),
+                a0=a0,
+                a1=a1,
+                dual=True,
+                pe_axis2=part_axis,
+                corrected_nifti=corrected,
+            )
+        )
+    return MultiEchoLocomocoResult(
+        per_echo=per_echo,
+        alpha=flow.alpha,
+        echo_times=torch.tensor([float(t) for t in echo_times]),
+        w_field=flow.w_field,
+        pe_axis=part_axis,
         linearity_r2=1.0,
     )

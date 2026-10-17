@@ -4073,7 +4073,10 @@ def _magphase_arg_error(args, *, dual: bool, slicewise: bool) -> str | None:
             "wrap period, and -phase_units rad needs it to convert to Hz."
         )
     if dual or slicewise:
-        return "is a 3-D solve along ONE encode axis (-is_3dacq / -me_3depi, a single -pe_dir)."
+        return (
+            "is a 3-D solve (-is_3dacq / -me_3depi): one partition axis, optionally with the "
+            "in-plane -pe_dir beside it -- not the 2-D two-in-plane-axis or slicewise modes."
+        )
     clashes = [
         (args.backend != "flow", "-backend " + args.backend),
         (args.me_interecho, "-me_interecho"),
@@ -4177,13 +4180,14 @@ def _magphase_hz(args, phases) -> list:
 
 
 def _write_magphase_outputs(
-    flow, args, fields, phases, pe_axis, stem, ext, affine, out_tr, device, *, single=False
+    flow, args, components, phases, stem, ext, affine, out_tr, device, *, single=False
 ) -> None:
     """Corrected phase (input units) and the per-voxel phase share of the information.
 
-    ``fields`` are each echo's FINAL field (after any -detask change), so the phase moves
-    exactly as the written magnitude did. ``phases`` are the input-unit arrays the run
-    held -- the injected copy under -inject_jitter, the file as given otherwise.
+    ``components`` are each echo's FINAL warp components, ``[(axis, field), ...]`` (one
+    axis, or in-plane + partition), after any -detask change, so the phase moves exactly
+    as the written magnitude did. ``phases`` are the input-unit arrays the run held --
+    the injected copy under -inject_jitter, the file as given otherwise.
     """
     import numpy as np
 
@@ -4197,11 +4201,11 @@ def _write_magphase_outputs(
         save_nifti(share, share_path, affine=affine)
     if args.no_corrected:
         return
-    for j, (ph, field) in enumerate(zip(phases, fields, strict=True)):
+    for j, (ph, comps) in enumerate(zip(phases, components, strict=True)):
         corrected = _resample_once(
             ph,
-            [field],
-            [pe_axis],
+            [f for _ax, f in comps],
+            [ax for ax, _f in comps],
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             device=device,
@@ -4284,7 +4288,8 @@ def _run_multiecho(
             )
             return 2
     if args.phase:
-        err = _magphase_arg_error(args, dual=pe_axis2 is not None, slicewise=slicewise)
+        # a 3-D two-axis run (-pe_dir + -pe_dir2) is fine: in-plane + partition
+        err = _magphase_arg_error(args, dual=False, slicewise=slicewise)
         if err:
             print(f"❌ -phase: {err}", file=sys.stderr)
             return 2
@@ -4532,11 +4537,15 @@ def _run_multiecho(
             magphase_me_result,
         )
 
+        # Two axes: pe_axis is the in-plane PE (the same at every echo), pe_axis2 the
+        # TE-scaled partition. -pe_dir2 alone has already been collapsed onto pe_axis.
+        part_axis, ip_axis = (pe_axis2, pe_axis) if pe_axis2 is not None else (pe_axis, None)
         magphase_flow = estimate_partition_flow_magphase(
             datas,
             phases_hz,
             args.echo_times,
-            pe_axis,
+            part_axis,
+            inplane_axis=ip_axis,
             window_sigma=float(args.window[0]),
             n_iters=args.iters,
             refine_rounds=args.refine,
@@ -4552,7 +4561,7 @@ def _run_multiecho(
             datas,
             magphase_flow,
             args.echo_times,
-            pe_axis,
+            part_axis,
             slice_axis,
             want_corrected=_estimator_wants_corrected(args),
             warp_interp=args.warp_interp,
@@ -4947,9 +4956,8 @@ def _run_multiecho(
         _write_magphase_outputs(
             magphase_flow,
             args,
-            [res.pe_displacement() for res in result.per_echo],
+            [res.warp_components() for res in result.per_echo],
             phases_in,
-            pe_axis,
             stem,
             ext,
             affine,
@@ -5534,11 +5542,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             magphase_me_result,
         )
 
+        part_axis, ip_axis = (pe_axis2, pe_axis) if pe_axis2 is not None else (pe_axis, None)
         magphase_flow = estimate_partition_flow_magphase(
             [data],
             _magphase_hz(args, phases_in),
             args.echo_times,
-            pe_axis,
+            part_axis,
+            inplane_axis=ip_axis,
             window_sigma=float(args.window[0]),
             n_iters=args.iters,
             refine_rounds=args.refine,
@@ -5552,7 +5562,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             [data],
             magphase_flow,
             args.echo_times,
-            pe_axis,
+            part_axis,
             slice_axis,
             want_corrected=_estimator_wants_corrected(args),
             warp_interp=args.warp_interp,
@@ -6009,9 +6019,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         _write_magphase_outputs(
             magphase_flow,
             args,
-            [result.pe_displacement()],
+            [result.warp_components()],
             phases_in,
-            pe_axis,
             stem,
             ext,
             affine,

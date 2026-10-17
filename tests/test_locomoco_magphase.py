@@ -223,7 +223,7 @@ def test_cli_phase_validation():
     assert "2 phase series for 3" in _magphase_arg_error(short, dual=False, slicewise=False)
     flat = _cli_args("-phase", "p1", "p2", "p3", "-me_flat_scaling")
     assert "-me_flat_scaling" in _magphase_arg_error(flat, dual=False, slicewise=False)
-    assert "ONE encode axis" in _magphase_arg_error(ok, dual=True, slicewise=False)
+    assert "one partition axis" in _magphase_arg_error(ok, dual=True, slicewise=False)
     two = _cli_args("-phase", "p1", "p2", "p3", "-phase_field_nuisance", "flat_offset")
     two.input = two.input[:2]
     two.phase = two.phase[:2]
@@ -304,3 +304,104 @@ def test_blind_to_receiver_offset_drift():
     )
     assert blind > 0.85, blind
     assert flat < blind - 0.15, (flat, blind)
+
+
+def _scene_dual(seed=0, mag_noise=2.0):
+    """Like _scene, plus an in-plane displacement u along axis 1 that is the SAME at
+    every echo (the partition one, w along axis 2, scales with TE)."""
+    rng = np.random.default_rng(seed)
+    g = np.stack(np.meshgrid(*[np.linspace(-1, 1, n) for n in SHAPE], indexing="ij"))
+    head = (np.sqrt((g**2).sum(0)) < 0.8).astype(np.float32)
+    s0 = (1000 + _smooth(rng, 1.2, 150)) * gaussian_filter(head, 1.0)
+    r2 = 0.03 + _smooth(rng, 1.5, 0.005)
+    field = _smooth(rng, 2.0, 15.0)
+    w_true = np.stack([_smooth(rng, 4.0, 0.04) for _ in range(NT)], -1)
+    u_true = np.stack([_smooth(rng, 4.0, 0.15) for _ in range(NT)], -1)
+    alpha = np.array(TE) / TE[0]
+    mags, phs = [], []
+    for te, a in zip(TE, alpha, strict=True):
+        m_tpl = torch.from_numpy(s0 * np.exp(-te * r2))
+        p_tpl = torch.from_numpy(np.where(head > 0, field, 0.0).astype(np.float32))
+        m4 = np.empty(SHAPE + (NT,), np.float32)
+        p4 = np.empty(SHAPE + (NT,), np.float32)
+        for t in range(NT):
+            dw = torch.from_numpy((-a * w_true[..., t]).astype(np.float32))[None]
+            du = torch.from_numpy((-u_true[..., t]).astype(np.float32))[None]
+            for tpl, out in ((m_tpl, m4), (p_tpl, p4)):
+                v = _shift3d_axis(tpl[None], dw, PE, mode="bicubic")
+                out[..., t] = _shift3d_axis(v, du, 1, mode="bicubic")[0].numpy()
+        m4 += rng.standard_normal(m4.shape).astype(np.float32) * mag_noise
+        p4 += rng.standard_normal(p4.shape).astype(np.float32) * 0.3 * (head[..., None] > 0)
+        mags.append(m4)
+        phs.append(p4)
+    return mags, phs, w_true, u_true, head > 0
+
+
+def test_two_axis_recovers_inplane_and_partition_separately():
+    """In-plane (echo-independent) and partition (TE-scaled) displacement together:
+    both are recovered. The in-plane footprint lies inside the per-voxel nuisance span
+    (s0r2 in log-magnitude, flat in Hz), so the joint partition estimate is blind to it:
+    w comes out the same whether or not u is solved, and u needs the un-projected
+    magnitude (brightness constancy) to be seen at all."""
+    mags, phs, w_true, u_true, head = _scene_dual()
+    m = _interior(head)
+
+    def r(est, tru):
+        est = (est - est.mean(-1, keepdims=True))[m]
+        tru = (tru - tru.mean(-1, keepdims=True))[m]
+        return np.corrcoef(est.ravel(), tru.ravel())[0, 1]
+
+    dual = _run(mags, phs, refine_rounds=1, inplane_axis=1)
+    assert dual.u_field is not None
+    assert r(dual.w_field.numpy(), w_true) > 0.9
+    assert r(dual.u_field.numpy(), u_true) > 0.9
+    single = _run(mags, phs, refine_rounds=1)
+    assert abs(r(single.w_field.numpy(), w_true) - r(dual.w_field.numpy(), w_true)) < 0.02
+
+
+def test_two_axis_result_is_a_dual_locomoco_result():
+    from fastfuncstuff.processing.locomoco_magphase import magphase_me_result
+
+    mags, phs, _w, _u, _head = _scene_dual()
+    flow = estimate_partition_flow_magphase(
+        mags[:2], phs[:2], TE[:2], PE, inplane_axis=1, mag_nuisance="none", n_iters=2,
+        warp_interp="bicubic", device=CPU, verbose=False,
+    )  # fmt: skip
+    res = magphase_me_result(mags[:2], flow, TE[:2], PE, 0, want_corrected=False, device=CPU)
+    e2 = res.per_echo[1]
+    assert e2.dual and e2.pe_axis == 1 and e2.pe_axis2 == PE
+    comps = dict((ax, f) for ax, f in e2.warp_components())
+    # echo 2's partition component is TE-scaled, its in-plane component is not
+    assert torch.allclose(comps[PE], flow.w_field * float(flow.alpha[1]))
+    assert torch.allclose(comps[1], flow.u_field)
+
+
+def test_cli_two_axis_with_phase_writes_both_components(tmp_path):
+    """-pe_dir (in-plane) + -pe_dir2 (partition) + -phase now runs: per echo both flow
+    components are written, the partition one TE-scaled, plus the corrected phase."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    mags, phs, _w, _u, _head = _scene_dual()
+    ins, phas = [], []
+    for e in range(len(TE)):
+        for kind, arr, lst in (("m", mags[e], ins), ("p", phs[e], phas)):
+            p = tmp_path / f"{kind}{e + 1}.nii.gz"
+            nib.save(nib.Nifti1Image(arr, np.eye(4)), str(p))
+            lst.append(str(p))
+    stem = str(tmp_path / "out")
+    rc = main(
+        ["-input", *ins, "-prefix", stem, "-phase", *phas, "-phase_units", "hz", "-echo_times", *map(str, TE),
+         "-me_3depi", "-pe_dir", "y", "-pe_dir2", "z", "-backend", "flow", "-device", "cpu",
+         "-no_warp", "-no_movie", "-levels", "1", "-iters", "2", "-refine", "0", "-ref", "mean"]
+    )  # fmt: skip
+    assert rc == 0
+    f1 = np.asarray(nib.load(str(tmp_path / "out_e1_flow_pe1.nii.gz")).dataobj)  # in-plane
+    f4 = np.asarray(nib.load(str(tmp_path / "out_e4_flow_pe1.nii.gz")).dataobj)
+    p1 = np.asarray(nib.load(str(tmp_path / "out_e1_flow_pe2.nii.gz")).dataobj)  # partition
+    p4 = np.asarray(nib.load(str(tmp_path / "out_e4_flow_pe2.nii.gz")).dataobj)
+    assert np.allclose(f1, f4, atol=1e-5)  # in-plane: the same at every echo
+    k = float((p4 * p1).sum() / (p1 * p1).sum())
+    assert abs(k - TE[3] / TE[0]) < 1e-3  # partition: TE-scaled
+    assert (tmp_path / "out_e4_phase_locomoco.nii.gz").exists()

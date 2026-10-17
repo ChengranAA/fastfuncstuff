@@ -1727,6 +1727,10 @@ def _stage_locomoco(plan: Plan, script_stem: str) -> str:
         '-input "stage02.moco.${FRAG[$k]}.nii$FMT"',
         '-prefix "${nlstem}.nii$FMT"',
         '-pe_dir "${pe:-y}"',
+        # 3-D EPI: the partition (2nd phase-encode) axis wiggles too, by a different
+        # mechanism (a field change during the shot), so both are solved at once. The
+        # partition is the third voxel axis of an axial 3-D acquisition.
+        *(["-pe_dir2 k"] if plan.options.acq_3d else []),
         *_split_flags(config.DEFAULT_OPTS["locomoco"]),
         # The design, for whichever step reads it. -tr rides along because a 3D
         # acquisition's header pixdim[4] is the per-partition time, not the volume TR

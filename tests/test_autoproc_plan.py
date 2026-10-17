@@ -301,6 +301,20 @@ def test_locomoco_consumes_the_moco_timeseries_not_the_mean():
     assert '-prefix \\"${mstem}.nii$FMT\\"' not in s2
 
 
+def test_locomoco_solves_the_partition_axis_too_for_3d():
+    """3-D EPI: locomoco gets the partition axis (-pe_dir2) beside the in-plane PE
+    one, so both directions are solved in one call; 2-D multi-slice does not."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+    s3 = write_script(
+        build_plan(subj, Options(locomoco=True, acq_3d=True)), "wd", bids_root="/bids"
+    )
+    s2 = write_script(
+        build_plan(subj, Options(locomoco=True, acq_3d=False)), "wd", bids_root="/bids"
+    )
+    assert "-pe_dir2 k" in s3
+    assert "-pe_dir2" not in s2
+
+
 def test_grand_reference_chain_and_borrowed_anat():
     """primary→floc: anat matrix borrowed from the ref dir, grandmean aligned to
     the ref (xref), one last segment on current data (anat_nl)."""

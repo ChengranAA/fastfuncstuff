@@ -648,6 +648,18 @@ def bytes_per_voxel_phasereg(n_timepoints: int, explore: bool = False) -> int:
     return n_timepoints * 4 * n_series
 
 
+def bytes_per_voxel_magphase_design(n_echoes: int, n_nuisance: int) -> int:
+    """Working memory per voxel for one chunk of the mag+phase weighted design build.
+
+    ``locomoco_magphase._weighted_design``: weights, design column and their product
+    (3 x E), the weighted nuisance block W·N (E x q), its Gram N'WN and a solve copy
+    (2 x q x q), the right-hand side and coefficients (2 x q), and the result M·x (E).
+    Doubled for the einsum/solve transients.
+    """
+    e, q = n_echoes, max(n_nuisance, 1)
+    return 2 * 4 * (4 * e + e * q + 2 * q * q + 2 * q)
+
+
 def bytes_per_voxel_arma_search(
     n_timepoints: int,
     n_regressors: int,

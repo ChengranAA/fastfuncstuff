@@ -4106,6 +4106,22 @@ def _magphase_arg_error(args, *, dual: bool, slicewise: bool) -> str | None:
     return None
 
 
+def _estimator_wants_corrected(args) -> bool:
+    """Whether an estimator must keep the corrected series: written, or read by a
+    reduction (-save_mean/max/min), the task-fit "after", the PC table or the QC maps.
+    Passing ``not args.no_corrected`` alone left those outputs reading an empty series
+    under -no_corrected (all-zero _locomoco_mean in the multi-echo path)."""
+    return bool(
+        not args.no_corrected
+        or args.save_mean
+        or args.save_max
+        or args.save_min
+        or (_want_qc(args) and _want_corrected_qc(args))
+        or getattr(args, "_task_after", None) is not None
+        or args.want_pcs is not None
+    )
+
+
 def _magphase_mag_nuisance(args) -> str:
     if args.phase_mag_nuisance != "auto":
         return args.phase_mag_nuisance
@@ -4538,7 +4554,7 @@ def _run_multiecho(
             args.echo_times,
             pe_axis,
             slice_axis,
-            want_corrected=not args.no_corrected,
+            want_corrected=_estimator_wants_corrected(args),
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             device=device,
@@ -4621,7 +4637,7 @@ def _run_multiecho(
                 warp_interp=args.warp_interp,
                 warp_radius=args.warp_radius,
                 hpf_sigma=hpf_sigma,
-                want_corrected=not args.no_corrected,
+                want_corrected=_estimator_wants_corrected(args),
                 device=device,
             )
     elif est_idx is not None:
@@ -4691,7 +4707,7 @@ def _run_multiecho(
             peak_mode="argmax" if args.argmax else "first_peak",
             search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
-            want_corrected=not args.no_corrected,
+            want_corrected=_estimator_wants_corrected(args),
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             hpf_sigma=hpf_sigma,
@@ -4822,6 +4838,7 @@ def _run_multiecho(
             or getattr(args, "_task_after", None) is not None
             or args.want_pcs is not None
             or args.save_echo_corr
+            or (j == 0 and (args.save_mean or args.save_max or args.save_min))
         )
         corrected_series = res.corrected_series() if want_corrected else None
         if corrected_series is not None and args.jacobian:
@@ -4845,6 +4862,22 @@ def _run_multiecho(
                     affine=affine,
                     tr=out_tr,
                 )
+        if j == 0 and corrected_series is not None:
+            # Echo 1's reductions under the single-echo names: it is the echo the rest
+            # of a pipeline registers from (ffs_autoproc aligns from _locomoco_mean).
+            for want, which, reduce in (
+                (args.save_mean, "mean", lambda s: s.mean(dim=-1)),
+                (args.save_max, "max", lambda s: s.amax(dim=-1)),
+                (args.save_min, "min", lambda s: s.amin(dim=-1)),
+            ):
+                if want:
+                    out_path = f"{stem}_locomoco_{which}{ext}"
+                    with spinner(f"Writing {Path(out_path).name}"):
+                        save_nifti(
+                            _neg_clip(reduce(corrected_series).numpy(), args.allow_neg),
+                            out_path,
+                            affine=affine,
+                        )
         if not args.no_flow:
             if res.pe_axis2 is not None:
                 for label, _axis, field in res.pe_displacements():
@@ -5521,7 +5554,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             args.echo_times,
             pe_axis,
             slice_axis,
-            want_corrected=not args.no_corrected,
+            want_corrected=_estimator_wants_corrected(args),
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             device=device,

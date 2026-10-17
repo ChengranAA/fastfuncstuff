@@ -811,6 +811,37 @@ def test_cli_want_pcs_written_with_no_warp(tmp_path):
     assert 1 <= arr.shape[1] <= 4  # up to n_pcs columns
 
 
+def test_me_3depi_writes_echo1_reductions_under_single_echo_names(tmp_path):
+    """-save_mean/-save_max/-save_min in the multi-echo path write ECHO 1's reductions
+    as {prefix}_locomoco_mean etc. -- the registration image a pipeline aligns from
+    (ffs_autoproc reads _locomoco_mean). The path used to ignore the flags."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    tes = [7.61, 21.71, 35.81]
+    datas, _ = _make_multiecho(tes, [0.0, 0.5, -0.4, 0.3, -0.5])
+    paths = []
+    for e, series in enumerate(datas):
+        p = tmp_path / f"e{e + 1}.nii.gz"
+        nib.save(nib.Nifti1Image(series, np.eye(4)), str(p))
+        paths.append(str(p))
+    stem = str(tmp_path / "out")
+    rc = main(
+        ["-input", *paths, "-prefix", stem, "-pe_dir2", "IS", "-backend", "flow", "-me_3depi",
+         "-echo_times", *[str(t) for t in tes], "-is_3dacq", "-me_fixed_scaling", "-device", "cpu",
+         "-no_warp", "-no_movie", "-no_corrected", "-no_flow", "-levels", "2", "-iters", "2",
+         "-refine", "0", "-save_mean", "-save_max", "-save_min"]
+    )  # fmt: skip
+    assert rc == 0
+    mean = np.asarray(nib.load(str(tmp_path / "out_locomoco_mean.nii.gz")).dataobj)
+    assert mean.shape == datas[0].shape[:3]
+    # echo 1's level, not the echo average (later echoes have decayed)
+    assert abs(float(mean.mean()) - float(datas[0].mean())) < 0.2 * float(datas[0].mean())
+    assert (tmp_path / "out_locomoco_max.nii.gz").exists()
+    assert (tmp_path / "out_locomoco_min.nii.gz").exists()
+
+
 def test_polish_single_pass_is_sharper_than_double_resample():
     """The qwarp polish registers the CORRECTED series, so its own warped output has been
     resampled twice — the estimator's pass plus qwarp's. Given ``raw_datas`` it must

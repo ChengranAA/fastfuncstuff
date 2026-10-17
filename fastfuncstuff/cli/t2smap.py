@@ -39,7 +39,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-d",
         nargs="+",
         required=True,
-        help="Per-echo 4D files in ascending echo order (one file per echo time).",
+        help="Per-echo 4D files in ascending echo order (one file per echo time). GIfTI "
+        "series (.gii, vertices x time, e.g. ffs_nwarp -surf output) work too: the same "
+        "fit and combination per vertex, every output written as .gii.",
     )
     parser.add_argument(
         "-tes",
@@ -126,6 +128,25 @@ def _tes_to_ms(tes: list[float]) -> torch.Tensor:
     return t
 
 
+def _load_surface(path, device):
+    """A GIfTI (V,) or (V, T) file as a (T, 1, 1, V) / (1, 1, V) tensor + its metadata."""
+    from fastfuncstuff.io.gifti import load_gifti_data
+
+    data, meta = load_gifti_data(path)
+    t = torch.from_numpy(data).to(device)
+    if t.ndim == 1:
+        return t.reshape(1, 1, -1), meta
+    return t.T.reshape(t.shape[1], 1, 1, t.shape[0]).contiguous(), meta
+
+
+def _save_surface(grid: torch.Tensor, path: str, meta) -> None:
+    from fastfuncstuff.io.gifti import save_gifti_data
+
+    a = grid.detach().cpu().numpy()
+    a = a.reshape(-1) if a.ndim == 3 else a.reshape(a.shape[0], -1).T
+    save_gifti_data(path, a, meta=meta)
+
+
 def _unmask(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Scatter masked samples back to the spatial grid.
 
@@ -161,11 +182,21 @@ def main(argv: list[str] | None = None) -> None:
     verb = args.verb
     t0 = time.time()
 
-    # Load echoes -> (E, T, nz, ny, nx); a lone 3D volume reads as T=1.
+    # Load echoes -> (E, T, nz, ny, nx); a lone 3D volume reads as T=1. A surface series
+    # rides the same path as a (T, 1, 1, V) "volume": every step below is per sample.
+    surface = [str(p).endswith(".gii") for p in args.input]
+    if any(surface) and not all(surface):
+        raise SystemExit("-input mixes GIfTI and volume files; give one kind.")
+    surface = all(surface)
+    if surface and args.automask:
+        raise SystemExit("-automask is a volume method; surface data are masked by default.")
     echoes = []
     header = None
     for path in args.input:
-        vol, hdr = load_image(path, device=device)
+        if surface:
+            vol, hdr = _load_surface(path, device)
+        else:
+            vol, hdr = load_image(path, device=device)
         if vol.ndim == 3:
             vol = vol.unsqueeze(0)
         echoes.append(vol)
@@ -179,7 +210,7 @@ def main(argv: list[str] | None = None) -> None:
     # Mask -> boolean (nz, ny, nx).
     if args.mask is not None:
         with spinner(f"Loading {Path(args.mask).name}"):
-            mvol, _ = load_image(args.mask, device=device)
+            mvol, _ = (_load_surface if surface else load_image)(args.mask, device=device)
         if mvol.ndim == 4:
             mvol = mvol[0]
         if tuple(mvol.shape) != tuple(spatial):
@@ -239,13 +270,15 @@ def main(argv: list[str] | None = None) -> None:
         t2s_full, s0_full, t2s_lim, s0_lim = t2s, s0, t2s, s0
 
     # --- Save core maps ---
+    def write(grid, path, labels=None):
+        if surface:
+            _save_surface(grid, path, header)
+        else:
+            save_image(grid, path, header_info=header, brick_labels=labels)
+
     def save(values, name, labels=None):
-        save_image(
-            _unmask(values, mask),
-            f"{args.prefix}{name}.nii.gz",
-            header_info=header,
-            brick_labels=labels,
-        )
+        ext = ".func.gii" if surface else ".nii.gz"
+        write(_unmask(values, mask), f"{args.prefix}{name}{ext}", labels)
 
     with spinner("Writing core maps"):
         save(t2s_full / 1000.0, "T2starmap")  # ms -> seconds for storage
@@ -261,7 +294,7 @@ def main(argv: list[str] | None = None) -> None:
         optcom = me.make_optcom(data_cat, tes, adaptive, t2s=t2s_full, combmode=args.combmode)
         save(optcom, "desc-optcom_bold")
         if args.optcom:
-            save_image(_unmask(optcom, mask), args.optcom, header_info=header)
+            write(_unmask(optcom, mask), args.optcom)
 
         echo_labels = [f"echo-{i + 1}" for i in range(n_echos)]
         if args.fittype == "curvefit" or args.fittype == "robust":

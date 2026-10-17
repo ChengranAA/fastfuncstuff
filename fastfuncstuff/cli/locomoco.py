@@ -4011,8 +4011,14 @@ def _pe_label(args) -> str:
     return f"{args.pe_dir2} (partition)"
 
 
-def _notch_estimation_data(datas, args, tr):
-    """Band-filtered copies of the series for estimation, plus a line describing the cut.
+def _notch_estimation_data(datas, args, tr, *, phases=None):
+    """Band-filtered copies of the series for estimation, a line describing the cut, and
+    the same cut applied to ``phases`` (the -phase fields in Hz) or None.
+
+    The phase gets the SAME basis as the magnitude: the joint solve reads one displacement
+    from both channels, so a task band left in either one lets task-locked change back
+    into the field. Voxel-frames with no phase value (0 / non-finite) keep it, so the
+    solver's phase support is unchanged by the cut.
 
     Raises ValueError with the reason if the design has no line to notch or is too
     broadband -- both are the tool declining to run rather than notching the data.
@@ -4024,7 +4030,6 @@ def _notch_estimation_data(datas, args, tr):
         default_polort,
         design_fit_basis,
         design_notch_bins,
-        filter_task_band,
         notch_basis,
     )
 
@@ -4033,10 +4038,7 @@ def _notch_estimation_data(datas, args, tr):
     polort = args.task_polort if args.task_polort is not None else default_polort(n_t, tr)
     if args.detask_fit is not None:
         basis = design_fit_basis(design, polort, n_deriv=args.detask_fit)
-        out = [
-            filter_task_band(torch.from_numpy(np.ascontiguousarray(d)), basis).numpy()
-            for d in datas
-        ]
+        out = [_cut(d, basis) for d in datas]
         deriv = "" if not args.detask_fit else f" + {args.detask_fit} time derivative(s)"
         note = (
             f"-detask fit: projected the {len(labels)}-condition design{deriv} out of "
@@ -4044,13 +4046,11 @@ def _notch_estimation_data(datas, args, tr):
             "Latency/width mismatch leaves task variance behind — read the enrichment "
             "diagnostic below rather than assuming the cut worked."
         )
-        return out, note
+        return out, note, _cut_phases(phases, basis)
     bins, info = design_notch_bins(design, polort, widen=args.detask_widen)
     basis = notch_basis(n_t, bins, polort)
     freqs = np.fft.rfftfreq(n_t, d=float(tr))
-    out = [
-        filter_task_band(torch.from_numpy(np.ascontiguousarray(d)), basis).numpy() for d in datas
-    ]
+    out = [_cut(d, basis) for d in datas]
     if info.get("warning"):
         print(f"   ⚠️  -detask filter: {info['warning']}")
     hz = ", ".join(f"{freqs[b]:.4f}" for b in bins)
@@ -4059,7 +4059,30 @@ def _notch_estimation_data(datas, args, tr):
         f"({info['spectrum_frac'] * 100:.1f}% of the spectrum, {basis.shape[1]} DoF) "
         f"from the estimation data; {len(labels)} condition(s), polort {polort}"
     )
-    return out, note
+    return out, note, _cut_phases(phases, basis)
+
+
+def _cut(d, basis):
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.stats.task_coupling import filter_task_band
+
+    return filter_task_band(torch.from_numpy(np.ascontiguousarray(d)), basis).numpy()
+
+
+def _cut_phases(phases, basis):
+    if phases is None:
+        return None
+    import numpy as np
+
+    out = []
+    for p in phases:
+        c = _cut(np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0), basis)
+        hole = ~np.isfinite(p) | (p == 0)
+        c[hole] = p[hole]
+        out.append(c)
+    return out
 
 
 def _magphase_arg_error(args, *, dual: bool, slicewise: bool) -> str | None:
@@ -4084,7 +4107,6 @@ def _magphase_arg_error(args, *, dual: bool, slicewise: bool) -> str | None:
         (args.me_estimate_from is not None, "-me_estimate_from"),
         (args.final_qwarp, "-final_qwarp"),
         (args.raw_input is not None or args.moco_matrix is not None, "rotation-aware mode"),
-        (_detask_pre_estimation(args), "-detask " + str(_detask_mode_name(args))),
     ]
     bad = [name for hit, name in clashes if hit]
     if bad:
@@ -4315,21 +4337,6 @@ def _run_multiecho(
     # `datas` are kept untouched -- the corrected series is re-resampled from them after
     # the solve, so the only thing the cut changes is what the estimator was allowed to
     # look at.
-    est_datas, notch_note = datas, None
-    if _detask_pre_estimation(args):
-        # One notch basis for every echo. The band is a property of the DESIGN, not of
-        # the data, and the estimator pools the echoes into one shared field -- so
-        # filtering them with anything but the same basis would let the task back in
-        # through whichever echo was treated differently.
-        try:
-            est_datas, notch_note = _notch_estimation_data(datas, args, tr_sec)
-        except ValueError as exc:
-            print(f"❌ -detask {_detask_mode_name(args)}: {exc}", file=sys.stderr)
-            return 2
-        print(f"   🔇 {notch_note}")
-        if args.final_qwarp or args.backend == "qwarp":
-            print(_qwarp_detask_note(args))
-
     phases_in = phases_hz = None
     if args.phase:
         try:
@@ -4338,6 +4345,26 @@ def _run_multiecho(
             print(f"❌ -phase: {exc}", file=sys.stderr)
             return 2
         phases_hz = _magphase_hz(args, phases_in)
+
+    est_datas, notch_note = datas, None
+    if _detask_pre_estimation(args):
+        # One notch basis for every echo. The band is a property of the DESIGN, not of
+        # the data, and the estimator pools the echoes into one shared field -- so
+        # filtering them with anything but the same basis would let the task back in
+        # through whichever echo was treated differently.
+        try:
+            est_datas, notch_note, est_phases = _notch_estimation_data(
+                datas, args, tr_sec, phases=phases_hz
+            )
+        except ValueError as exc:
+            print(f"❌ -detask {_detask_mode_name(args)}: {exc}", file=sys.stderr)
+            return 2
+        if est_phases is not None:
+            phases_hz = est_phases
+            notch_note += "; the -phase fields got the same cut"
+        print(f"   🔇 {notch_note}")
+        if args.final_qwarp or args.backend == "qwarp":
+            print(_qwarp_detask_note(args))
 
     smooth_sigma = 0.0
     hpf_sigma = 0.0
@@ -4540,8 +4567,10 @@ def _run_multiecho(
         # Two axes: pe_axis is the in-plane PE (the same at every echo), pe_axis2 the
         # TE-scaled partition. -pe_dir2 alone has already been collapsed onto pe_axis.
         part_axis, ip_axis = (pe_axis2, pe_axis) if pe_axis2 is not None else (pe_axis, None)
+        # Estimated from the (possibly task-cut) copies; magphase_me_result below
+        # resamples the untouched `datas`, so no detask re-derivation is needed after.
         magphase_flow = estimate_partition_flow_magphase(
-            datas,
+            est_datas,
             phases_hz,
             args.echo_times,
             part_axis,
@@ -4775,8 +4804,12 @@ def _run_multiecho(
             device=device,
         )
 
-    # qwarp already resampled its output from `datas`.
-    if _detask_pre_estimation(args) and not (qwarp_backend or args.final_qwarp):
+    # qwarp already resampled its output from `datas`; so did the mag+phase result.
+    if (
+        _detask_pre_estimation(args)
+        and not (qwarp_backend or args.final_qwarp)
+        and magphase_flow is None
+    ):
         # The estimator was shown task-cut images (notched or design-projected), so the
         # series it warped carries that cut too. Re-derive it from the untouched input
         # with the same field.
@@ -5385,13 +5418,20 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
 
     # -detask filter/fit: the estimator sees a task-cut copy, `data` stays raw so the
     # corrected series can be re-derived from it after the solve.
-    est_data = data
+    est_data, est_phase = data, None
     if _detask_pre_estimation(args):
         try:
-            (est_data,), note = _notch_estimation_data([data], args, tr_sec)
+            (est_data,), note, est_phase = _notch_estimation_data(
+                [data],
+                args,
+                tr_sec,
+                phases=None if phases_in is None else _magphase_hz(args, phases_in),
+            )
         except ValueError as exc:
             print(f"❌ -detask {_detask_mode_name(args)}: {exc}", file=sys.stderr)
             return 2
+        if est_phase is not None:
+            note += "; the -phase field got the same cut"
         print(f"   🔇 {note}")
         if args.final_qwarp or args.backend == "qwarp":
             print(_qwarp_detask_note(args))
@@ -5544,8 +5584,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
 
         part_axis, ip_axis = (pe_axis2, pe_axis) if pe_axis2 is not None else (pe_axis, None)
         magphase_flow = estimate_partition_flow_magphase(
-            [data],
-            _magphase_hz(args, phases_in),
+            [est_data],
+            est_phase if est_phase is not None else _magphase_hz(args, phases_in),
             args.echo_times,
             part_axis,
             inplane_axis=ip_axis,
@@ -5787,8 +5827,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         )
         result = polished.per_echo[0]
 
-    # qwarp already resampled its output from `data`.
-    if _detask_pre_estimation(args) and not (qwarp_backend or args.final_qwarp):
+    # qwarp already resampled its output from `data`; so did the mag+phase result.
+    if (
+        _detask_pre_estimation(args)
+        and not (qwarp_backend or args.final_qwarp)
+        and magphase_flow is None
+    ):
         # The estimator was shown task-cut images (notched or design-projected), so the
         # series it warped carries that cut too. Re-derive it from the untouched input
         # with the same field.

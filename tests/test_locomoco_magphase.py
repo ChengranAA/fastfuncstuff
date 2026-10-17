@@ -405,3 +405,58 @@ def test_cli_two_axis_with_phase_writes_both_components(tmp_path):
     k = float((p4 * p1).sum() / (p1 * p1).sum())
     assert abs(k - TE[3] / TE[0]) < 1e-3  # partition: TE-scaled
     assert (tmp_path / "out_e4_phase_locomoco.nii.gz").exists()
+
+
+def test_cli_detask_fit_cuts_mag_and_phase_alike_and_outputs_stay_raw(tmp_path, monkeypatch):
+    """-detask fit with -phase: the estimator sees the task projected out of BOTH channels
+    with one basis (else task-locked change re-enters through the uncut one), the phase
+    support is untouched by the cut, and the written series are resampled from the raw
+    input (the task is still in them)."""
+    import nibabel as nib
+
+    import fastfuncstuff.processing.locomoco_magphase as lmp
+    from fastfuncstuff.cli.locomoco import _parse, main
+    from fastfuncstuff.cli.task_events import task_design_from_events
+
+    mags, phs, _w, _u, head = _scene_dual()
+    ev = tmp_path / "ev.tsv"
+    ev.write_text("onset\tduration\ttrial_type\n8.0\t6.0\tA\n26.0\t6.0\tA\n40.0\t6.0\tA\n")
+    ins = [str(tmp_path / f"m{e + 1}.nii.gz") for e in range(len(TE))]
+    phas = [str(tmp_path / f"p{e + 1}.nii.gz") for e in range(len(TE))]
+    stem = str(tmp_path / "out")
+    argv = ["-input", *ins, "-prefix", stem, "-phase", *phas, "-phase_units", "hz",
+            "-echo_times", *map(str, TE), "-me_3depi", "-pe_dir", "y", "-pe_dir2", "z",
+            "-backend", "flow", "-device", "cpu", "-no_warp", "-no_movie", "-levels", "1",
+            "-iters", "2", "-refine", "0", "-ref", "mean", "-events", str(ev), "-tr", "2.0",
+            "-detask", "fit", "-task_comps", "off"]  # fmt: skip
+    design, _ = task_design_from_events(_parse(argv), NT, 2.0, CPU)
+    task = design[:, 0].numpy().astype(np.float32)
+    task = (task - task.mean()) / np.abs(task - task.mean()).max()
+    for e in range(len(TE)):
+        mags[e] = mags[e] * (1 + 0.03 * task)
+        phs[e] = phs[e] + 4.0 * task * head[..., None]
+        nib.save(nib.Nifti1Image(mags[e].astype(np.float32), np.eye(4)), ins[e])
+        nib.save(nib.Nifti1Image(phs[e].astype(np.float32), np.eye(4)), phas[e])
+
+    seen = {}
+    real = lmp.estimate_partition_flow_magphase
+
+    def spy(mags_in, phases_in, *a, **kw):
+        seen["mag"], seen["phase"] = mags_in[0], phases_in[0]
+        return real(mags_in, phases_in, *a, **kw)
+
+    monkeypatch.setattr(lmp, "estimate_partition_flow_magphase", spy)
+    assert main(argv) == 0
+    inner = _interior(head)
+    d_phase = (phs[0] - seen["phase"])[inner].mean(0)
+    d_mag = (mags[0] - seen["mag"])[inner].mean(0)
+    assert abs(np.corrcoef(d_phase, d_mag)[0, 1]) > 0.99  # one basis for both channels
+    outside = phs[0] == 0
+    assert outside.any() and (seen["phase"][outside] == 0).all()
+
+    def amp(tc):
+        return float((tc - tc.mean()) @ task / (task @ task))
+
+    out_ph = np.asarray(nib.load(f"{stem}_e1_phase_locomoco.nii.gz").dataobj)[inner].mean(0)
+    assert abs(amp(out_ph) - 4.0) < 0.3  # the injected 4 Hz, intact in the output
+    assert abs(amp(seen["phase"][inner].mean(0))) < 0.5  # ... and (mostly) gone from the fit

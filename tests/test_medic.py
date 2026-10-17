@@ -607,3 +607,63 @@ def test_medic_fieldmaps_gpu_unwrap_recovers_field():
     core = head & (res.masks[..., 0].numpy() == 2)
     err = np.abs(res.field_native.numpy() - field)[core]
     assert np.mean(err < 5.0) > 0.98
+
+
+def test_cli_precomputed_fieldmap_skips_estimation(tmp_path):
+    """-fieldmap: no phase, no TEs, no warpkit. A rank-1-in-time field passes the SVD
+    unchanged, so the undistorted echoes equal the manual field -> pull -> undistort; the
+    magnitude is read through a sub-brick selector (autoproc trims noise volumes that
+    way); and -phase_is_unwrapped interpolates unwrapped radians as a plain image (a
+    circular interpolation would fold 10 rad back into (-pi, pi])."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.medic import main
+    from fastfuncstuff.processing.medic import field_to_pull_warp
+
+    rng = np.random.default_rng(0)
+    nx, ny, nz, nt, extra = 16, 18, 6, 12, 2
+    g = np.meshgrid(*[np.linspace(-1, 1, n) for n in (nx, ny, nz)], indexing="ij")
+    blob = np.exp(-(g[0] ** 2 + g[1] ** 2 + g[2] ** 2) * 2).astype(np.float32)
+    spatial = (20 * g[1] + 8 * g[0]).astype(np.float32)  # Hz
+    field = (spatial[..., None] * (1 + 0.1 * np.sin(np.arange(nt) / 2))).astype(np.float32)
+    mags = []
+    for e in range(2):
+        m = 1000 * blob[..., None] * (1 + 0.01 * rng.standard_normal((1, 1, 1, nt + extra)))
+        p = tmp_path / f"m{e}.nii.gz"
+        nib.save(nib.Nifti1Image(m.astype(np.float32), np.eye(4)), str(p))
+        mags.append(f"{p}[0..{nt - 1}]")
+    fmap = tmp_path / "fmap.nii.gz"
+    nib.save(nib.Nifti1Image(field.astype(np.float32), np.eye(4)), str(fmap))
+    ph = tmp_path / "ph.nii.gz"
+    nib.save(
+        nib.Nifti1Image(np.full((nx, ny, nz, nt + extra), 10.0, np.float32), np.eye(4)), str(ph)
+    )
+    stem = str(tmp_path / "dc")
+    rc = main(
+        ["-magnitude", *mags, "-fieldmap", str(fmap), "-total_readout_time", "0.03", "-pe_dir", "j-",
+         "-prefix", f"{stem}.nii.gz", "-device", "cpu", "-interp", "linear", "-verb", "0",
+         "-apply_phase", "-phase_is_unwrapped", "-phase", f"{ph}[0..{nt - 1}]", f"{ph}[0..{nt - 1}]"]
+    )  # fmt: skip
+    assert rc == 0
+    pull, _ = field_to_pull_warp(torch.from_numpy(field), 0.03, "j-", 1, torch.device("cpu"))
+    m1 = np.asarray(nib.load(mags[0].split("[")[0]).dataobj)[..., :nt]
+    want = undistort_series(torch.from_numpy(m1), pull, 1, interp="linear", verbose=False).numpy()
+    got = np.asarray(nib.load(f"{stem}_e1_undist.nii.gz").dataobj)
+    assert got.shape == (nx, ny, nz, nt)
+    assert np.allclose(got, want, atol=1e-2 * want.max())
+    phu = np.asarray(nib.load(f"{stem}_e1_phase_undist.nii.gz").dataobj)
+    assert np.allclose(phu[3:-3, 4:-4, 1:-1], 10.0, atol=1e-3)
+
+
+def test_cli_precomputed_fieldmap_refuses_wrong_length(tmp_path):
+    import nibabel as nib
+
+    from fastfuncstuff.cli.medic import main
+
+    m = tmp_path / "m.nii.gz"
+    nib.save(nib.Nifti1Image(np.ones((6, 6, 4, 8), np.float32), np.eye(4)), str(m))
+    f = tmp_path / "f.nii.gz"
+    nib.save(nib.Nifti1Image(np.ones((6, 6, 4, 7), np.float32), np.eye(4)), str(f))
+    rc = main(["-magnitude", str(m), "-fieldmap", str(f), "-total_readout_time", "0.03",
+               "-pe_dir", "j", "-prefix", str(tmp_path / "x"), "-device", "cpu", "-verb", "0"])  # fmt: skip
+    assert rc == 1

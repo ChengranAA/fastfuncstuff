@@ -96,8 +96,9 @@ def create_parser() -> argparse.ArgumentParser:
         "-phase",
         nargs="+",
         metavar="FILE",
-        required=True,
-        help="Phase files, one 4D file per echo, matching -magnitude.",
+        default=None,
+        help="Phase files, one 4D file per echo, matching -magnitude. Not needed with "
+        "-fieldmap unless -apply_phase.",
     )
     req.add_argument(
         "-prefix",
@@ -137,6 +138,33 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIR",
         help="Phase-encoding direction: i, j, k, i-, j-, k- (or x/y/z).",
+    )
+
+    pre = parser.add_argument_group("Precomputed field map (skips the estimation)")
+    pre.add_argument(
+        "-fieldmap",
+        metavar="FILE",
+        default=None,
+        help="Per-frame field map (Hz, native distorted space, x,y,z,t), e.g. "
+        "ffs_phase_unwrap's {stem}_fieldmap. The unwrap is skipped (no warpkit, no "
+        "-phase, no -tes): the map gets the same SVD denoising, then the pull warp. "
+        "Lets a pipeline that already unwrapped reuse that field instead of a second, "
+        "different estimate.",
+    )
+    pre.add_argument(
+        "-fieldmap_mask",
+        metavar="FILE",
+        default=None,
+        help="Mask for -fieldmap's SVD denoising (2 = core, 1 = border band, as "
+        "ffs_phase_unwrap -save_mask writes). Default: every voxel with a nonzero field, "
+        "as core (no border pass).",
+    )
+    pre.add_argument(
+        "-phase_is_unwrapped",
+        action="store_true",
+        help="-apply_phase: the -phase files are UNWRAPPED radians (e.g. ffs_phase_unwrap "
+        "output), so they are interpolated as a continuous image, not circularly, and "
+        "are not rescaled.",
     )
 
     opt = parser.add_argument_group("MEDIC Options")
@@ -448,12 +476,13 @@ def _load_cached_volume(path: str, expected_shape: tuple[int, ...], device):
 def _load_echoes(paths: list[str]) -> tuple[np.ndarray, np.ndarray, object]:
     """Load per-echo 4D files into (nx, ny, nz, ne, t); return data + affine + header."""
     from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.headers import parse_subbrick_selector
 
     vols = []
     affine = np.eye(4)
     header: object = None
     for i, p in enumerate(paths):
-        if not Path(p).exists():
+        if not Path(parse_subbrick_selector(p)[0]).exists():
             raise FileNotFoundError(f"File not found: {p}")
         img = load_nifti(p)
         data = np.asarray(img.dataobj, dtype=np.float32)
@@ -468,6 +497,48 @@ def _load_echoes(paths: list[str]) -> tuple[np.ndarray, np.ndarray, object]:
         raise ValueError(f"All echo files must share a shape; got {shapes}")
     stacked = np.stack(vols, axis=3)  # (nx, ny, nz, ne, t)
     return stacked, affine, header
+
+
+class _Precomputed:
+    """Stands in for a MedicResult when -fieldmap gave the field: only the field map is
+    written back (the SVD-denoised one, as QC), and there is no per-echo unwrap."""
+
+    unwrapped_field_hz = None
+
+    def __init__(self, field_native):
+        self.field_native = field_native
+
+
+def _precomputed_field(args, shape, frames, affine, device):
+    """-fieldmap -> SVD-denoised native field map (x,y,z,t) torch on the host."""
+    import torch
+
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.processing.phase_unwrap import svd_filter_fields
+
+    field, _, _ = _load_echoes([args.fieldmap])
+    field = field[:, :, :, 0, :]
+    if field.shape != shape:
+        raise ValueError(f"{args.fieldmap} is {field.shape}, the magnitude is {shape}.")
+    field = np.ascontiguousarray(field[..., frames[0] : frames[1]])
+    if args.fieldmap_mask is not None:
+        m, _, _ = _load_echoes([args.fieldmap_mask])
+        mask = m[:, :, :, 0, :]
+        mask = mask[..., 0] if mask.shape[-1] == 1 else mask[..., frames[0] : frames[1]]
+        if mask.shape[:3] != shape[:3]:
+            raise ValueError(f"{args.fieldmap_mask} is {mask.shape[:3]}, the field is {shape[:3]}.")
+    else:
+        mask = np.where(np.any(field != 0, axis=-1), 2, 0)
+    voxel_size = float(np.linalg.norm(affine[:3, 0]))
+    with spinner(f"SVD denoising the given field map (rank {args.svd_filt})"):
+        out = svd_filter_fields(
+            np.nan_to_num(field),
+            np.rint(mask).astype(np.int8),
+            voxel_size,
+            svd_filt=args.svd_filt,
+            device=device,
+        )
+    return torch.nan_to_num(torch.from_numpy(np.ascontiguousarray(out, dtype=np.float32)))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -496,7 +567,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: Could not import fastfuncstuff: {e}", file=sys.stderr)
         return 1
 
-    if not warpkit_available():
+    precomputed = args.fieldmap is not None
+    if not precomputed and not warpkit_available():
         print(
             "ERROR: ffs_medic needs warpkit for the field-map estimation.\n"
             "       pip install warpkit  (github.com/vanandrew/warpkit)",
@@ -518,15 +590,30 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: reading -metadata sidecars: {e}", file=sys.stderr)
             return 1
     else:
-        if args.tes is None or args.total_readout_time is None or args.pe_dir is None:
+        if (
+            (args.tes is None and not precomputed)
+            or args.total_readout_time is None
+            or args.pe_dir is None
+        ):
             print(
-                "ERROR: give -metadata, or all of -tes / -total_readout_time / -pe_dir.",
+                "ERROR: give -metadata, or all of -tes / -total_readout_time / -pe_dir "
+                "(-tes is not needed with -fieldmap).",
                 file=sys.stderr,
             )
             return 1
         tes, total_readout_time, pe_dir = args.tes, args.total_readout_time, args.pe_dir
+        if tes is None:
+            tes = [0.0] * len(args.magnitude)  # unused: the field is given
 
-    if len(args.magnitude) != len(args.phase):
+    need_phase = not precomputed or args.apply_phase
+    if args.phase is None:
+        if need_phase:
+            print(
+                "ERROR: -phase is required (unless -fieldmap without -apply_phase).",
+                file=sys.stderr,
+            )
+            return 1
+    elif len(args.magnitude) != len(args.phase):
         print(
             f"ERROR: {len(args.magnitude)} magnitude files but {len(args.phase)} phase files.",
             file=sys.stderr,
@@ -541,7 +628,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.anchor_frames < 0:
         print("ERROR: -anchor_frames must be >= 0.", file=sys.stderr)
         return 1
-    if args.unwrap == "gpu" and len(tes) < 2:
+    if args.phase_is_unwrapped and not args.apply_phase:
+        print(
+            "ERROR: -phase_is_unwrapped describes -apply_phase's input; add -apply_phase.",
+            file=sys.stderr,
+        )
+        return 1
+    if precomputed and args.debug_3d:
+        print("ERROR: -debug_3d is not combined with -fieldmap.", file=sys.stderr)
+        return 1
+    if args.unwrap == "gpu" and len(tes) < 2 and not precomputed:
         # one echo cannot separate the field from the phase at TE 0
         print("ERROR: -unwrap gpu needs at least 2 echoes.", file=sys.stderr)
         return 1
@@ -560,11 +656,16 @@ def main(argv: list[str] | None = None) -> int:
 
     with spinner(f"Loading {len(args.magnitude)} magnitude echo(es)"):
         mag, affine, _ = _load_echoes(args.magnitude)
-    with spinner(f"Loading {len(args.phase)} phase echo(es)"):
-        phase, _, _ = _load_echoes(args.phase)
-    if mag.shape != phase.shape:
-        print(f"ERROR: magnitude shape {mag.shape} != phase shape {phase.shape}", file=sys.stderr)
-        return 1
+    if args.phase is not None and need_phase:
+        with spinner(f"Loading {len(args.phase)} phase echo(es)"):
+            phase, _, _ = _load_echoes(args.phase)
+        if mag.shape != phase.shape:
+            print(
+                f"ERROR: magnitude shape {mag.shape} != phase shape {phase.shape}", file=sys.stderr
+            )
+            return 1
+    else:
+        phase = np.zeros((1, 1, 1, 1, mag.shape[4]), np.float32)  # never read
 
     # Frame selection: trim ends, then optionally cap to first N (testing).
     nt_full = mag.shape[4]
@@ -597,7 +698,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.verb >= 1:
         print(f"  {ne} echoes, {nt} frames, grid {nx}x{ny}x{nz}")
-        print(f"  TEs: {tes} ms   readout: {total_readout_time}s   PE: {pe_dir}\n")
+        te_txt = "(field given)" if precomputed else f"{tes} ms"
+        print(f"  TEs: {te_txt}   readout: {total_readout_time}s   PE: {pe_dir}\n")
 
     pe_axis = PE_AXIS_MAP[pe_dir]
     Z_AXIS = 2  # slice / partition-encode (k) — the residual axis for -debug_3d
@@ -635,7 +737,19 @@ def main(argv: list[str] | None = None) -> int:
     # cache, so -save_unwrapped_phase must re-run estimation (like -recompute).
     # The GPU estimate costs about as much as reading the cache, and a cache written
     # by the other -unwrap method must not be reused silently.
-    if not args.recompute and not args.save_unwrapped and args.unwrap == "warpkit":
+    if precomputed:
+        try:
+            field_native = _precomputed_field(
+                args, (nx, ny, nz, nt_full), (t0, t0 + nt), affine, device
+            )
+        except (OSError, ValueError) as e:
+            print(f"ERROR: -fieldmap: {e}", file=sys.stderr)
+            return 1
+        disp_pull, field_undist = field_to_pull_warp(
+            field_native, total_readout_time, pe_dir, pe_axis, device, args.verb >= 1
+        )
+        result = _Precomputed(field_native)
+    elif not args.recompute and not args.save_unwrapped and args.unwrap == "warpkit":
         field_native = _load_cached_volume(field_cache, expected, host)
         if field_native is not None:
             disp_pull = _load_cached_volume(disp_cache, expected, host)
@@ -837,14 +951,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.apply_phase:
         ph_lo, ph_hi = float(phase.min()), float(phase.max())
         for e in range(ne):
-            ph_rad = rescale_phase_to_radians(phase[:, :, :, e, :].astype(np.float32), ph_lo, ph_hi)
+            ph_rad = phase[:, :, :, e, :].astype(np.float32)
+            if not args.phase_is_unwrapped:
+                ph_rad = rescale_phase_to_radians(ph_rad, ph_lo, ph_hi)
             series = torch.from_numpy(np.ascontiguousarray(ph_rad))
             undist = undistort_series(
                 series,
                 disp_pull,
                 pe_axis,
                 interp=args.interp,
-                circular=True,
+                circular=not args.phase_is_unwrapped,
                 verbose=args.verb >= 1,
                 desc=f"undistort phase e{e + 1}",
                 device=device,
@@ -866,14 +982,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.save_unwrapped:
         # Per-echo unwrapped-phase field estimates (Hz), one file per echo. Only
         # available on a fresh estimate (see -save_unwrapped_phase / cache note).
-        if result is None or result.unwrapped_field_hz is None:
+        unwrapped_hz = getattr(result, "unwrapped_field_hz", None)  # (nx,ny,nz,ne,T) host
+        if unwrapped_hz is None:
             print(
                 "WARNING: -save_unwrapped_phase set but per-echo phase unavailable "
                 "(reused cache?); skipping.",
                 file=sys.stderr,
             )
         else:
-            unwrapped_hz = result.unwrapped_field_hz  # (nx,ny,nz,ne,T) host
             for e in range(unwrapped_hz.shape[-2]):
                 uw_path = f"{prefix_stem}_e{e + 1}_unwrapped_fieldmap{nii_ext}"
                 with spinner(f"Writing {Path(uw_path).name}"):

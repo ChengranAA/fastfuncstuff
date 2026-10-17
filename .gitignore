@@ -107,3 +107,6 @@ docs/temp_*.md
 
 # Wiki (lives at ~/Dropbox/Resources/code/fmri_wiki; never track here)
 wiki/
+
+# Per-developer scratch: notebooks, figures, throwaway scripts (never tracked)
+scratch/

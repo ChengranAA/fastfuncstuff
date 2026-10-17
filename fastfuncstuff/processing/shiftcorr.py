@@ -204,6 +204,10 @@ class ShiftEstimate:
     slope: np.ndarray | None
     intercept: np.ndarray | None
     applied: np.ndarray
+    # Optional linear change of the correction along the axis, per volume and echo
+    # [voxels per voxel], about ``stretch_center`` (see fold_partition_into_matrices).
+    stretch: np.ndarray | None = None
+    stretch_center: float = 0.0
 
     @property
     def frequency_drift_hz(self) -> np.ndarray | None:
@@ -715,12 +719,44 @@ def fold_shift_into_matrices(matrices_vox: Tensor, shifts: np.ndarray, axis: int
     and the resulting matrix is literally the total transform, so a saved
     ``.aff12.1D`` describes exactly what happened to the data.
     """
-    out = matrices_vox.clone()
-    d = torch.as_tensor(np.asarray(shifts, dtype=np.float64).reshape(-1), dtype=out.dtype)
-    if d.numel() != out.shape[0]:
-        raise ValueError(f"got {d.numel()} shifts for {out.shape[0]} matrices")
-    out[:, axis, 3] -= d
-    return out
+    return fold_partition_into_matrices(matrices_vox, shifts, None, axis)
+
+
+def partition_correction_matrices(
+    shifts: np.ndarray, stretch: np.ndarray | None, axis: int, center: float
+) -> Tensor:
+    """``(nt, 4, 4)`` raw-frame pull maps of the partition correction alone.
+
+    The correction displaces content along ``axis`` by ``d(z) = s + k (z - center)``
+    (voxels): ``corrected(z) = raw(z - d(z))``. Only the partition row differs from
+    the identity: ``z_raw = (1 - k) z - s + k center``.
+    """
+    d = np.asarray(shifts, dtype=np.float64).reshape(-1)
+    k = np.zeros_like(d) if stretch is None else np.asarray(stretch, dtype=np.float64).reshape(-1)
+    if k.size != d.size:
+        raise ValueError(f"got {k.size} stretches for {d.size} shifts")
+    m = np.repeat(np.eye(4)[None], d.size, axis=0)
+    m[:, axis, axis] = 1.0 - k
+    m[:, axis, 3] = -d + k * center
+    return torch.from_numpy(m)
+
+
+def fold_partition_into_matrices(
+    matrices_vox: Tensor,
+    shifts: np.ndarray,
+    stretch: np.ndarray | None,
+    axis: int,
+    center: float = 0.0,
+) -> Tensor:
+    """Compose a per-volume partition shift (and optional stretch about ``center``)
+    into voxel-space pull matrices, after the motion in the raw frame, where the
+    partition encoding happened. With ``stretch`` None this is one subtraction on
+    the translation entry of row ``axis`` (see :func:`fold_shift_into_matrices`)."""
+    d = np.asarray(shifts, dtype=np.float64).reshape(-1)
+    if d.size != matrices_vox.shape[0]:
+        raise ValueError(f"got {d.size} shifts for {matrices_vox.shape[0]} matrices")
+    corr = partition_correction_matrices(d, stretch, axis, center).to(matrices_vox.dtype)
+    return corr.to(matrices_vox.device) @ matrices_vox
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +825,7 @@ def partition_shift_from_phase(
     *,
     device: torch.device,
     dephase_cycles: float = 0.6,
+    stretch: bool = False,
 ) -> np.ndarray:
     """Per-volume partition shift at the FIRST echo [voxels], from unwrapped phase.
 
@@ -810,6 +847,11 @@ def partition_shift_from_phase(
     is invisible here (it is in every frame's field), so the result has zero mean.
     Same sign as :attr:`ShiftEstimate.applied`: :func:`shift_table_from_partition_shift`
     gives the correction to apply.
+
+    ``stretch``: also fit a linear change of the shift along the axis about the slab
+    centre ``(n - 1) / 2`` (a breathing field's gradient changes at different rates
+    across the head). Returns ``(T, 2)``: shift at the centre [voxels] and stretch
+    [voxels per voxel], both at the first echo, for :func:`fold_partition_into_matrices`.
     """
     te = torch.as_tensor(np.asarray(tes, dtype=np.float32), device=device)
     if te.numel() < 2:
@@ -821,8 +863,16 @@ def partition_shift_from_phase(
     fmean = (w * fbar).sum(-1) / np.maximum(w.sum(-1), 1e-12)
     g = np.gradient(fmean, axis=axis).astype(np.float32)
     use = mask & (np.abs(g) * float(np.max(tes)) * 1e-3 < dephase_cycles) & (np.abs(g) > 0)
-    num = torch.zeros(unwrapped.shape[-1], dtype=torch.float64, device=device)
-    den = torch.zeros((), dtype=torch.float64, device=device)
+    n_basis = 2 if stretch else 1
+    num = torch.zeros(n_basis, unwrapped.shape[-1], dtype=torch.float64, device=device)
+    den = torch.zeros(n_basis, n_basis, dtype=torch.float64, device=device)
+    zc = (unwrapped.shape[axis] - 1) / 2.0
+    line = [1, 1, 1]
+    line[axis] = unwrapped.shape[axis]
+    zpos = np.broadcast_to(
+        np.arange(unwrapped.shape[axis], dtype=np.float32).reshape(line) - np.float32(zc),
+        unwrapped.shape[:3],
+    ).reshape(-1)
     idx = np.flatnonzero(use)
     chunk = max(1, int(2e8 // max(1, unwrapped.shape[3] * unwrapped.shape[4] * 4)))
     flat_u = unwrapped.reshape(-1, *unwrapped.shape[3:])
@@ -835,16 +885,23 @@ def partition_shift_from_phase(
         f = u / (2 * np.pi * te[None, :, None] * 1e-3)
         r = f - torch.from_numpy(flat_f[sel]).to(device)[..., None]
         wt = torch.from_numpy(flat_w[sel]).to(device)[..., None]  # V, e, 1
-        A = alpha[None, :, None] * torch.from_numpy(flat_g[sel]).to(device)[:, None, None]
+        gsel = torch.from_numpy(flat_g[sel]).to(device)
+        basis = [gsel]
+        if stretch:
+            basis.append(gsel * torch.from_numpy(zpos[sel]).to(device))
 
         def proj(x, wt=wt):
             return x - (wt * x).sum(1, keepdim=True) / wt.sum(1, keepdim=True).clamp_min(1e-12)
 
-        Ap, Rp = proj(A), proj(r)
-        num += (wt * Ap * Rp).sum((0, 1)).double()
-        den += (wt * Ap * Ap).sum().double()
-    shift = (num / den.clamp_min(1e-30)).float().cpu().numpy()
-    return shift - shift.mean()
+        Rp = proj(r)
+        Ap = [proj(alpha[None, :, None] * b[:, None, None]) for b in basis]
+        for i in range(n_basis):
+            num[i] += (wt * Ap[i] * Rp).sum((0, 1)).double()
+            for j in range(n_basis):
+                den[i, j] += (wt * Ap[i] * Ap[j]).sum().double()
+    coef = torch.linalg.solve(den, num).float().cpu().numpy()  # (n_basis, T)
+    coef = coef - coef.mean(1, keepdims=True)
+    return coef.T if stretch else coef[0]
 
 
 def shift_table_from_partition_shift(shift_te1: np.ndarray, tes: np.ndarray) -> np.ndarray:

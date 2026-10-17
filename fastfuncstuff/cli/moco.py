@@ -67,9 +67,11 @@ from fastfuncstuff.processing.motsim import (
 from fastfuncstuff.processing.shiftcorr import (
     ShiftEstimate,
     apply_shift,
+    axis_to_dim,
     estimate_shifts,
-    fold_shift_into_matrices,
+    fold_partition_into_matrices,
     load_shift_table,
+    partition_correction_matrices,
     save_shift_tables,
     shift_table_paths,
 )
@@ -525,6 +527,16 @@ def parse_args(
         "-save_shifts _shifts_applied.1D from an earlier run also works.",
     )
     sc_group.add_argument(
+        "-stretch_table",
+        default=None,
+        metavar="FILE",
+        help="With -shift_table: a matching table of per-echo partition STRETCH [voxels "
+        "per voxel, about the slab centre], so the correction is shift + stretch along "
+        "the partition axis only (a breathing field's gradient changes at different "
+        "rates across the head). Written by ffs_phase_unwrap -save_partition_stretch. "
+        "Motion stays rigid; this is folded into each echo's matrices like the shift.",
+    )
+    sc_group.add_argument(
         "-save_shifts",
         "-save-shifts",
         dest="save_shifts",
@@ -817,6 +829,28 @@ def _load_trimmed(path: str, skip_first: int, skip_last: int, verb: int):
     return data, header_info
 
 
+def _partition_correct(data, est, i: int, axis: int, config, device):
+    """Echo ``i``'s -me_3depi correction applied to a raw series before estimation.
+
+    A pure shift is a sinc-exact Fourier shift; with a stretch the correction varies
+    along the axis, so it goes through the same resampler as the final output.
+    """
+    if est.stretch is None:
+        return apply_shift(data, est.applied[:, i], axis, device=device)
+    mats = partition_correction_matrices(
+        est.applied[:, i], est.stretch[:, i], axis, est.stretch_center
+    )
+    out, _ = resample_timeseries(data, mats.float(), config, device)
+    return out
+
+
+def _fold_partition(matrices, est, i: int, axis: int):
+    stretch = None if est.stretch is None else est.stretch[:, i]
+    return fold_partition_into_matrices(
+        matrices, est.applied[:, i], stretch, axis, est.stretch_center
+    )
+
+
 def _load_echo_mean(
     input_files: list[str],
     skip_first: int,
@@ -824,6 +858,8 @@ def _load_echo_mean(
     verb: int,
     est=None,
     axis: int | None = None,
+    config=None,
+    device=None,
 ):
     """Per-timepoint mean across echoes, accumulated one echo at a time.
 
@@ -840,7 +876,7 @@ def _load_echo_mean(
     for i, path in enumerate(input_files):
         echo, hdr = _load_trimmed(path, skip_first, skip_last, verb)
         if est is not None:
-            echo = apply_shift(echo, est.applied[:, i], axis)
+            echo = _partition_correct(echo, est, i, axis, config, device)
         if acc is None:
             acc = echo.float()
             header_info = hdr
@@ -1345,6 +1381,7 @@ def _validate_shiftcorr_args(args: argparse.Namespace) -> None:
     """Validate the -me_3depi request (and the flags that only mean anything with it)."""
     dependent = {
         "shift_table": "-shift_table",
+        "stretch_table": "-stretch_table",
         "save_shifts": "-save_shifts",
         "onedfile_shiftcorr": "-1Dfile_shiftcorr",
         "onedmatrix_shiftcorr": "-1Dmatrix_shiftcorr",
@@ -1388,6 +1425,9 @@ def _validate_shiftcorr_args(args: argparse.Namespace) -> None:
         sys.exit(1)
     if args.shift_max <= 0:
         print("Error: -shift_max must be positive.", file=sys.stderr)
+        sys.exit(1)
+    if args.stretch_table is not None and args.shift_table is None:
+        print("Error: -stretch_table goes with -shift_table.", file=sys.stderr)
         sys.exit(1)
 
 
@@ -1489,6 +1529,7 @@ def _estimate_shiftcorr(args, input_files: list[str], device: torch.device, verb
     if args.shift_table is not None:
         first, _ = _load_trimmed(input_files[0], args.skip_first, args.skip_last, verb)
         n_t = int(first.shape[0]) if first.ndim == 4 else 1
+        n_axis = int(first.shape[axis_to_dim(axis, first.ndim)])
         del first
         try:
             applied = load_shift_table(args.shift_table, n_t, len(input_files))
@@ -1500,6 +1541,15 @@ def _estimate_shiftcorr(args, input_files: list[str], device: torch.device, verb
                 f"-me_3depi: partition axis {args.axis} (voxel axis {axis}), shifts from "
                 f"{args.shift_table} (SD per echo {np.round(applied.std(0), 4)} vox)"
             )
+        stretch = None
+        center = 0.0
+        if args.stretch_table is not None:
+            try:
+                stretch = load_shift_table(args.stretch_table, n_t, len(input_files))
+            except (OSError, ValueError) as exc:
+                print(f"Error: -stretch_table: {exc}", file=sys.stderr)
+                sys.exit(1)
+            center = (n_axis - 1) / 2.0
         nan = np.full_like(applied, np.nan)
         slope = applied[:, 0] / tes[0] if tes is not None else None
         est = ShiftEstimate(
@@ -1509,6 +1559,8 @@ def _estimate_shiftcorr(args, input_files: list[str], device: torch.device, verb
             slope=slope,
             intercept=np.zeros(n_t) if tes is not None else None,
             applied=applied,
+            stretch=stretch,
+            stretch_center=center,
         )
         if args.save_shifts is not None:
             save_shift_tables(est, args.save_shifts, tes, verb)
@@ -1555,7 +1607,7 @@ def _save_shiftcorr_params(
     affine = header_info["affine"] if header_info else np.eye(4)
     for i in range(est.applied.shape[1]):
         tag = f"e{i + 1}_"
-        mats = fold_shift_into_matrices(result.matrices_vox, est.applied[:, i], axis)
+        mats = _fold_partition(result.matrices_vox, est, i, axis)
         dicom = np.stack(
             [voxel_matrix_to_dicom(mats[t], affine, affine).numpy() for t in range(mats.shape[0])]
         )
@@ -1877,21 +1929,28 @@ def _run_multi_echo(
     if args.me_3depi:
         est, shift_axis = _estimate_shiftcorr(args, input_files, device, verb)
 
+    # Estimate once — matrices only. Each echo (including the reg echo) is
+    # resampled separately below from its own data, so skip Pass 2 here.
+    config = _build_config(args, device, verb, skip_resample=True, base_index=base_index)
+
     # Build the estimation source (one echo, or the per-timepoint mean).
     if reg_mean:
         reg_data, header_info = _load_echo_mean(
-            input_files, args.skip_first, args.skip_last, verb, est=est, axis=shift_axis
+            input_files,
+            args.skip_first,
+            args.skip_last,
+            verb,
+            est=est,
+            axis=shift_axis,
+            config=config,
+            device=device,
         )
     else:
         reg_data, header_info = _load_trimmed(
             input_files[reg_index], args.skip_first, args.skip_last, verb
         )
         if est is not None:
-            reg_data = apply_shift(reg_data, est.applied[:, reg_index], shift_axis, device=device)
-
-    # Estimate once — matrices only. Each echo (including the reg echo) is
-    # resampled separately below from its own data, so skip Pass 2 here.
-    config = _build_config(args, device, verb, skip_resample=True, base_index=base_index)
+            reg_data = _partition_correct(reg_data, est, reg_index, shift_axis, config, device)
     if verb >= 1:
         print_cli_section("Estimating motion")
     t1 = time.time()
@@ -1936,7 +1995,7 @@ def _run_multi_echo(
             # motion and shift reach the output through ONE interpolation.
             matrices = result.matrices_vox
             if est is not None:
-                matrices = fold_shift_into_matrices(matrices, est.applied[:, i], shift_axis)
+                matrices = _fold_partition(matrices, est, i, shift_axis)
 
             # Post-alignment RMS is only wired into the dfile, which reports the
             # reg echo's motion — compute it just for that echo when -dfile is set.

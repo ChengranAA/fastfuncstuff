@@ -14,6 +14,7 @@ from fastfuncstuff.processing.shiftcorr import (
     detect_phase_convention,
     estimate_pair_shift,
     estimate_shifts,
+    fold_partition_into_matrices,
     partition_shift_from_phase,
     search_bounds,
     shift_table_from_partition_shift,
@@ -309,3 +310,53 @@ def test_partition_shift_from_phase_returns_the_correction_apply_shift_needs():
     table = shift_table_from_partition_shift(w, tes)
     assert table.shape == (n_t, 3)
     assert np.allclose(table[:, 2], w * tes[2] / tes[0])
+
+
+def test_partition_stretch_from_phase_and_its_fold_undo_the_displacement():
+    """A shift that grows linearly along the partition axis (TE-scaled): the phase
+    estimate recovers shift and stretch, and the folded matrix undoes it."""
+    nx, ny, nz, n_t = 16, 14, 40, 24
+    tes = np.array([8.0, 20.0, 32.0])
+    zc = (nz - 1) / 2
+    t = np.linspace(0, 10, n_t)
+    s_true = 0.2 * np.sin(t)
+    s_true -= s_true.mean()
+    k_true = 0.006 * np.cos(1.3 * t)
+    k_true -= k_true.mean()
+
+    def field(x, y, z):  # Hz, analytic so it can be sampled anywhere along z
+        return 25 * np.sin(0.12 * z) + 8 * x + 4 * y
+
+    x, y, z = np.meshgrid(
+        np.linspace(-1, 1, nx), np.linspace(-1, 1, ny), np.arange(nz), indexing="ij"
+    )
+    rng = np.random.default_rng(1)
+    unwrapped = np.zeros((nx, ny, nz, len(tes), n_t), np.float32)
+    for e, te in enumerate(tes):
+        a = te / tes[0]
+        for i in range(n_t):
+            corr = a * (s_true[i] + k_true[i] * (z - zc))  # the correction at echo e
+            f_e = field(x, y, z + corr) + 1.5 * np.cos(t[i])  # raw = original pushed by -corr
+            unwrapped[..., e, i] = 2 * np.pi * f_e * te * 1e-3 + rng.normal(0, 0.01, f_e.shape)
+    mask = np.zeros((nx, ny, nz), bool)
+    mask[2:-2, 2:-2, 3:-3] = True
+    sk = partition_shift_from_phase(
+        unwrapped, np.ones_like(unwrapped), tes, mask, 2, device=torch.device("cpu"), stretch=True
+    )
+    assert sk.shape == (n_t, 2)
+    assert np.corrcoef(sk[:, 0], s_true)[0, 1] > 0.99
+    assert np.corrcoef(sk[:, 1], k_true)[0, 1] > 0.98
+    assert np.polyfit(k_true, sk[:, 1], 1)[0] == pytest.approx(1.0, abs=0.1)
+
+    # The fold, applied with identity motion, maps each output voxel to where the
+    # original content sits in the raw frame.
+    m = fold_partition_into_matrices(
+        torch.eye(4, dtype=torch.float64).repeat(n_t, 1, 1), s_true, k_true, 2, zc
+    ).numpy()
+    zz = np.arange(nz, dtype=np.float64)
+    for i in (0, n_t // 2):
+        raw = field(0.0, 0.0, zz + (s_true[i] + k_true[i] * (zz - zc)))
+        z_raw = m[i, 2, 2] * zz + m[i, 2, 3]
+        corrected = np.interp(z_raw, zz, raw)
+        inner = slice(4, -4)
+        assert np.abs(corrected[inner] - field(0.0, 0.0, zz)[inner]).max() < 0.05

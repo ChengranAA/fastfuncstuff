@@ -353,3 +353,60 @@ def test_me_3depi_shift_table_replaces_the_estimate(tmp_path):
     np.savetxt(tmp_path / "bad.1D", table[:, :2])
     with pytest.raises(SystemExit):
         main([*args, "-shift_table", str(tmp_path / "bad.1D")])
+
+
+def test_me_3depi_stretch_table_corrects_both_slab_ends(tmp_path):
+    """Echoes displaced by TE x (shift + stretch) along z: with -stretch_table blobs at
+    both ends of the slab line up across echoes (a shift alone leaves them apart)."""
+    from scipy.ndimage import map_coordinates
+
+    tes = [7.6, 21.7, 35.8]
+    nz, ny, nx = 40, 18, 18
+    zz, yy, xx = np.meshgrid(np.arange(nz), np.arange(ny), np.arange(nx), indexing="ij")
+    centres = (8.0, 20.0, 32.0)
+    vol = sum(
+        (1.0 + 0.3 * j)
+        * np.exp(-((zz - c) ** 2 + (yy - 8.5) ** 2 + (xx - 8.5) ** 2) / (2 * 2.2**2))
+        for j, c in enumerate(centres)
+    )
+    base = np.stack([vol, vol, vol]).astype(
+        np.float32
+    )  # no head motion: isolate the partition term
+    nt = base.shape[0]
+    zc = (nz - 1) / 2
+    # the correction per ms of TE (shift, stretch about zc), per volume
+    s_rate = np.array([0.010, -0.006, 0.004])
+    k_rate = np.array([-0.0012, 0.0009, -0.0006])
+    paths = []
+    for i, te in enumerate(tes):
+        raw = np.empty_like(base)
+        for t in range(nt):
+            s, k = s_rate[t] * te, k_rate[t] * te
+            # exact inverse of the correction's pull z_raw = (1 - k) c - s + k zc
+            src = (zz + s - k * zc) / (1 - k)
+            raw[t] = map_coordinates(base[t], [src, yy, xx], order=3, mode="nearest")
+        p = tmp_path / f"e{i + 1}.nii.gz"
+        _write(p, torch.from_numpy(raw))
+        paths.append(str(p))
+    np.savetxt(tmp_path / "s.1D", s_rate[:, None] * np.asarray(tes)[None])
+    np.savetxt(tmp_path / "k.1D", k_rate[:, None] * np.asarray(tes)[None])
+    common = ["-input", *paths, "-reg_echo", "1", "-me_3depi", "-axis", "z", "-echo_times"]
+    common += [str(t) for t in tes] + ["-shift_table", str(tmp_path / "s.1D"), "-device", "cpu"]
+
+    def worst_blob_offset(name, extra):
+        main([*common, *extra, "-prefix", str(tmp_path / name), "-verb", "0"])
+        e1, e3 = (load_image(str(tmp_path / f"e{i}_{name}"))[0].numpy() for i in (1, 3))
+        worst = 0.0
+        for c in (centres[0], centres[-1]):
+            win = (np.arange(nz) > c - 5) & (np.arange(nz) < c + 5)
+            z = np.arange(nz)[win]
+            cz = [(v[:, win].sum((2, 3)) * z).sum(1) / v[:, win].sum((1, 2, 3)) for v in (e1, e3)]
+            worst = max(worst, float(np.abs(cz[0] - cz[1]).max()))
+        return worst
+
+    # Frame 0 has a negative stretch and identity motion: the matrix that tripped
+    # the shear path's near-identity shortcut (scale dropped, shifts kept).
+    with_stretch = worst_blob_offset("st.nii.gz", ["-stretch_table", str(tmp_path / "k.1D")])
+    shift_only = worst_blob_offset("sh.nii.gz", [])
+    assert with_stretch < 0.03
+    assert shift_only > 0.2

@@ -55,6 +55,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Output prefix/stem. Outputs are <prefix>T2starmap.nii.gz, etc.",
     )
+    parser.add_argument(
+        "-optcom",
+        default=None,
+        metavar="FILE",
+        help="Also write the optimally combined series to exactly this path (any format "
+        "ffs writes, e.g. .nii.zst), for pipelines that read it under their own name.",
+    )
     parser.add_argument("-mask", default=None, help="Binary brain mask (strongly recommended).")
     parser.add_argument(
         "-automask",
@@ -253,6 +260,8 @@ def main(argv: list[str] | None = None) -> None:
 
         optcom = me.make_optcom(data_cat, tes, adaptive, t2s=t2s_full, combmode=args.combmode)
         save(optcom, "desc-optcom_bold")
+        if args.optcom:
+            save_image(_unmask(optcom, mask), args.optcom, header_info=header)
 
         echo_labels = [f"echo-{i + 1}" for i in range(n_echos)]
         if args.fittype == "curvefit" or args.fittype == "robust":

@@ -75,6 +75,30 @@ def _run_stem(pr: PlanRun, label: str, src: str | None = None) -> str:
     return stem(NameKey(label, session=b.session, task=b.task, run=b.run or None, src=src))
 
 
+# ---------------------------------------------------------------------------
+# Multi-echo. Echo 1 keeps every single-echo file name, so stages that only need one
+# image (coregistration, means, lanes, masks, the GLM) are untouched; only the
+# stages that need every echo loop over them, naming echoes 2..N ``.echo-N``. In
+# bash, MAGE["$k|$e"] / PHASEE["$k|$e"] hold a multi-echo run's per-echo sources and
+# fall back to MAG / PHASE for a single-echo run, so one loop serves both.
+# ---------------------------------------------------------------------------
+_ECHO_LOOP = (
+    'for e in $(seq 1 "${NECHO[$k]:-1}"); do\n    esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"'
+)
+_ECHO_MAG = "${MAGE[$k|$e]:-${MAG[$k]}}"
+_ECHO_PHASE = "${PHASEE[$k|$e]:-${PHASE[$k]:-}}"
+
+
+def _any_me(plan: Plan) -> bool:
+    return any(pr.bold.is_multiecho for pr in plan.runs)
+
+
+def _me_3d(pr: PlanRun, opt) -> bool:
+    """A multi-echo 3-D run: its partition shift differs per echo (TE-scaled), so
+    moco and locomoco hand stage10 per-echo transforms."""
+    return bool(opt is not None and opt.acq_3d and pr.bold.is_multiecho)
+
+
 def _fmap_stem(pr: PlanRun, label: str) -> str:
     fid = pr.fmap.fmap_id if pr.fmap else "x"
     return stem(NameKey(label, session=pr.bold.session, fmap=fid))
@@ -91,6 +115,15 @@ def _phase_on(plan: Plan) -> bool:
 def _nordic_mag(plan: Plan) -> str:
     """The NORDIC magnitude output."""
     return "stage00.nordic.${FRAG[$k]}.nii$FMT"
+
+
+def _nordic_fmt(plan: Plan) -> str:
+    return "$FMT"
+
+
+def _indent(block: str, n: int) -> str:
+    pad = " " * n
+    return "\n".join(pad + ln if ln.strip() else ln for ln in block.split("\n"))
 
 
 def _nordic_phase() -> str:
@@ -259,9 +292,18 @@ def _nl_source_args(in_source: bool, aligned: str, native: str, matrix: str) -> 
     return [f'-source "{native}"', f'-matrix "{matrix}"']
 
 
-def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
+def _token_files(pr: PlanRun, tok: str, fmt: str, opt, echo: int | None = None) -> list[str]:
     """The concrete file(s) one warp-chain token resolves to. Single source of
-    truth for both the full chain and the fmap sub-chain (no drift)."""
+    truth for both the full chain and the fmap sub-chain (no drift).
+
+    ``echo``: resolve for that echo of a multi-echo 3-D run, whose moco matrices
+    carry its own (TE-scaled) partition correction and whose locomoco warp is its
+    own; every other link is shared by the echoes."""
+    if echo is not None and _me_3d(pr, opt):
+        if tok == "moco":
+            return [f"e{echo}_" + _run_stem(pr, "moco") + ".sc.aff12.1D"]
+        if tok == "locomoco":
+            return [_run_stem(pr, "nlmoco") + f"_e{echo}_warp{fmt}"]
     if tok == "mni_nl":
         # .gz, not $FMT: every backend takes the warp's extension from its -prefix,
         # and that prefix is the whole-brain MNI underlay, which has to be openable
@@ -300,7 +342,9 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
     return []
 
 
-def chain_files(pr: PlanRun, fmt: str, opt=None, tokens: list[str] | None = None) -> list[str]:
+def chain_files(
+    pr: PlanRun, fmt: str, opt=None, tokens: list[str] | None = None, echo: int | None = None
+) -> list[str]:
     """Resolve a run's warp chain into filenames (nwarp-apply order).
 
     ``tokens`` overrides which links to resolve — used for the run-average chain
@@ -310,7 +354,7 @@ def chain_files(pr: PlanRun, fmt: str, opt=None, tokens: list[str] | None = None
     """
     resolved: list[str] = []
     for tok in pr.warp_chain if tokens is None else tokens:
-        resolved.extend(_token_files(pr, tok, fmt, opt))
+        resolved.extend(_token_files(pr, tok, fmt, opt, echo=echo))
     return resolved
 
 
@@ -1249,6 +1293,9 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
         # Keys are "ses:task:run": undeclared, bash takes SURFCHAIN as an indexed
         # array and evaluates the key as arithmetic, failing every assignment.
         + (" SURFCHAIN" if plan.options.surface_target else "")
+        # Declared even for single-echo data: the echo loops read ${NECHO[$k]:-1},
+        # and an undeclared array would take the "ses:task:run" key as arithmetic.
+        + " NECHO TES MAGE PHASEE ECHAIN"
     )
 
     # first run per session (the no-fmap anchor).
@@ -1274,6 +1321,13 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
             lines.append(f"PHASE[{q(k)}]={q(str(b.phase_path) + sel)}")
         if b.sbref_path:
             lines.append(f"SBREF[{q(k)}]={q(str(b.sbref_path))}")
+        if b.is_multiecho:
+            lines.append(f"NECHO[{q(k)}]={b.n_echoes}")
+            lines.append(f"TES[{q(k)}]={q(' '.join(f'{t:g}' for t in b.echo_tes))}")
+            for e, (em, ep) in enumerate(zip(b.echo_mags, b.echo_phases, strict=True), start=1):
+                lines.append(f"MAGE[{q(f'{k}|{e}')}]={q(str(em) + sel)}")
+                if ep is not None:
+                    lines.append(f"PHASEE[{q(f'{k}|{e}')}]={q(str(ep) + sel)}")
         lines.append(f"JSON[{q(k)}]={q(str(_sidecar(b.mag_path)))}")
         tr = plan.options.tr if plan.options.tr is not None else b.tr
         lines.append(f"TR[{q(k)}]={q(str(tr if tr is not None else ''))}")
@@ -1314,6 +1368,12 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
         lines.append(f'AVGCHAIN[{q(k)}]="{" ".join(avg)}"')
         chain = chain_files(pr, ".nii$FMT", plan.options)
         lines.append(f'CHAIN[{q(k)}]="{" ".join(chain)}"')
+        if b.is_multiecho:
+            # Each echo's chain: echo 1's for 2-D (one warp moves every echo alike);
+            # for 3-D each echo's own moco matrices and locomoco warp (TE-scaled).
+            for e in range(1, b.n_echoes + 1):
+                ech = chain_files(pr, ".nii$FMT", plan.options, echo=e)
+                lines.append(f'ECHAIN[{q(f"{k}|{e}")}]="{" ".join(ech)}"')
         if plan.options.surface_target:
             # The surfaces live in the anat's scanner space: the chain stops there.
             surf = chain_files(
@@ -1592,7 +1652,7 @@ def _stage_nordic(plan: Plan) -> str:
     nordic_cmd = _ffs(
         "ffs_nordic",
         [
-            '-input_magn "${MAG[$k]}"',
+            '-input_magn "$mag"',
             '"${phase_arg[@]}"',
             '-prefix "$outf"',
             '-noise-volume-last "${NOISE[$k]}"',
@@ -1625,13 +1685,17 @@ def _stage_nordic(plan: Plan) -> str:
 # correction, so read the enrichment and the component scan, not the per-voxel R
 # maps. -nordic_task_rescue is what ACTS on it.
 echo '== stage00: NORDIC denoise =='
+# Multi-echo: each echo denoised on its own for now (echo 1 keeps the single-echo
+# name, echo N becomes .echo-N); a joint cross-echo denoising is still to be tested.
 for k in "${{RUN_KEYS[@]}}"; do
-  outf="{_nordic_mag(plan)}"
-  [ "$skip_nordic" -eq 1 ] && [ -f "$outf" ] && continue
-  ph="${{PHASE[$k]:-}}"
-  if [ -n "$ph" ]; then phase_arg=(-input_phase "$ph"); else phase_arg=(-magnitude-only); fi
   ev="${{EVENTS[$k]:-}}"   # unset for a run whose events did not resolve; set -u
-{nordic_cmd}
+  {_ECHO_LOOP}
+    outf="stage00.nordic.${{FRAG[$k]}}${{esfx}}.nii{_nordic_fmt(plan)}"
+    [ "$skip_nordic" -eq 1 ] && [ -f "$outf" ] && continue
+    mag="{_ECHO_MAG}"; ph="{_ECHO_PHASE}"
+    if [ -n "$ph" ]; then phase_arg=(-input_phase "$ph"); else phase_arg=(-magnitude-only); fi
+{_indent(nordic_cmd, 2)}
+  done
 done
 """
 
@@ -1687,6 +1751,7 @@ def _stage_moco(plan: Plan, script_stem: str) -> str:
         else ""
     )
     censor_arg = _moco_censor_flags(plan)
+    me3d_block, me3d_links = _moco_me3d(plan)
     return f"""
 # ============================ stage02: motion correction ====================
 # Batched: ONE ffs_moco process motion-corrects every run, so the Python/CUDA/
@@ -1712,11 +1777,73 @@ for k in "${{RUN_KEYS[@]}}"; do
     last)  nv=$(ffs_info -nv "$raw"); base_str="-base $((nv - 1))" ;;
     *)     base_str="-base \\"$MOCO_REF\\"" ;;   # integer volume index
   esac
-  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"{motsim_arg}{censor_arg}" >> "$mocobatch"
+  ins="\\"$raw\\""; me_args=""
+{me3d_block}  printf '%s\\n' "-input $ins $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"{motsim_arg}{censor_arg}$me_args" >> "$mocobatch"
 done
 batch_skip=(); [ "$skip_moco" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
-"""
+{me3d_links}"""
+
+
+def _moco_me3d(plan: Plan) -> tuple[str, str]:
+    """stage02's multi-echo 3-D additions: (bash in the manifest loop, bash after the batch).
+
+    Motion is estimated from echo 1, but every echo goes in: -me_3depi removes the
+    TE-scaled partition shift (and stretch) from echo 1 BEFORE the rigid estimate, so
+    the head's motion is not confused with it, and writes each echo's matrices with
+    its own correction folded in (eN_<mstem>.sc.aff12.1D, read by ECHAIN). The
+    correction comes from stage00's phase echo-slope when the phase is processed,
+    else from moco's own inter-echo cross-correlation of the magnitude. With locomoco,
+    every echo's corrected series (and phase) is written for its joint solve.
+    """
+    opt = plan.options
+    if not (opt.acq_3d and _any_me(plan)):
+        return "", ""
+    tables = (
+        '      [ -n "${PHASE[$k]:-}" ] && [ -f "' + _pshift() + '" ] && '
+        'me_args="$me_args -shift_table \\"'
+        + _pshift()
+        + '\\" -stretch_table \\"'
+        + _pstretch()
+        + '\\""\n'
+        if _phase_on(plan)
+        else ""
+    )
+    phase = ""
+    if opt.locomoco and _phase_on(plan):
+        phase = (
+            '      if [ -n "${PHASE[$k]:-}" ]; then\n'
+            '        phs=""; for e in $(seq 1 "${NECHO[$k]}"); do '
+            'phs="$phs \\"' + _me_unwrap_stem() + '_e$e.nii$FMT\\""; done\n'
+            '        me_args="$me_args -phase$phs -phase_units rad"\n'
+            "      fi\n"
+        )
+    block = (
+        '  if [ "${NECHO[$k]:-1}" -gt 1 ]; then\n'
+        '    ins=""\n'
+        '    for e in $(seq 1 "${NECHO[$k]}"); do\n'
+        '      esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"\n'
+        + _echo_pair_source(plan, indent="      ")
+        + '\n      ins="$ins \\"$mag\\""\n'
+        "    done\n"
+        '    me_args=" -reg_echo 1 -me_3depi -axis k -echo_times ${TES[$k]}'
+        ' -1Dmatrix_shiftcorr \\"${mstem}.sc.aff12.1D\\""\n'
+        + tables.replace("      ", "    ", 1)
+        + phase.replace("      ", "    ")
+        + "  fi\n"
+    )
+    links = (
+        "# Multi-echo 3-D: echo 1 is the registration echo -- its eN_-prefixed\n"
+        "# reductions take the single-echo names every later stage reads.\n"
+        'for k in "${RUN_KEYS[@]}"; do\n'
+        '  [ "${NECHO[$k]:-1}" -gt 1 ] || continue\n'
+        '  mstem="stage02.moco.${FRAG[$k]}"\n'
+        "  for which in mean max min; do\n"
+        '    ln -sf "e1_${mstem}_${which}.nii$FMT" "${mstem}_${which}.nii$FMT"\n'
+        "  done\n"
+        "done\n"
+    )
+    return block, links
 
 
 def _stage_locomoco(plan: Plan, script_stem: str) -> str:
@@ -1724,13 +1851,12 @@ def _stage_locomoco(plan: Plan, script_stem: str) -> str:
         return ""
     detask = plan.options.locomoco_detask
     parts = [
-        '-input "stage02.moco.${FRAG[$k]}.nii$FMT"',
+        # $lm_in / $lm_pe / $lm_me are set per run in the loop below (multi-echo 3-D
+        # changes all three).
+        "-input $lm_in",
         '-prefix "${nlstem}.nii$FMT"',
-        '-pe_dir "${pe:-y}"',
-        # 3-D EPI: the partition (2nd phase-encode) axis wiggles too, by a different
-        # mechanism (a field change during the shot), so both are solved at once. The
-        # partition is the third voxel axis of an axial 3-D acquisition.
-        *(["-pe_dir2 k"] if plan.options.acq_3d else []),
+        "$lm_pe",
+        "$lm_me",
         *_split_flags(config.DEFAULT_OPTS["locomoco"]),
         # The design, for whichever step reads it. -tr rides along because a 3D
         # acquisition's header pixdim[4] is the per-partition time, not the volume TR
@@ -1775,10 +1901,46 @@ for k in "${{RUN_KEYS[@]}}"; do
   nlstem="stage03.nlmoco.${{FRAG[$k]}}"
   pe="${{PEDIR[$k]}}"; pe="${{pe//[!a-zA-Z]/}}"
   ev="${{EVENTS[$k]:-}}"   # unset for a run whose events did not resolve; set -u
+{_locomoco_run_vars(plan)}
 {_manifest_line("lmbatch", parts)}
 done
 {_batch_launch("ffs_locomoco", "lmbatch", "skip_locomoco")}
 """
+
+
+def _locomoco_run_vars(plan: Plan) -> str:
+    """Per-run locomoco inputs, axes and multi-echo flags (bash in the stage03 loop).
+
+    Single echo: stage02's corrected series; the in-plane PE axis, plus the partition
+    axis for 3-D EPI (a field change during the shot moves it too) in one solve.
+    Multi-echo 3-D: every echo's corrected series, the partition axis (TE-dependent:
+    echo e moves TE_e/TE1 times as far), and the unwrapped phase when processed, so the
+    estimate is the joint, field-blind magnitude+phase one; each echo gets its own warp
+    (stage10's ECHAIN). Multi-echo 2-D: echo 1 alone -- the in-plane warp moves every
+    echo alike, and stage10 applies it to each.
+    """
+    pe = '-pe_dir \\"${pe:-y}\\"' + (" -pe_dir2 k" if plan.options.acq_3d else "")
+    out = [
+        '  lm_in="\\"stage02.moco.${FRAG[$k]}.nii$FMT\\""',
+        f'  lm_pe="{pe}"; lm_me=""',
+    ]
+    if plan.options.acq_3d and _any_me(plan):
+        phase = ""
+        if _phase_on(plan):
+            phase = (
+                '    if [ -n "${PHASE[$k]:-}" ]; then\n'
+                '      for e in $(seq 1 "${NECHO[$k]}"); do '
+                'lm_ph="${lm_ph:-} \\"phase_e${e}_stage02.moco.${FRAG[$k]}.nii$FMT\\""; done\n'
+                '      lm_me="$lm_me -phase$lm_ph -phase_units rad"; unset lm_ph\n'
+                "    fi\n"
+            )
+        out.append(
+            '  if [ "${NECHO[$k]:-1}" -gt 1 ]; then\n'
+            '    lm_in=""; for e in $(seq 1 "${NECHO[$k]}"); do '
+            'lm_in="$lm_in \\"e${e}_stage02.moco.${FRAG[$k]}.nii$FMT\\""; done\n'
+            '    lm_pe="-pe_dir2 k"; lm_me="-me_3depi -echo_times ${TES[$k]}"\n' + phase + "  fi"
+        )
+    return "\n".join(out)
 
 
 def _fmap_pe(pr: PlanRun) -> str:
@@ -3327,12 +3489,65 @@ for k in "${{RUN_KEYS[@]}}"; do
   meanf="{meanf}"
 {phase_out}{st}
 {_raw_source(plan)}
-  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -chain_base \\"$MASTER\\" -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean \\"$meanf\\" -prefix \\"$outf\\"{phase_args}{surf_args}" >> "$nwarpbatch"
+{_final_me_jobs(plan, nwarp_flags)}  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -chain_base \\"$MASTER\\" -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean \\"$meanf\\" -prefix \\"$outf\\"{phase_args}{surf_args}" >> "$nwarpbatch"
 done
 {_numcomps_final_jobs(plan)}{_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
-echo 'done → stage10.final.*'
+{_final_me_combine(plan)}echo 'done → stage10.final.*'
 {_qc_final(plan)}
+"""
+
+
+def _final_me_jobs(plan: Plan, nwarp_flags: str) -> str:
+    """stage10 manifest lines for a multi-echo run: one resample per echo, each with
+    its own chain (ECHAIN) and phase, written as stage10.final.<frag>.echo-N; the
+    run's own name is left for the optimal combination (_final_me_combine). Echo 1's
+    job writes the QC mean. Ends the iteration for a multi-echo run."""
+    if not _any_me(plan):
+        return ""
+    phase = ""
+    if _phase_on(plan):
+        phase = (
+            '      [ -n "${PHASE[$k]:-}" ] && pe_args=" -phase \\"'
+            + _me_unwrap_stem()
+            + '_e$e.nii$FMT\\" -phase_units rad -phase_warp direct -phase_prefix '
+            '\\"stage10.final.${FRAG[$k]}.echo-$e.part-phase.nii$FINAL_FMT\\""\n'
+        )
+    return (
+        '  if [ "${NECHO[$k]:-1}" -gt 1 ]; then\n'
+        '    for e in $(seq 1 "${NECHO[$k]}"); do\n'
+        '      esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"\n'
+        + _echo_pair_source(plan)
+        + '\n      eoutf="stage10.final.${FRAG[$k]}.echo-$e.nii$FINAL_FMT"; pe_args=""; em=""\n'
+        + phase
+        + '      [ "$e" -eq 1 ] && em=" -save_mean \\"$meanf\\""\n'
+        '      printf \'%s\\n\' "-source \\"$mag\\" -nwarp \\"${ECHAIN[$k|$e]}\\"'
+        '${JAC[$k]:+ -jac \\"${JAC[$k]}\\"} -master stage10.warpmaster.nii$FMT '
+        '-chain_base \\"$MASTER\\" -dxyz \\"$FINAL_DXYZ\\" '
+        + nwarp_flags
+        + ' $st_str$em -prefix \\"$eoutf\\"$pe_args" >> "$nwarpbatch"\n'
+        "    done\n"
+        "    continue\n"
+        "  fi\n"
+    )
+
+
+def _final_me_combine(plan: Plan) -> str:
+    """Optimal combination of each multi-echo run's per-echo finals into the run's own
+    stage10.final name, which every later stage reads (ffs_t2smap: monoexponential
+    T2*/S0 fit, T2*-weighted combination; maps kept as stage10.t2s.<frag>_*)."""
+    if not _any_me(plan):
+        return ""
+    return """# Multi-echo: combine each run's warped echoes (optimal combination, T2*-weighted)
+# into stage10.final.<frag> -- the series every later stage reads. The per-echo
+# finals and the T2*/S0 maps (stage10.t2s.<frag>_*) stay beside it.
+for k in "${RUN_KEYS[@]}"; do
+  [ "${NECHO[$k]:-1}" -gt 1 ] || continue
+  outf="stage10.final.${FRAG[$k]}.nii$FINAL_FMT"
+  [ "$skip_final" -eq 1 ] && [ -f "$outf" ] && continue
+  ins=(); for e in $(seq 1 "${NECHO[$k]}"); do ins+=("stage10.final.${FRAG[$k]}.echo-$e.nii$FINAL_FMT"); done
+  ffs_t2smap -input "${ins[@]}" -tes ${TES[$k]} -automask -no_qc -prefix "stage10.t2s.${FRAG[$k]}_" -optcom "$outf" -device "$DEVICE" -verb 0
+done
 """
 
 
@@ -3529,6 +3744,16 @@ def _stage_unwrap(plan: Plan) -> str:
     if not _phase_on(plan):
         return ""
     opt = plan.options
+    # 3-D multi-echo: the per-echo partition shift + stretch, measured from the phase
+    # echo-slope (head motion and whole-head field changes cancel across echoes),
+    # for stage02 to fold into each echo's matrices.
+    me_3d_args = (
+        f' -partition_axis k -save_partition_shift "{_pshift()}"'
+        f' -save_partition_stretch "{_pstretch()}"'
+        if opt.acq_3d
+        else ""
+    )
+    me_3d_note = ", and the per-echo partition shift + stretch for stage02" if opt.acq_3d else ""
     unwrap_opts = " ".join(_split_flags(config.DEFAULT_OPTS["unwrap"]))
     unwrap_opts = f" {unwrap_opts}" if unwrap_opts else ""
     uw = _unwrapped()
@@ -3578,12 +3803,57 @@ def _stage_unwrap(plan: Plan) -> str:
 echo '== stage00: phase unwrap =='
 for k in "${{RUN_KEYS[@]}}"; do
   [ -n "${{PHASE[$k]:-}}" ] || continue  # no phase for this run (e.g. spin echo)
+  if [ "${{NECHO[$k]:-1}}" -gt 1 ]; then
+    # Multi-echo: ONE call over every echo -- the echo ladder, the field map, the
+    # removal of the head-wide drift of the phase at TE 0{me_3d_note}.
+    uwe="{_me_unwrap_stem()}"
+    [ "$skip_unwrap" -eq 1 ] && [ -f "${{uwe}}_e1.nii$FMT" ] && continue
+    mags=(); phs=()
+    for e in $(seq 1 "${{NECHO[$k]}}"); do
+      esfx=""; [ "$e" -gt 1 ] && esfx=".echo-$e"
+{_echo_pair_source(plan)}
+      mags+=("$mag"); phs+=("$ph")
+    done
+    ffs_phase_unwrap -phase "${{phs[@]}}" -magnitude "${{mags[@]}}" -echo_times ${{TES[$k]}} -prefix "${{uwe}}.nii$FMT" -device "$DEVICE" -verb 0{me_3d_args}{unwrap_opts}
+    continue
+  fi
   uw="{uw}"{drift_vars}
   [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ]{drift_done} && continue
 {src}
   [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ] || ffs_phase_unwrap -phase "$ph" -magnitude "$mag" -prefix "$uw" -device "$DEVICE" -verb 0{unwrap_opts}{drift_cmd}
 done
 """
+
+
+def _me_unwrap_stem() -> str:
+    """A multi-echo run's unwrapped-phase stem: ffs_phase_unwrap writes <stem>_eN."""
+    return "stage00.unwrap.${FRAG[$k]}.part-phase"
+
+
+def _pshift() -> str:
+    """Per-echo partition shift table from the phase echo-slope (3-D multi-echo)."""
+    return "stage00.unwrap.${FRAG[$k]}.pshift.1D"
+
+
+def _pstretch() -> str:
+    return "stage00.unwrap.${FRAG[$k]}.pstretch.1D"
+
+
+def _echo_pair_source(plan: Plan, indent: str = "      ") -> str:
+    """Bash setting ``mag``/``ph`` to echo $e's sources (esfx set by the echo loop):
+    the NORDIC pair, or the raw BIDS pair with the noise volumes dropped by selector."""
+    if plan.options.want_nordic:
+        return (
+            f'{indent}mag="stage00.nordic.${{FRAG[$k]}}${{esfx}}.nii$FMT"; '
+            'ph="stage00.nordic.${FRAG[$k]}${esfx}_phase.nii$FMT"'
+        )
+    return (
+        f'{indent}mag="{_ECHO_MAG}"; ph="{_ECHO_PHASE}"\n'
+        f'{indent}if [ "${{NOISE[$k]}}" -gt 0 ]; then\n'
+        f'{indent}  nv=$(ffs_info -nv "$mag"); last=$((nv - ${{NOISE[$k]}} - 1))\n'
+        f'{indent}  mag="${{mag}}[0..$last]"; ph="${{ph}}[0..$last]"\n'
+        f"{indent}fi"
+    )
 
 
 def _mask_epi() -> str:

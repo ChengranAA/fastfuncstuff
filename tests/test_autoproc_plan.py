@@ -293,7 +293,8 @@ def test_locomoco_consumes_the_moco_timeseries_not_the_mean():
 
     s = write_script(build_plan(subj, Options(locomoco=True)), "wd", bids_root="/bids")
     assert '-prefix \\"${mstem}.nii$FMT\\"' in s
-    assert '-input \\"stage02.moco.${FRAG[$k]}.nii$FMT\\"' in s
+    assert 'lm_in="\\"stage02.moco.${FRAG[$k]}.nii$FMT\\""' in s
+    assert "-input $lm_in" in s
     # and the mean that goes downstream is locomoco's, not moco's
     assert "stage03.nlmoco.ses-01.task-foo.run-1_locomoco_mean.nii$FMT" in s
 
@@ -3285,3 +3286,73 @@ def test_phasereg_folders_are_numbered_per_setting_and_reused_on_rerun(tmp_path:
     assert run(a) == "phasereg_01"
     assert (tmp_path / "phasereg_02" / "settings.txt").read_text().strip() == b
     assert len((tmp_path / "phasereg_01" / "history.txt").read_text().splitlines()) == 3
+
+
+def _me_run(session, task, run, n=3, phase=True):
+    r = _run(session, task, run)
+    base = str(r.mag_path).replace("_bold.nii.gz", "")
+    r.echo_mags = [Path(f"{base}_echo-{e}_part-mag_bold.nii.gz") for e in range(1, n + 1)]
+    r.echo_phases = [
+        Path(f"{base}_echo-{e}_part-phase_bold.nii.gz") if phase else None for e in range(1, n + 1)
+    ]
+    r.echo_tes = [7.6, 21.7, 35.8, 49.9][:n]
+    r.mag_path, r.phase_path = r.echo_mags[0], r.echo_phases[0]
+    return r
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+@pytest.mark.parametrize("acq_3d", [True, False])
+def test_multiecho_estimates_from_echo1_warps_each_echo_and_combines(tmp_path, acq_3d):
+    """Multi-echo: echo 1 drives the estimates; 3-D adds the per-echo partition
+    correction (phase tables -> moco -me_3depi) and a joint per-echo locomoco; every
+    echo is warped with its own chain at stage10 and optimally combined into the
+    run's own stage10.final name."""
+    subj = Subject("X", [Session("01", [_me_run("01", "foo", "1")])])
+    opt = Options(
+        phase_proc=True, locomoco=True, acq_3d=acq_3d, go_to_anat=False, distortion=False,
+        slicetiming_method="none" if acq_3d else "integrate",
+    )  # fmt: skip
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+    assert "NECHO[01:foo:1]=3" in s
+    assert "TES[01:foo:1]='7.6 21.7 35.8'" in s
+    assert "MAGE['01:foo:1|3']=" in s and "PHASEE['01:foo:1|3']=" in s
+    # one unwrap over every echo
+    assert 'ffs_phase_unwrap -phase "${phs[@]}" -magnitude "${mags[@]}" -echo_times ${TES[$k]}' in s
+    # every echo warped with ITS chain, then combined into the run's name
+    assert '-nwarp \\"${ECHAIN[$k|$e]}\\"' in s
+    assert 'ffs_t2smap -input "${ins[@]}" -tes ${TES[$k]}' in s
+    assert '-optcom "$outf"' in s
+    if acq_3d:
+        assert "-save_partition_shift" in s and "-save_partition_stretch" in s
+        assert "-reg_echo 1 -me_3depi -axis k" in s and "-1Dmatrix_shiftcorr" in s
+        assert "-shift_table" in s and "-stretch_table" in s
+        assert 'lm_me="-me_3depi -echo_times ${TES[$k]}"' in s and "-phase$lm_ph" in s
+        assert "e3_stage02.moco.ses-01.task-foo.run-1.sc.aff12.1D" in s  # echo 3's matrices
+        assert "stage03.nlmoco.ses-01.task-foo.run-1_e3_warp" in s  # echo 3's warp
+        assert 'ln -sf "e1_${mstem}_${which}.nii$FMT"' in s
+    else:
+        assert "-me_3depi" not in s and "-save_partition_shift" not in s
+        # 2-D: one in-plane warp moves every echo alike -> echo chains share it
+        ech = [ln for ln in s.splitlines() if ln.startswith("ECHAIN[")]
+        assert len(ech) == 3 and len({ln.split("=", 1)[1] for ln in ech}) == 1
+
+
+def test_multiecho_refuses_what_it_does_not_handle_yet():
+    from fastfuncstuff.cli.autoproc import _multiecho_errors
+
+    subj = Subject("X", [Session("01", [_me_run("01", "foo", "1")])])
+    assert _multiecho_errors(Options(), subj) == []
+    errs = _multiecho_errors(Options(slicetiming_method="first", phasereg=True), subj)
+    assert any("slicetiming_method first" in e for e in errs)
+    assert any("-phasereg" in e for e in errs)
+    bad = _me_run("01", "foo", "2")
+    bad.echo_tes = []
+    assert any(
+        "EchoTime" in e for e in _multiecho_errors(Options(), Subject("X", [Session("01", [bad])]))
+    )

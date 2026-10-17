@@ -1216,6 +1216,35 @@ def _resolve_nl_backends(args) -> dict[str, str]:
     return out
 
 
+def _multiecho_errors(opt: Options, subject) -> list[str]:
+    """What the multi-echo path does not handle yet, refused at generation time.
+
+    Multi-echo runs are estimated from echo 1, every echo is warped with its own
+    chain at stage10 and the echoes are optimally combined into the run's series.
+    The stages below were written for one series per run."""
+    me = [r for s in subject.sessions for r in s.bold_runs if r.is_multiecho]
+    if not me:
+        return []
+    errs = []
+    no_te = [f"{r.task} run {r.run or '-'}" for r in me if len(r.echo_tes) != r.n_echoes]
+    if no_te:
+        errs.append(
+            "multi-echo runs without an EchoTime in every echo's sidecar: " + ", ".join(no_te)
+        )
+    if opt.slicetiming_method == "first":
+        errs.append(
+            "-slicetiming_method first is single-echo for now; multi-echo runs integrate "
+            "slice timing into the final resample (the default)."
+        )
+    if opt.surface_target:
+        errs.append("-surface_target with multi-echo runs is not wired yet.")
+    if opt.phasereg:
+        errs.append("-phasereg with multi-echo runs is not wired yet (which echo's phase?).")
+    if opt.acq_3d and opt.motsim:
+        errs.append("-motsim with multi-echo 3-D runs is not wired yet.")
+    return errs
+
+
 def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[str], list[str]]:
     """Return (errors, warnings). Non-empty errors ⇒ do not write the script."""
     errors: list[str] = []
@@ -1402,6 +1431,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 f"slice timing is on but {len(no_tr)} run(s) have no RepetitionTime in their "
                 "sidecar. Pass -TR SECONDS (volume TR) or -slicetiming_method none."
             )
+    errors += _multiecho_errors(opt, subject)
     if opt.phase_proc:
         # Phase is carried per run, wherever a run has one: a session can mix
         # gradient-echo runs (with phase) and spin-echo runs (without).
@@ -1947,6 +1977,24 @@ def _resolve_slicetiming(args, rget, subject) -> str:
     return "none"
 
 
+def _report_multiecho(subject, acq_3d: bool) -> None:
+    """Say which runs are multi-echo and what happens to them (printed once)."""
+    me = [r for s in subject.sessions for r in s.bold_runs if r.is_multiecho]
+    if not me:
+        return
+    tes = sorted({tuple(r.echo_tes) for r in me})
+    how = (
+        "per-echo partition shift+stretch in moco, joint locomoco per echo"
+        if acq_3d
+        else "one in-plane warp for every echo"
+    )
+    print(
+        f"== multi-echo: {len(me)} run(s), TEs {', '.join(str(list(t)) for t in tes)} ms — "
+        f"estimated from echo 1, {how}, each echo warped at stage10, optimally combined ==",
+        file=sys.stderr,
+    )
+
+
 def _resolve_acq_3d(args, subject) -> bool:
     """2-D multi-slice or 3-D, decided once and printed.
 
@@ -2276,6 +2324,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _report_fmap_assignment(subject)
     acq_3d = _resolve_acq_3d(args, subject)
+    _report_multiecho(subject, acq_3d)
 
     anat_paths, tpm_source = _resolve_anat(args)
     unused: list[Path] = []

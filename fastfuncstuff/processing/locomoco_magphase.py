@@ -56,11 +56,10 @@ def phase_to_hz(phase: np.ndarray, te_ms: float, units: str) -> np.ndarray:
 
 
 def phase_wrap_fraction(hz_vol: np.ndarray, te_ms: float, mask: np.ndarray) -> float:
-    """Fraction of in-mask neighbour steps larger than half a wrap period.
+    """Fraction of in-mask neighbour steps larger than half a wrap period (``1000/TE`` Hz).
 
-    A wrap at echo time TE is a jump of ``1000/TE`` Hz. Smooth unwrapped field maps
-    essentially never step by half of that between neighbours (67 Hz at TE 7.45 ms), so
-    a non-trivial fraction means the phase was not unwrapped -- or is in the wrong units.
+    Only meaningful at good SNR: a late echo's unwrapped field is noisy enough that 10-20%
+    of its steps exceed half of its small period, wrapped or not (measured, 7T, TE 59 ms).
     """
     half = 0.5 * 1000.0 / te_ms
     n_big = n_all = 0
@@ -73,6 +72,37 @@ def phase_wrap_fraction(hz_vol: np.ndarray, te_ms: float, mask: np.ndarray) -> f
         n_big += int((d[both] > half).sum())
         n_all += int(both.sum())
     return n_big / max(n_all, 1)
+
+
+def phase_input_problem(
+    hz_vols: list[np.ndarray], tes: list[float], brain: np.ndarray
+) -> str | None:
+    """Why one frame per echo of ``-phase`` (in Hz) is not an unwrapped field, or None.
+
+    Two checks, each on the echo where it is decisive:
+
+    * the LONGEST echo has the smallest wrap period. A wrapped series lives inside one
+      period, while a real field spans several there (tens of Hz across a brain at any
+      field strength vs 1000/TE_last). Radians passed as Hz land here too.
+    * the SHORTEST echo has the best SNR, so an unwrapped field is smooth there; raw
+      scanner units (e.g. Siemens +-4096) step by more than half a period almost
+      everywhere (64% measured vs 0.5% for the unwrapped field).
+    """
+    last, te_last = hz_vols[-1][brain], tes[-1]
+    lo, hi = np.percentile(last, [0.5, 99.5])
+    if hi - lo <= 1.05 * 1000.0 / te_last:
+        return (
+            f"echo {len(tes)} spans only {hi - lo:.1f} Hz inside the brain, one wrap period at "
+            f"TE {te_last:g} ms is {1000.0 / te_last:.1f} Hz: it looks WRAPPED (or radians "
+            "passed as Hz)."
+        )
+    frac = phase_wrap_fraction(hz_vols[0], tes[0], brain)
+    if frac > 0.1:
+        return (
+            f"echo 1 is not a smooth field: {100 * frac:.0f}% of in-brain neighbour steps "
+            "exceed half a wrap period. Raw scanner phase, or the wrong -phase_units?"
+        )
+    return None
 
 
 def nuisance_columns(kind: str, te: torch.Tensor) -> torch.Tensor:

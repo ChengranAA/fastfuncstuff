@@ -9,6 +9,7 @@ from fastfuncstuff.processing.locomoco import _shift3d_axis
 from fastfuncstuff.processing.locomoco_magphase import (
     estimate_partition_flow_magphase,
     nuisance_columns,
+    phase_input_problem,
     phase_to_hz,
     phase_wrap_fraction,
 )
@@ -141,6 +142,14 @@ def test_wrap_guard_flags_wrapped_phase():
     wrapped = (field + period / 2) % period - period / 2
     assert phase_wrap_fraction(field, te, mask) < 1e-3
     assert phase_wrap_fraction(wrapped, te, mask) > 1e-2
+    # The run-level guard: the longest echo's wrapped series lives inside one period.
+    tes = [te, 3 * te]
+    late = field * 1.0
+    late_wrapped = (late + period / 6) % (period / 3) - period / 6
+    assert phase_input_problem([field, late], tes, mask) is None
+    assert "WRAPPED" in phase_input_problem([field, late_wrapped], tes, mask)
+    raw = np.random.default_rng(2).uniform(-4096, 4096, SHAPE).astype(np.float32)
+    assert "smooth" in phase_input_problem([raw, late], tes, mask)
 
 
 def test_phase_units_and_nuisance_columns():
@@ -151,3 +160,28 @@ def test_phase_units_and_nuisance_columns():
     assert nuisance_columns("none", t).shape == (4, 0)
     assert nuisance_columns("s0", t).shape == (4, 1)
     assert nuisance_columns("s0r2", t).shape == (4, 2)
+
+
+def _cli_args(*extra):
+    from fastfuncstuff.cli.locomoco import _parse
+
+    base = ["-input", "a.nii", "b.nii", "c.nii", "-echo_times", "10", "20", "30", "-me_3depi"]
+    args = _parse(base + ["-pe_dir2", "IS", *extra])
+    # main() derives the -detask mode fields after parsing; no -detask here.
+    for name in ("detask_widen", "detask_fit"):
+        if not hasattr(args, name):
+            setattr(args, name, None)
+    return args
+
+
+def test_cli_phase_validation():
+    from fastfuncstuff.cli.locomoco import _magphase_arg_error, _magphase_mag_nuisance
+
+    ok = _cli_args("-phase", "p1", "p2", "p3")
+    assert _magphase_arg_error(ok, dual=False, slicewise=False) is None
+    assert _magphase_mag_nuisance(ok) == "s0r2"
+    short = _cli_args("-phase", "p1", "p2")
+    assert "2 phase series for 3" in _magphase_arg_error(short, dual=False, slicewise=False)
+    flat = _cli_args("-phase", "p1", "p2", "p3", "-me_flat_scaling")
+    assert "-me_flat_scaling" in _magphase_arg_error(flat, dual=False, slicewise=False)
+    assert "3-D partition" in _magphase_arg_error(ok, dual=True, slicewise=False)

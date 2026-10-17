@@ -1982,14 +1982,14 @@ def _report_multiecho(subject, acq_3d: bool) -> None:
     me = [r for s in subject.sessions for r in s.bold_runs if r.is_multiecho]
     if not me:
         return
-    tes = sorted({tuple(r.echo_tes) for r in me})
+    tes = sorted({tuple(round(t, 2) for t in r.echo_tes) for r in me})
     how = (
         "per-echo partition shift+stretch in moco, joint locomoco per echo"
         if acq_3d
         else "one in-plane warp for every echo"
     )
     print(
-        f"== multi-echo: {len(me)} run(s), TEs {', '.join(str(list(t)) for t in tes)} ms — "
+        f"== multi-echo: {len(me)} run(s), TEs {', '.join('/'.join(f'{x:g}' for x in t) for t in tes)} ms — "
         f"estimated from echo 1, {how}, each echo warped at stage10, optimally combined ==",
         file=sys.stderr,
     )

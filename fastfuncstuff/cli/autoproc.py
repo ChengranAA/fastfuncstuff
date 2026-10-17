@@ -1248,8 +1248,6 @@ def _multiecho_errors(opt: Options, subject) -> list[str]:
         errs.append("-surface_target with multi-echo runs is not wired yet.")
     if opt.phasereg:
         errs.append("-phasereg with multi-echo runs is not wired yet (which echo's phase?).")
-    if opt.acq_3d and opt.motsim:
-        errs.append("-motsim with multi-echo 3-D runs is not wired yet.")
     return errs
 
 

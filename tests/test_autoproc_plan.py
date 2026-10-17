@@ -3446,3 +3446,18 @@ def test_multiecho_slice_timing_first_shifts_every_echo_and_its_phase(tmp_path, 
         assert s.index("stage01: slice timing") < s.index("stage01: MEDIC")
         medic_stage = s[s.index("stage01: MEDIC") : s.index("stage02: moco")]
         assert shifted in medic_stage
+
+
+def test_multiecho_3d_motsim_rides_the_echo1_registration():
+    """-motsim with 3-D multi-echo: ffs_moco simulates from echo 1's rigid motion (the
+    TE-scaled partition shift is corrected in the data, not modelled as motion)."""
+    from fastfuncstuff.cli.autoproc import _multiecho_errors
+
+    r = _me_run("01", "foo", "1")
+    subj = Subject("X", [Session("01", [r])])
+    opt = Options(phase_proc=True, acq_3d=True, motsim="both,12", go_to_anat=False,
+                  distortion=False, slicetiming_method="none")  # fmt: skip
+    assert _multiecho_errors(opt, subj) == []
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    line = next(ln for ln in s.splitlines() if "-1Dmatrix_save" in ln and "mocobatch" in ln)
+    assert "-motsim both,12" in line and "$me_args" in line

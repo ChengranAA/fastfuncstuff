@@ -736,7 +736,7 @@ def _phase_run(session, task, run, **kw):
 @pytest.mark.parametrize("stc", ["integrate", "first"])
 @pytest.mark.parametrize("drift", [True, False])
 def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc, drift):
-    """-phase_proc: ROMEO unwrap happens once up front (after NORDIC when NORDIC
+    """-phase_proc: the unwrap happens once up front (after NORDIC when NORDIC
     runs), per-slice field drift comes off in native space right after it, the
     phase is untouched in between, and the SAME warp chain carries it at stage10
     into a separately-labelled part-phase output."""
@@ -759,38 +759,39 @@ def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc,
         == 0
     )
 
-    # ROMEO is an external dependency; the script's preflight must catch a missing one.
     preflight = next(line for line in s.splitlines() if line.startswith("for t in ffs_"))
-    assert " romeo" in preflight
-    assert "PHASE_FMT=.gz" in s  # ROMEO can't read .zst
-    assert 'romeo -p "$ph" -m "$mag" -o "$uw" -t epi -v' in s
+    assert " ffs_phase_unwrap" in preflight
+    # phase files follow FMT: every reader is an ffs tool now (ROMEO could not read .zst)
+    assert "PHASE_FMT" not in s and "romeo" not in s
+    assert 'ffs_phase_unwrap -phase "$ph" -magnitude "$mag" -prefix "$uw" -device "$DEVICE"' in s
 
-    unwrapped = "stage00.unwrap.${FRAG[$k]}.part-phase.nii$PHASE_FMT"
+    unwrapped = "stage00.unwrap.${FRAG[$k]}.part-phase.nii$FMT"
     if drift:
-        # Native space, after ROMEO, before anything mixes the acquired slices.
+        # Native space, after the unwrap, before anything mixes the acquired slices.
         assert " ffs_phasedrift" in preflight
         assert 'ffs_phasedrift -input "$uw" -magnitude "$mag" -prefix "$pd"' in s
-        assert s.index("romeo -p") < s.index("ffs_phasedrift -input") < s.index("stage02: motion")
-        unwrapped = "stage00.unwrapdrift.${FRAG[$k]}.part-phase.nii$PHASE_FMT"
+        assert (
+            s.index("ffs_phase_unwrap -phase")
+            < s.index("ffs_phasedrift -input")
+            < s.index("stage02: motion")
+        )
+        unwrapped = "stage00.unwrapdrift.${FRAG[$k]}.part-phase.nii$FMT"
     else:
         assert "ffs_phasedrift" not in s
     if nordic:
         # NORDIC already wrote the denoised pair AND trimmed the noise volumes.
-        assert 'ph="stage00.nordic.${FRAG[$k]}_phase.nii$PHASE_FMT"' in s
-        assert "stage00.trim." not in s
+        assert 'ph="stage00.nordic.${FRAG[$k]}_phase.nii$FMT"' in s
         assert s.index("stage00: NORDIC") < s.index("stage00: phase unwrap")
     else:
-        # No NORDIC: noise volumes must come off BOTH before unwrapping, and
-        # ROMEO needs real files rather than [0..n] selectors.
-        assert 'tp="stage00.trim.${FRAG[$k]}.part-phase.nii$PHASE_FMT"' in s
+        # No NORDIC: noise volumes come off BOTH before unwrapping, as a selector
+        # on the raw pair (ffs_phase_unwrap reads selectors, so nothing is copied).
         assert 'mag="${mag}[0..$last]"; ph="${ph}[0..$last]"' in s
-        assert '-input "$ph" -expr a -prefix "$tp"' in s
 
     # Slice timing done up front must be applied to the phase too, and that
     # tshifted phase is what reaches stage10.
     if stc == "first":
         assert f'-input "{unwrapped}"' in s
-        phase_in = "stage01.tshift.${FRAG[$k]}.part-phase.nii$PHASE_FMT"
+        phase_in = "stage01.tshift.${FRAG[$k]}.part-phase.nii$FMT"
     else:
         phase_in = unwrapped
     assert f'-phase \\"{phase_in}\\" -phase_units rad -phase_warp direct' in s
@@ -827,7 +828,7 @@ def test_phase_proc_skips_runs_without_phase(tmp_path, stc):
 
     # Run the stage10 argument builder for both runs: only the GE line has phase.
     for k, ph in (("ge", "x_phase.nii.gz"), ("se", "")):
-        frag = f'declare -A PHASE FRAG; PHASE[{k}]="{ph}"; FRAG[{k}]={k}; k={k}; FINAL_FMT=.gz; PHASE_FMT=.gz\n'
+        frag = f'declare -A PHASE FRAG; PHASE[{k}]="{ph}"; FRAG[{k}]={k}; k={k}; FINAL_FMT=.gz; FMT=.gz\n'
         lines = [ln for ln in s.splitlines() if "phoutf=" in ln or 'pa=" -phase' in ln]
         out = subprocess.run(  # noqa: S603
             ["bash", "-c", frag + "\n".join(lines) + '\necho "[$pa]"'],
@@ -846,8 +847,8 @@ def test_phase_proc_off_emits_no_phase_machinery():
     subj = Subject("X", [Session("SM", [_phase_run("SM", "primary", "1")])])
     s = write_script(build_plan(subj, Options(go_to_anat=False, distortion=False)), "wd")
     # The PHASE[] data-array entry is always emitted (NORDIC may want it); the
-    # unwrap stage, ROMEO, and the phase-side outputs must not be.
-    assert "PHASE_FMT" not in s and "romeo" not in s
+    # unwrap stage and the phase-side outputs must not be.
+    assert "ffs_phase_unwrap" not in s
     assert "stage00.unwrap" not in s and "-phase_prefix" not in s
 
 
@@ -2851,9 +2852,9 @@ def test_cut_task_vols_trims_only_the_longer_runs_of_that_task(tmp_path: Path):
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
-def test_cut_task_vols_reaches_the_phase_and_romeo_gets_real_files(tmp_path: Path):
+def test_cut_task_vols_reaches_the_phase_and_the_unwrap_reads_it(tmp_path: Path):
     """The cut rides PHASE[] too (the pair must stay the same length), and without
-    NORDIC the unwrap stage materialises the selected pair, since ROMEO reads files."""
+    NORDIC the unwrap reads the selected pair in place: no copy of the raw data."""
     from fastfuncstuff.autoproc.bids import scan_subject
 
     _bids_uneven_runs(tmp_path, phase=True)
@@ -2862,7 +2863,8 @@ def test_cut_task_vols_reaches_the_phase_and_romeo_gets_real_files(tmp_path: Pat
     s = write_script(build_plan(subj, opt), str(tmp_path / "wd"), bids_root=str(tmp_path))
 
     assert re.search(r"^PHASE\[SM:floc:01\]=.*part-phase_bold\.nii\.gz\[0\.\.11\]'$", s, re.M)
-    assert '[[ "$mag" == *"]" ]]' in s
+    assert 'mag="${MAG[$k]}"; ph="${PHASE[$k]}"' in s
+    assert "stage00.trim." not in s
     assert (
         subprocess.run(  # noqa: S603
             ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True, text=True

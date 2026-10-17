@@ -89,24 +89,22 @@ def _phase_on(plan: Plan) -> bool:
 
 
 def _nordic_mag(plan: Plan) -> str:
-    """The NORDIC magnitude output. With -phase_proc it is written as plain gzip
-    (ROMEO reads the matching phase file, and ROMEO cannot read .zst)."""
-    fmt = "$PHASE_FMT" if _phase_on(plan) else "$FMT"
-    return "stage00.nordic.${FRAG[$k]}.nii" + fmt
+    """The NORDIC magnitude output."""
+    return "stage00.nordic.${FRAG[$k]}.nii$FMT"
 
 
 def _nordic_phase() -> str:
     """The NORDIC phase output — ffs_nordic appends ``_phase`` to the -prefix stem
     whenever phase input was used; that name is the tool's, not ours."""
-    return "stage00.nordic.${FRAG[$k]}_phase.nii$PHASE_FMT"
+    return "stage00.nordic.${FRAG[$k]}_phase.nii$FMT"
 
 
 def _phase_file(label: str, part: bool = True) -> str:
     """A per-run phase-side working file, e.g. ``stage00.unwrap.<frag>.part-phase``.
     Built in bash from ``${FRAG[$k]}`` so it matches the Python-side stems; ``part``
-    is False for the magnitude member of a pair (the trimmed copies)."""
+    is False for a magnitude-side file."""
     tail = ".part-phase" if part else ""
-    return f"stage{STAGE_NUMBERS[label]:02d}.{label}." + "${FRAG[$k]}" + f"{tail}.nii$PHASE_FMT"
+    return f"stage{STAGE_NUMBERS[label]:02d}.{label}." + "${FRAG[$k]}" + f"{tail}.nii$FMT"
 
 
 def _unwrapped(label: str = "unwrap") -> str:
@@ -115,7 +113,7 @@ def _unwrapped(label: str = "unwrap") -> str:
 
 def _phase_clean(plan: Plan) -> str:
     """The stage00 phase every later stage reads: drift-cleaned unless
-    -no_phase_drift, else ROMEO's output."""
+    -no_phase_drift, else the unwrap's output."""
     return _unwrapped("unwrapdrift") if plan.options.phase_drift else _unwrapped()
 
 
@@ -1170,13 +1168,6 @@ def _cut_header_note(plan: Plan) -> str:
 
 def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
     opt = plan.options
-    # Phase working files are plain gzip whatever FMT is: ROMEO (and every other
-    # non-ffs reader) cannot open .nii.zst.
-    phase_fmt = (
-        "\nPHASE_FMT=.gz         # phase working files; ROMEO can't read .zst"
-        if _phase_on(plan)
-        else ""
-    )
     phase_skip = "\nskip_unwrap=1" if _phase_on(plan) else ""
     return f"""#!/usr/bin/env bash
 # =============================================================================
@@ -1214,7 +1205,7 @@ OUT={shlex.quote(out_dir)}
 DEVICE={shlex.quote(opt.device)}          # compute device for every ffs stage; -device
 FMT={opt.fmt}           # working intermediates (read many times); -format
 FINAL_FMT={opt.final_fmt}     # final timeseries (portable); -final_format
-GLM_FMT={opt.glm_fmt}       # GLM stat buckets; -glm_format{phase_fmt}
+GLM_FMT={opt.glm_fmt}       # GLM stat buckets; -glm_format
 
 mkdir -p "$OUT"; cd "$OUT"
 
@@ -1401,7 +1392,6 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         }
     )
     checks = " \\\n".join(f"  {shlex.quote(p)}" for p in inputs)
-    # romeo (MRItools) is an external dependency, only needed with -phase_proc.
     # Only the *command* is checked, not the flags that fix a backend's identity
     # ("ffs_optiwarp -force demons" is one executable), and only for the stages
     # this script actually runs -- a missing tool nobody calls is not a problem.
@@ -1417,7 +1407,7 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
     ]
     tools = [*_TOOLS, *dict.fromkeys(nl_tools)]
     if _phase_on(plan):
-        tools = [*tools, "romeo"]
+        tools = [*tools, "ffs_phase_unwrap"]
         if opt.phase_drift:
             tools = [*tools, "ffs_phasedrift"]
     if opt.presurf and _own_anat(opt):
@@ -1567,8 +1557,7 @@ def _numcomps_native(plan: Plan) -> str:
     ffs_nordic appends ``_numcomps`` to the -prefix stem, so it inherits whatever
     format the magnitude output was written in.
     """
-    fmt = "$PHASE_FMT" if _phase_on(plan) else "$FMT"
-    return "stage00.nordic.${FRAG[$k]}_numcomps.nii" + fmt
+    return "stage00.nordic.${FRAG[$k]}_numcomps.nii$FMT"
 
 
 def _numcomps_final(frag: str) -> str:
@@ -1588,11 +1577,11 @@ def _stage_nordic(plan: Plan) -> str:
     resid = "-save-residual-map" if getattr(opt, "nordic_save_resid", False) else ""
     # ffs_nordic writes a denoised phase alongside the magnitude whenever phase
     # input was used, and it trims the noise volumes off both — so the -phase_proc
-    # path needs nothing extra here beyond the plain-gzip output format.
+    # path needs nothing extra here.
     phase_note = (
         "\n# -phase_proc: the denoised phase lands beside the magnitude as\n"
-        "# stage00.nordic.<frag>_phase.nii.gz (noise volumes already trimmed);\n"
-        "# stage00 unwrap picks it up. Plain gzip because ROMEO can't read .zst.\n"
+        "# stage00.nordic.<frag>_phase (noise volumes already trimmed);\n"
+        "# stage00 unwrap picks it up.\n"
         if _phase_on(plan)
         else ""
     )
@@ -3518,24 +3507,26 @@ def _sbref_final_jobs(plan: Plan) -> str:
 
 
 def _stage_unwrap(plan: Plan) -> str:
-    """Temporal phase unwrapping (ROMEO) — the one thing done to phase before the
+    """Phase unwrapping (ffs_phase_unwrap) — the one thing done to phase before the
     final resample.
 
     Unwrapping happens as early as possible, in native space, while the phase is
-    still voxelwise aligned to its own magnitude: ROMEO's spatial+temporal
-    unwrapping wants the magnitude as a quality weight, and every later stage
-    resamples. After this the phase is in **radians**, monotone in time, and is
-    simply carried; the warp chain is estimated from magnitude alone.
+    still voxelwise aligned to its own magnitude: the unwrap wants the magnitude as a
+    quality weight, and every later stage resamples. After this the phase is in
+    **radians**, continuous in time, and is simply carried; the warp chain is
+    estimated from magnitude alone.
 
-    With NORDIC the input is the denoised mag+phase pair (NORDIC has already
-    trimmed the noise volumes). Without NORDIC the raw BIDS pair is used, and the
-    noise volumes must come off *both* first — ROMEO reads files, not sub-brick
-    selectors, so this is the one stage that materialises a copy of the raw data.
+    ffs_phase_unwrap ROMEOs one reference (the temporal-mean complex image, checked
+    against a few ROMEO'd frames) and anchors every frame to it on the GPU, following
+    a voxel along time where its field moves further than half a period. It reads
+    sub-brick selectors, so without NORDIC the noise volumes come off as a
+    ``[0..n]`` selector on the raw BIDS pair rather than as a copy.
     """
     if not _phase_on(plan):
         return ""
     opt = plan.options
-    romeo_opts = " ".join(_split_flags(config.DEFAULT_OPTS["unwrap"]))
+    unwrap_opts = " ".join(_split_flags(config.DEFAULT_OPTS["unwrap"]))
+    unwrap_opts = f" {unwrap_opts}" if unwrap_opts else ""
     uw = _unwrapped()
     drift_note = drift_vars = drift_done = drift_cmd = ""
     if opt.phase_drift:
@@ -3545,7 +3536,7 @@ def _stage_unwrap(plan: Plan) -> str:
         drift_note = (
             "\n# Then ffs_phasedrift removes each slice's dynamic field offset + in-plane\n"
             "# gradient per volume (breathing, B0 drift) -> stage00.unwrapdrift.*;\n"
-            "# that, not ROMEO's output, is the phase every later stage reads."
+            "# that, not the unwrap's output, is the phase every later stage reads."
         )
         trace = "stage00.unwrapdrift.${FRAG[$k]}.trace.1D"
         drift_vars = f'\n  pd="{_unwrapped("unwrapdrift")}"'
@@ -3560,46 +3551,33 @@ def _stage_unwrap(plan: Plan) -> str:
         src = f'  mag="{_nordic_mag(plan)}"; ph="{_nordic_phase()}"'
         note = "# Inputs: the NORDIC-denoised pair (noise volumes already trimmed)."
     else:
-        # A -cut_task_vols run arrives with its selector already on MAG/PHASE;
-        # the noise-volume trim adds one here. Either way ROMEO gets a real file.
-        trim = (
-            f'    tm="{_phase_file("trim", part=False)}"\n'
-            f'    tp="{_phase_file("trim")}"\n'
-            f'    [ -f "$tm" ] || ffs_util_3dmath -input "$mag" -expr a '
-            f'-prefix "$tm" -device cpu\n'
-            f'    [ -f "$tp" ] || ffs_util_3dmath -input "$ph" -expr a '
-            f'-prefix "$tp" -device cpu\n'
-            f'    mag="$tm"; ph="$tp"\n'
-        )
+        # A -cut_task_vols run arrives with its selector already on MAG/PHASE and
+        # NOISE[$k]=0, so the two selectors never stack.
         src = (
             '  mag="${MAG[$k]}"; ph="${PHASE[$k]}"\n'
             '  if [ "${NOISE[$k]}" -gt 0 ]; then\n'
             '    nv=$(ffs_info -nv "$mag"); last=$((nv - ${NOISE[$k]} - 1))\n'
             '    mag="${mag}[0..$last]"; ph="${ph}[0..$last]"\n'
-            "  fi\n"
-            '  if [[ "$mag" == *"]" ]]; then\n'
-            f"{trim}"
             "  fi"
         )
         note = (
-            "# Inputs: the raw BIDS pair. With NOISE[$k]>0 (or -cut_task_vols) both\n"
-            "# are trimmed into stage00.trim.* first (ROMEO takes files, not [0..n]\n"
-            "# selectors)."
+            "# Inputs: the raw BIDS pair, noise volumes (NOISE[$k]) dropped by a [0..n]\n"
+            "# selector on both."
         )
     return f"""
-# ============================ stage00: phase unwrap (ROMEO) =================
-# -phase_proc: temporally unwrap the phase up front, in native space, while it is
-# still voxelwise aligned to its magnitude. Output is radians; nothing touches the
+# ============================ stage00: phase unwrap (GPU) ===================
+# -phase_proc: unwrap the phase up front, in native space, while it is still
+# voxelwise aligned to its magnitude. Output is radians; nothing touches the
 # phase again until the final resample (stage10) carries it along the magnitude's
-# warp chain. ROMEO is external (MRItools) — it must be on $PATH.
+# warp chain.
 {note}{drift_note}
-echo '== stage00: phase unwrap (ROMEO) =='
+echo '== stage00: phase unwrap =='
 for k in "${{RUN_KEYS[@]}}"; do
   [ -n "${{PHASE[$k]:-}}" ] || continue  # no phase for this run (e.g. spin echo)
   uw="{uw}"{drift_vars}
   [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ]{drift_done} && continue
 {src}
-  [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ] || romeo -p "$ph" -m "$mag" -o "$uw" {romeo_opts}{drift_cmd}
+  [ "$skip_unwrap" -eq 1 ] && [ -f "$uw" ] || ffs_phase_unwrap -phase "$ph" -magnitude "$mag" -prefix "$uw" -device "$DEVICE" -verb 0{unwrap_opts}{drift_cmd}
 done
 """
 

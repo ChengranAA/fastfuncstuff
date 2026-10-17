@@ -43,11 +43,11 @@ class Options:
 
     recipe: str | None = None  # named preset (for the header/provenance only)
     want_nordic: bool = False
-    # Carry the phase timeseries through the pipeline: ROMEO-unwrap it up front
+    # Carry the phase timeseries through the pipeline: unwrap it up front
     # (after NORDIC when NORDIC runs), then ride it along the magnitude's warp
     # chain at the final resample. Nothing between those two points touches it.
     phase_proc: bool = False
-    phase_drift: bool = True  # -phase_proc: ffs_phasedrift after ROMEO
+    phase_drift: bool = True  # -phase_proc: ffs_phasedrift after the unwrap
     # Phase regression after stage10, into phasereg_NN/ (and a GLM on its output).
     phasereg: bool = False
     phasereg_opts: str = ""

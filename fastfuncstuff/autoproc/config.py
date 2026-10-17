@@ -88,10 +88,8 @@ DEFAULT_OPTS: dict[str, str] = {
     "presurf": "-no_classes",
     # final compose+resample (ffs_nwarp).
     "nwarp": "-interp wsinc5 -no_neg",
-    # ROMEO temporal phase unwrapping (-phase_proc). "-t epi" is the single-echo
-    # EPI timeseries mode (identical echo times); append a TE in ms if you want
-    # ROMEO's B0 output. NOT an ffs tool — romeo must be on $PATH.
-    "unwrap": "-t epi -v",
+    # phase unwrapping (-phase_proc), ffs_phase_unwrap.
+    "unwrap": "",
 }
 
 # ---------------------------------------------------------------------------

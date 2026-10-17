@@ -18,10 +18,10 @@ import functools
 import importlib
 import re
 
-# Stage key → the cli module whose parser owns that stage's flags. "unwrap" is
-# ROMEO (external, not ours) and has no parser to ask.
+# Stage key → the cli module whose parser owns that stage's flags.
 STAGE_TOOL: dict[str, str] = {
     "nordic": "nordic",
+    "unwrap": "phase_unwrap",
     "tshift": "slicetime",
     "moco": "moco",
     "locomoco": "locomoco",
@@ -119,8 +119,8 @@ def _grab_parser(module: str) -> argparse.ArgumentParser | None:
 def check_opts(key: str, opts: str, module: str | None = None) -> list[str]:
     """Errors for flags in ``opts`` that the stage's tool does not accept.
 
-    Empty when everything is spelled right, the stage has no ffs parser (ROMEO),
-    or the parser could not be obtained — a validator that cannot validate must
+    Empty when everything is spelled right, the stage has no ffs parser, or the
+    parser could not be obtained — a validator that cannot validate must
     not block script generation.
 
     ``module`` overrides the stage's usual tool, for the nonlinear stages: their

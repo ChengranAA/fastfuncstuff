@@ -433,10 +433,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-phase_proc",
         "-phase-proc",
         action="store_true",
-        help="carry the phase timeseries through the pipeline: ROMEO-unwrap it up front "
+        help="carry the phase timeseries through the pipeline: unwrap it up front "
         "(after NORDIC if NORDIC runs), then ride it along the magnitude's warp chain at "
         "the final resample → stage10.final.*.part-phase.*, unwrapped radians in the same "
-        "space as the magnitude. Requires romeo (MRItools) on $PATH and a part-phase bold "
+        "space as the magnitude (ffs_phase_unwrap: ROMEO once, every frame anchored to it "
+        "on -device). Requires a part-phase bold "
         "for every run. The unwrapped phase then has per-slice field wobble "
         "(breathing, B0 drift) removed in native space by ffs_phasedrift — see "
         "-no_phase_drift.",
@@ -447,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with -phase_proc, skip ffs_phasedrift. By default each slice's "
         "dynamic field offset and in-plane gradient are removed per volume right "
-        "after ROMEO, while the slices are still the acquired ones; on 7T 0.8 mm "
+        "after the unwrap, while the slices are still the acquired ones; on 7T 0.8 mm "
         "data that cut phase noise ~3x and is what lets phase regression see the "
         "vessel phase at all. Skip it only to reproduce older output.",
     )
@@ -1414,11 +1415,6 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             warnings.append(
                 "-phase_proc: these runs have no phase and are processed magnitude-only: "
                 + ", ".join(missing)
-            )
-        if shutil.which("romeo") is None:
-            warnings.append(
-                "-phase_proc: 'romeo' (MRItools) is not on $PATH. The script's preflight will "
-                "refuse to run until it is — install it or add it to PATH."
             )
     if opt.phasereg and not opt.phase_proc:
         errors.append("-phasereg needs -phase_proc: it regresses the phase that carries.")

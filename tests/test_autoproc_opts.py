@@ -102,9 +102,8 @@ def test_every_stage_default_passes_its_own_tools_parser(key):
 
 
 def test_every_opts_key_is_mapped_to_a_tool():
-    # "unwrap" (ROMEO) and "synthstrip" (FreeSurfer) are external tools with no
-    # parser of ours to ask.
-    external = {"unwrap", "synthstrip"}
+    # "synthstrip" (FreeSurfer) is an external tool with no parser of ours to ask.
+    external = {"synthstrip"}
     unmapped = set(config.STAGE_OPT_KEYS) - set(optcheck.STAGE_TOOL) - external
     assert not unmapped, f"no tool mapping (so no typo check) for: {sorted(unmapped)}"
 
@@ -125,8 +124,14 @@ def test_negative_number_values_are_not_mistaken_for_flags():
 
 
 def test_unknown_stage_and_external_tool_are_skipped():
-    assert optcheck.check_opts("unwrap", "-t epi -v") == []
+    assert optcheck.check_opts("synthstrip", "--whatever") == []
     assert optcheck.check_opts("not_a_stage", "-whatever") == []
+
+
+def test_unwrap_opts_are_checked_and_old_romeo_flags_are_caught():
+    # the stage was Julia ROMEO (no parser); its "-t epi" must not pass silently now
+    assert optcheck.check_opts("unwrap", "-anchor_frames 4") == []
+    assert any("-t" in e for e in optcheck.check_opts("unwrap", "-t epi -v"))
 
 
 def test_input_paths_are_absolutized(tmp_path, monkeypatch):

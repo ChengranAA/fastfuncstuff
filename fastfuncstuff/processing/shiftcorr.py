@@ -778,3 +778,88 @@ def shift_table_paths(stem: str, with_te_fit: bool) -> list[str]:
     if with_te_fit:
         paths.append(f"{stem}_te_fit.1D")
     return paths
+
+
+def partition_shift_from_phase(
+    unwrapped: np.ndarray,
+    mag: np.ndarray,
+    tes: np.ndarray,
+    mask: np.ndarray,
+    axis: int,
+    *,
+    device: torch.device,
+    dephase_cycles: float = 0.6,
+) -> np.ndarray:
+    """Per-volume partition shift at the FIRST echo [voxels], from unwrapped phase.
+
+    The shift moves the field pattern too: echo e reads the field at a displaced
+    position, so its field estimate changes by ``s_e * dz f`` with ``s_e`` ∝ TE.
+    Head motion and a field change shared by the whole volume are the same in Hz at
+    every echo, so per voxel the echo-constant change is projected out (noise
+    weights ``M^2 TE^2``) and what is left is fitted to ``(TE_e / TE_1) w(t) dz f``
+    across the volume. Needs no image registration, so motion cannot leak in.
+
+    Only voxels where the field changes by less than ``dephase_cycles`` cycles per
+    voxel over the last echo enter: steeper ones dephase towards a signal null, their
+    late echoes are noise, and they attenuate the fit (A01D: amplitude 0.56x the
+    magnitude estimate with them, 0.99x without).
+
+    ``unwrapped``/``mag``: ``(x, y, z, e, t)`` in NIfTI axis order, radians with the
+    phase offset removed (:func:`.phase_unwrap.unwrap_timeseries`); ``mask``: the
+    voxels to use; ``axis``: the partition axis (NIfTI). The static part of the shift
+    is invisible here (it is in every frame's field), so the result has zero mean.
+    Same sign as :attr:`ShiftEstimate.applied`: :func:`shift_table_from_partition_shift`
+    gives the correction to apply.
+    """
+    te = torch.as_tensor(np.asarray(tes, dtype=np.float32), device=device)
+    if te.numel() < 2:
+        raise ValueError("the echo-slope estimate needs at least two echoes")
+    alpha = te / te[0]
+    w = (mag.astype(np.float32, copy=False) ** 2).mean(-1) * (np.asarray(tes, np.float32) ** 2)
+    # Temporal-mean field (noise-weighted over echoes) and its gradient along the axis.
+    fbar = unwrapped.mean(-1) / (2 * np.pi * np.asarray(tes, np.float32) * 1e-3)
+    fmean = (w * fbar).sum(-1) / np.maximum(w.sum(-1), 1e-12)
+    g = np.gradient(fmean, axis=axis).astype(np.float32)
+    use = mask & (np.abs(g) * float(np.max(tes)) * 1e-3 < dephase_cycles) & (np.abs(g) > 0)
+    num = torch.zeros(unwrapped.shape[-1], dtype=torch.float64, device=device)
+    den = torch.zeros((), dtype=torch.float64, device=device)
+    idx = np.flatnonzero(use)
+    chunk = max(1, int(2e8 // max(1, unwrapped.shape[3] * unwrapped.shape[4] * 4)))
+    flat_u = unwrapped.reshape(-1, *unwrapped.shape[3:])
+    flat_w = w.reshape(-1, w.shape[-1])
+    flat_g = g.reshape(-1)
+    flat_f = fbar.reshape(-1, fbar.shape[-1])
+    for a in range(0, idx.size, chunk):
+        sel = idx[a : a + chunk]
+        u = torch.from_numpy(np.ascontiguousarray(flat_u[sel])).to(device)  # V, e, t
+        f = u / (2 * np.pi * te[None, :, None] * 1e-3)
+        r = f - torch.from_numpy(flat_f[sel]).to(device)[..., None]
+        wt = torch.from_numpy(flat_w[sel]).to(device)[..., None]  # V, e, 1
+        A = alpha[None, :, None] * torch.from_numpy(flat_g[sel]).to(device)[:, None, None]
+
+        def proj(x, wt=wt):
+            return x - (wt * x).sum(1, keepdim=True) / wt.sum(1, keepdim=True).clamp_min(1e-12)
+
+        Ap, Rp = proj(A), proj(r)
+        num += (wt * Ap * Rp).sum((0, 1)).double()
+        den += (wt * Ap * Ap).sum().double()
+    shift = (num / den.clamp_min(1e-30)).float().cpu().numpy()
+    return shift - shift.mean()
+
+
+def shift_table_from_partition_shift(shift_te1: np.ndarray, tes: np.ndarray) -> np.ndarray:
+    """``(T, E)`` per-echo shifts [voxels] from the first echo's: the shift scales with TE."""
+    tes = np.asarray(tes, dtype=np.float64)
+    return np.asarray(shift_te1, dtype=np.float64)[:, None] * (tes / tes[0])[None, :]
+
+
+def load_shift_table(path: str, n_frames: int, n_echoes: int) -> np.ndarray:
+    """A ``(T, E)`` per-echo shift table [voxels] as written by ``-save_shifts`` /
+    ``ffs_phase_unwrap -save_partition_shift``, checked against the data."""
+    table = np.atleast_2d(np.loadtxt(path, comments="#"))
+    if table.shape != (n_frames, n_echoes):
+        raise ValueError(
+            f"{path}: shift table is {table.shape[0]} x {table.shape[1]}, the data has "
+            f"{n_frames} volumes x {n_echoes} echoes"
+        )
+    return table

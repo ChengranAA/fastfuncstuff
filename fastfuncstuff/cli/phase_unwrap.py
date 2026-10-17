@@ -92,6 +92,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-save_mask", default=None, metavar="FILE", help="Write the mask (2 core, 1 border)."
     )
     parser.add_argument(
+        "-partition_axis",
+        default=None,
+        metavar="AXIS",
+        help="3-D EPI partition (slow phase-encode) axis: AP/PA/LR/RL/IS/SI or x/y/z. "
+        "Needed for -save_partition_shift.",
+    )
+    parser.add_argument(
+        "-save_partition_shift",
+        default=None,
+        metavar="FILE.1D",
+        help="Multi-echo 3-D EPI: write the per-volume, per-echo partition-axis shift "
+        "[voxels] measured from the phase echo-slope (head motion and whole-head field "
+        "changes cancel across echoes; no registration). Same convention as ffs_moco "
+        "-me_3depi, so it can be passed straight to ffs_moco -shift_table. The static "
+        "part of the shift is invisible to phase, so each column has zero mean.",
+    )
+    parser.add_argument(
         "-save_path_map",
         default=None,
         metavar="FILE",
@@ -121,6 +138,18 @@ def main(argv: list[str] | None = None) -> int:
         return _error("-echo_times must increase (shortest echo first).")
     if args.anchor_frames < 0:
         return _error("-anchor_frames must be >= 0.")
+    if args.save_partition_shift is not None:
+        if ne < 2:
+            return _error("-save_partition_shift needs at least two echoes.")
+        if args.partition_axis is None:
+            return _error("-save_partition_shift needs -partition_axis.")
+    if args.partition_axis is not None:
+        from fastfuncstuff.processing.locomoco import resolve_pe_axis
+
+        try:
+            resolve_pe_axis(args.partition_axis)
+        except ValueError as exc:
+            return _error(str(exc))
 
     import torch
 
@@ -161,8 +190,37 @@ def main(argv: list[str] | None = None) -> int:
         return_unwrapped=True,
         verbose=verbose,
     )
-    del phase, mag
+    del phase
     assert res.unwrapped is not None
+    if args.save_partition_shift is not None:
+        from fastfuncstuff.processing.locomoco import resolve_pe_axis
+        from fastfuncstuff.processing.shiftcorr import (
+            partition_shift_from_phase,
+            shift_table_from_partition_shift,
+        )
+
+        with spinner("Partition shift from the phase echo-slope", enabled=verbose):
+            w = partition_shift_from_phase(
+                res.unwrapped,
+                mag,
+                np.asarray(tes),
+                res.mask == 2,
+                resolve_pe_axis(args.partition_axis),
+                device=device,
+            )
+        table = shift_table_from_partition_shift(w, np.asarray(tes))
+        np.savetxt(
+            args.save_partition_shift,
+            table,
+            fmt="%12.6f",
+            header="partition shift correction [voxels] from the phase echo-slope; rows = "
+            "volumes, cols = " + " ".join(f"e{e + 1}" for e in range(ne)) + "; zero mean",
+        )
+        if verbose:
+            print(
+                f"  partition shift at echo 1: SD {w.std():.4f} vox -> {args.save_partition_shift}"
+            )
+    del mag
 
     def tkji(a: np.ndarray) -> torch.Tensor:
         return torch.from_numpy(np.ascontiguousarray(a.transpose(*range(a.ndim)[::-1])))

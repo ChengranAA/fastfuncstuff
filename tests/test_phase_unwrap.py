@@ -189,3 +189,13 @@ def test_breath_hold_excursion_does_not_wrap_noisy_voxels():
     off = unwrap_timeseries(phase, mag, tes, device=CPU, frame_field_order=None, verbose=False)
     assert wrong(off) > 0.2
     assert wrong(on) < 0.03
+
+
+def test_cli_partition_shift_needs_axis_and_echoes(tmp_path):
+    from fastfuncstuff.cli.phase_unwrap import main
+
+    out = str(tmp_path / "s.1D")
+    one = ["-phase", "a", "-magnitude", "b", "-prefix", str(tmp_path / "o")]
+    assert main([*one, "-partition_axis", "IS", "-save_partition_shift", out]) == 1
+    two = ["-phase", "a", "c", "-magnitude", "b", "d", "-echo_times", "5", "10"]
+    assert main([*two, "-prefix", str(tmp_path / "o"), "-save_partition_shift", out]) == 1

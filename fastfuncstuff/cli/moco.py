@@ -65,9 +65,11 @@ from fastfuncstuff.processing.motsim import (
     save_1d as save_motsim_1D,
 )
 from fastfuncstuff.processing.shiftcorr import (
+    ShiftEstimate,
     apply_shift,
     estimate_shifts,
     fold_shift_into_matrices,
+    load_shift_table,
     save_shift_tables,
     shift_table_paths,
 )
@@ -511,6 +513,16 @@ def parse_args(
         help="Voxel weighting for the correlation. 'none' is a plain Pearson r over "
         "the whole volume and is enough here because the patch IS the volume; "
         "'signal' softly weights by mean echo-1 intensity.",
+    )
+    sc_group.add_argument(
+        "-shift_table",
+        default=None,
+        metavar="FILE",
+        help="Use these per-echo partition shifts [voxels; rows = volumes after "
+        "-skip_first/-skip_last, cols = echoes] instead of estimating them by "
+        "inter-echo cross-correlation. ffs_phase_unwrap -save_partition_shift writes "
+        "one from the phase echo-slope, which needs no image registration; a "
+        "-save_shifts _shifts_applied.1D from an earlier run also works.",
     )
     sc_group.add_argument(
         "-save_shifts",
@@ -1332,6 +1344,7 @@ def _validate_motsim_args(args: argparse.Namespace) -> None:
 def _validate_shiftcorr_args(args: argparse.Namespace) -> None:
     """Validate the -me_3depi request (and the flags that only mean anything with it)."""
     dependent = {
+        "shift_table": "-shift_table",
         "save_shifts": "-save_shifts",
         "onedfile_shiftcorr": "-1Dfile_shiftcorr",
         "onedmatrix_shiftcorr": "-1Dmatrix_shiftcorr",
@@ -1473,6 +1486,33 @@ def _estimate_shiftcorr(args, input_files: list[str], device: torch.device, verb
     """
     axis = resolve_pe_axis(args.axis)
     tes = np.asarray(args.echo_times, dtype=np.float64) if args.echo_times else None
+    if args.shift_table is not None:
+        first, _ = _load_trimmed(input_files[0], args.skip_first, args.skip_last, verb)
+        n_t = int(first.shape[0]) if first.ndim == 4 else 1
+        del first
+        try:
+            applied = load_shift_table(args.shift_table, n_t, len(input_files))
+        except (OSError, ValueError) as exc:
+            print(f"Error: -shift_table: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if verb >= 1:
+            print(
+                f"-me_3depi: partition axis {args.axis} (voxel axis {axis}), shifts from "
+                f"{args.shift_table} (SD per echo {np.round(applied.std(0), 4)} vox)"
+            )
+        nan = np.full_like(applied, np.nan)
+        slope = applied[:, 0] / tes[0] if tes is not None else None
+        est = ShiftEstimate(
+            pairwise=nan,
+            cumulative=nan,
+            corr=nan,
+            slope=slope,
+            intercept=np.zeros(n_t) if tes is not None else None,
+            applied=applied,
+        )
+        if args.save_shifts is not None:
+            save_shift_tables(est, args.save_shifts, tes, verb)
+        return est, axis
     if verb >= 1:
         mode = "TE regression through the origin" if tes is not None else "raw cumulative"
         print(

@@ -307,3 +307,49 @@ def test_me_3depi_rejects_a_single_echo(tmp_path):
                 "0",
             ]
         )
+
+
+def test_me_3depi_shift_table_replaces_the_estimate(tmp_path):
+    """-shift_table: externally measured per-echo shifts (e.g. from the phase
+    echo-slope) are folded exactly as the cross-correlation estimate would be;
+    a table that does not match the data is refused."""
+    import pytest
+
+    from fastfuncstuff.processing.shiftcorr import apply_shift, estimate_pair_shift
+
+    tes = [7.6, 21.7, 35.8]
+    base = _shifted_series(_blob(shape=(24, 20, 20)), n_vols=3)
+    disp = np.array([-0.010, 0.006, -0.002])  # voxels per ms of TE, per volume
+    paths = []
+    for i, te in enumerate(tes):
+        p = tmp_path / f"e{i + 1}.nii.gz"
+        _write(p, apply_shift(base, disp * te, axis=2))
+        paths.append(str(p))
+    table = -disp[:, None] * np.asarray(tes)[None, :]  # the correction, per volume x echo
+    np.savetxt(tmp_path / "shifts.1D", table)
+    args = [
+        "-input",
+        *paths,
+        "-reg_echo",
+        "1",
+        "-prefix",
+        str(tmp_path / "mc.nii.gz"),
+        "-me_3depi",
+        "-axis",
+        "z",
+        "-echo_times",
+        *[str(t) for t in tes],
+        "-device",
+        "cpu",
+        "-verb",
+        "0",
+    ]
+    main([*args, "-shift_table", str(tmp_path / "shifts.1D")])
+    outs = [load_image(str(tmp_path / f"e{i + 1}_mc.nii.gz"))[0] for i in range(3)]
+    for i in range(1, 3):
+        resid, _ = estimate_pair_shift(outs[i - 1], outs[i], axis=2, max_shift=2.0)
+        assert np.abs(resid).max() < 0.05, f"echo {i + 1} still offset by {resid}"
+
+    np.savetxt(tmp_path / "bad.1D", table[:, :2])
+    with pytest.raises(SystemExit):
+        main([*args, "-shift_table", str(tmp_path / "bad.1D")])

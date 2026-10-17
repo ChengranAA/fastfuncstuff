@@ -150,6 +150,25 @@ def create_parser() -> argparse.ArgumentParser:
         help="warpkit SVD components kept for field-map denoising.",
     )
     opt.add_argument(
+        "-unwrap",
+        choices=["warpkit", "gpu"],
+        default="warpkit",
+        help="Field-map estimation. warpkit: ROMEO on every frame, then temporal "
+        "consistency (MEDIC as published). gpu (EXPERIMENTAL): ROMEO once on the "
+        "temporal-mean reference and on -anchor_frames frames, every frame anchored to "
+        "it on -device; several times faster and far fewer frame-to-frame unwrap "
+        "spikes. The same SVD denoising follows either way.",
+    )
+    opt.add_argument(
+        "-anchor_frames",
+        type=int,
+        default=8,
+        metavar="N",
+        help="-unwrap gpu: frames also ROMEO'd to vote on the reference's 2pi counts "
+        "and phase offset, which the decohered temporal mean gets wrong where the "
+        "field is steep. 0 = the temporal mean alone.",
+    )
+    opt.add_argument(
         "-interp",
         choices=["wsinc5", "linear"],
         default="wsinc5",
@@ -519,6 +538,13 @@ def main(argv: list[str] | None = None) -> int:
     if pe_dir not in PE_AXIS_MAP:
         print(f"ERROR: phase-encoding dir must be one of {sorted(PE_AXIS_MAP)}", file=sys.stderr)
         return 1
+    if args.anchor_frames < 0:
+        print("ERROR: -anchor_frames must be >= 0.", file=sys.stderr)
+        return 1
+    if args.unwrap == "gpu" and len(tes) < 2:
+        # one echo cannot separate the field from the phase at TE 0
+        print("ERROR: -unwrap gpu needs at least 2 echoes.", file=sys.stderr)
+        return 1
 
     pfx = parse_prefix(args.prefix)
     prefix_stem, nii_ext = pfx.stem, pfx.nifti_ext
@@ -607,7 +633,9 @@ def main(argv: list[str] | None = None) -> int:
     field_undist = None
     # The per-echo unwrapped phase is a warpkit by-product, not stored in the field
     # cache, so -save_unwrapped_phase must re-run estimation (like -recompute).
-    if not args.recompute and not args.save_unwrapped:
+    # The GPU estimate costs about as much as reading the cache, and a cache written
+    # by the other -unwrap method must not be reused silently.
+    if not args.recompute and not args.save_unwrapped and args.unwrap == "warpkit":
         field_native = _load_cached_volume(field_cache, expected, host)
         if field_native is not None:
             disp_pull = _load_cached_volume(disp_cache, expected, host)
@@ -633,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             debug_dir=f"{prefix_stem}_debug" if args.debug else None,
             return_unwrapped=args.save_unwrapped,
+            unwrap=args.unwrap,
+            anchor_frames=args.anchor_frames,
             verbose=args.verb >= 1,
         )
         field_native = result.field_native

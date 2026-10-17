@@ -580,3 +580,30 @@ def test_medic_warp_extra_components_survive_both_formats(tmp_path):
         assert np.abs(got[..., 2]).max() > 1e-6, (as_5d, "extra component was dropped")
         # ...and the axis that was never written stays clean.
         assert np.abs(got[..., 0]).max() < 1e-6, (as_5d, "unwritten axis polluted")
+
+
+def test_medic_fieldmaps_gpu_unwrap_recovers_field():
+    """-unwrap gpu: anchored unwrap + SVD denoising end to end (on the CPU here)."""
+    import pytest
+
+    pytest.importorskip("warpkit")
+    from test_phase_unwrap import _scene
+
+    from fastfuncstuff.processing.medic import medic_fieldmaps
+
+    tes = [5.0, 12.0, 19.0]
+    ph, mag, field, head, _blob = _scene(tes)
+    res = medic_fieldmaps(
+        phase=ph / np.pi * 4096,
+        mag=mag,
+        tes=tes,
+        affine=np.diag([2.0, 2.0, 2.0, 1.0]),
+        total_readout_time=0.03,
+        pe_dir="j",
+        unwrap="gpu",
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    core = head & (res.masks[..., 0].numpy() == 2)
+    err = np.abs(res.field_native.numpy() - field)[core]
+    assert np.mean(err < 5.0) > 0.98

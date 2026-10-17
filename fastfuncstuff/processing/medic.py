@@ -392,6 +392,8 @@ def medic_fieldmaps(
     device: torch.device | None = None,
     debug_dir: str | None = None,
     return_unwrapped: bool = False,
+    unwrap: str = "warpkit",
+    anchor_frames: int = 8,
     verbose: bool = True,
 ) -> MedicResult:
     """Estimate frame-wise field maps (warpkit) and build our GPU pull warp.
@@ -405,6 +407,10 @@ def medic_fieldmaps(
 
     ``return_unwrapped``: also keep warpkit's per-echo unwrapped phase, converted
     to a per-echo field estimate (Hz), in ``MedicResult.unwrapped_field_hz``.
+
+    ``unwrap="gpu"`` (experimental) replaces warpkit's per-frame ROMEO + temporal
+    consistency with :func:`.phase_unwrap.unwrap_timeseries` (ROMEO once, every frame
+    anchored to it on ``device``), then the same SVD denoising, ported to torch.
 
     Parameters
     ----------
@@ -439,21 +445,49 @@ def medic_fieldmaps(
     # 1. estimation: warpkit native field map (Hz, distorted space). The per-frame
     #    fields stay on the host; the GPU only ever sees a time-chunk (step 2).
     unwrapped_np = None
-    est = warpkit_field_native(
-        phase,
-        mag,
-        affine,
-        tes_np,
-        n_cpus=n_cpus,
-        svd_filt=svd_filt,
-        border_filt=border_filt,
-        return_unwrapped=return_unwrapped,
-        verbose=verbose,
-    )
-    if return_unwrapped:
-        field_native_np, unwrapped_np = est
+    if unwrap == "gpu":
+        from .phase_unwrap import raw_phase_to_radians, svd_filter_fields, unwrap_timeseries
+
+        t0 = time.perf_counter()
+        uw = unwrap_timeseries(
+            raw_phase_to_radians(phase),
+            mag,
+            tes_np,
+            device=device,
+            anchor_frames=anchor_frames,
+            return_unwrapped=return_unwrapped,
+            verbose=verbose,
+        )
+        voxel_size = float(np.linalg.norm(affine[:3, 0]))
+        field_native_np = svd_filter_fields(
+            uw.field_hz,
+            uw.mask,
+            voxel_size,
+            border_filt=border_filt,
+            svd_filt=svd_filt,
+            device=device,
+        )
+        unwrapped_np = uw.unwrapped
+        if verbose:
+            print(f"  GPU estimate incl. SVD denoising: {time.perf_counter() - t0:.1f}s")
+    elif unwrap == "warpkit":
+        est = warpkit_field_native(
+            phase,
+            mag,
+            affine,
+            tes_np,
+            n_cpus=n_cpus,
+            svd_filt=svd_filt,
+            border_filt=border_filt,
+            return_unwrapped=return_unwrapped,
+            verbose=verbose,
+        )
+        if return_unwrapped:
+            field_native_np, unwrapped_np = est
+        else:
+            field_native_np = est
     else:
-        field_native_np = est
+        raise ValueError(f"unwrap must be 'warpkit' or 'gpu', got {unwrap!r}")
     field_native = torch.nan_to_num(torch.from_numpy(np.ascontiguousarray(field_native_np)))
     unwrapped_field_hz = None
     if unwrapped_np is not None:

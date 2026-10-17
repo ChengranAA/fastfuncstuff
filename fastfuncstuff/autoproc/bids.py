@@ -195,6 +195,21 @@ class BoldRun:
     phase_path: Path | None = None
     sbref_path: Path | None = None  # magnitude SBRef, if present
     fmap_id: str | None = None  # assigned in plan.py
+    # Multi-echo (BIDS ``echo-`` entity): every echo, in echo order, with its TE in ms
+    # from its own sidecar. Empty for single-echo data. ``mag_path`` / ``phase_path``
+    # / ``sbref_path`` above are echo 1's, so a stage that only needs one image (moco
+    # estimation, coregistration, the means) is unchanged by multi-echo.
+    echo_mags: list[Path] = field(default_factory=list)
+    echo_phases: list[Path | None] = field(default_factory=list)
+    echo_tes: list[float] = field(default_factory=list)
+
+    @property
+    def n_echoes(self) -> int:
+        return max(1, len(self.echo_mags))
+
+    @property
+    def is_multiecho(self) -> bool:
+        return len(self.echo_mags) >= 2
 
     @property
     def tr(self) -> float | None:
@@ -452,6 +467,14 @@ def _scan_session(
                 continue
             run = ents.get("run", "")
             slot = grouped.setdefault((task, ents.get("acq", ""), run), {})
+            if "echo" in ents:
+                # one sub-slot per echo; without this every echo overwrote the last
+                # and a multi-echo run was silently processed as its LAST echo
+                try:
+                    echo_no = int(ents["echo"])
+                except ValueError:
+                    continue
+                slot = slot.setdefault("echoes", {}).setdefault(echo_no, {})
             if suffix == "sbref":
                 if _is_phase(nf, ents, bids_root):
                     slot.setdefault("sbref_phase", nf)  # quirk file; unused now
@@ -482,22 +505,35 @@ def _scan_session(
         acqs_by_task.setdefault(task, set()).add(acq)
 
     for (task, acq, run), slot in sorted(grouped.items()):
-        mag = slot.get("mag")
-        if mag is None:
-            continue  # no magnitude BOLD → nothing to process
+        echoes = [slot["echoes"][n] for n in sorted(slot.get("echoes", {}))]
+        if echoes:
+            if any("mag" not in e for e in echoes):
+                continue  # an echo without its magnitude: not a usable multi-echo run
+            first = echoes[0]
+            mag, phase, sbref = first["mag"], first.get("phase"), first.get("sbref")
+            sbref = sbref or slot.get("sbref")
+            jsons = [load_sidecar(e["mag"], bids_root) for e in echoes]
+            tes = [float(j["EchoTime"]) * 1e3 for j in jsons if j.get("EchoTime") is not None]
+        else:
+            mag, phase, sbref = slot.get("mag"), slot.get("phase"), slot.get("sbref")
+            if mag is None:
+                continue  # no magnitude BOLD → nothing to process
         unit = task_unit(task, acq) if len(acqs_by_task[task]) > 1 else task
-        sess.bold_runs.append(
-            BoldRun(
-                subject=sub_label,
-                session=ses_label,
-                task=unit,
-                run=run,
-                mag_path=mag,
-                json=load_sidecar(mag, bids_root),
-                phase_path=slot.get("phase"),
-                sbref_path=slot.get("sbref"),
-            )
+        run_obj = BoldRun(
+            subject=sub_label,
+            session=ses_label,
+            task=unit,
+            run=run,
+            mag_path=mag,
+            json=load_sidecar(mag, bids_root),
+            phase_path=phase,
+            sbref_path=sbref,
         )
+        if len(echoes) >= 2:
+            run_obj.echo_mags = [e["mag"] for e in echoes]
+            run_obj.echo_phases = [e.get("phase") for e in echoes]
+            run_obj.echo_tes = tes if len(tes) == len(echoes) else []
+        sess.bold_runs.append(run_obj)
 
     # ---- fmap: reverse-PE images (conventional epi OR task-tagged bold/sbref) ----
     fmap_dir = sdir / "fmap"

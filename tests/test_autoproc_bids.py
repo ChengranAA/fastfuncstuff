@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from fastfuncstuff.autoproc.bids import (
     find_events,
     pair_undetermined,
@@ -657,3 +659,33 @@ def test_single_acq_task_keeps_its_name(tmp_path: Path):
     func = tmp_path / "sub-1" / "func"
     _touch(func / "sub-1_task-Foo_acq-mb4_run-01_bold.nii.gz", {"RepetitionTime": 1.0})
     assert scan_subject(tmp_path, "1").sessions[0].bold_runs[0].task == "Foo"
+
+
+def test_multiecho_echoes_land_on_one_run_in_echo_order(tmp_path: Path):
+    """echo-1..3 (part-mag + part-phase): one BoldRun carrying every echo, ordered,
+    TEs from each echo's own sidecar, and echo 1 as the run's main image. Before
+    this, each echo overwrote the last and the run was its last echo."""
+    func = tmp_path / "sub-01" / "func"
+    tes = {1: 0.0076, 2: 0.0217, 3: 0.0358}
+    for e in (3, 1, 2):  # filesystem order must not matter
+        base = f"sub-01_task-foo_run-1_echo-{e}"
+        _touch(func / f"{base}_part-mag_bold.nii.gz", {"EchoTime": tes[e], "RepetitionTime": 2.0})
+        _touch(func / f"{base}_part-phase_bold.nii.gz", {"EchoTime": tes[e]})
+    subj = scan_subject(tmp_path, "01")
+    runs = [r for s in subj.sessions for r in s.bold_runs]
+    assert len(runs) == 1
+    r = runs[0]
+    assert r.is_multiecho and r.n_echoes == 3
+    assert [p.name for p in r.echo_mags] == [
+        f"sub-01_task-foo_run-1_echo-{e}_part-mag_bold.nii.gz" for e in (1, 2, 3)
+    ]
+    assert all(p is not None and "part-phase" in p.name for p in r.echo_phases)
+    assert r.echo_tes == pytest.approx([7.6, 21.7, 35.8])
+    assert r.mag_path == r.echo_mags[0] and r.phase_path == r.echo_phases[0]
+
+
+def test_single_echo_runs_are_unchanged(tmp_path: Path):
+    func = tmp_path / "sub-01" / "func"
+    _touch(func / "sub-01_task-foo_run-1_bold.nii.gz", {"EchoTime": 0.03, "RepetitionTime": 2.0})
+    r = scan_subject(tmp_path, "01").sessions[0].bold_runs[0]
+    assert not r.is_multiecho and r.n_echoes == 1 and r.echo_mags == []

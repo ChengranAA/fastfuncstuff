@@ -1235,3 +1235,19 @@ def test_cli_save_echo_corr_writes_one_labelled_bucket(tmp_path):
     for k in range(3):
         np.testing.assert_allclose(v[..., 3 * k + 2], v[..., 3 * k + 1] - v[..., 3 * k], atol=1e-6)
     assert np.abs(v[..., 0]).max() > 0.5  # it actually correlated something
+
+
+def test_echoes_share_one_field_and_differ_by_alpha():
+    """Every echo's result holds a VIEW of the shared field plus its alpha, not a scaled
+    copy (memory: one field per axis however many echoes), yet reads back as alpha_e * w."""
+    tes = [15.0, 30.0, 45.0]
+    datas, _ = _make_multiecho(tes, [0.0, 0.6, -0.5, 0.4])
+    res = estimate_residual_flow_multiecho(
+        datas, tes, pe_axis=PE, slice_axis=PE, learn_scaling=False,
+        device=torch.device("cpu"), verbose=False,
+    )  # fmt: skip
+    e1, e3 = res.per_echo[0], res.per_echo[2]
+    f1, f3 = e1.pe_displacement(), e3.pe_displacement()
+    assert torch.allclose(f3, f1 * (tes[2] / tes[0]), atol=1e-6)
+    stored = [r.u_canon if r.pe_flow_is_u else r.v_canon for r in res.per_echo]
+    assert len({t.untyped_storage().data_ptr() for t in stored}) == 1  # one field in memory

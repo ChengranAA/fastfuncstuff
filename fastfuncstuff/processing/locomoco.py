@@ -1366,6 +1366,13 @@ class LocomocoResult:
     # CLI writes them one echo at a time. Each call resamples again; callers that need it
     # twice keep the tensor.
     corrected_fn: Callable[[], torch.Tensor] | None = None
+    # The fields are u_scale * u_canon and v_scale * v_canon. Multi-echo echoes share ONE
+    # field per axis and differ only by alpha_e (TE ratio on the partition axis, 1 in
+    # plane), so each echo holds a view of the shared field and its factor instead of a
+    # scaled copy. Read the fields through _u() / _v(); replace() a field with absolute
+    # values -> reset its scale to 1.
+    u_scale: float = 1.0
+    v_scale: float = 1.0
     drift_rms: float | None = None  # chain-vs-anchor drift (in-brain), voxels
     drift_max: float | None = None
     fused: bool = False  # whether the anchor smoother was engaged
@@ -1393,7 +1400,7 @@ class LocomocoResult:
         it like a timeseries. Also the content of the saved warp (before mm). For a
         dual-PE run use :meth:`warp_components` / :meth:`flow_magnitude` instead.
         """
-        return self._to_nifti(self.u_canon if self.pe_flow_is_u else self.v_canon)
+        return self._to_nifti(self._u() if self.pe_flow_is_u else self._v())
 
     def warp_components(self) -> list[tuple[int, torch.Tensor]]:
         """``(nifti_axis, signed_displacement)`` pairs to write into the warp.
@@ -1412,8 +1419,8 @@ class LocomocoResult:
             return [(a, p * w[:, a]) for a in (0, 1, 2)]
         if self.dual:
             return [
-                (self.a1, self._to_nifti(self.u_canon)),
-                (self.a0, self._to_nifti(self.v_canon)),
+                (self.a1, self._to_nifti(self._u())),
+                (self.a0, self._to_nifti(self._v())),
             ]
         return [(self.pe_axis, self.pe_displacement())]
 
@@ -1430,8 +1437,8 @@ class LocomocoResult:
         """
         if not self.dual or self.pe_axis2 is None:
             return [("pe1", self.pe_axis, self.pe_displacement())]
-        u = self._to_nifti(self.u_canon)
-        v = self._to_nifti(self.v_canon)
+        u = self._to_nifti(self._u())
+        v = self._to_nifti(self._v())
 
         def pick(ax: int) -> torch.Tensor:
             return u if ax == self.a1 else v
@@ -1454,7 +1461,7 @@ class LocomocoResult:
 
     def flow_magnitude(self) -> torch.Tensor:
         """Per-frame displacement magnitude ``sqrt(u²+v²)`` ``(nx,ny,nz,T)`` (voxels)."""
-        return self._to_nifti((self.u_canon**2 + self.v_canon**2).sqrt())
+        return self._to_nifti((self._u() ** 2 + self._v() ** 2).sqrt())
 
     def flow_angle(self) -> torch.Tensor:
         """Per-frame displacement direction in degrees [0,360) ``(nx,ny,nz,T)``.
@@ -1462,8 +1469,14 @@ class LocomocoResult:
         The dual-PE companion to the magnitude map (no single signed scalar can hold
         a 2-D vector): scrub the two together, or feed the direction to a movie.
         """
-        ang = torch.atan2(self.v_canon, self.u_canon) * (180.0 / np.pi)
+        ang = torch.atan2(self._v(), self._u()) * (180.0 / np.pi)
         return self._to_nifti(ang % 360.0)
+
+    def _u(self) -> torch.Tensor:
+        return self.u_canon if self.u_scale == 1.0 else self.u_canon * self.u_scale
+
+    def _v(self) -> torch.Tensor:
+        return self.v_canon if self.v_scale == 1.0 else self.v_canon * self.v_scale
 
     def corrected_series(self) -> torch.Tensor:
         """Motion-corrected 4-D series ``(nx, ny, nz, T)``.
@@ -1489,8 +1502,8 @@ class LocomocoResult:
         than ``max_tile`` are block-averaged down first — the flow field is smooth,
         so this only shrinks the movie (and the color step) without hiding motion.
         """
-        u = self.u_canon.numpy()
-        v = self.v_canon.numpy()
+        u = self._u().numpy()
+        v = self._v().numpy()
         hh, ww = u.shape[2], u.shape[3]
         f = max(1, int(np.ceil(max(hh, ww) / max_tile)))
         if f > 1:
@@ -2467,9 +2480,11 @@ def detask_result(
         back = list(result.perm)
         return keep.permute(back).contiguous(), drop.permute(back).contiguous()
 
-    (u_clean, u_task), (v_clean, v_task) = _clean(result.u_canon), _clean(result.v_canon)
-    cleaned = replace(result, u_canon=u_clean, v_canon=v_clean)
-    removed = replace(result, u_canon=u_task, v_canon=v_task).pe_displacements()
+    (u_clean, u_task), (v_clean, v_task) = _clean(result._u()), _clean(result._v())
+    cleaned = replace(result, u_canon=u_clean, v_canon=v_clean, u_scale=1.0, v_scale=1.0)
+    removed = replace(
+        result, u_canon=u_task, v_canon=v_task, u_scale=1.0, v_scale=1.0
+    ).pe_displacements()
 
     if result.reproject_weights is not None:
         return (
@@ -2536,9 +2551,11 @@ def pc_reconstruct_result(
     if result.dual and result.pe_axis2 is not None:
         u_axis = result.pe_axis if result.pe_axis == result.a1 else result.pe_axis2
         v_axis = result.pe_axis2 if u_axis == result.pe_axis else result.pe_axis
-        out = replace(result, u_canon=_to_canon(u_axis), v_canon=_to_canon(v_axis))
+        out = replace(
+            result, u_canon=_to_canon(u_axis), v_canon=_to_canon(v_axis), u_scale=1.0, v_scale=1.0
+        )
     else:
-        out = replace(result, u_canon=_to_canon(result.pe_axis))
+        out = replace(result, u_canon=_to_canon(result.pe_axis), u_scale=1.0)
 
     if result.reproject_weights is not None:
         return out, (
@@ -6223,18 +6240,19 @@ def estimate_residual_flow_multiecho(
         # pure waste when the caller won't write it (-no_corrected); the warp field and
         # diagnostics don't need it. Refine builds its own corrected internally above.
         # Built on demand (corrected_fn), so the CLI's one-echo-at-a-time write frees each
-        # echo's series before the next is made. An axis whose alpha is 1 (the in-plane
-        # one, pinned flat) is the shared field itself: a view, not a copy per echo.
-        canon = [
-            (w[k] if float(alphas[k, j]) == 1.0 else alphas[k, j] * w[k]).permute(perm4)
-            for k in range(n_ax)
-        ]
+        # echo's series before the next is made. Every echo holds a VIEW of the shared
+        # field per axis plus its alpha (u_scale / v_scale), not a scaled copy: the
+        # fields differ between echoes only by that factor.
+        canon = [w[k].permute(perm4) for k in range(n_ax)]
+        scale = {ax: float(alphas[k, j]) for k, ax in enumerate(axes)}
         by_axis = dict(zip(axes, canon, strict=True))
         zero = _zeros_like_view(canon[0])
         per_echo.append(
             LocomocoResult(
                 u_canon=by_axis.get(a1, zero),
                 v_canon=by_axis.get(a0, zero),
+                u_scale=scale.get(a1, 1.0),
+                v_scale=scale.get(a0, 1.0),
                 corrected_canon=_zeros_like_view(canon[0]),
                 perm=perm4,
                 pe_flow_is_u=pe_flow_is_u,

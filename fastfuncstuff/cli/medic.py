@@ -104,7 +104,7 @@ def create_parser() -> argparse.ArgumentParser:
         "-prefix",
         required=True,
         metavar="OUTPUT",
-        help="Output prefix (writes _e{N}_undist undistorted echoes + _fieldmap).",
+        help="Output prefix (writes {prefix}.echo-N_undist undistorted echoes + _fieldmap).",
     )
 
     acq = parser.add_argument_group("Acquisition (give -metadata OR the three explicit values)")
@@ -239,7 +239,7 @@ def create_parser() -> argparse.ArgumentParser:
         dest="save_unwrapped",
         action="store_true",
         help="Also write warpkit's per-echo unwrapped phase as a field map (Hz), "
-        "one file per echo: {prefix}_e{N}_unwrapped_fieldmap. These are the "
+        "one file per echo: {prefix}.echo-N_unwrapped_fieldmap. These are the "
         "single-echo estimates that get collapsed into the combined _fieldmap. "
         "Forces a fresh warpkit run (not reconstructable from the cached field map).",
     )
@@ -317,7 +317,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Add an experimental slice-direction (k) displacement to the later "
         "echoes, proportional to the demeaned+detrended per-frame field map and "
         "growing linearly with echo index (0 at echo 1, max at the last echo). "
-        "Writes {prefix}_e{N}_3ddebug_{pos,neg} for both signs so you can see which "
+        "Writes {prefix}.echo-N_3ddebug_{pos,neg} for both signs so you can see which "
         "direction cancels the residual up/down motion, plus {prefix}_fieldmap_detrend.",
     )
     d3.add_argument(
@@ -548,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         import torch
 
-        from fastfuncstuff.cli_utils import parse_prefix, setup_device, spinner
+        from fastfuncstuff.cli_utils import entity_stem, parse_prefix, setup_device, spinner
         from fastfuncstuff.io.afni import save_nifti
         from fastfuncstuff.processing.medic import (
             PE_AXIS_MAP,
@@ -806,7 +806,7 @@ def main(argv: list[str] | None = None) -> int:
                 desc=f"undistort mag e{e + 1}",
                 device=device,
             )
-            out_path = f"{prefix_stem}_e{e + 1}_undist{nii_ext}"
+            out_path = entity_stem(prefix_stem, echo=e + 1) + f"_undist{nii_ext}"
             save_nifti(undist.cpu().numpy(), out_path, affine=affine)
             undist_paths.append(out_path)
             if args.verb >= 1:
@@ -915,7 +915,7 @@ def main(argv: list[str] | None = None) -> int:
                     desc=f"3ddebug e{e + 1}",
                     device=device,
                 )
-                out_path = f"{prefix_stem}_e{e + 1}_3ddebug{nii_ext}"
+                out_path = entity_stem(prefix_stem, echo=e + 1) + f"_3ddebug{nii_ext}"
                 save_nifti(undist.cpu().numpy(), out_path, affine=affine)
                 if args.verb >= 1:
                     print(f"  3ddebug echo {e + 1} (no shift): {out_path}")
@@ -942,7 +942,7 @@ def main(argv: list[str] | None = None) -> int:
                     extra_nifti_axis=Z_AXIS,
                     device=device,
                 )
-                out_path = f"{prefix_stem}_e{e + 1}_3ddebug_{tag}{nii_ext}"
+                out_path = entity_stem(prefix_stem, echo=e + 1) + f"_3ddebug_{tag}{nii_ext}"
                 save_nifti(undist.cpu().numpy(), out_path, affine=affine)
                 if args.verb >= 1:
                     wlabel = "TE" if args.debug3d_dfield else "frac"
@@ -965,7 +965,7 @@ def main(argv: list[str] | None = None) -> int:
                 desc=f"undistort phase e{e + 1}",
                 device=device,
             )
-            out_path = f"{prefix_stem}_e{e + 1}_phase_undist{nii_ext}"
+            out_path = entity_stem(prefix_stem, echo=e + 1, phase=True) + f"_undist{nii_ext}"
             save_nifti(undist.cpu().numpy(), out_path, affine=affine)
             if args.verb >= 1:
                 print(f"  undistorted phase echo {e + 1} (rad): {out_path}")
@@ -991,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             for e in range(unwrapped_hz.shape[-2]):
-                uw_path = f"{prefix_stem}_e{e + 1}_unwrapped_fieldmap{nii_ext}"
+                uw_path = entity_stem(prefix_stem, echo=e + 1) + f"_unwrapped_fieldmap{nii_ext}"
                 with spinner(f"Writing {Path(uw_path).name}"):
                     save_nifti(unwrapped_hz[..., e, :].cpu().numpy(), uw_path, affine=affine)
                 if args.verb >= 1:
@@ -1020,7 +1020,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.verb >= 1:
             print(f"\nDone: {datetime.now():%Y-%m-%d %H:%M:%S}")
             print(
-                "3d-debug: overlay {prefix}_e{N}_3ddebug_{pos,neg} on the brain's "
+                "3d-debug: overlay {prefix}.echo-N_3ddebug_{pos,neg} on the brain's "
                 "up/down (k) motion;"
             )
             print(

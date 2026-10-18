@@ -2011,10 +2011,10 @@ def _finalize_echo(
 
     if cfg.make_complex_nii:
         magn_path = out_dir / f"{out_prefix.name}_magn{ext}"
-        phase_path = out_dir / f"{out_prefix.name}_phase{ext}"
+        phase_path = out_dir / f"{out_prefix.name}.part-phase{ext}"
     else:
         magn_path = out_dir / f"{out_prefix.name}{ext}"
-        phase_path = out_dir / f"{out_prefix.name}_phase{ext}" if phase_in_used else None
+        phase_path = out_dir / f"{out_prefix.name}.part-phase{ext}" if phase_in_used else None
 
     # Compute magnitude (and phase) on GPU, move to CPU, then free GPU
     # to avoid holding denoised + abs + angle all at once.

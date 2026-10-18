@@ -152,7 +152,7 @@ def test_cli_multiecho_writes_echoes_and_field(tmp_path):
     core = head & (m.numpy().transpose(2, 1, 0) == 2)
     assert np.mean(np.abs(got - field)[core] < 5.0) > 0.99
     for e in range(3):
-        assert (tmp_path / f"uw_e{e + 1}.nii.gz").exists()
+        assert (tmp_path / f"uw.echo-{e + 1}.part-phase.nii.gz").exists()
 
 
 def test_cli_refuses_multiecho_without_echo_times(tmp_path):

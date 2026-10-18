@@ -105,8 +105,8 @@ def test_multiecho_applies_shared_transforms(tmp_path):
         ]
     )
 
-    out1 = tmp_path / "e1_mc.nii.gz"
-    out2 = tmp_path / "e2_mc.nii.gz"
+    out1 = tmp_path / "mc.echo-1.nii.gz"
+    out2 = tmp_path / "mc.echo-2.nii.gz"
     assert out1.exists() and out2.exists()
 
     a1, _ = load_image(str(out1))
@@ -148,11 +148,11 @@ def test_multiecho_mean_and_params(tmp_path):
         ]
     )
 
-    assert (tmp_path / "e1_mc.nii.gz").exists()
-    assert (tmp_path / "e2_mc.nii.gz").exists()
+    assert (tmp_path / "mc.echo-1.nii.gz").exists()
+    assert (tmp_path / "mc.echo-2.nii.gz").exists()
     # -save_mean (no value) derives mean_{eN_prefix}.
-    assert (tmp_path / "mean_e1_mc.nii.gz").exists()
-    assert (tmp_path / "mean_e2_mc.nii.gz").exists()
+    assert (tmp_path / "mean_mc.echo-1.nii.gz").exists()
+    assert (tmp_path / "mean_mc.echo-2.nii.gz").exists()
     # One shared motion file for the whole multi-echo run.
     params = np.loadtxt(oned)
     assert params.shape == (echo1.shape[0], 6)
@@ -272,17 +272,17 @@ def test_me_3depi_removes_the_te_dependent_shift(tmp_path):
     assert np.allclose(te_fit[:, 0], -slope, atol=2e-3)
 
     # Every echo now sits at the same partition offset.
-    outs = [load_image(str(tmp_path / f"e{i + 1}_mc.nii.gz"))[0] for i in range(3)]
+    outs = [load_image(str(tmp_path / f"mc.echo-{i + 1}.nii.gz"))[0] for i in range(3)]
     for i in range(1, 3):
         resid, _ = estimate_pair_shift(outs[i - 1], outs[i], axis=2, max_shift=2.0)
         assert np.abs(resid).max() < 0.05, f"echo {i + 1} still offset by {resid}"
 
     # Per-echo total transforms exist and genuinely differ across echoes.
-    p1 = np.loadtxt(tmp_path / "e1_motion_sc.1D")
-    p3 = np.loadtxt(tmp_path / "e3_motion_sc.1D")
+    p1 = np.loadtxt(tmp_path / "motion_sc.echo-1.1D")
+    p3 = np.loadtxt(tmp_path / "motion_sc.echo-3.1D")
     assert np.abs(p1 - p3).max() > 1e-3
     for i in range(3):
-        assert (tmp_path / f"e{i + 1}_mat_sc.aff12.1D").exists()
+        assert (tmp_path / f"mat_sc.echo-{i + 1}.aff12.1D").exists()
 
 
 def test_me_3depi_rejects_a_single_echo(tmp_path):
@@ -345,7 +345,7 @@ def test_me_3depi_shift_table_replaces_the_estimate(tmp_path):
         "0",
     ]
     main([*args, "-shift_table", str(tmp_path / "shifts.1D")])
-    outs = [load_image(str(tmp_path / f"e{i + 1}_mc.nii.gz"))[0] for i in range(3)]
+    outs = [load_image(str(tmp_path / f"mc.echo-{i + 1}.nii.gz"))[0] for i in range(3)]
     for i in range(1, 3):
         resid, _ = estimate_pair_shift(outs[i - 1], outs[i], axis=2, max_shift=2.0)
         assert np.abs(resid).max() < 0.05, f"echo {i + 1} still offset by {resid}"
@@ -395,7 +395,9 @@ def test_me_3depi_stretch_table_corrects_both_slab_ends(tmp_path):
 
     def worst_blob_offset(name, extra):
         main([*common, *extra, "-prefix", str(tmp_path / name), "-verb", "0"])
-        e1, e3 = (load_image(str(tmp_path / f"e{i}_{name}"))[0].numpy() for i in (1, 3))
+        from fastfuncstuff.cli_utils import entity_path
+
+        e1, e3 = (load_image(entity_path(str(tmp_path / name), echo=i))[0].numpy() for i in (1, 3))
         worst = 0.0
         for c in (centres[0], centres[-1]):
             win = (np.arange(nz) > c - 5) & (np.arange(nz) < c + 5)

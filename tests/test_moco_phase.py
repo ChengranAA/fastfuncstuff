@@ -40,7 +40,7 @@ def test_single_echo_phase_gets_identical_resample(tmp_path):
         ]
     )
     a, _ = load_image(str(tmp_path / "mc.nii.gz"))
-    p, _ = load_image(str(tmp_path / "phase_mc.nii.gz"))
+    p, _ = load_image(str(tmp_path / "mc.part-phase.nii.gz"))
     assert torch.allclose(p, a * SCALE, atol=1e-3 * SCALE)
 
 
@@ -66,10 +66,10 @@ def test_multiecho_phase_per_echo(tmp_path):
             str(tmp_path / "mc.nii.gz"),
         ]
     )
-    a1, _ = load_image(str(tmp_path / "e1_mc.nii.gz"))
-    a2, _ = load_image(str(tmp_path / "e2_mc.nii.gz"))
-    p1, _ = load_image(str(tmp_path / "phase_e1_mc.nii.gz"))
-    p2, _ = load_image(str(tmp_path / "phase_e2_mc.nii.gz"))
+    a1, _ = load_image(str(tmp_path / "mc.echo-1.nii.gz"))
+    a2, _ = load_image(str(tmp_path / "mc.echo-2.nii.gz"))
+    p1, _ = load_image(str(tmp_path / "mc.echo-1.part-phase.nii.gz"))
+    p2, _ = load_image(str(tmp_path / "mc.echo-2.part-phase.nii.gz"))
     assert torch.allclose(p1, a1 * SCALE, atol=1e-3 * SCALE)
     assert torch.allclose(p2, a2 * 2 * SCALE, atol=1e-3 * SCALE)
 

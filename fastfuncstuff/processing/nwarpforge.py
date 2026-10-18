@@ -96,27 +96,16 @@ def _sample_field(field: Tensor, x: Tensor, y: Tensor, z: Tensor, interp: str = 
 
 
 def derive_phase_output_path(prefix: str) -> str:
-    """Derive phase output path from magnitude prefix.
+    """Derive phase output path from magnitude prefix (the toolbox-wide entity).
 
     Examples:
-        out.nii.gz   -> out_phase.nii.gz
-        out.nii.zst  -> out_phase.nii.zst
-        out.nii      -> out_phase.nii
+        out.nii.gz   -> out.part-phase.nii.gz
+        out.nii.zst  -> out.part-phase.nii.zst
+        out.nii      -> out.part-phase.nii
     """
-    from pathlib import Path
+    from fastfuncstuff.cli_utils import entity_path
 
-    p = Path(prefix)
-    if p.name.endswith(".nii.gz"):
-        stem = p.name[: -len(".nii.gz")]
-        return str(p.parent / f"{stem}_phase.nii.gz")
-    elif p.name.endswith(".nii.zst"):
-        stem = p.name[: -len(".nii.zst")]
-        return str(p.parent / f"{stem}_phase.nii.zst")
-    elif p.name.endswith(".nii"):
-        stem = p.name[: -len(".nii")]
-        return str(p.parent / f"{stem}_phase.nii")
-    else:
-        return str(p.parent / f"{p.stem}_phase{p.suffix}")
+    return entity_path(prefix, phase=True)
 
 
 from ..io.afni import get_afni_space_info, set_afni_space_info  # noqa: E402

@@ -186,10 +186,10 @@ def test_moco_expected_outputs_multi_echo_prefixes_each():
     )
     outs = _expected_outputs(a)
     # Per-echo series + QC get eN_ prefixes; the matrix is single-instance.
-    assert "e1_mc.nii.gz" in outs
-    assert "e2_mc.nii.gz" in outs
-    assert "tsnr_e1_mc.nii.gz" in outs
-    assert "tsnr_e2_mc.nii.gz" in outs
+    assert "mc.echo-1.nii.gz" in outs
+    assert "mc.echo-2.nii.gz" in outs
+    assert "tsnr_mc.echo-1.nii.gz" in outs
+    assert "tsnr_mc.echo-2.nii.gz" in outs
     assert "mat.aff12.1D" in outs
     assert outs.count("mat.aff12.1D") == 1
 
@@ -218,7 +218,7 @@ def test_nwarp_expected_outputs_prefix_verbatim_plus_derived():
     )
     outs = _expected_outputs(a)
     assert outs[0] == "out.nii.gz"  # prefix used as-is (no parse_prefix)
-    assert "out_phase.nii.gz" in outs
+    assert "out.part-phase.nii.gz" in outs
     assert "mean_out.nii.gz" in outs
     assert "firstlast_out.nii.gz" in outs
 
@@ -412,7 +412,7 @@ def test_emit_moco_stage_is_batched():
     # The manifest is (re)truncated then appended per run inside the loop.
     assert ': > "$mocobatch"' in s
     # Each run's args (incl. the motion params) are printf'd into the manifest.
-    assert "printf " in s and '.motion.1D\\"" >> "$mocobatch"' in s
+    assert "printf " in s and '-1Dfile \\"${mstem}.motion.1D\\"' in s and '>> "$mocobatch"' in s
 
 
 def test_emit_final_stage_is_batched():

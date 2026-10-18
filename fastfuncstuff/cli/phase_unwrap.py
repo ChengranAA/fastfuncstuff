@@ -18,7 +18,7 @@ like warpkit's; a single echo keeps it, like ROMEO's.
 Usage:
     ffs_phase_unwrap -phase ph.nii.gz -magnitude mag.nii.gz -prefix ph_uw.nii.gz
     ffs_phase_unwrap -phase p1 p2 p3 -magnitude m1 m2 m3 -echo_times 7.6 21.7 35.8 \\
-                     -prefix uw.nii.gz        # -> uw_e1/2/3 + uw_fieldmap
+                     -prefix uw.nii.gz        # -> uw.echo-1/2/3.part-phase + uw_fieldmap
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-prefix",
         required=True,
-        help="Output. One echo: the unwrapped phase itself. Several: {stem}_eN per echo "
+        help="Output. One echo: the unwrapped phase itself. Several: {stem}.echo-N.part-phase per echo "
         "plus {stem}_fieldmap (Hz, unfiltered).",
     )
     parser.add_argument(
@@ -173,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import torch
 
-    from fastfuncstuff.cli_utils import parse_prefix, setup_device
+    from fastfuncstuff.cli_utils import entity_stem, parse_prefix, setup_device
     from fastfuncstuff.processing.io import load_image, save_image
     from fastfuncstuff.processing.phase_unwrap import raw_phase_to_radians, unwrap_timeseries
 
@@ -271,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
             save_image(tkji(res.unwrapped[..., 0, :]), args.prefix, header_info=hdr)
         else:
             for e in range(ne):
-                out = f"{pfx.stem}_e{e + 1}{pfx.nifti_ext}"
+                out = entity_stem(pfx.stem, echo=e + 1, phase=True) + pfx.nifti_ext
                 save_image(tkji(res.unwrapped[..., e, :]), out, header_info=hdr)
             save_image(tkji(res.field_hz), f"{pfx.stem}_fieldmap{pfx.nifti_ext}", header_info=hdr)
         if args.save_mask:

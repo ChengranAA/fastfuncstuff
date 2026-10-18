@@ -142,7 +142,7 @@ Examples:
         "-phase_prefix",
         default=None,
         help="Output path for warped phase. Auto-derived from -prefix when not given "
-        "(e.g. out.nii.gz -> out_phase.nii.gz). Only used with -phase.",
+        "(e.g. out.nii.gz -> out.part-phase.nii.gz). Only used with -phase.",
     )
     io_group.add_argument(
         "-phase_units",

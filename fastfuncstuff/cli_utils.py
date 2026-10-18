@@ -150,6 +150,30 @@ def has_imaging_ext(path: str | Path) -> bool:
     return str(path).endswith(_NIFTI_EXTENSIONS)
 
 
+_ENTITY_EXTENSIONS = (*_NIFTI_EXTENSIONS, ".aff12.1D", ".1D", ".json")
+
+
+def entity_stem(stem: str, *, echo: int | None = None, phase: bool = False) -> str:
+    """``stem`` + BIDS-style entities: ``run`` -> ``run.echo-2.part-phase``.
+
+    Every multi-echo / phase-aware tool names its per-echo and phase files through
+    this (or :func:`entity_path`), so a pipeline reads one convention end to end:
+    ``<stem>.echo-N[.part-phase]`` before any ``_suffix`` and the extension. A single
+    echo passes ``echo=None`` and stays unlabeled; magnitude is never labeled.
+    """
+    return stem + (f".echo-{echo}" if echo is not None else "") + (".part-phase" if phase else "")
+
+
+def entity_path(path: str, *, echo: int | None = None, phase: bool = False) -> str:
+    """:func:`entity_stem` applied before ``path``'s extension (NIfTI, GIfTI, .1D,
+    .aff12.1D, .json): ``out.nii.zst`` -> ``out.echo-2.part-phase.nii.zst``."""
+    path = str(path)
+    for ext in _ENTITY_EXTENSIONS:
+        if path.endswith(ext):
+            return entity_stem(path[: -len(ext)], echo=echo, phase=phase) + ext
+    return entity_stem(path, echo=echo, phase=phase)
+
+
 def parse_prefix(prefix: str, default_ext: str = ".nii.gz") -> PrefixInfo:
     """Parse a CLI ``-prefix`` value into a stem and NIfTI extension.
 

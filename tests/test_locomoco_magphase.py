@@ -404,14 +404,14 @@ def test_cli_two_axis_with_phase_writes_both_components(tmp_path):
          "-no_warp", "-no_movie", "-levels", "1", "-iters", "2", "-refine", "0", "-ref", "mean"]
     )  # fmt: skip
     assert rc == 0
-    f1 = np.asarray(nib.load(str(tmp_path / "out_e1_flow_pe1.nii.gz")).dataobj)  # in-plane
-    f4 = np.asarray(nib.load(str(tmp_path / "out_e4_flow_pe1.nii.gz")).dataobj)
-    p1 = np.asarray(nib.load(str(tmp_path / "out_e1_flow_pe2.nii.gz")).dataobj)  # partition
-    p4 = np.asarray(nib.load(str(tmp_path / "out_e4_flow_pe2.nii.gz")).dataobj)
+    f1 = np.asarray(nib.load(str(tmp_path / "out.echo-1_flow_pe1.nii.gz")).dataobj)  # in-plane
+    f4 = np.asarray(nib.load(str(tmp_path / "out.echo-4_flow_pe1.nii.gz")).dataobj)
+    p1 = np.asarray(nib.load(str(tmp_path / "out.echo-1_flow_pe2.nii.gz")).dataobj)  # partition
+    p4 = np.asarray(nib.load(str(tmp_path / "out.echo-4_flow_pe2.nii.gz")).dataobj)
     assert np.allclose(f1, f4, atol=1e-5)  # in-plane: the same at every echo
     k = float((p4 * p1).sum() / (p1 * p1).sum())
     assert abs(k - TE[3] / TE[0]) < 1e-3  # partition: TE-scaled
-    assert (tmp_path / "out_e4_phase_locomoco.nii.gz").exists()
+    assert (tmp_path / "out.echo-4.part-phase_locomoco.nii.gz").exists()
 
 
 def test_cli_detask_fit_cuts_mag_and_phase_alike_and_outputs_stay_raw(tmp_path, monkeypatch):
@@ -464,6 +464,8 @@ def test_cli_detask_fit_cuts_mag_and_phase_alike_and_outputs_stay_raw(tmp_path, 
     def amp(tc):
         return float((tc - tc.mean()) @ task / (task @ task))
 
-    out_ph = np.asarray(nib.load(f"{stem}_e1_phase_locomoco.nii.gz").dataobj)[inner].mean(0)
+    out_ph = np.asarray(nib.load(f"{stem}.echo-1.part-phase_locomoco.nii.gz").dataobj)[inner].mean(
+        0
+    )
     assert abs(amp(out_ph) - 4.0) < 0.3  # the injected 4 Hz, intact in the output
     assert abs(amp(seen["phase"][inner].mean(0))) < 0.5  # ... and (mostly) gone from the fit

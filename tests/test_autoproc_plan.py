@@ -292,14 +292,14 @@ def test_locomoco_consumes_the_moco_timeseries_not_the_mean():
     subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
 
     s = write_script(build_plan(subj, Options(locomoco=True)), "wd", bids_root="/bids")
-    assert '-prefix \\"${mstem}.nii$FMT\\"' in s
-    assert 'lm_in="\\"stage02.moco.${FRAG[$k]}.nii$FMT\\""' in s
+    assert '-prefix \\"${mpfx}.nii$FMT\\"' in s
+    assert 'lm_in="\\"stage02.moco.${FRAG[$k]}${E1[$k]:-}.nii$FMT\\""' in s
     assert "-input $lm_in" in s
     # and the mean that goes downstream is locomoco's, not moco's
     assert "stage03.nlmoco.ses-01.task-foo.run-1_locomoco_mean.nii$FMT" in s
 
     s2 = write_script(build_plan(subj, Options(locomoco=False)), "wd", bids_root="/bids")
-    assert '-prefix \\"${mstem}.nii$FMT\\"' not in s2
+    assert '-prefix \\"${mpfx}.nii$FMT\\"' not in s2
 
 
 def test_locomoco_solves_the_partition_axis_too_for_3d():
@@ -795,7 +795,7 @@ def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc,
         assert "ffs_phasedrift" not in s
     if nordic:
         # NORDIC already wrote the denoised pair AND trimmed the noise volumes.
-        assert 'ph="stage00.nordic.${FRAG[$k]}_phase.nii$FMT"' in s
+        assert 'ph="stage00.nordic.${FRAG[$k]}.part-phase.nii$FMT"' in s
         assert s.index("stage00: NORDIC") < s.index("stage00: phase unwrap")
     else:
         # No NORDIC: noise volumes come off BOTH before unwrapping, as a selector
@@ -2097,7 +2097,7 @@ def test_nordic_dof_adjust_is_wired_end_to_end(tmp_path):
     # within-run motion links: a run-pooled count has no volume-0 pose.
     assert '-nwarp \\"${AVGCHAIN[$k]}\\"' in job[0]
     assert "${CHAIN[$k]}" not in job[0]
-    assert "stage00.nordic.${FRAG[$k]}_numcomps" in job[0]
+    assert "stage00.nordic.${FRAG[$k]}${E1[$k]:-}_numcomps" in job[0]
     assert "-master stage10.warpmaster" in job[0]
     # A count, not an intensity: no ringing kernel and no Jacobian modulation.
     assert "-interp linear" in job[0] and "-no_neg" in job[0]
@@ -3321,6 +3321,15 @@ def test_multiecho_estimates_from_echo1_warps_each_echo_and_combines(tmp_path, a
     )
     assert "NECHO[01:foo:1]=3" in s
     assert "TES[01:foo:1]='7.6 21.7 35.8'" in s
+    # one echo/phase naming rule in every stage: <stem>.echo-N[.part-phase], echo 1
+    # labeled too (E1), never an eN_ prefix, an _eN infix or a _phase suffix
+    assert "E1[01:foo:1]=.echo-1" in s
+    s_nordic = write_script(
+        build_plan(subj, Options(phase_proc=True, want_nordic=True, acq_3d=acq_3d)), "wd"
+    )
+    assert "stage00.nordic.${FRAG[$k]}${E1[$k]:-}_numcomps.nii$FMT" in s_nordic
+    old = r"\be(?:[0-9]+|\$\{e\}|\$e)_|_e(?:[0-9]+|\$\{e\}|\$e)[_.]|phase_e|_phase\.nii"
+    assert not re.search(old, s), re.search(old, s)
     assert "MAGE['01:foo:1|3']=" in s and "PHASEE['01:foo:1|3']=" in s
     # one unwrap over every echo
     assert 'ffs_phase_unwrap -phase "${phs[@]}" -magnitude "${mags[@]}" -echo_times ${TES[$k]}' in s
@@ -3333,9 +3342,9 @@ def test_multiecho_estimates_from_echo1_warps_each_echo_and_combines(tmp_path, a
         assert "-reg_echo 1 -me_3depi -axis k" in s and "-1Dmatrix_shiftcorr" in s
         assert "-shift_table" in s and "-stretch_table" in s
         assert 'lm_me="-me_3depi -echo_times ${TES[$k]}"' in s and "-phase$lm_ph" in s
-        assert "e3_stage02.moco.ses-01.task-foo.run-1.sc.aff12.1D" in s  # echo 3's matrices
-        assert "stage03.nlmoco.ses-01.task-foo.run-1_e3_warp" in s  # echo 3's warp
-        assert 'ln -sf "e1_${mstem}_${which}.nii$FMT"' in s
+        assert "stage02.moco.ses-01.task-foo.run-1.echo-3.aff12.1D" in s  # echo 3's matrices
+        assert "stage03.nlmoco.ses-01.task-foo.run-1.echo-3_warp" in s  # echo 3's warp
+        assert 'ln -sf "${mstem}.echo-1_${which}.nii$FMT"' in s
     else:
         assert "-me_3depi" not in s and "-save_partition_shift" not in s
         # 2-D: one in-plane warp moves every echo alike -> echo chains share it
@@ -3388,17 +3397,17 @@ def test_medic_reuses_the_unwrap_field_and_sits_rightmost_in_every_chain(tmp_pat
         == 0
     )
     assert "TRT[01:foo:1]=0.0312" in s and "\nSBREF[" not in s
-    assert '-save_mask "stage00.unwrap.${FRAG[$k]}.part-phase_mask.nii$FMT"' in s
+    assert '-save_mask "stage00.unwrap.${FRAG[$k]}_mask.nii$FMT"' in s
     assert '-fieldmap "${uwe}_fieldmap.nii$FMT" -fieldmap_mask "${uwe}_mask.nii$FMT"' in s
     assert s.index("stage01: MEDIC") < s.index("stage02: moco")
-    assert 'raw="stage01.medic.${FRAG[$k]}_e1_undist.nii$FMT"' in s
+    assert 'raw="stage01.medic.${FRAG[$k]}.echo-1_undist.nii$FMT"' in s
     medic_warp = "stage01.medic.ses-01.task-foo.run-1_warp.nii$FMT"
     ech = [ln for ln in s.splitlines() if ln.startswith("ECHAIN[")]
     assert len(ech) == 3 and all(ln.rstrip("'\"").endswith(medic_warp) for ln in ech)
     if acq_3d:
-        assert 'mag="stage01.medic.${FRAG[$k]}_e${e}_undist.nii$FMT"' in s
+        assert 'mag="stage01.medic.${FRAG[$k]}.echo-${e}_undist.nii$FMT"' in s
         assert "-apply_phase -phase_is_unwrapped" in s
-        assert "stage01.medic.${FRAG[$k]}_e${e}_phase_undist.nii$FMT" in s
+        assert "stage01.medic.${FRAG[$k]}.echo-${e}.part-phase_undist.nii$FMT" in s
         assert 'lm_pe="-pe_dir2 k"' in s
     else:
         assert "-apply_phase" not in s and 'lm_pe="-pe_dir2 k"' not in s
@@ -3441,7 +3450,7 @@ def test_multiecho_slice_timing_first_shifts_every_echo_and_its_phase(tmp_path, 
     )
     shifted = 'mag="stage01.tshift.${FRAG[$k]}${esfx}.nii$FMT"'
     assert 'eoutf="stage01.tshift.${FRAG[$k]}${esfx}.nii$FMT"' in s
-    assert '-input "stage00.unwrap.${FRAG[$k]}.part-phase_e${e}.nii$FMT"' in s
+    assert '-input "stage00.unwrap.${FRAG[$k]}.echo-${e}.part-phase.nii$FMT"' in s
     final = s[s.index("stage10.final.${FRAG[$k]}.echo-$e") - 400 :]
     assert shifted in final
     assert '-phase \\"stage01.tshift.${FRAG[$k]}${esfx}.part-phase.nii$FMT\\"' in final
@@ -3488,7 +3497,7 @@ def test_multiecho_surface_reads_every_echo_and_combines_per_vertex(tmp_path):
     )
     surf = {ln.split("=", 1)[0]: ln for ln in s.splitlines() if ln.startswith("SURFCHAIN[")}
     assert "SURFCHAIN['01:foo:1|3']" in surf
-    assert "_e3_warp" in surf["SURFCHAIN['01:foo:1|3']"]  # echo 3's own locomoco warp
+    assert ".echo-3_warp" in surf["SURFCHAIN['01:foo:1|3']"]  # echo 3's own locomoco warp
     assert '-surf_prefix \\"stage10s.surf.${FRAG[$k]}.echo-$e\\"' in s
     assert '-surf_nwarp \\"${SURFCHAIN[$k|$e]}\\"' in s
     assert "$pe_args$sa" in s
@@ -3516,7 +3525,7 @@ def test_multiecho_phasereg_corrects_each_echo_then_combines(tmp_path):
     )
     stage = s[s.index("== phasereg ==") :]
     for e in (1, 2, 3):
-        assert f'-prefix "$PHASEREG_DIR/task-foo_echo-{e}"' in stage
+        assert f'-prefix "$PHASEREG_DIR/task-foo.echo-{e}"' in stage
         assert f"stage10.final.ses-01.task-foo.run-2.echo-{e}.part-phase.nii$FINAL_FMT" in stage
     assert stage.count("ffs_phasereg") >= 3
     assert "ffs_t2smap -input" in stage and "-tes 7.6 21.7 35.8" in stage

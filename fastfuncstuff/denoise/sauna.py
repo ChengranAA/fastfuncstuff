@@ -1385,10 +1385,10 @@ def run_sauna(
 
     if cfg.make_complex_nii:
         magn_path = out_dir / f"{out_prefix.name}_magn{ext}"
-        phase_path = out_dir / f"{out_prefix.name}_phase{ext}"
+        phase_path = out_dir / f"{out_prefix.name}.part-phase{ext}"
     else:
         magn_path = out_dir / f"{out_prefix.name}{ext}"
-        phase_path = out_dir / f"{out_prefix.name}_phase{ext}" if phase_in_used else None
+        phase_path = out_dir / f"{out_prefix.name}.part-phase{ext}" if phase_in_used else None
 
     magn_np_out = torch.abs(denoised).cpu().numpy().astype(np.float32)
     phase_out_np: np.ndarray | None = None

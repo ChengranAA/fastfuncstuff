@@ -48,6 +48,7 @@ from fastfuncstuff.cli_utils import (
     add_device_arg,
     check_bids_event_args,
     collect_batch_jobs,
+    entity_stem,
     print_cli_footer,
     print_cli_header,
     print_cli_section,
@@ -649,11 +650,11 @@ def create_parser() -> argparse.ArgumentParser:
         " term per voxel and frame is fitted out) and needs no high-pass. Solves one shared"
         " field from both channels with the TE law FIXED (alpha_e = TE_e/TE_1), noise-weighted"
         " per voxel. Needs -me_3depi, 2+ echoes, -backend flow. Also writes the corrected phase"
-        " ({prefix}_e{N}_phase_locomoco, input units) and the per-voxel phase share of the"
+        " ({prefix}.echo-N.part-phase_locomoco, input units) and the per-voxel phase share of the"
         " information ({prefix}_phase_share).\n"
         "Getting the input: ffs_medic -save_unwrapped_phase -save_warp (per-echo Hz field),"
         " ffs_moco on the MAGNITUDE with -1Dmatrix_save, then ffs_nwarp each"
-        " {medic}_e{N}_unwrapped_fieldmap with -nwarp 'mc.aff12.1D {medic}_warp' -- the same"
+        " {medic}.echo-N_unwrapped_fieldmap with -nwarp 'mc.aff12.1D {medic}_warp' -- the same"
         " single resample as the magnitude.",
     )
     mp.add_argument(
@@ -4236,9 +4237,7 @@ def _write_magphase_outputs(
             device=device,
             desc=f"resample phase e{j + 1}",
         )
-        out_path = (
-            f"{stem}_phase_locomoco{ext}" if single else f"{stem}_e{j + 1}_phase_locomoco{ext}"
-        )
+        out_path = entity_stem(stem, echo=None if single else j + 1, phase=True) + f"_locomoco{ext}"
         with spinner(f"Writing {Path(out_path).name}"):
             save_nifti(corrected.numpy(), out_path, affine=affine, tr=out_tr)
 
@@ -4854,7 +4853,7 @@ def _run_multiecho(
     corr_sum = None
     echo_corrected: list[torch.Tensor] = []
     for j, res in enumerate(result.per_echo):
-        estem = f"{stem}_e{j + 1}"
+        estem = entity_stem(stem, echo=j + 1)
         if not args.no_warp:
             from fastfuncstuff.processing.medic import save_medic_warp
 
@@ -5039,7 +5038,12 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     if not args.prefix:
         return []
     stem, ext = _split_prefix(args.prefix)
-    outs = [f"{stem}_warp{ext}"]
+    inputs = args.input if isinstance(args.input, list) else [args.input]
+    if args.me_3depi or len(inputs) > 1:
+        # multi-echo writes one warp per echo (each TE-scaled), none for the run
+        outs = [entity_stem(stem, echo=j + 1) + f"_warp{ext}" for j in range(len(inputs))]
+    else:
+        outs = [f"{stem}_warp{ext}"]
     for which in ("mean", "max", "min"):
         if getattr(args, f"save_{which}", False):
             outs.append(f"{stem}_locomoco_{which}{ext}")

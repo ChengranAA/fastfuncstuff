@@ -24,6 +24,8 @@ from fastfuncstuff.cli_utils import (
     add_outlier_censor_args,
     add_verbose_arg,
     collect_batch_jobs,
+    entity_path,
+    entity_stem,
     parse_prefix,
     print_cli_footer,
     print_cli_header,
@@ -95,6 +97,16 @@ _TEMPORAL_REDUCTIONS: tuple[tuple[str, str], ...] = (
 
 # Sentinel for `-save_weight` given with no value: derive the paths from -prefix.
 _WEIGHT_FROM_PREFIX = "\x00weight_from_prefix"
+
+
+def _echo_reduction(value: str, which: str, echo: int) -> str:
+    """Echo ``echo``'s copy of an explicit reduction path, entity before the
+    reduction suffix: ``run_mean.nii.zst`` -> ``run.echo-2_mean.nii.zst``."""
+    p = parse_prefix(value)
+    tail = f"_{which}"
+    if p.stem.endswith(tail):
+        return entity_stem(p.stem[: -len(tail)], echo=echo) + tail + p.nifti_ext
+    return entity_path(p.as_file(), echo=echo)
 
 
 def _sibling(path: str, prefix: str) -> str:
@@ -220,7 +232,7 @@ def parse_args(
         default=None,
         help="Output prefix for the corrected timeseries. Omit to skip writing "
         "it (e.g. when you only want motion params or -save_mean). With "
-        "multiple echoes each output is prefixed with eN_ (e1_, e2_, ...).",
+        "multiple echoes each output gets a .echo-N entity (out.echo-1.nii.gz, ...).",
     )
     io_group.add_argument(
         "-phase",
@@ -230,8 +242,8 @@ def parse_args(
         help="UNWRAPPED phase, one series per -input echo (same grid, same order). Motion is"
         " still estimated from the magnitude alone; each phase is resampled with exactly the"
         " matrices its magnitude echo gets (with -me_3depi, including that echo's partition"
-        " shift -- it moves the complex image) and written next to it as phase_{output}"
-        " (phase_eN_{prefix} for multi-echo). Wrapped phase must never be interpolated, so a"
+        " shift -- it moves the complex image) and written next to it as {prefix}.part-phase"
+        " ({prefix}.echo-N.part-phase for multi-echo). Wrapped phase must never be interpolated, so a"
         " wrapped or raw-scanner input is refused before the registration runs. Needs"
         " -prefix; -phase_units hz also needs -echo_times (the wrap period is 1000/TE Hz).",
     )
@@ -555,8 +567,8 @@ def parse_args(
         dest="onedfile_shiftcorr",
         default=None,
         help="-me_3depi: save the TOTAL per-echo motion parameters — rigid motion "
-        "WITH that echo's partition-axis shift folded in — one eN_ prefixed 6-column "
-        ".1D per echo. Unlike -1Dfile (one shared rigid pose) these differ across "
+        "WITH that echo's partition-axis shift folded in — one 6-column .1D per echo,"
+        " named PREFIX.echo-N.1D. Unlike -1Dfile (one shared rigid pose) these differ across "
         "echoes, which is the whole point.",
     )
     out_group.add_argument(
@@ -565,7 +577,7 @@ def parse_args(
         dest="onedmatrix_shiftcorr",
         default=None,
         help="-me_3depi: the same total per-echo transforms as affine matrices, one "
-        "eN_ prefixed .aff12.1D per echo. These are exactly the matrices the "
+        "PREFIX.echo-N.aff12.1D per echo. These are exactly the matrices the "
         "resampler used.",
     )
     out_group.add_argument(
@@ -1512,8 +1524,9 @@ def _resample_phase(args, i, n_echoes, matrices, config, device, base_copy_idx, 
     aligned, _ = resample_timeseries(
         ph, matrices, config, device, base_copy_idx=base_copy_idx, disable_pbar=verb == 0
     )
-    tag = f"phase_e{i + 1}_" if n_echoes > 1 else "phase_"
-    out_path = parse_prefix(_sibling(args.prefix, tag)).as_file()
+    out_path = entity_path(
+        parse_prefix(args.prefix).as_file(), echo=i + 1 if n_echoes > 1 else None, phase=True
+    )
     with spinner(f"Writing {out_path}", enabled=verb >= 1):
         save_image(aligned, out_path, header_info=hdr)
 
@@ -1606,13 +1619,12 @@ def _save_shiftcorr_params(
         return
     affine = header_info["affine"] if header_info else np.eye(4)
     for i in range(est.applied.shape[1]):
-        tag = f"e{i + 1}_"
         mats = _fold_partition(result.matrices_vox, est, i, axis)
         dicom = np.stack(
             [voxel_matrix_to_dicom(mats[t], affine, affine).numpy() for t in range(mats.shape[0])]
         )
         if args.onedmatrix_shiftcorr is not None:
-            path = _sibling(args.onedmatrix_shiftcorr, tag)
+            path = entity_path(args.onedmatrix_shiftcorr, echo=i + 1)
             save_matrix_1D(
                 dicom,
                 path,
@@ -1628,7 +1640,7 @@ def _save_shiftcorr_params(
                     for t in range(len(dicom))
                 ]
             )
-            path = _sibling(args.onedfile_shiftcorr, tag)
+            path = entity_path(args.onedfile_shiftcorr, echo=i + 1)
             save_moco_1D(params, path)
             if verb >= 1:
                 print(f"Saved echo {i + 1} params: {path}")
@@ -1668,22 +1680,22 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
 
     Mirrors the naming in `_run_single_echo` / `_run_multi_echo` and
     `_save_estimation_outputs` so `-batch_skip` checks exactly what the run
-    produces. Multi-echo per-echo files get their eN_ prefix. Conditional QC /
+    produces. Multi-echo per-echo files get their .echo-N entity. Conditional QC /
     reweight maps are listed on intent: if a runtime guard prevents one (tSNR
     needs >=2 volumes; reweight maps need a live reweight), the run simply isn't
     skipped next time — safe, since re-running is cheaper than a wrong skip.
     """
     outs: list[str] = []
     n_echoes = len(args.input_file or [])
-    echo_tags = [f"e{i + 1}_" for i in range(n_echoes)] if n_echoes > 1 else [""]
+    echoes: list[int | None] = list(range(1, n_echoes + 1)) if n_echoes > 1 else [None]
 
-    def _pfx(value: str, tag: str) -> str:
-        return _sibling(value, tag) if tag else value
+    def _pfx(value: str, echo: int | None) -> str:
+        return entity_path(parse_prefix(value).as_file(), echo=echo)
 
-    for tag in echo_tags:
+    for tag in echoes:
         # Corrected series.
         if args.prefix is not None:
-            outs.append(parse_prefix(_pfx(args.prefix, tag)).as_file())
+            outs.append(_pfx(args.prefix, tag))
         # Temporal reductions of the corrected series.
         for dest, which in _TEMPORAL_REDUCTIONS:
             value = getattr(args, dest, None)
@@ -1691,16 +1703,14 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
                 continue
             if value is _MEAN_FROM_PREFIX:
                 if args.prefix is not None:
-                    outs.append(
-                        derive_prefixed_output_path(
-                            parse_prefix(_pfx(args.prefix, tag)).as_file(), which
-                        )
-                    )
+                    outs.append(derive_prefixed_output_path(_pfx(args.prefix, tag), which))
+            elif tag is None:
+                outs.append(parse_prefix(value).as_file())
             else:
-                outs.append(parse_prefix(_pfx(value, tag)).as_file())
+                outs.append(_echo_reduction(value, which, tag))
         # QC files — all named after the (per-echo) prefix.
         if _want_qc(args) and args.prefix is not None:
-            base_file = parse_prefix(_pfx(args.prefix, tag)).as_file()
+            base_file = _pfx(args.prefix, tag)
             want_plain = bool(args.save_first_last)
             want_diff = bool(args.save_first_last_diff)
             if want_plain:
@@ -1743,7 +1753,7 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         for name in ("onedfile_shiftcorr", "onedmatrix_shiftcorr"):
             val = getattr(args, name, None)
             if val is not None:
-                outs.extend(_sibling(val, tag) for tag in echo_tags)
+                outs.extend(entity_path(val, echo=e) for e in echoes)
 
     # Reweight weight/diagnostic maps — only written when reweight actually runs.
     if args.save_weight is not None and args.reweight:
@@ -1908,7 +1918,7 @@ def _run_multi_echo(
     reg_index: int,
 ) -> None:
     """Multi-echo: estimate motion from one echo (or the cross-echo mean), then
-    apply the same transforms to every echo, writing eN_ prefixed outputs."""
+    apply the same transforms to every echo, writing .echo-N outputs."""
     if getattr(args, "tpattern", None) is not None:
         print(
             "Error: -tpattern (slice-timing-aware moco) is single-echo only for now.",
@@ -1978,7 +1988,7 @@ def _run_multi_echo(
     write_reductions = _want_reductions(args)
     want_qc = _want_qc(args)
 
-    # Resample each echo with the shared matrices and write eN_ outputs.
+    # Resample each echo with the shared matrices and write .echo-N outputs.
     if write_series or write_reductions or want_qc:
         # Normally the base volume is copied through verbatim to spare it an
         # interpolation. With -me_3depi it must NOT be: its own shift correction
@@ -2024,7 +2034,7 @@ def _run_multi_echo(
                 result.rms_after = rms_after  # feed the dfile written after the loop
 
             if write_series:
-                out_path = parse_prefix(_sibling(args.prefix, f"e{echo_num}_")).as_file()
+                out_path = entity_path(parse_prefix(args.prefix).as_file(), echo=echo_num)
                 with spinner(f"Writing {out_path}", enabled=verb >= 1):
                     save_image(aligned, out_path, header_info=echo_hdr)
 
@@ -2032,9 +2042,15 @@ def _run_multi_echo(
                 value = getattr(args, dest)
                 if value is None:
                     continue
-                echo_prefix = _sibling(args.prefix, f"e{echo_num}_") if args.prefix else None
+                echo_prefix = (
+                    entity_path(parse_prefix(args.prefix).as_file(), echo=echo_num)
+                    if args.prefix
+                    else None
+                )
                 out_path = _reduction_path(
-                    value if value is _MEAN_FROM_PREFIX else _sibling(value, f"e{echo_num}_"),
+                    value
+                    if value is _MEAN_FROM_PREFIX
+                    else _echo_reduction(value, which, echo_num),
                     which,
                     echo_prefix,
                     dest,
@@ -2043,7 +2059,7 @@ def _run_multi_echo(
                     save_image(_reduce_time(aligned, which), out_path, header_info=echo_hdr)
 
             if want_qc:
-                base_path = parse_prefix(_sibling(args.prefix, f"e{echo_num}_")).as_file()
+                base_path = entity_path(parse_prefix(args.prefix).as_file(), echo=echo_num)
                 _write_qc(args, aligned, echo, base_path, echo_hdr, verb)
 
             if args.phase:

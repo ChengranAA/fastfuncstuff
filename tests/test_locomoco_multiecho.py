@@ -1070,7 +1070,7 @@ def test_cli_detask_ica_rejects_on_every_echo_not_just_the_first(tmp_path):
         )
         assert rc == 0, stem
         return [
-            np.asarray(nib.load(str(tmp_path / f"{stem}_e{j + 1}_flow.nii.gz")).dataobj)
+            np.asarray(nib.load(str(tmp_path / f"{stem}.echo-{j + 1}_flow.nii.gz")).dataobj)
             for j in range(len(tes))
         ]
 
@@ -1186,8 +1186,8 @@ def test_cli_jacobian_modulates_each_echo_by_its_own_field(tmp_path):
     departure = []
     for e in (1, 2):
         load = lambda f: torch.from_numpy(nib.load(tmp_path / f).get_fdata(dtype=np.float32))  # noqa: E731
-        plain, jac = load(f"plain_e{e}_locomoco.nii.gz"), load(f"jac_e{e}_locomoco.nii.gz")
-        flow = load(f"plain_e{e}_flow.nii.gz")
+        plain, jac = load(f"plain.echo-{e}_locomoco.nii.gz"), load(f"jac.echo-{e}_locomoco.nii.gz")
+        flow = load(f"plain.echo-{e}_flow.nii.gz")
         res = SimpleNamespace(pe_displacements=lambda flow=flow: [("pe", PE, flow)])
         j = apply_pe_jacobian(res, torch.ones_like(plain))
         assert torch.allclose(jac, plain * j, rtol=1e-4, atol=1e-4), e

@@ -648,10 +648,10 @@ def test_cli_precomputed_fieldmap_skips_estimation(tmp_path):
     pull, _ = field_to_pull_warp(torch.from_numpy(field), 0.03, "j-", 1, torch.device("cpu"))
     m1 = np.asarray(nib.load(mags[0].split("[")[0]).dataobj)[..., :nt]
     want = undistort_series(torch.from_numpy(m1), pull, 1, interp="linear", verbose=False).numpy()
-    got = np.asarray(nib.load(f"{stem}_e1_undist.nii.gz").dataobj)
+    got = np.asarray(nib.load(f"{stem}.echo-1_undist.nii.gz").dataobj)
     assert got.shape == (nx, ny, nz, nt)
     assert np.allclose(got, want, atol=1e-2 * want.max())
-    phu = np.asarray(nib.load(f"{stem}_e1_phase_undist.nii.gz").dataobj)
+    phu = np.asarray(nib.load(f"{stem}.echo-1.part-phase_undist.nii.gz").dataobj)
     assert np.allclose(phu[3:-3, 4:-4, 1:-1], 10.0, atol=1e-3)
 
 

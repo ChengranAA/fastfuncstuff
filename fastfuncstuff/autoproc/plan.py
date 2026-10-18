@@ -196,6 +196,10 @@ class Options:
     # CHANGES the field the correction applies, where the -events diagnostic the
     # locomoco stage always emits only measures the contamination. Read that first.
     locomoco_detask: str | None = None
+    # Phase INTO locomoco (ffs_locomoco -phase, the joint magnitude+phase solve) is an
+    # experiment that did not hold up: on the hardest 3-D run (1.25 mm, 3 echoes) it left
+    # 2-4x more partition wiggle than magnitude alone at the later echo. Opt-in only.
+    locomoco_phase: bool = False
     xrun_nonlin: bool = False
     xfmap_nonlin: bool = False
     xses_nonlin: bool = False

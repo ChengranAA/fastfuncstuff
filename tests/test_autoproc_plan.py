@@ -3341,7 +3341,8 @@ def test_multiecho_estimates_from_echo1_warps_each_echo_and_combines(tmp_path, a
         assert "-save_partition_shift" in s and "-save_partition_stretch" in s
         assert "-reg_echo 1 -me_3depi -axis k" in s and "-1Dmatrix_shiftcorr" in s
         assert "-shift_table" in s and "-stretch_table" in s
-        assert 'lm_me="-me_3depi -echo_times ${TES[$k]}"' in s and "-phase$lm_ph" in s
+        # phase into locomoco is an opt-in experiment: not passed by default
+        assert 'lm_me="-me_3depi -echo_times ${TES[$k]}"' in s and "-phase$lm_ph" not in s
         assert "stage02.moco.ses-01.task-foo.run-1.echo-3.aff12.1D" in s  # echo 3's matrices
         assert "stage03.nlmoco.ses-01.task-foo.run-1.echo-3_warp" in s  # echo 3's warp
         assert 'ln -sf "${mstem}.echo-1_${which}.nii$FMT"' in s
@@ -3406,8 +3407,7 @@ def test_medic_reuses_the_unwrap_field_and_sits_rightmost_in_every_chain(tmp_pat
     assert len(ech) == 3 and all(ln.rstrip("'\"").endswith(medic_warp) for ln in ech)
     if acq_3d:
         assert 'mag="stage01.medic.${FRAG[$k]}.echo-${e}_undist.nii$FMT"' in s
-        assert "-apply_phase -phase_is_unwrapped" in s
-        assert "stage01.medic.${FRAG[$k]}.echo-${e}.part-phase_undist.nii$FMT" in s
+        assert "-apply_phase" not in s and "part-phase_undist" not in s
         assert 'lm_pe="-pe_dir2 k"' in s
     else:
         assert "-apply_phase" not in s and 'lm_pe="-pe_dir2 k"' not in s
@@ -3530,3 +3530,40 @@ def test_multiecho_phasereg_corrects_each_echo_then_combines(tmp_path):
     assert stage.count("ffs_phasereg") >= 3
     assert "ffs_t2smap -input" in stage and "-tes 7.6 21.7 35.8" in stage
     assert "task-foo_corrected_run-02.nii$FINAL_FMT" in stage
+
+
+@pytest.mark.parametrize("medic", [False, True])
+def test_locomoco_phase_is_an_explicit_experimental_opt_in(medic):
+    """-locomoco_phase hands ffs_locomoco every echo's unwrapped phase (and, under
+    -medic, has the phase undistorted with its magnitude); without it none of that is
+    emitted, and moco does not carry a phase it has no consumer for."""
+    r = _me_run("01", "foo", "1")
+    r.json["TotalReadoutTime"] = 0.0312
+    subj = Subject("X", [Session("01", [r])])
+    kw = dict(phase_proc=True, locomoco=True, acq_3d=True, go_to_anat=False, medic=medic,
+              slicetiming_method="none")  # fmt: skip
+    on = write_script(build_plan(subj, Options(locomoco_phase=True, **kw)), "wd", bids_root="/bids")
+    off = write_script(build_plan(subj, Options(**kw)), "wd", bids_root="/bids")
+    assert "-phase$lm_ph -phase_units rad" in on and "-phase$phs -phase_units rad" in on
+    assert "-phase$lm_ph" not in off and "-phase$phs" not in off
+    assert ("-apply_phase -phase_is_unwrapped" in on) is medic
+    assert "-apply_phase" not in off
+
+
+def test_locomoco_phase_refuses_what_it_cannot_use():
+    from fastfuncstuff.cli.autoproc import _locomoco_phase_errors
+
+    r = _me_run("01", "foo", "1")
+    subj = Subject("X", [Session("01", [r])])
+    ok = dict(locomoco=True, phase_proc=True, acq_3d=True, locomoco_phase=True)
+    assert _locomoco_phase_errors(Options(**ok), subj) == []
+    assert _locomoco_phase_errors(Options(locomoco_phase=False), subj) == []
+    for drop, text in (
+        ("locomoco", "-locomoco"),
+        ("phase_proc", "-phase_proc"),
+        ("acq_3d", "acq_3d"),
+    ):
+        errs = _locomoco_phase_errors(Options(**{**ok, drop: False}), subj)
+        assert errs and text in errs[0]
+    single = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+    assert "not multi-echo" in _locomoco_phase_errors(Options(**ok), single)[0]

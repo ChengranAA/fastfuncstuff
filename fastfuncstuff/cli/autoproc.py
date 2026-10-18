@@ -673,6 +673,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     g.add_argument(
+        "-locomoco_phase",
+        "-locomoco-phase",
+        action="store_true",
+        help="EXPERIMENTAL. Give ffs_locomoco each echo's unwrapped phase as well\n"
+        "(the joint magnitude+phase solve for the TE-scaled partition shift). Off by\n"
+        "default: on the hardest test run (1.25 mm, 3 echoes) magnitude alone left\n"
+        "2-4x LESS partition wiggle at the later echo, and phase put flow where the\n"
+        "magnitude has none (the head's edge). Needs -locomoco, -phase_proc and 3-D\n"
+        "multi-echo EPI; with -medic the phase is undistorted along with it.",
+    )
+    g.add_argument(
         "-locomoco_task_qc",
         action="store_true",
         help="Pass each run's events to ffs_locomoco with -task_qc: the stage03\n"
@@ -1282,6 +1293,25 @@ def _medic_errors(opt: Options, subject) -> list[str]:
     return errs
 
 
+def _locomoco_phase_errors(opt: Options, subject) -> list[str]:
+    """-locomoco_phase is the joint solve over 3-D multi-echo runs with phase; anything
+    else has nothing to hand it, and is refused rather than silently ignored."""
+    if not opt.locomoco_phase:
+        return []
+    if not opt.locomoco:
+        return ["-locomoco_phase needs -locomoco."]
+    if not opt.phase_proc:
+        return ["-locomoco_phase needs -phase_proc: the phase comes from the unwrap stage."]
+    if not opt.acq_3d:
+        return ["-locomoco_phase is the 3-D partition solve; it needs -acq_3d EPI."]
+    errs = []
+    for r in (r for s in subject.sessions for r in s.bold_runs):
+        if not r.is_multiecho or any(p is None for p in r.echo_phases):
+            name = f"{r.session or '-'}/{r.task}/{r.run or '-'}"
+            errs.append(f"-locomoco_phase: {name} is not multi-echo with a phase for every echo.")
+    return errs
+
+
 def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[str], list[str]]:
     """Return (errors, warnings). Non-empty errors ⇒ do not write the script."""
     errors: list[str] = []
@@ -1470,6 +1500,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             )
     errors += _multiecho_errors(opt, subject)
     errors += _medic_errors(opt, subject)
+    errors += _locomoco_phase_errors(opt, subject)
     if opt.medic and any(s.fmaps for s in subject.sessions):
         warnings.append(
             "-medic: the session fieldmaps are not used -- the per-frame field corrects "
@@ -2421,6 +2452,7 @@ def main(argv: list[str] | None = None) -> int:
         phase_proc=args.phase_proc,
         phase_drift=not args.no_phase_drift,
         medic=args.medic,
+        locomoco_phase=args.locomoco_phase,
         phasereg=args.phasereg,
         phasereg_opts=args.phasereg_opts,
         phasereg_veins=args.phasereg_veins,

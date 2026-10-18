@@ -103,6 +103,12 @@ def _me_3d(pr: PlanRun, opt) -> bool:
     return bool(opt is not None and opt.acq_3d and pr.bold.is_multiecho)
 
 
+def _lm_phase(plan: Plan) -> bool:
+    """Phase goes into locomoco only when asked for (-locomoco_phase, experimental)."""
+    opt = plan.options
+    return bool(opt.locomoco and opt.locomoco_phase and _phase_on(plan))
+
+
 def _medic_on(plan: Plan) -> bool:
     return plan.options.medic and _phase_on(plan)
 
@@ -1893,7 +1899,7 @@ def _stage_medic(plan: Plan) -> str:
         return ""
     opt = plan.options
     phase = ""
-    if opt.locomoco and opt.acq_3d:
+    if _lm_phase(plan) and opt.acq_3d:
         phase = (
             '\n  phs=(); for e in $(seq 1 "${NECHO[$k]}"); do '
             'esfx=".echo-$e"; '
@@ -1934,7 +1940,8 @@ def _moco_me3d(plan: Plan) -> tuple[str, str]:
     its own correction folded in (<mstem>.echo-N.aff12.1D, read by ECHAIN). The
     correction comes from stage00's phase echo-slope when the phase is processed,
     else from moco's own inter-echo cross-correlation of the magnitude. With locomoco,
-    every echo's corrected series (and phase) is written for its joint solve.
+    every echo's corrected series is written for its solve (and the phase, under
+    -locomoco_phase).
     """
     opt = plan.options
     if not (opt.acq_3d and _any_me(plan)):
@@ -1950,7 +1957,7 @@ def _moco_me3d(plan: Plan) -> tuple[str, str]:
         else ""
     )
     phase = ""
-    if opt.locomoco and _phase_on(plan):
+    if _lm_phase(plan):
         phase = (
             '      if [ -n "${PHASE[$k]:-}" ]; then\n'
             '        phs=""; for e in $(seq 1 "${NECHO[$k]}"); do '
@@ -2054,9 +2061,9 @@ def _locomoco_run_vars(plan: Plan) -> str:
     axis for 3-D EPI (a field change during the shot moves it too) in one solve.
     Multi-echo 3-D: every echo's corrected series, both axes -- the partition one
     TE-scaled (echo e moves TE_e/TE1 times as far), the in-plane one the same at every
-    echo -- and the unwrapped phase when processed, so the partition estimate is the
-    joint, field-blind magnitude+phase one; each echo gets its own warp (stage10's
-    ECHAIN). Nothing else corrects in-plane distortion frame by frame here. Multi-echo 2-D: echo 1 alone -- the in-plane warp moves every
+    echo -- and, only under -locomoco_phase (experimental), the unwrapped phase, making
+    the partition estimate the joint, field-blind magnitude+phase one; each echo gets
+    its own warp (stage10's ECHAIN). Nothing else corrects in-plane distortion frame by frame here. Multi-echo 2-D: echo 1 alone -- the in-plane warp moves every
     echo alike, and stage10 applies it to each.
     """
     pe = '-pe_dir \\"${pe:-y}\\"' + (" -pe_dir2 k" if plan.options.acq_3d else "")
@@ -2066,7 +2073,7 @@ def _locomoco_run_vars(plan: Plan) -> str:
     ]
     if plan.options.acq_3d and _any_me(plan):
         phase = ""
-        if _phase_on(plan):
+        if _lm_phase(plan):
             phase = (
                 '    if [ -n "${PHASE[$k]:-}" ]; then\n'
                 '      for e in $(seq 1 "${NECHO[$k]}"); do '

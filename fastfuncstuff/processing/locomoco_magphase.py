@@ -458,8 +458,10 @@ def magphase_me_result(
     per_echo = []
     for j, data in enumerate(datas):
         field = flow.alpha[j] * flow.w_field
-        corrected = (
-            _resample_once(
+
+        def corrected_fn(data=data, field=field, j=j):
+            # On demand (see LocomocoResult.corrected_fn): the CLI writes one echo at a time.
+            return _resample_once(
                 data,
                 [field],
                 [pe_axis],
@@ -468,10 +470,8 @@ def magphase_me_result(
                 device=device,
                 desc=f"resample e{j + 1}",
             )
-            if want_corrected
-            else None
-        )
-        canon = field.permute(perm4).contiguous()
+
+        canon = field.permute(perm4)
         zero = _zeros_like_view(canon)
         per_echo.append(
             LocomocoResult(
@@ -485,7 +485,7 @@ def magphase_me_result(
                 orig_shape=(nx, ny, nz, nt),
                 a0=a0,
                 a1=a1,
-                corrected_nifti=corrected,
+                corrected_fn=corrected_fn if want_corrected else None,
             )
         )
     return MultiEchoLocomocoResult(
@@ -517,12 +517,14 @@ def _magphase_dual_result(
     disp_slice = next(a for a in (0, 1, 2) if a not in (ip, part_axis))
     a0, a1 = sorted((ip, part_axis))
     perm4 = [3, disp_slice, a0, a1]
-    u_canon_ip = flow.u_field.permute(perm4).contiguous()
+    u_canon_ip = flow.u_field.permute(perm4)
     per_echo = []
     for j, data in enumerate(datas):
         part = flow.alpha[j] * flow.w_field
-        corrected = (
-            _resample_once(
+
+        def corrected_fn(data=data, part=part, j=j):
+            # On demand (see LocomocoResult.corrected_fn): the CLI writes one echo at a time.
+            return _resample_once(
                 data,
                 [part, flow.u_field],
                 [part_axis, ip],
@@ -531,10 +533,8 @@ def _magphase_dual_result(
                 device=device,
                 desc=f"resample e{j + 1}",
             )
-            if want_corrected
-            else None
-        )
-        part_canon = part.permute(perm4).contiguous()
+
+        part_canon = part.permute(perm4)
         on_a1 = {ip: u_canon_ip, part_axis: part_canon}
         per_echo.append(
             LocomocoResult(
@@ -550,7 +550,7 @@ def _magphase_dual_result(
                 a1=a1,
                 dual=True,
                 pe_axis2=part_axis,
-                corrected_nifti=corrected,
+                corrected_fn=corrected_fn if want_corrected else None,
             )
         )
     return MultiEchoLocomocoResult(

@@ -1693,23 +1693,34 @@ def test_defaults_are_one_refine_eight_iters_and_a_median_reference():
     < 0.01 vox and the median reference made no measurable difference."""
     from fastfuncstuff.cli.locomoco import _apply_preset, _parse
 
-    a = _parse(["-input", "x.nii.gz", "-pe_dir", "y"])
-    assert (a.iters, a.refine, a.ref) == (8, 1, None)  # None resolves to median (max if rotaware)
-    sup = _parse(["-input", "x.nii.gz", "-pe_dir", "y", "-superhard"])
-    _apply_preset(sup)
-    assert (sup.iters, sup.refine) == (16, 3)
-    mine = _parse(["-input", "x.nii.gz", "-pe_dir", "y", "-superhard", "-iters", "12"])
-    _apply_preset(mine)
-    assert (mine.iters, mine.refine) == (12, 3)  # an explicit flag still wins over the preset
+    def resolved(*extra):
+        a = _parse(["-input", "x.nii.gz", "-pe_dir", "y", *extra])
+        _apply_preset(a)
+        return a
+
+    a = resolved()
+    assert (a.iters, a.refine, a.levels, a.xcorr_step, a.stride) == (8, 1, [3], [0.5], 8)
+    assert a.ref is None  # resolves to median (max if rotation-aware)
+    sup = resolved("-superhard")
+    assert (sup.iters, sup.refine, sup.levels, sup.xcorr_step) == (16, 3, [5], [0.25])
+    # an explicit flag wins over the preset, EVEN when it equals the default
+    assert resolved("-superhard", "-refine", "1").refine == 1
+    assert resolved("-superhard", "-iters", "12").iters == 12
+    # list-valued knobs reach the preset too (comparing [3] with 3 once meant they never did)
+    work = resolved("-workhard")
+    assert (work.levels, work.xcorr_step, work.stride, work.iters, work.refine) == (
+        [4], [0.25], 4, 8, 1,
+    )  # fmt: skip
 
 
 def test_qwarp_backend_follows_refine_and_the_polish_is_one_pass():
     """Under -backend qwarp -refine drives the qwarp passes (default 1: it registers to a
     cleaned-up template, so two passes); the -final_qwarp polish is always one."""
-    from fastfuncstuff.cli.locomoco import _parse, _qwarp_template_args
+    from fastfuncstuff.cli.locomoco import _apply_preset, _parse, _qwarp_template_args
 
     def passes(*extra, backend=False):
         a = _parse(["-input", "x.nii.gz", "-pe_dir", "y", *extra])
+        _apply_preset(a)
         return _qwarp_template_args(a, backend)[1]
 
     assert passes(backend=True) == 1  # initial + one refine pass

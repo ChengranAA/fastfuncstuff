@@ -290,9 +290,9 @@ ACCURACY  (trade time for exactness — all backends)
   -jacobian              conserve PE signal — stretched regions dim, compressed brighten
                          (J = det(I+grad disp)). Off by default; for data with real B0
                          pile-up, not a purely geometric shift.
-  -workhard / -superhard presets: -workhard = denser search only; -superhard = 16
-                         iters + 3 refines (~1.5-2x time for ~1% tSNR). Explicit flags
-                         override the preset.
+  -workhard / -superhard presets: -workhard = 4 pyramid levels + finer search;
+                         -superhard = 16 iters, 3 refines, 5 levels, finest search (~1.5-2x
+                         time for ~1% tSNR, measured at 3 levels). Explicit flags win.
 
 EXAMPLES
 
@@ -1002,8 +1002,8 @@ def create_parser() -> argparse.ArgumentParser:
         "-levels",
         type=int,
         nargs="+",
-        default=[3],
-        help="[flow only] Coarse-to-fine pyramid levels. The flow is solved on a stack "
+        default=None,
+        help="[flow only] Coarse-to-fine pyramid levels (default 3). The flow is solved on a stack "
         "of images each halved in size; the coarsest catches large displacements "
         "(1 px there = 2^(levels-1) px full-res), finer levels refine. More = handles "
         "bigger motion, but risks aliasing on thin slices.\n"
@@ -1020,7 +1020,7 @@ def create_parser() -> argparse.ArgumentParser:
     tune.add_argument(
         "-iters",
         type=int,
-        default=8,
+        default=None,
         help="[flow, phase] Refinement iterations INSIDE one estimate (not the outer"
         " -refine reference loop).\n"
         "  flow   LK warp-and-update passes per pyramid level.\n"
@@ -1099,12 +1099,13 @@ def create_parser() -> argparse.ArgumentParser:
         "-xcorr_step",
         type=float,
         nargs="+",
-        default=[0.5],
+        default=None,
         metavar="VOX",
         help="[xcorr only] Trial-offset spacing (voxels) of the correlation search — "
         "xcorr's sub-voxel knob, like -iters is for the others. The peak is fit by a "
         "5-point parabola either way; a finer step (e.g. 0.25) samples the curve more "
-        "densely for a touch more accuracy at ~2× the trials. 0.5 is the sweet spot." + PERAXIS,
+        "densely for a touch more accuracy at ~2× the trials. 0.5 (the default) is the sweet "
+        "spot." + PERAXIS,
     )
     search.add_argument(
         "-reg_sigma",
@@ -1144,8 +1145,8 @@ def create_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "-stride",
         type=int,
-        default=8,
-        help="[phase only] Spacing (voxels) between patch centres; < patch gives "
+        default=None,
+        help="[phase only] Spacing (voxels) between patch centres (default 8); < patch gives "
         "NORDIC-style overlap. Smaller = denser, smoother field, more FFTs (slower); "
         "~patch/2 is a good overlap.",
     )
@@ -1288,7 +1289,7 @@ def create_parser() -> argparse.ArgumentParser:
     acc.add_argument(
         "-refine",
         type=int,
-        default=1,
+        default=None,
         metavar="ROUNDS",
         help="[plain path + -backend qwarp] Outer reference-refinement rounds (the cap when "
         "-converge is set). The first reference is built from frames that still carry the "
@@ -1333,16 +1334,17 @@ def create_parser() -> argparse.ArgumentParser:
     acc.add_argument(
         "-workhard",
         action="store_true",
-        help="Preset: denser search than the default (xcorr/phase backends: finer stride "
-        "and step). Its iterations (8) and refine (1) now equal the defaults. Explicit "
-        "flags still override.",
+        help="Preset: one more pyramid level (4) for flow, a finer xcorr step and phase "
+        "stride; iterations and refine stay at the defaults. Explicit flags still "
+        "override, even when they equal a default.",
     )
     acc.add_argument(
         "-superhard",
         action="store_true",
-        help="Preset: 16 iterations, 3 refine rounds, finest search. About 1.5-2x the "
-        "default's time for ~1%% tSNR on the runs measured (2 mm and 1.25 mm, 3-5 echoes): "
-        "rarely worth it. Explicit flags still override.",
+        help="Preset: 16 iterations, 3 refine rounds, 5 pyramid levels, finest search. "
+        "Measured with 3 levels (before presets applied their levels): ~1.5-2x the "
+        "default's time for ~1%% tSNR (2 mm and 1.25 mm, 3-5 echoes), rarely worth it. "
+        "Explicit flags still override, even when they equal a default.",
     )
 
     rot = p.add_argument_group("Rotation-aware residual motion (needs -raw_input + -moco_matrix)")
@@ -1903,27 +1905,28 @@ def create_parser() -> argparse.ArgumentParser:
 # Presets bump the levers that helped on spatially-varying (local stretch/squish)
 # field tests: bicubic warp (better for flow, neutral elsewhere), more convergence
 # iterations, reference-refinement rounds, and denser search.
+# Effort knobs default to None so "not given" is told apart from "given the default
+# value": a preset fills only what the user left unset (a typed `-refine 1` beside
+# -superhard stays 1), and list-valued knobs (-levels, -xcorr_step) compare like any
+# other -- comparing [3] against 3 used to mean a preset never set them.
 _PRESET_DEFAULTS = {
     "iters": 8,
-    "levels": 3,
+    "levels": [3],
     "stride": 8,
-    "xcorr_step": 0.5,
-    "warp_interp": "auto",
+    "xcorr_step": [0.5],
     "refine": 1,
 }
 _PRESETS = {
     "workhard": {
-        "iters": 8,
-        "levels": 4,
+        "levels": [4],
         "stride": 4,
-        "xcorr_step": 0.25,
-        "refine": 1,
+        "xcorr_step": [0.25],
     },
     "superhard": {
         "iters": 16,
-        "levels": 5,
+        "levels": [5],
         "stride": 2,
-        "xcorr_step": 0.25,
+        "xcorr_step": [0.25],
         "refine": 3,
     },
 }
@@ -1945,17 +1948,14 @@ def _warp_kernel_label(interp: str, radius: int, *, rotaware: bool = False) -> s
 
 
 def _apply_preset(args) -> str | None:
-    """Fill accuracy knobs from -workhard/-superhard, but let explicit flags win.
-
-    A knob still sitting at its documented default is taken from the preset; a knob
-    the user set to a non-default value is left alone. Returns the preset name (or None).
-    """
+    """Resolve the effort knobs: what the user typed wins, then -workhard/-superhard,
+    then the default. Every knob is concrete afterwards (idempotent; run once per run).
+    Returns the preset name (or None)."""
     name = "superhard" if args.superhard else "workhard" if args.workhard else None
-    if name is None:
-        return None
-    for knob, val in _PRESETS[name].items():
-        if getattr(args, knob) == _PRESET_DEFAULTS[knob]:  # user left it default → preset sets it
-            setattr(args, knob, val)
+    preset = _PRESETS[name] if name else {}
+    for knob, default in _PRESET_DEFAULTS.items():
+        if getattr(args, knob, None) is None:
+            setattr(args, knob, preset.get(knob, default))
     return name
 
 

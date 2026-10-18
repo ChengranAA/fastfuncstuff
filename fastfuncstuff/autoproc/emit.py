@@ -2555,10 +2555,12 @@ def _stage_grandmean(plan: Plan, script_stem: str) -> str:
 
 
 # Tokens that do NOT belong to the grandmean chain: the within-run motion the
-# lane images already have baked in, and everything ABOVE grandmean space (which
-# is by definition estimated from the grandmean, so it cannot act before it).
+# lane images already have baked in, MEDIC (under -medic moco registers the
+# undistorted echoes, so its lane images are already undistorted -- the warp again
+# would correct them twice), and everything ABOVE grandmean space (which is by
+# definition estimated from the grandmean, so it cannot act before it).
 _GRANDMEAN_DROP = frozenset(
-    {"moco", "locomoco", "mni_lin", "mni_nl", "anat_lin", "anat_nl", "xref_lin", "xref_nl"}
+    {"moco", "locomoco", "medic", "mni_lin", "mni_nl", "anat_lin", "anat_nl", "xref_lin", "xref_nl"}
 )
 
 

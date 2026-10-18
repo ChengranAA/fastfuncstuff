@@ -449,9 +449,12 @@ def run_average_chain(pr: PlanRun) -> list[str]:
     pose the intended question: ffs_nwarp resolves a time-varying transform at
     frame 0, and there is nothing special about the first volume's pose.
 
-    ``medic`` stays, although it is time-varying too: these images are in the raw,
+    ``medic`` stays, although it is time-varying too: the images this chain serves
+    under -medic (NORDIC's dof map; the SBRef is not used then) are in the raw,
     distorted space, and most of a frame's distortion is the static field, so its
-    frame-0 warp undistorts them far better than leaving them distorted would.
+    frame-0 warp undistorts them far better than leaving them distorted would. The
+    moco/locomoco lane images are the opposite -- already undistorted, because moco
+    registered MEDIC's output -- which is why the grandmean chain drops it.
     """
     return [tok for tok in pr.warp_chain if tok not in ("moco", "locomoco")]
 

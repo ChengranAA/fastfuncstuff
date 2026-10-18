@@ -3392,6 +3392,12 @@ def test_medic_reuses_the_unwrap_field_and_sits_rightmost_in_every_chain(tmp_pat
     )  # fmt: skip
     plan = build_plan(subj, opt)
     assert plan.runs[0].warp_chain[-2:] == ["moco", "medic"]
+    # moco registered the undistorted echoes, so the lane images are already undistorted:
+    # the grandmean chain must not apply MEDIC's warp to them again (it once did)
+    from fastfuncstuff.autoproc.emit import _grandmean_tokens, _needs_gmrun
+
+    assert "medic" not in _grandmean_tokens(plan.runs[0])
+    assert not _needs_gmrun(plan.runs[0])  # one run: its runmean already is the image
     assert not plan.use_sbref
     s = write_script(plan, "wd", bids_root="/bids")
     assert (

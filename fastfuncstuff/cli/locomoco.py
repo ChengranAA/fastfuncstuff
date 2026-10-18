@@ -687,8 +687,10 @@ def create_parser() -> argparse.ArgumentParser:
         "  s0r2  that plus a change proportional to TE (BOLD / R2*), so the task cannot"
         " masquerade as displacement. Costs magnitude most of its information (the"
         " displacement's leading footprint is also proportional to TE); the phase then"
-        " carries the estimate. Needs 3+ echoes.\n"
-        "  auto  s0r2 with 3+ echoes, none with 2.",
+        " carries the estimate. Needs 3+ echoes. On a 5-echo 3-D rest run it left the"
+        " echo-1 slab-end wiggle that 'none' removes, and its task blindness is better had"
+        " from -detask.\n"
+        "  auto  none.",
     )
     mp.add_argument(
         "-phase_field_nuisance",
@@ -4152,8 +4154,7 @@ def _estimator_wants_corrected(args) -> bool:
 def _magphase_mag_nuisance(args) -> str:
     if args.phase_mag_nuisance != "auto":
         return args.phase_mag_nuisance
-    n = len(args.input) if isinstance(args.input, list) else 1
-    return "s0r2" if n >= 3 else "none"
+    return "none"
 
 
 def _magphase_hpf_vox(args, affine, n_echoes: int) -> float:

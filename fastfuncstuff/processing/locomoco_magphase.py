@@ -147,7 +147,7 @@ def estimate_partition_flow_magphase(
     window_sigma: float = 2.0,
     n_iters: int = 4,
     refine_rounds: int = 0,
-    mag_nuisance: str = "s0r2",
+    mag_nuisance: str = "none",
     phase_nuisance: str = "auto",
     phase_hpf_sigma: float = 0.0,
     warp_interp: str = "lanczos",
@@ -160,8 +160,9 @@ def estimate_partition_flow_magphase(
 
     ``mags`` / ``phases_hz``: one ``(nx, ny, nz, T)`` array per echo, same grid, same
     motion/distortion resample. ``mag_nuisance`` picks what the magnitude may change by
-    in place at each voxel and frame: 'none' (plain), 's0' (echo-constant), 's0r2' (plus
-    proportional to TE; BOLD-blind, needs 3+ echoes). With 2+ echoes the phase gets the
+    in place at each voxel and frame: 'none' (plain, the default), 's0' (echo-constant),
+    's0r2' (plus proportional to TE; BOLD-blind, needs 3+ echoes, but hands the estimate
+    to the phase). With 2+ echoes the phase gets the
     echo-constant field term (``phase_nuisance='auto'`` = 'flat'). 'flat_offset' adds a
     receiver-offset term (TE1/TE in Hz), opt-in: across 8 OHBM pilot runs it cut the
     residual whole-volume shift in 6, but made the local flow 27-50% noisier in 4 and

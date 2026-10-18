@@ -126,16 +126,18 @@ def _recovery_r(flow, w_true, head):
 def test_blind_to_echo_constant_field_change(monkeypatch):
     # A field fluctuation (Hz, identical at every echo) ~6x the displacement's phase
     # footprint. The phase's per-voxel flat nuisance must shrug it off; without that
-    # term the same solve reads the field change as shift.
+    # term the same solve reads the field change as shift. s0r2 makes the phase carry
+    # the estimate, so the test sees the phase's term rather than the magnitude.
     mags, phs, w_true, head = _scene(field_noise=6.0)
-    blind = _recovery_r(_run(mags, phs, refine_rounds=1, phase_nuisance="flat"), w_true, head)
+    kw = {"refine_rounds": 1, "phase_nuisance": "flat", "mag_nuisance": "s0r2"}
+    blind = _recovery_r(_run(mags, phs, **kw), w_true, head)
     import fastfuncstuff.processing.locomoco_magphase as lm
 
     orig = lm.nuisance_columns
     monkeypatch.setattr(
         lm, "nuisance_columns", lambda k, te: orig("none" if k == "flat" else k, te)
     )
-    naive = _recovery_r(_run(mags, phs, refine_rounds=1, phase_nuisance="flat"), w_true, head)
+    naive = _recovery_r(_run(mags, phs, **kw), w_true, head)
     assert blind > 0.93, blind
     assert naive < blind - 0.2, (naive, blind)
 
@@ -218,7 +220,7 @@ def test_cli_phase_validation():
 
     ok = _cli_args("-phase", "p1", "p2", "p3")
     assert _magphase_arg_error(ok, dual=False, slicewise=False) is None
-    assert _magphase_mag_nuisance(ok) == "s0r2"
+    assert _magphase_mag_nuisance(ok) == "none"
     short = _cli_args("-phase", "p1", "p2")
     assert "2 phase series for 3" in _magphase_arg_error(short, dual=False, slicewise=False)
     flat = _cli_args("-phase", "p1", "p2", "p3", "-me_flat_scaling")
@@ -356,11 +358,11 @@ def test_two_axis_recovers_inplane_and_partition_separately():
         tru = (tru - tru.mean(-1, keepdims=True))[m]
         return np.corrcoef(est.ravel(), tru.ravel())[0, 1]
 
-    dual = _run(mags, phs, refine_rounds=1, inplane_axis=1)
+    dual = _run(mags, phs, refine_rounds=1, inplane_axis=1, mag_nuisance="s0r2")
     assert dual.u_field is not None
     assert r(dual.w_field.numpy(), w_true) > 0.9
     assert r(dual.u_field.numpy(), u_true) > 0.9
-    single = _run(mags, phs, refine_rounds=1)
+    single = _run(mags, phs, refine_rounds=1, mag_nuisance="s0r2")
     assert abs(r(single.w_field.numpy(), w_true) - r(dual.w_field.numpy(), w_true)) < 0.02
 
 

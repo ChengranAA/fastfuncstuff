@@ -36,7 +36,7 @@ import contextlib
 import functools
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -1318,6 +1318,17 @@ def _montage(slices_rgb: np.ndarray, pad: int = 1) -> np.ndarray:
 
 
 # ── result container + orchestration ──────────────────────────────────────────
+def _zeros_like_view(x: torch.Tensor) -> torch.Tensor:
+    """Zeros shaped like ``x`` with no storage of their own (a zero-stride view).
+
+    For the fields a result carries but never reads -- the un-encoded axis of a
+    single-axis run, the ``corrected_canon`` placeholder when ``corrected_nifti`` /
+    ``corrected_fn`` supplies the series. Each was a full ``(nx, ny, nz, T)`` float
+    tensor per echo: on a 1.25 mm, 225-frame run, 2.6 GB apiece.
+    """
+    return torch.zeros((), dtype=x.dtype, device=x.device).expand_as(x)
+
+
 @dataclass
 class LocomocoResult:
     """Per-frame residual-motion estimate and the outputs derived from it.
@@ -1350,6 +1361,11 @@ class LocomocoResult:
     # ── rotation-aware (idea 2) extras — None for the plain idea-1 path ──
     reproject_weights: torch.Tensor | None = None  # (T, 3) per-frame axis weights
     corrected_nifti: torch.Tensor | None = None  # precomputed (nx,ny,nz,T) 3-D-warp series
+    # Builds the corrected (nx,ny,nz,T) series on demand instead of holding it: the
+    # multi-echo paths would otherwise keep every echo's series alive at once, though the
+    # CLI writes them one echo at a time. Each call resamples again; callers that need it
+    # twice keep the tensor.
+    corrected_fn: Callable[[], torch.Tensor] | None = None
     drift_rms: float | None = None  # chain-vs-anchor drift (in-brain), voxels
     drift_max: float | None = None
     fused: bool = False  # whether the anchor smoother was engaged
@@ -1458,6 +1474,8 @@ class LocomocoResult:
         """
         if self.corrected_nifti is not None:
             return self.corrected_nifti
+        if self.corrected_fn is not None:
+            return self.corrected_fn()
         return self._to_nifti(self.corrected_canon)
 
     def flow_movie(
@@ -2979,8 +2997,8 @@ def estimate_residual_flow_rotaware(
     # Pack into a LocomocoResult: store p as the PE flow so the flow map / movie work;
     # warp_components() reprojects it via the weights; corrected is precomputed 3-D.
     p_canon = p.permute(perm4).contiguous()  # (T,nS,H,W)
-    u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
-    v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+    u_canon = p_canon if pe_flow_is_u else _zeros_like_view(p_canon)
+    v_canon = _zeros_like_view(p_canon) if pe_flow_is_u else p_canon
 
     if verbose:
         tilt = pe_tilt_degrees(matrices_dicom, affine, pe_axis)
@@ -3000,7 +3018,7 @@ def estimate_residual_flow_rotaware(
     return LocomocoResult(
         u_canon=u_canon,
         v_canon=v_canon,
-        corrected_canon=torch.zeros_like(p_canon),  # unused; corrected_nifti takes over
+        corrected_canon=_zeros_like_view(p_canon),  # unused; corrected_nifti takes over
         perm=perm4,
         pe_flow_is_u=pe_flow_is_u,
         pe_axis=pe_axis,
@@ -4836,7 +4854,7 @@ def _run_3dacq_plain(
     # component and leaves the other zero; dual fills both with real displacements.
     canon = [d.permute(perm4).contiguous() for d in disp]
     by_axis = dict(zip(axes, canon, strict=True))
-    zero = torch.zeros_like(canon[0])
+    zero = _zeros_like_view(canon[0])
     u_canon = by_axis.get(a1, zero)
     v_canon = by_axis.get(a0, zero)
     if verbose:
@@ -4888,7 +4906,7 @@ def _run_3dacq_plain(
     return LocomocoResult(
         u_canon=u_canon,
         v_canon=v_canon,
-        corrected_canon=torch.zeros_like(canon[0]),
+        corrected_canon=_zeros_like_view(canon[0]),
         perm=perm4,
         pe_flow_is_u=pe_flow_is_u,
         pe_axis=pe_axis,
@@ -6200,17 +6218,20 @@ def estimate_residual_flow_multiecho(
         # Materializing the corrected 4-D series (a per-frame warp of every echo) is
         # pure waste when the caller won't write it (-no_corrected); the warp field and
         # diagnostics don't need it. Refine builds its own corrected internally above.
-        corrected = _corrected_echo(w, j) if want_corrected else None
+        # Built on demand (corrected_fn), so the CLI's one-echo-at-a-time write frees each
+        # echo's series before the next is made. An axis whose alpha is 1 (the in-plane
+        # one, pinned flat) is the shared field itself: a view, not a copy per echo.
         canon = [
-            (alphas[k, j] * w[k]).contiguous().permute(perm4).contiguous() for k in range(n_ax)
+            (w[k] if float(alphas[k, j]) == 1.0 else alphas[k, j] * w[k]).permute(perm4)
+            for k in range(n_ax)
         ]
         by_axis = dict(zip(axes, canon, strict=True))
-        zero = torch.zeros_like(canon[0])
+        zero = _zeros_like_view(canon[0])
         per_echo.append(
             LocomocoResult(
                 u_canon=by_axis.get(a1, zero),
                 v_canon=by_axis.get(a0, zero),
-                corrected_canon=torch.zeros_like(canon[0]),
+                corrected_canon=_zeros_like_view(canon[0]),
                 perm=perm4,
                 pe_flow_is_u=pe_flow_is_u,
                 pe_axis=pe_axis,
@@ -6221,7 +6242,7 @@ def estimate_residual_flow_multiecho(
                 dual=dual,
                 pe_axis2=pe_axis2,
                 sep_map=sep_canon,
-                corrected_nifti=corrected,
+                corrected_fn=(lambda j=j: _corrected_echo(w, j)) if want_corrected else None,
             )
         )
 
@@ -6423,13 +6444,13 @@ def estimate_residual_flow_me_scaled(
                 radius=warp_radius,
             )[0].cpu()
         p_canon = disp_e.permute(perm4).contiguous()
-        u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
-        v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+        u_canon = p_canon if pe_flow_is_u else _zeros_like_view(p_canon)
+        v_canon = _zeros_like_view(p_canon) if pe_flow_is_u else p_canon
         per_echo.append(
             LocomocoResult(
                 u_canon=u_canon,
                 v_canon=v_canon,
-                corrected_canon=torch.zeros_like(p_canon),
+                corrected_canon=_zeros_like_view(p_canon),
                 perm=perm4,
                 pe_flow_is_u=pe_flow_is_u,
                 pe_axis=pe_axis,
@@ -6887,12 +6908,12 @@ def polish_me_result(
             for ax, wk in zip(axes, w_axes_new, strict=True)
         ]
         by_axis = dict(zip(axes, canon, strict=True))
-        zero = torch.zeros_like(canon[0])
+        zero = _zeros_like_view(canon[0])
         per_echo.append(
             LocomocoResult(
                 u_canon=by_axis.get(a1, zero),
                 v_canon=by_axis.get(a0, zero),
-                corrected_canon=torch.zeros_like(canon[0]),
+                corrected_canon=_zeros_like_view(canon[0]),
                 perm=perm4,
                 pe_flow_is_u=pe_flow_is_u,
                 pe_axis=axes[0] if dual else pe_axis,
@@ -7178,13 +7199,13 @@ def estimate_residual_flow_me_interecho(
                 radius=warp_radius,
             )[0].cpu()
         p_canon = disp_e.permute(perm4).contiguous()
-        u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
-        v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+        u_canon = p_canon if pe_flow_is_u else _zeros_like_view(p_canon)
+        v_canon = _zeros_like_view(p_canon) if pe_flow_is_u else p_canon
         per_echo.append(
             LocomocoResult(
                 u_canon=u_canon,
                 v_canon=v_canon,
-                corrected_canon=torch.zeros_like(p_canon),
+                corrected_canon=_zeros_like_view(p_canon),
                 perm=perm4,
                 pe_flow_is_u=pe_flow_is_u,
                 pe_axis=pe_axis,
@@ -7524,13 +7545,13 @@ def refine_interecho_temporally(
     for j in range(e):
         corrected = cur[j] if want_corrected else None
         p_canon = totals[j].permute(proto.perm).contiguous()
-        u_canon = p_canon if proto.pe_flow_is_u else torch.zeros_like(p_canon)
-        v_canon = torch.zeros_like(p_canon) if proto.pe_flow_is_u else p_canon
+        u_canon = p_canon if proto.pe_flow_is_u else _zeros_like_view(p_canon)
+        v_canon = _zeros_like_view(p_canon) if proto.pe_flow_is_u else p_canon
         per_echo.append(
             LocomocoResult(
                 u_canon=u_canon,
                 v_canon=v_canon,
-                corrected_canon=torch.zeros_like(p_canon),
+                corrected_canon=_zeros_like_view(p_canon),
                 perm=proto.perm,
                 pe_flow_is_u=proto.pe_flow_is_u,
                 pe_axis=pe_axis,

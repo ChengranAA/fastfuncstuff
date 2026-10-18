@@ -198,16 +198,19 @@ def test_want_corrected_false_skips_corrected_but_keeps_warp():
     # The estimate itself is identical — only the corrected output differs.
     assert np.allclose(on.w_field.numpy(), off.w_field.numpy(), atol=1e-6)
     assert np.allclose(on.alpha.numpy(), off.alpha.numpy(), atol=1e-6)
+    # On: available on demand, not held (the CLI writes one echo at a time and frees it).
     for res in on.per_echo:
-        assert res.corrected_nifti is not None
+        assert res.corrected_nifti is None and res.corrected_fn is not None
+        a, b = res.corrected_series(), res.corrected_series()
+        assert a.shape == datas[0].shape and torch.equal(a, b)
     for res in off.per_echo:
-        assert res.corrected_nifti is None
+        assert res.corrected_nifti is None and res.corrected_fn is None
 
     # Refine still converges with the flag off (it builds its own corrected internally).
     ref = estimate_residual_flow_multiecho(
         datas, tes, want_corrected=False, refine_rounds=2, **common
     )
-    assert ref.per_echo[0].corrected_nifti is None
+    assert ref.per_echo[0].corrected_nifti is None and ref.per_echo[0].corrected_fn is None
     assert float(np.abs(ref.w_field.numpy()).max()) > 0
 
 

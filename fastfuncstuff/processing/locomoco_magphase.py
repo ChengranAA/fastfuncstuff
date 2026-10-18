@@ -438,7 +438,12 @@ def magphase_me_result(
     Same geometry derivation and per-echo layout as the magnitude-only estimator, so the
     warps, flows and corrected series are written by the unchanged output code.
     """
-    from .locomoco import LocomocoResult, MultiEchoLocomocoResult, _resample_once
+    from .locomoco import (
+        LocomocoResult,
+        MultiEchoLocomocoResult,
+        _resample_once,
+        _zeros_like_view,
+    )
 
     if device is None:
         device = torch.device("cpu")
@@ -467,7 +472,7 @@ def magphase_me_result(
             else None
         )
         canon = field.permute(perm4).contiguous()
-        zero = torch.zeros_like(canon)
+        zero = _zeros_like_view(canon)
         per_echo.append(
             LocomocoResult(
                 u_canon=canon if pe_axis == a1 else zero,
@@ -499,7 +504,12 @@ def _magphase_dual_result(
     """The two-axis result: in-plane ``u`` (primary, the same at every echo) and the
     TE-scaled partition ``alpha_e w`` (``pe_axis2``), in the dual layout the output code
     writes (u on ``a1``, v on ``a0``, the undisplaced axis as the slice)."""
-    from .locomoco import LocomocoResult, MultiEchoLocomocoResult, _resample_once
+    from .locomoco import (
+        LocomocoResult,
+        MultiEchoLocomocoResult,
+        _resample_once,
+        _zeros_like_view,
+    )
 
     assert flow.u_field is not None and flow.inplane_axis is not None
     nx, ny, nz, nt = (int(s) for s in datas[0].shape)
@@ -530,7 +540,7 @@ def _magphase_dual_result(
             LocomocoResult(
                 u_canon=on_a1[a1],
                 v_canon=on_a1[a0],
-                corrected_canon=torch.zeros_like(part_canon),
+                corrected_canon=_zeros_like_view(part_canon),
                 perm=perm4,
                 pe_flow_is_u=ip == a1,
                 pe_axis=ip,

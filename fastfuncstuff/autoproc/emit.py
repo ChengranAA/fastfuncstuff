@@ -2085,7 +2085,10 @@ def _locomoco_run_vars(plan: Plan) -> str:
             '  if [ "${NECHO[$k]:-1}" -gt 1 ]; then\n'
             '    lm_in=""; for e in $(seq 1 "${NECHO[$k]}"); do '
             'lm_in="$lm_in \\"stage02.moco.${FRAG[$k]}.echo-${e}.nii$FMT\\""; done\n'
-            '    lm_me="-me_3depi -echo_times ${TES[$k]}"\n'
+            # The TE law fixed, not learned: learned on A01D (magnitude only) it came out
+            # non-physical (1, 1.24, 0.78, 0.42, 0.36 against TE ratios to 7.9; linear-in-TE
+            # r2 -2.7), and the learning pass holds a field per axis per echo.
+            '    lm_me="-me_3depi -echo_times ${TES[$k]} -me_fixed_scaling"\n'
             + phase
             # MEDIC already corrected each frame in-plane: only the TE-scaled partition
             # shift is left for the joint solve.

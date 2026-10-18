@@ -3342,7 +3342,10 @@ def test_multiecho_estimates_from_echo1_warps_each_echo_and_combines(tmp_path, a
         assert "-reg_echo 1 -me_3depi -axis k" in s and "-1Dmatrix_shiftcorr" in s
         assert "-shift_table" in s and "-stretch_table" in s
         # phase into locomoco is an opt-in experiment: not passed by default
-        assert 'lm_me="-me_3depi -echo_times ${TES[$k]}"' in s and "-phase$lm_ph" not in s
+        assert (
+            'lm_me="-me_3depi -echo_times ${TES[$k]} -me_fixed_scaling"' in s
+            and "-phase$lm_ph" not in s
+        )
         assert "stage02.moco.ses-01.task-foo.run-1.echo-3.aff12.1D" in s  # echo 3's matrices
         assert "stage03.nlmoco.ses-01.task-foo.run-1.echo-3_warp" in s  # echo 3's warp
         assert 'ln -sf "${mstem}.echo-1_${which}.nii$FMT"' in s

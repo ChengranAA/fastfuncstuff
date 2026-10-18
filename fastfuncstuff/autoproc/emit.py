@@ -1960,7 +1960,9 @@ def _moco_me3d(plan: Plan) -> tuple[str, str]:
     if _lm_phase(plan):
         phase = (
             '      if [ -n "${PHASE[$k]:-}" ]; then\n'
-            '        phs=""; for e in $(seq 1 "${NECHO[$k]}"); do '
+            # esfx set per echo here too: the name can carry it (slice timing up front),
+            # and this loop is not the magnitude loop that set it before.
+            '        phs=""; for e in $(seq 1 "${NECHO[$k]}"); do esfx=".echo-$e"; '
             'phs="$phs \\"' + _moco_phase_file(plan) + '\\""; done\n'
             '        me_args="$me_args -phase$phs -phase_units rad"\n'
             "      fi\n"
@@ -3715,9 +3717,12 @@ def _me_surface_combine(plan: Plan) -> str:
     for space in dict.fromkeys(space_name(m) for m in plan.options.surface_target):
         for hemi in ("lh", "rh"):
             tail = f"{space}.{hemi}"
+            sopt = f"stage10s.surf.${{FRAG[$k]}}.{tail}.func.gii"
             out += [
-                f'  sins=(); for e in $(seq 1 "${{NECHO[$k]}}"); do sins+=("stage10s.surf.${{FRAG[$k]}}.echo-$e.{tail}.func.gii"); done',
-                f'  ffs_t2smap -input "${{sins[@]}}" -tes ${{TES[$k]}} -no_qc -prefix "stage10s.t2s.${{FRAG[$k]}}.{tail}_" -optcom "stage10s.surf.${{FRAG[$k]}}.{tail}.func.gii" -device "$DEVICE" -verb 0',
+                f'  if ! {{ [ "$skip_final" -eq 1 ] && [ -f "{sopt}" ]; }}; then',
+                f'    sins=(); for e in $(seq 1 "${{NECHO[$k]}}"); do sins+=("stage10s.surf.${{FRAG[$k]}}.echo-$e.{tail}.func.gii"); done',
+                f'    ffs_t2smap -input "${{sins[@]}}" -tes ${{TES[$k]}} -no_qc -prefix "stage10s.t2s.${{FRAG[$k]}}.{tail}_" -optcom "{sopt}" -device "$DEVICE" -verb 0',
+                "  fi",
                 "  for w in mask mean; do "
                 f'ln -sf "stage10s.surf.${{FRAG[$k]}}.echo-1.{tail}.$w.shape.gii" '
                 f'"stage10s.surf.${{FRAG[$k]}}.{tail}.$w.shape.gii"; done',
@@ -3735,38 +3740,42 @@ def _phasereg_field_on(plan: Plan) -> bool:
 def _final_me_combine(plan: Plan) -> str:
     """Optimal combination of each multi-echo run's per-echo finals into the run's own
     stage10.final name, which every later stage reads (ffs_t2smap: monoexponential
-    T2*/S0 fit, T2*-weighted combination; maps kept as stage10.t2s.<frag>_*)."""
+    T2*/S0 fit, T2*-weighted combination; maps kept as stage10.t2s.<frag>_*).
+
+    The volume and surface combines resume independently: a work dir that gains
+    -surface_target (or stopped between the two) must still combine its surfaces, so
+    the volume's skip is a guard on its own command, not a ``continue``. Under
+    -phasereg_me field the frequency-shift series rides along, for runs with phase."""
     if not _any_me(plan):
         return ""
     field = _phasereg_field_on(plan)
-    head = """# Multi-echo: combine each run's warped echoes (optimal combination, T2*-weighted)
-# into stage10.final.<frag> -- the series every later stage reads. The per-echo
-# finals and the T2*/S0 maps (stage10.t2s.<frag>_*) stay beside it.
-for k in "${RUN_KEYS[@]}"; do
-  [ "${NECHO[$k]:-1}" -gt 1 ] || continue
-  outf="stage10.final.${FRAG[$k]}.nii$FINAL_FMT"
-%(field_def)s  [ "$skip_final" -eq 1 ] && [ -f "$outf" ]%(field_done)s && continue
-  ins=(); for e in $(seq 1 "${NECHO[$k]}"); do ins+=("stage10.final.${FRAG[$k]}.echo-$e.nii$FINAL_FMT"); done
-%(field_args)s  ffs_t2smap -input "${ins[@]}" -tes ${TES[$k]} -automask -no_qc -prefix "stage10.t2s.${FRAG[$k]}_" -optcom "$outf"%(field_flags)s -device "$DEVICE" -verb 0
-"""
-    head = (
-        head.replace("%(field_done)s", ' && [ -f "$fieldf" ]' if field else "")
-        .replace(
-            "%(field_def)s",
-            '  fieldf="stage10.field.${FRAG[$k]}.nii$FINAL_FMT"\n' if field else "",
-        )
-        .replace(
-            "%(field_args)s",
-            (
-                '  phs=(); for e in $(seq 1 "${NECHO[$k]}"); do '
-                'phs+=("stage10.final.${FRAG[$k]}.echo-$e.part-phase.nii$FINAL_FMT"); done\n'
-            )
-            if field
-            else "",
-        )
-        .replace("%(field_flags)s", ' -phase "${phs[@]}" -field_hz "$fieldf"' if field else "")
-    )
-    return head + _me_surface_combine(plan) + "done\n"
+    lines = [
+        "# Multi-echo: combine each run's warped echoes (optimal combination, T2*-weighted)",
+        "# into stage10.final.<frag> -- the series every later stage reads. The per-echo",
+        "# finals and the T2*/S0 maps (stage10.t2s.<frag>_*) stay beside it.",
+        'for k in "${RUN_KEYS[@]}"; do',
+        '  [ "${NECHO[$k]:-1}" -gt 1 ] || continue',
+        '  outf="stage10.final.${FRAG[$k]}.nii$FINAL_FMT"; fa=(); fdone=1',
+    ]
+    if field:
+        lines += [
+            '  if [ -n "${PHASE[$k]:-}" ]; then',
+            '    fieldf="stage10.field.${FRAG[$k]}.nii$FINAL_FMT"; [ -f "$fieldf" ] || fdone=0',
+            '    phs=(); for e in $(seq 1 "${NECHO[$k]}"); do '
+            'phs+=("stage10.final.${FRAG[$k]}.echo-$e.part-phase.nii$FINAL_FMT"); done',
+            '    fa=(-phase "${phs[@]}" -field_hz "$fieldf")',
+            "  fi",
+        ]
+    lines += [
+        '  if ! { [ "$skip_final" -eq 1 ] && [ -f "$outf" ] && [ "$fdone" -eq 1 ]; }; then',
+        '    ins=(); for e in $(seq 1 "${NECHO[$k]}"); do '
+        'ins+=("stage10.final.${FRAG[$k]}.echo-$e.nii$FINAL_FMT"); done',
+        '    ffs_t2smap -input "${ins[@]}" -tes ${TES[$k]} -automask -no_qc '
+        '-prefix "stage10.t2s.${FRAG[$k]}_" -optcom "$outf" ${fa[@]+"${fa[@]}"} '
+        '-device "$DEVICE" -verb 0',
+        "  fi",
+    ]
+    return "\n".join(lines) + "\n" + _me_surface_combine(plan) + "done\n"
 
 
 _MNI_TOKENS = ("mni_nl", "mni_lin")

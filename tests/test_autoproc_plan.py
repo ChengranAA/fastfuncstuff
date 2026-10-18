@@ -3614,3 +3614,37 @@ def test_phasereg_me_field_regresses_the_combination_on_one_fitted_field(tmp_pat
     assert "-phasereg" in _phasereg_me_errors(Options(phasereg_me="field"))[0]
     assert "-phase_proc" in _phasereg_me_errors(Options(phasereg_me="field", phasereg=True))[0]
     assert _phasereg_me_errors(Options()) == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_me_combine_resumes_surfaces_on_their_own_and_fits_the_field_only_with_phase(tmp_path):
+    """Run the emitted stage10 combine with a stub ffs_t2smap. A run whose volume is done
+    but whose surfaces are not still combines its surfaces (the volume skip used to be a
+    `continue`), and -phasereg_me field passes -phase only for a run that has phase (a
+    run without it was handed phase files that do not exist)."""
+    from fastfuncstuff.autoproc.emit import _final_me_combine
+
+    runs = [_me_run("01", "foo", "1"), _me_run("01", "foo", "2")]
+    opt = Options(phase_proc=True, phasereg=True, phasereg_me="field", acq_3d=False,
+                  go_to_anat=False, distortion=False, surface_target=["fsnative"])  # fmt: skip
+    block = _final_me_combine(build_plan(Subject("X", [Session("01", runs)]), opt))
+    (tmp_path / "stage10.final.A.nii").write_text("")  # run A: volume combined already
+    (tmp_path / "stage10.field.A.nii").write_text("")
+    script = (
+        "set -euo pipefail\n"
+        'ffs_t2smap() { echo "T2SMAP $*" >> calls.log; }\n'
+        "declare -A NECHO FRAG TES PHASE\n"
+        "RUN_KEYS=(a b); NECHO[a]=3; NECHO[b]=3; FRAG[a]=A; FRAG[b]=B\n"
+        "TES[a]='7.6 21.7 35.8'; TES[b]='7.6 21.7 35.8'; PHASE[a]=/p.nii\n"
+        "skip_final=1; FINAL_FMT=''; DEVICE=cpu\n" + block
+    )
+    (tmp_path / "s.sh").write_text(script)
+    r = subprocess.run(["bash", "s.sh"], cwd=tmp_path, capture_output=True, text=True)  # noqa: S603, S607
+    assert r.returncode == 0, r.stderr
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    vol = [c for c in calls if "-optcom stage10.final." in c]
+    surf = [c for c in calls if "stage10s.surf." in c and "-optcom" in c]
+    assert len(vol) == 1 and "stage10.final.B.nii" in vol[0]  # A skipped, B combined
+    assert "-phase" not in vol[0] and "-field_hz" not in vol[0]  # B has no phase
+    assert any("stage10s.surf.A." in c for c in surf)  # A's surfaces still combined
+    assert any("stage10s.surf.B." in c for c in surf)

@@ -508,3 +508,25 @@ def test_romeo_quality_ranks_coherent_phase_above_incoherent():
     q = romeo_voxel_quality(mags, [p.astype(np.float32) for p in phs], tes)
     assert q.shape == shape[:3]
     assert np.median(q[2:10, 2:-2, 2:-2]) > 0.8 > 0.3 > np.median(q[14:22, 2:-2, 2:-2])
+
+
+def test_converge_stops_the_refine_rounds_early(capsys):
+    """A round that moves the field by less than ``converge`` ends the loop: a huge
+    threshold stops after the first refine pass, 0 runs them all, and both agree
+    on the first pass's field (the stop discards nothing already computed)."""
+    mags, phs, _w, _head = _scene()
+
+    def go(converge):
+        return estimate_partition_flow_magphase(
+            mags, phs, TE, PE, window_sigma=2.0, n_iters=2, refine_rounds=3,
+            warp_interp="bicubic", converge=converge, device=CPU, verbose=True,
+        )  # fmt: skip
+
+    capsys.readouterr()
+    early = go(1e3)
+    out_early = capsys.readouterr().out
+    full = go(0.0)
+    out_full = capsys.readouterr().out
+    assert out_early.count("refine pass") == 1 and "converged" in out_early
+    assert out_full.count("refine pass") == 3 and "converged" not in out_full
+    assert early.w_field.shape == full.w_field.shape

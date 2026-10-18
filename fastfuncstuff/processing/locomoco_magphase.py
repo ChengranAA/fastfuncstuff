@@ -154,6 +154,7 @@ def estimate_partition_flow_magphase(
     warp_radius: int = 3,
     inplane_axis: int | None = None,
     phase_quality: np.ndarray | None = None,
+    converge: float = 0.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MagPhaseFlow:
@@ -190,6 +191,10 @@ def estimate_partition_flow_magphase(
     poor model of how it moves, which no temporal variance reveals. Down-weighted, the
     magnitude carries that voxel -- or nothing does; no field is borrowed from
     neighbours beyond the solve's own window.
+
+    ``converge``: stop the refine rounds once a round moves the in-brain field by less
+    than this many voxels (RMS against the round before); each round's step is printed.
+    0 runs every round.
     """
     from .locomoco import _blur3d_b, _shift3d_axis
     from .mask import automask
@@ -343,7 +348,9 @@ def estimate_partition_flow_magphase(
     def blur(vals: torch.Tensor) -> torch.Tensor:
         return _blur3d_b(to_vol(vals)[None], window_sigma)[0]
 
+    brain_cpu = torch.from_numpy(brain_np)
     for rnd in range(refine_rounds + 1):
+        prev_w = w_all[brain_cpu].clone() if rnd > 0 else None
         tpl = templates(None if rnd == 0 else w_all, None if rnd == 0 else u_all)
         mx, info = {}, {}
         sww = torch.zeros(v, device=device)
@@ -383,6 +390,14 @@ def estimate_partition_flow_magphase(
             w_all[..., t] = w.cpu()
             if u_all is not None and u is not None:
                 u_all[..., t] = u.cpu()
+        if prev_w is not None:
+            step = float(((w_all[brain_cpu] - prev_w) ** 2).mean().sqrt())
+            if verbose:
+                print(f"   refine pass {rnd}/{refine_rounds}: step {step:.4f} vox (in-brain)")
+            if converge > 0 and step < converge:
+                if verbose:
+                    print(f"   converged (step < {converge:g} vox): stopping after pass {rnd + 1}")
+                break
 
     if verbose:
         ap = w_all[torch.from_numpy(brain_np)].abs()

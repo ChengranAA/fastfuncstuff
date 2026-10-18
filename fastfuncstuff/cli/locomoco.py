@@ -1315,7 +1315,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         metavar="VOX",
-        help="[plain path only] Stop the -refine loop early once a pass's step size (RMS "
+        help="[plain path and -phase] Stop the -refine loop early once a pass's step size (RMS "
         "displacement change vs the previous pass, in-brain voxels) falls below this — so "
         "you spend passes only while they still move the estimate. 0 = off (run all "
         "-refine rounds). Try ~0.02; the printed per-pass Δ tells you where it plateaus.",
@@ -4612,6 +4612,7 @@ def _run_multiecho(
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             phase_quality=_magphase_quality(args, est_datas, phases_hz),
+            converge=args.converge,
             device=device,
         )
         del phases_hz

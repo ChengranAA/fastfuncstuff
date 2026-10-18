@@ -19,15 +19,15 @@ PIPELINE
               -phase    e1p.nii.gz e2p.nii.gz e3p.nii.gz \\
               -metadata e1.json e2.json e3.json -prefix sub_dc
     # (or pass -tes / -total_readout_time / -pe_dir explicitly instead of -metadata)
-    # -> sub_dc_e1_undist.nii.gz ...
+    # -> sub_dc.echo-1_undist.nii.gz ...
 
     # 2. motion on the undistorted echoes (rigid is now valid)
-    ffs_moco -input sub_dc_e1_undist.nii.gz sub_dc_e2_undist.nii.gz \\
-             sub_dc_e3_undist.nii.gz -reg_echo mean -1Dmatrix_save mc.aff12.1D \\
+    ffs_moco -input sub_dc.echo-1_undist.nii.gz sub_dc.echo-2_undist.nii.gz \\
+             sub_dc.echo-3_undist.nii.gz -reg_echo mean -1Dmatrix_save mc.aff12.1D \\
              -prefix sub_mc.nii.gz
 
     # 3. compose motion + coreg + atlas (all affines) in one resample
-    ffs_nwarp -source sub_dc_e1_undist.nii.gz -master atlas.nii.gz \\
+    ffs_nwarp -source sub_dc.echo-1_undist.nii.gz -master atlas.nii.gz \\
               -nwarp 'mc.aff12.1D coreg.aff12.1D atlas_warp.nii.gz' \\
               -prefix sub_e1_atlas.nii.gz
 

@@ -164,6 +164,28 @@ def _save_surface(grid: torch.Tensor, path: str, meta) -> None:
     save_gifti_data(path, a, meta=meta)
 
 
+def _field_in_chunks(
+    phases: torch.Tensor, mask: torch.Tensor, data_cat: torch.Tensor, tes: torch.Tensor, device
+) -> torch.Tensor:
+    """:func:`me.phase_field_hz` over voxel chunks sized from the free device memory.
+
+    ``phases`` is ``(E, T, nz, ny, nx)`` on the host; each chunk is moved over, fitted
+    and dropped. A chunk holds the phase, its validity, the weights and the products
+    (~6 copies of ``(E, T)`` floats per voxel), taken to 30% of what is free.
+    """
+    from fastfuncstuff.memory import get_available_memory
+
+    n_echo, n_t = phases.shape[0], phases.shape[1]
+    host = phases[:, :, mask.cpu()].permute(2, 0, 1)  # (V, E, T), a host copy
+    n_vox = host.shape[0]
+    chunk = max(1, int(0.3 * get_available_memory(device) // (6 * n_echo * n_t * 4)))
+    out = torch.empty((n_vox, n_t), dtype=torch.float32, device=device)
+    for s in range(0, n_vox, chunk):
+        sl = slice(s, min(n_vox, s + chunk))
+        out[sl] = me.phase_field_hz(host[sl].to(device), data_cat[sl], tes)
+    return out
+
+
 def _unmask(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Scatter masked samples back to the spatial grid.
 
@@ -231,9 +253,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.phase is not None:
         if surface:
             raise SystemExit("-field_hz is a volume output.")
+        # Held on the host: the fit below streams voxel chunks to the device, so the phase
+        # does not double the (already large) echo stack there.
         phases = []
         for path in args.phase:
-            ph, _ = load_image(path, device=device)
+            ph, _ = load_image(path, device=torch.device("cpu"))
             phases.append(ph.unsqueeze(0) if ph.ndim == 3 else ph)
         phases = torch.stack(phases, dim=0)
         if tuple(phases.shape) != tuple(data.shape):
@@ -265,7 +289,7 @@ def main(argv: list[str] | None = None) -> None:
     field_hz = None
     if phases is not None:
         with spinner("Fitting the frequency shift from every echo's phase"):
-            field_hz = me.phase_field_hz(phases[:, :, mask].permute(2, 0, 1), data_cat, tes)
+            field_hz = _field_in_chunks(phases, mask, data_cat, tes, device)
         del phases
     del echoes, data
 

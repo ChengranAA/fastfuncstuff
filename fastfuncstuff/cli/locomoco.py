@@ -290,8 +290,9 @@ ACCURACY  (trade time for exactness — all backends)
   -jacobian              conserve PE signal — stretched regions dim, compressed brighten
                          (J = det(I+grad disp)). Off by default; for data with real B0
                          pile-up, not a purely geometric shift.
-  -workhard / -superhard presets over the above + more iters + denser search
-                         (~3-5x / ~15-30x time). Explicit flags override the preset.
+  -workhard / -superhard presets: -workhard = denser search only; -superhard = 16
+                         iters + 3 refines (~1.5-2x time for ~1% tSNR). Explicit flags
+                         override the preset.
 
 EXAMPLES
 
@@ -688,9 +689,8 @@ def create_parser() -> argparse.ArgumentParser:
         "  s0r2  that plus a change proportional to TE (BOLD / R2*), so the task cannot"
         " masquerade as displacement. Costs magnitude most of its information (the"
         " displacement's leading footprint is also proportional to TE); the phase then"
-        " carries the estimate. Needs 3+ echoes. On a 5-echo 3-D rest run it left the"
-        " echo-1 slab-end wiggle that 'none' removes, and its task blindness is better had"
-        " from -detask.\n"
+        " carries the estimate. Needs 3+ echoes. Measured to leave slab-end wiggle that"
+        " 'none' removes; for task blindness use -detask instead.\n"
         "  auto  none.",
     )
     mp.add_argument(
@@ -709,13 +709,13 @@ def create_parser() -> argparse.ArgumentParser:
         "-phase_weight",
         choices=("noise", "romeo"),
         default="noise",
-        help="[-phase] How much each voxel's PHASE is trusted:\n"
+        help="[-phase, EXPERIMENTAL] How much each voxel's PHASE is trusted:\n"
         "  noise  by its frame-to-frame noise alone.\n"
-        "  romeo  that times ROMEO's voxel quality (phase coherence with the neighbours,"
-        " echo agreement, magnitude), from the inputs' temporal means. A spatially"
-        " incoherent phase (dephasing, partial volume, the head's edge) has a gradient"
-        " that does not say how it moves, and its noise does not show it; down-weighted,"
-        " the magnitude carries that voxel. Needs 2+ echoes and warpkit.",
+        "  romeo  that times ROMEO's voxel quality (neighbour phase coherence, echo"
+        " agreement, magnitude), from the inputs' temporal means. It only re-balances"
+        " phase against magnitude where BOTH carry information; where the magnitude has"
+        " none the weight cancels in the update and the phase still sets the field. No"
+        " measured benefit on the 1.25 mm test run. Needs 2+ echoes and warpkit.",
     )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
@@ -1027,9 +1027,9 @@ def create_parser() -> argparse.ArgumentParser:
         "  phase  whole-field warp-and-re-read passes, which cancel the single-patch"
         " leakage bias.\n"
         "  xcorr  ignores it; it is single-shot.\n"
-        "Default 8: the coarse levels settle in 5-7, the finest level only circles at ~0.01 vox, "
-        "and 16 reproduces -superhard's field, which on near-zero motion is the estimator "
-        "fitting its own noise.\n"
+        "Default 8: coarse levels settle in 5-7 and the finest only circles at ~0.01 vox; "
+        "16 changes the corrected data by ~1%% tSNR, and on near-zero motion more "
+        "iterations mostly fit noise.\n"
         "More = better convergence for larger motion, at linear cost.\n"
         "The flow backend reports whether it settled, per pyramid level and coarsest "
         "first: `4 iters, conv @ 2,4,3` settled inside the cap; a starred level (`2,4*,3`) "
@@ -1290,17 +1290,14 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         metavar="ROUNDS",
-        help="[plain path + -backend qwarp] Outer reference-refinement rounds (the max cap when "
-        "-converge is set). Default 1: later passes moved the estimate < 0.01 vox. After the first estimate, rebuild the reference from the "
-        "corrected series (motion removed → sharp, and aggregated per -ref: a max stays "
-        "FoV-filled) and re-register the original frames against it. Each pass prints its "
-        "step size (RMS displacement change, in-brain). 1–3 tightens the values; 0 = off. "
-        "Under -backend qwarp there is no flow pass, so this drives the QWARP passes "
-        "instead: the first template is built from data that still carries the distortion, "
-        "so it is blurred by it and biases the field LOW, and each refine pass registers "
-        "every frame again to a template rebuilt from the corrected series (so the default "
-        "is two qwarp passes). The -final_qwarp polish is always ONE pass: it starts from "
-        "a template the estimator's own refine already sharpened.",
+        help="[plain path + -backend qwarp] Outer reference-refinement rounds (the cap when "
+        "-converge is set). The first reference is built from frames that still carry the "
+        "motion, so it is blurred and biases the displacement LOW; each round rebuilds it "
+        "from the corrected series (aggregated per -ref) and re-registers the original "
+        "frames. Default 1; on real runs the second round moved the estimate by < 0.01 vox. "
+        "0 = off. Each round prints its step (RMS displacement change, in-brain). Under "
+        "-backend qwarp it sets the qwarp passes instead (default: two, as no flow pass "
+        "runs there); the -final_qwarp polish is always one pass.",
     )
     acc.add_argument(
         "-converge",
@@ -1336,14 +1333,16 @@ def create_parser() -> argparse.ArgumentParser:
     acc.add_argument(
         "-workhard",
         action="store_true",
-        help="Preset: crank the accuracy knobs (bicubic warp, more iters, 1 refine "
-        "round, denser search) for ~3–5× the time. Explicit flags still override.",
+        help="Preset: denser search than the default (xcorr/phase backends: finer stride "
+        "and step). Its iterations (8) and refine (1) now equal the defaults. Explicit "
+        "flags still override.",
     )
     acc.add_argument(
         "-superhard",
         action="store_true",
-        help="Preset: maximum accuracy (bicubic warp, many iters, 3 refine rounds, "
-        "finest search) for ~15–30× the time. Explicit flags still override.",
+        help="Preset: 16 iterations, 3 refine rounds, finest search. About 1.5-2x the "
+        "default's time for ~1%% tSNR on the runs measured (2 mm and 1.25 mm, 3-5 echoes): "
+        "rarely worth it. Explicit flags still override.",
     )
 
     rot = p.add_argument_group("Rotation-aware residual motion (needs -raw_input + -moco_matrix)")

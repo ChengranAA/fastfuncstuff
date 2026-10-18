@@ -1913,7 +1913,7 @@ def nwarpforge(
                     to real+imag, each component is warped independently, then
                     converted back to magnitude+phase for output.
         phase_prefix: Output path for warped phase.  Auto-derived from prefix
-                      (e.g. out.nii.gz -> out_phase.nii.gz) when not given.
+                      (e.g. out.nii.gz -> out.part-phase.nii.gz) when not given.
         master_path: Path to master dataset for output grid (optional). The
             literal string "WARP"/"NWARP" uses the first nonlinear warp's grid
             as the output master (matching 3dNwarpApply -master WARP).

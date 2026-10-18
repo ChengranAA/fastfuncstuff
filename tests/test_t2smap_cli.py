@@ -148,3 +148,23 @@ def test_cli_field_hz_matches_the_library_and_needs_every_echo(tmp_path):
         assert "2 -phase" in str(exc)
     else:
         raise AssertionError("a missing echo's phase must be refused")
+
+
+def test_field_fit_in_chunks_equals_one_pass(monkeypatch):
+    """The streamed fit (phase on the host, voxel chunks on the device) must not depend
+    on the chunk size: a budget small enough for a handful of voxels gives the same field."""
+    import fastfuncstuff.memory as memory
+    from fastfuncstuff.cli.t2smap import _field_in_chunks
+    from fastfuncstuff.processing.multiecho import phase_field_hz
+
+    df, phase, mag, te = _field_scene(v=150, nt=20)
+    # lay the (V, E, T) scene on a (E, T, 5, 6, 5) grid with every voxel inside the mask
+    grid = (5, 6, 5)
+    ph = phase.permute(1, 2, 0).reshape(len(te), 20, *grid)
+    mask = torch.ones(grid, dtype=torch.bool)
+    full = phase_field_hz(phase, mag, te)
+    monkeypatch.setattr(
+        memory, "get_available_memory", lambda *a, **k: 6 * len(te) * 20 * 4 * 7 * 4
+    )
+    chunked = _field_in_chunks(ph, mask, mag, te, torch.device("cpu"))
+    assert torch.allclose(chunked, full, atol=1e-5)

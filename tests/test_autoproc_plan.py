@@ -3567,3 +3567,41 @@ def test_locomoco_phase_refuses_what_it_cannot_use():
         assert errs and text in errs[0]
     single = Subject("X", [Session("01", [_run("01", "foo", "1")])])
     assert "not multi-echo" in _locomoco_phase_errors(Options(**ok), single)[0]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_phasereg_me_field_regresses_the_combination_on_one_fitted_field(tmp_path):
+    """-phasereg_me field: stage10's combine also writes the frequency-shift series fitted
+    from every echo's phase, and phasereg runs ONCE per task on the combined echoes
+    against it (Hz, so no temporal unwrap) instead of once per echo."""
+    from fastfuncstuff.cli.autoproc import _phasereg_me_errors
+
+    runs = [_me_run("01", "foo", "1"), _me_run("01", "foo", "2")]
+    kw = dict(phase_proc=True, phasereg=True, acq_3d=False, go_to_anat=False,
+              distortion=False, slicetiming_method="integrate")  # fmt: skip
+    subj = Subject("X", [Session("01", runs)])
+    on = write_script(build_plan(subj, Options(phasereg_me="field", **kw)), "wd", bids_root="/bids")
+    off = write_script(build_plan(subj, Options(**kw)), "wd", bids_root="/bids")
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", on))], capture_output=True, text=True
+        ).returncode
+        == 0
+    )
+    # the combine writes the field, from every echo's final phase
+    assert 'fieldf="stage10.field.${FRAG[$k]}.nii$FINAL_FMT"' in on
+    assert '-phase "${phs[@]}" -field_hz "$fieldf"' in on
+    assert 'phs+=("stage10.final.${FRAG[$k]}.echo-$e.part-phase.nii$FINAL_FMT")' in on
+    # one phasereg call per task, on the combination and the field, no per-echo calls
+    stage = on[on.index("== phasereg ==") :]
+    assert stage.count("ffs_phasereg") >= 1 and "task-foo.echo-" not in stage
+    assert '-magnitude "stage10.final.ses-01.task-foo.run-1.nii$FINAL_FMT"' in stage
+    assert '-phase "stage10.field.ses-01.task-foo.run-1.nii$FINAL_FMT"' in stage
+    assert "-no_phase_unwrap" in stage
+    assert "task-foo_corrected_run-02.nii$FINAL_FMT" in stage
+    # off: nothing of it
+    assert "-field_hz" not in off and "stage10.field" not in off
+    assert _phasereg_me_errors(Options(phasereg_me="field", phasereg=True, phase_proc=True)) == []
+    assert "-phasereg" in _phasereg_me_errors(Options(phasereg_me="field"))[0]
+    assert "-phase_proc" in _phasereg_me_errors(Options(phasereg_me="field", phasereg=True))[0]
+    assert _phasereg_me_errors(Options()) == []

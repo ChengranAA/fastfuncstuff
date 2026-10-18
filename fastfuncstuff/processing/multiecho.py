@@ -509,6 +509,36 @@ def modify_t2s_s0_maps(
 # ---------------------------------------------------------------------------
 
 
+def phase_field_hz(phase: Tensor, mag: Tensor, tes: Tensor) -> Tensor:
+    """One frequency-shift time series per voxel from every echo's unwrapped phase.
+
+    ``phase`` / ``mag``: ``(V, E, T)`` -- phase in radians, unwrapped, magnitude of the
+    same echoes; ``tes`` in ms. Returns ``(V, T)`` in Hz.
+
+    A voxel's phase at echo e is ``2 pi df TE_e`` plus an offset that does not depend on
+    TE, so every echo measures the same ``df`` and only the noise differs: phase noise is
+    ~1/|S_e|, hence ``df`` from echo e has variance ~ 1/(|S_e| TE_e)^2. The
+    inverse-variance combination is
+
+        df = sum_e w_e TE_e phi_e / (2 pi sum_e w_e TE_e^2),   w_e = |S_e|^2.
+
+    Averaging frequency, not phase, is what makes combining legitimate. There is no
+    intercept: a per-voxel offset costs one of the few echoes' degrees of freedom, and
+    its time-constant part is removed by any later demeaning (the head-wide drift is
+    already out of the unwrapped phase). An echo with no phase at a voxel and frame (zero
+    or non-finite, as the unwrap leaves outside its support) gets no weight there; a
+    voxel with no echo at all is 0.
+    """
+    have = torch.isfinite(phase) & (phase != 0)
+    ph = torch.where(have, phase, torch.zeros_like(phase))
+    w = (mag.mean(dim=2, keepdim=True) ** 2) * have  # (V, E, T): static |S|^2 where valid
+    te = tes.to(phase.dtype)[None, :, None]
+    num = (w * te * ph).sum(dim=1)
+    den = (w * te**2).sum(dim=1)
+    out = num / den.clamp_min(torch.finfo(phase.dtype).tiny) * (1000.0 / (2.0 * torch.pi))
+    return torch.where(den > 0, out, torch.zeros_like(out))
+
+
 def make_optcom(
     data_cat: Tensor,
     tes: Tensor,

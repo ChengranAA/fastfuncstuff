@@ -480,6 +480,17 @@ def build_parser() -> argparse.ArgumentParser:
         "stable, an even ~10%% suppression.",
     )
     g.add_argument(
+        "-phasereg_me",
+        choices=["per_echo", "field"],
+        default="per_echo",
+        help="multi-echo phase regression. per_echo (default): each echo against its own\n"
+        "phase, then the corrected echoes are combined. field (EXPERIMENTAL): the optimal\n"
+        "combination against ONE frequency-shift series fitted from every echo's phase\n"
+        "(phase is 2*pi*df*TE at every echo, so df is inverse-variance weighted across\n"
+        "them: a much less noisy regressor, and one regression per voxel instead of one\n"
+        "per echo). Part of the folder's settings.",
+    )
+    g.add_argument(
         "-phasereg_opts",
         default="",
         metavar="'FLAGS'",
@@ -1312,6 +1323,20 @@ def _locomoco_phase_errors(opt: Options, subject) -> list[str]:
     return errs
 
 
+def _phasereg_me_errors(opt: Options) -> list[str]:
+    """-phasereg_me field regresses the combined echoes on a field fitted from every
+    echo's phase; without phase regression or the processed phase there is none."""
+    if opt.phasereg_me != "field":
+        return []
+    if not opt.phasereg:
+        return ["-phasereg_me field needs -phasereg."]
+    if not opt.phase_proc:
+        return [
+            "-phasereg_me field needs -phase_proc: the field is fitted from the unwrapped phase."
+        ]
+    return []
+
+
 def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[str], list[str]]:
     """Return (errors, warnings). Non-empty errors ⇒ do not write the script."""
     errors: list[str] = []
@@ -1501,6 +1526,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     errors += _multiecho_errors(opt, subject)
     errors += _medic_errors(opt, subject)
     errors += _locomoco_phase_errors(opt, subject)
+    errors += _phasereg_me_errors(opt)
     if opt.medic and any(s.fmaps for s in subject.sessions):
         warnings.append(
             "-medic: the session fieldmaps are not used -- the per-frame field corrects "
@@ -2455,6 +2481,7 @@ def main(argv: list[str] | None = None) -> int:
         locomoco_phase=args.locomoco_phase,
         phasereg=args.phasereg,
         phasereg_opts=args.phasereg_opts,
+        phasereg_me=args.phasereg_me,
         phasereg_veins=args.phasereg_veins,
         tissue=[str(Path(t).resolve()) for t in args.tissue] if args.tissue else None,
         acq_3d=acq_3d,

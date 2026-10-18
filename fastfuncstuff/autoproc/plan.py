@@ -55,6 +55,10 @@ class Options:
     # Phase regression after stage10, into phasereg_NN/ (and a GLM on its output).
     phasereg: bool = False
     phasereg_opts: str = ""
+    # Multi-echo phase regression. "per_echo": each echo against its own phase, then the
+    # corrected echoes are combined. "field": the optimal combination against ONE
+    # frequency-shift series fitted from every echo's phase (ffs_t2smap -field_hz).
+    phasereg_me: str = "per_echo"
     # "auto": sPR restricted to ffs_veinmask's candidates when tissue maps exist.
     phasereg_veins: str = "off"
     tissue: list[str] | None = None  # GM/WM/CSF fractions in anat space

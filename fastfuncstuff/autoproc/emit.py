@@ -3720,27 +3720,48 @@ def _me_surface_combine(plan: Plan) -> str:
     return "\n".join(out) + "\n"
 
 
+def _phasereg_field_on(plan: Plan) -> bool:
+    """-phasereg_me field: phase regression runs on the combined echoes against one
+    frequency-shift series, which the stage10 combine writes beside the run's final."""
+    opt = plan.options
+    return bool(opt.phasereg and opt.phasereg_me == "field" and _phase_on(plan))
+
+
 def _final_me_combine(plan: Plan) -> str:
     """Optimal combination of each multi-echo run's per-echo finals into the run's own
     stage10.final name, which every later stage reads (ffs_t2smap: monoexponential
     T2*/S0 fit, T2*-weighted combination; maps kept as stage10.t2s.<frag>_*)."""
     if not _any_me(plan):
         return ""
-    return (
-        """# Multi-echo: combine each run's warped echoes (optimal combination, T2*-weighted)
+    field = _phasereg_field_on(plan)
+    head = """# Multi-echo: combine each run's warped echoes (optimal combination, T2*-weighted)
 # into stage10.final.<frag> -- the series every later stage reads. The per-echo
 # finals and the T2*/S0 maps (stage10.t2s.<frag>_*) stay beside it.
 for k in "${RUN_KEYS[@]}"; do
   [ "${NECHO[$k]:-1}" -gt 1 ] || continue
   outf="stage10.final.${FRAG[$k]}.nii$FINAL_FMT"
-  [ "$skip_final" -eq 1 ] && [ -f "$outf" ] && continue
+%(field_def)s  [ "$skip_final" -eq 1 ] && [ -f "$outf" ]%(field_done)s && continue
   ins=(); for e in $(seq 1 "${NECHO[$k]}"); do ins+=("stage10.final.${FRAG[$k]}.echo-$e.nii$FINAL_FMT"); done
-  ffs_t2smap -input "${ins[@]}" -tes ${TES[$k]} -automask -no_qc -prefix "stage10.t2s.${FRAG[$k]}_" -optcom "$outf" -device "$DEVICE" -verb 0
+%(field_args)s  ffs_t2smap -input "${ins[@]}" -tes ${TES[$k]} -automask -no_qc -prefix "stage10.t2s.${FRAG[$k]}_" -optcom "$outf"%(field_flags)s -device "$DEVICE" -verb 0
 """
-        + _me_surface_combine(plan)
-        + """done
-"""
+    head = (
+        head.replace("%(field_done)s", ' && [ -f "$fieldf" ]' if field else "")
+        .replace(
+            "%(field_def)s",
+            '  fieldf="stage10.field.${FRAG[$k]}.nii$FINAL_FMT"\n' if field else "",
+        )
+        .replace(
+            "%(field_args)s",
+            (
+                '  phs=(); for e in $(seq 1 "${NECHO[$k]}"); do '
+                'phs+=("stage10.final.${FRAG[$k]}.echo-$e.part-phase.nii$FINAL_FMT"); done\n'
+            )
+            if field
+            else "",
+        )
+        .replace("%(field_flags)s", ' -phase "${phs[@]}" -field_hz "$fieldf"' if field else "")
     )
+    return head + _me_surface_combine(plan) + "done\n"
 
 
 _MNI_TOKENS = ("mni_nl", "mni_lin")
@@ -4508,7 +4529,7 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
                     "are chosen on the task-included series (can remove tissue response)'"
                 )
 
-        def pr_call(mags, phs, prefix, select=select):
+        def pr_call(mags, phs, prefix, select=select, extra_flags=()):
             return _ffs(
                 "ffs_phasereg",
                 [
@@ -4516,6 +4537,7 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
                     f"-phase {phs}",
                     f'-prefix "{prefix}"',
                     "-keep_drift",
+                    *extra_flags,
                     *spr,
                     *select,
                     "-verb 1",
@@ -4524,7 +4546,16 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
                 ],
             )
 
-        if prs[0].bold.is_multiecho:
+        if prs[0].bold.is_multiecho and _phasereg_field_on(plan):
+            # The optimal combination (stage10.final, what the GLM reads) against the one
+            # frequency-shift series fitted from every echo's phase (stage10.field): Hz,
+            # not radians, so no temporal unwrap; one regression per voxel, not per echo.
+            fields = " ".join(f'"stage10.field.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
+            body.append(f'[ -f "{_phasereg_corrected(task, len(prs))}" ] || \\')
+            pr_cmd = pr_call(mags, fields, f"{d}/task-{task}", extra_flags=["-no_phase_unwrap"])
+            commands.append(pr_cmd)
+            body.append(pr_cmd)
+        elif prs[0].bold.is_multiecho:
             # Each echo against its own phase (the vessel's phase and its magnitude
             # footprint both scale with TE), then the corrected echoes are combined
             # like the stage10 echoes were, into the names the GLM reads.

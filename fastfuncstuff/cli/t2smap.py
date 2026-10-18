@@ -64,6 +64,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Also write the optimally combined series to exactly this path (any format "
         "ffs writes, e.g. .nii.zst), for pipelines that read it under their own name.",
     )
+    parser.add_argument(
+        "-phase",
+        nargs="+",
+        default=None,
+        metavar="FILE",
+        help="Unwrapped phase (radians), one file per echo, same order and grid as -input. "
+        "With -field_hz: the echoes' common frequency shift is fitted from them.",
+    )
+    parser.add_argument(
+        "-field_hz",
+        default=None,
+        metavar="FILE",
+        help="Write each voxel's frequency-shift time series (Hz) from ALL echoes' phase "
+        "(needs -phase): phase is 2 pi df TE (+ an offset free of TE) at every echo, so "
+        "df is estimated by inverse-variance weighting, a much cleaner regressor than any "
+        "single echo's phase -- e.g. for phase regression of the optimal combination.",
+    )
     parser.add_argument("-mask", default=None, help="Binary brain mask (strongly recommended).")
     parser.add_argument(
         "-automask",
@@ -176,6 +193,10 @@ def main(argv: list[str] | None = None) -> None:
             "provide one file per echo time."
         )
 
+    if (args.phase is None) != (args.field_hz is None):
+        raise SystemExit("-phase and -field_hz go together.")
+    if args.phase is not None and len(args.phase) != len(args.input):
+        raise SystemExit(f"Got {len(args.phase)} -phase file(s) for {len(args.input)} echoes.")
     device = setup_device(args.device)
     tes = _tes_to_ms(args.tes).to(device)
     n_echos = len(tes)
@@ -206,6 +227,17 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"All echo files must share a shape; got {shapes}")
     data = torch.stack(echoes, dim=0)  # (E, T, nz, ny, nx)
     spatial = data.shape[2:]
+    phases = None
+    if args.phase is not None:
+        if surface:
+            raise SystemExit("-field_hz is a volume output.")
+        phases = []
+        for path in args.phase:
+            ph, _ = load_image(path, device=device)
+            phases.append(ph.unsqueeze(0) if ph.ndim == 3 else ph)
+        phases = torch.stack(phases, dim=0)
+        if tuple(phases.shape) != tuple(data.shape):
+            raise SystemExit(f"-phase shape {tuple(phases.shape)} != -input {tuple(data.shape)}")
 
     # Mask -> boolean (nz, ny, nx).
     if args.mask is not None:
@@ -230,6 +262,11 @@ def main(argv: list[str] | None = None) -> None:
 
     # (E, T, nz, ny, nx) -> masked (V, E, T).
     data_cat = data[:, :, mask].permute(2, 0, 1).contiguous()  # (V, E, T)
+    field_hz = None
+    if phases is not None:
+        with spinner("Fitting the frequency shift from every echo's phase"):
+            field_hz = me.phase_field_hz(phases[:, :, mask].permute(2, 0, 1), data_cat, tes)
+        del phases
     del echoes, data
 
     if verb >= 1:
@@ -275,6 +312,11 @@ def main(argv: list[str] | None = None) -> None:
             _save_surface(grid, path, header)
         else:
             save_image(grid, path, header_info=header, brick_labels=labels)
+
+    if field_hz is not None:
+        with spinner("Writing the frequency-shift series"):
+            write(_unmask(field_hz, mask), args.field_hz)
+        del field_hz
 
     def save(values, name, labels=None):
         ext = ".func.gii" if surface else ".nii.gz"

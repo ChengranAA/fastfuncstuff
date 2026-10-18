@@ -1906,8 +1906,11 @@ def _stage_medic(plan: Plan) -> str:
             f'phs+=("{_echo_phase_file(plan)}"); done'
         )
         apply = ' -apply_phase -phase_is_unwrapped -phase "${phs[@]}"'
+        # a work dir that gains -locomoco_phase has the warp but not the phase
+        phase_done = ' && [ -f "${ms}.echo-${NECHO[$k]}.part-phase_undist.nii$FMT" ]'
     else:
         apply = ""
+        phase_done = ""
     return f"""
 # ============================ stage01: MEDIC (frame-wise distortion) ========
 # -medic: each frame's field map (stage00's multi-echo unwrap) -> SVD denoising ->
@@ -1919,7 +1922,7 @@ echo '== stage01: MEDIC =='
 for k in "${{RUN_KEYS[@]}}"; do
   [ -n "${{PHASE[$k]:-}}" ] && [ "${{NECHO[$k]:-1}}" -gt 1 ] || continue
   ms="{_medic_stem()}"; uwe="{_me_unwrap_stem()}"
-  [ "$skip_medic" -eq 1 ] && [ -f "${{ms}}_warp.nii$FMT" ] && continue
+  [ "$skip_medic" -eq 1 ] && [ -f "${{ms}}_warp.nii$FMT" ]{phase_done} && continue
   mags=()
   for e in $(seq 1 "${{NECHO[$k]}}"); do
     esfx=".echo-$e"

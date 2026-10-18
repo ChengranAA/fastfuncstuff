@@ -1696,6 +1696,10 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         # Corrected series.
         if args.prefix is not None:
             outs.append(_pfx(args.prefix, tag))
+            if getattr(args, "phase", None):
+                # its phase, named as _resample_phase writes it: without this a work dir
+                # that adds -phase skips the run and never writes the phase it now needs
+                outs.append(entity_path(parse_prefix(args.prefix).as_file(), echo=tag, phase=True))
         # Temporal reductions of the corrected series.
         for dest, which in _TEMPORAL_REDUCTIONS:
             value = getattr(args, dest, None)

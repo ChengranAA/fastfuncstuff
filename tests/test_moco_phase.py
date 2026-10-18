@@ -1,5 +1,7 @@
 """ffs_moco -phase: unwrapped phase takes exactly the magnitude's resample."""
 
+from pathlib import Path
+
 import pytest
 import torch
 from test_moco_multiecho import _blob, _shifted_series
@@ -49,23 +51,29 @@ def test_multiecho_phase_per_echo(tmp_path):
     mag2 = mag1 * 0.6
     for name, t in (("m1", mag1), ("m2", mag2), ("p1", mag1 * SCALE), ("p2", mag2 * 2 * SCALE)):
         _write(tmp_path / f"{name}.nii.gz", t)
-    _run(
-        [
-            "-input",
-            str(tmp_path / "m1.nii.gz"),
-            str(tmp_path / "m2.nii.gz"),
-            "-phase",
-            str(tmp_path / "p1.nii.gz"),
-            str(tmp_path / "p2.nii.gz"),
-            "-reg_echo",
-            "1",
-            "-echo_times",
-            TE,
-            "20",
-            "-prefix",
-            str(tmp_path / "mc.nii.gz"),
-        ]
-    )
+    argv = [
+        "-input",
+        str(tmp_path / "m1.nii.gz"),
+        str(tmp_path / "m2.nii.gz"),
+        "-phase",
+        str(tmp_path / "p1.nii.gz"),
+        str(tmp_path / "p2.nii.gz"),
+        "-reg_echo",
+        "1",
+        "-echo_times",
+        TE,
+        "20",
+        "-prefix",
+        str(tmp_path / "mc.nii.gz"),
+    ]
+    _run(argv)
+    # -batch_skip's list names exactly what was written, the phase included: a run
+    # listed without it would be skipped and never write the phase a later stage reads.
+    from fastfuncstuff.cli.moco import _expected_outputs, parse_args
+
+    expected = _expected_outputs(parse_args(argv))
+    assert any(".part-phase" in o for o in expected)
+    assert all(Path(o).exists() for o in expected), [o for o in expected if not Path(o).exists()]
     a1, _ = load_image(str(tmp_path / "mc.echo-1.nii.gz"))
     a2, _ = load_image(str(tmp_path / "mc.echo-2.nii.gz"))
     p1, _ = load_image(str(tmp_path / "mc.echo-1.part-phase.nii.gz"))

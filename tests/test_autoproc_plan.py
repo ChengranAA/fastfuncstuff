@@ -3557,6 +3557,9 @@ def test_locomoco_phase_is_an_explicit_experimental_opt_in(medic):
     assert "-phase$lm_ph" not in off and "-phase$phs" not in off
     assert ("-apply_phase -phase_is_unwrapped" in on) is medic
     assert "-apply_phase" not in off
+    # resume: MEDIC's skip waits for the phase it now has to write, not just the warp
+    phase_done = '[ -f "${ms}.echo-${NECHO[$k]}.part-phase_undist.nii$FMT" ]'
+    assert (phase_done in on) is medic and phase_done not in off
 
 
 def test_locomoco_phase_refuses_what_it_cannot_use():

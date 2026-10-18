@@ -19,7 +19,12 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.commands import Command
-from fastfuncstuff.viewer.compose import plane_position, plane_view, render_viewport
+from fastfuncstuff.viewer.compose import (
+    plane_position,
+    plane_view,
+    render_viewport,
+    tile_layers,
+)
 from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.surfaces import Grab
@@ -33,7 +38,7 @@ from fastfuncstuff.viewer.ui.shortcuts import (
     keep_keys_for_shortcuts,
 )
 from fastfuncstuff.viewer.ui.stripbar import StripBar
-from fastfuncstuff.viewer.viewports import Viewport
+from fastfuncstuff.viewer.viewports import Viewport, tile_grid
 from fastfuncstuff.viewer.vocab import (
     DeleteSurfaceVertex,
     EditSurface,
@@ -52,6 +57,7 @@ from fastfuncstuff.viewer.vocab import (
     SetViewPosition,
     SetViewSolo,
     SetViewStrip,
+    SetViewTiles,
     SetXYZ,
     SetZoom,
     SplitSurfaceEdge,
@@ -82,6 +88,8 @@ class ImageWindow(QtWidgets.QWidget):
     painted = QtCore.Signal(int)
     #: `c c`: centre every window on the crosshair, not just this one.
     centre_all_requested = QtCore.Signal()
+    #: `\`: tile (True) or untile every image window, not just this one.
+    tiles_all_requested = QtCore.Signal(bool)
 
     def __init__(
         self,
@@ -281,7 +289,22 @@ class ImageWindow(QtWidgets.QWidget):
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(3)
-        self.splitter.addWidget(self.pane)
+        # Tiles: one pane per visible image, on this window's view. self.pane
+        # stays the window's pane of record (its slice, layout and the editing
+        # tools read it) and is still drawn while hidden behind the tiles.
+        self.tile_box = QtWidgets.QWidget()
+        self._tile_layout = QtWidgets.QGridLayout(self.tile_box)
+        self._tile_layout.setContentsMargins(0, 0, 0, 0)
+        self._tile_layout.setSpacing(2)
+        self._tiles: list[ImagePane] = []
+        #: (tile count, columns) as last laid out.
+        self._tile_shape: tuple[int, int] = (0, 0)
+        #: The window's size before `\` grew it for the tiles, given back on untile.
+        self._untiled_size: QtCore.QSize | None = None
+        self.view_stack = QtWidgets.QStackedWidget()
+        self.view_stack.addWidget(self.pane)
+        self.view_stack.addWidget(self.tile_box)
+        self.splitter.addWidget(self.view_stack)
         self.splitter.addWidget(self.strip)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 0)
@@ -319,6 +342,12 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("PgUp", "next slice", lambda: self._step(1), group="navigate"),
                 Binding("PgDown", "previous slice", lambda: self._step(-1), group="navigate"),
                 Binding("o", "solo the selected layer", self.solo_button.click, group="view"),
+                Binding(
+                    "\\",
+                    "tile the visible images, one per pane, zoom and pan shared (every window)",
+                    self._request_tiles,
+                    group="view",
+                ),
                 Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
                 Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),
                 Binding("0", "fit the whole plane", self._reset_view, group="view"),
@@ -769,6 +798,89 @@ class ImageWindow(QtWidgets.QWidget):
         if vp is not None:
             self._dispatch(SetZoom(self.vid, max(1.0, min(vp.zoom * factor, 16.0))))
 
+    def _request_tiles(self) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self.tiles_all_requested.emit(not vp.tiles)
+
+    def set_tiled(self, on: bool) -> None:
+        """Tile or untile this window, growing it so each tile keeps the size the
+        single view had (within the screen), and giving the size back after."""
+        vp = self._viewport()
+        if vp is None or vp.tiles == on:
+            return
+        n = len(tile_layers(self.session.state))
+        if on and n > 1:
+            self._untiled_size = self.size()
+            rows, cols = tile_grid(n)
+            pane = self.view_stack.size()
+            w = self.width() + pane.width() * (cols - 1)
+            h = self.height() + pane.height() * (rows - 1)
+            screen = self.screen()
+            if screen is not None:
+                room = screen.availableGeometry()
+                w, h = min(w, room.width()), min(h, room.height())
+            self.resize(w, h)
+        elif not on and self._untiled_size is not None:
+            self.resize(self._untiled_size)
+            self._untiled_size = None
+        self._dispatch(SetViewTiles(self.vid, on))
+        if on and n < 2:
+            self._toast("tiles: only one visible image")
+
+    def _active_tiles(self) -> list[ImagePane]:
+        """The tiles on screen; empty while the single view is shown."""
+        if self.view_stack.currentWidget() is not self.tile_box:
+            return []
+        return self._tiles[: self._tile_shape[0]]
+
+    def _toast(self, text: str) -> None:
+        tiles = self._active_tiles()
+        (tiles[0] if tiles else self.pane).show_toast(text)
+
+    def _make_tile(self, plane: Plane) -> ImagePane:
+        """A tile reads input like the single view: a click, scroll, zoom or pan in
+        any tile acts on the window, so every tile follows. The editing tools stay
+        with the single view."""
+        pane = ImagePane(plane)
+        pane.picked.connect(lambda r, c: self._pick(r, c, seed=False))
+        pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
+        pane.stepped.connect(self._step)
+        pane.panned.connect(self._pan_by)
+        pane.zoomed.connect(self._zoom_by)
+        return pane
+
+    def _redraw_tiles(self, vp: Viewport) -> None:
+        layers = tile_layers(self.session.state) if vp.tiles else []
+        if len(layers) < 2:
+            self.view_stack.setCurrentWidget(self.pane)
+            return
+        while len(self._tiles) < len(layers):
+            self._tiles.append(self._make_tile(vp.plane))
+        rows, cols = tile_grid(len(layers))
+        if self._tile_shape != (len(layers), cols):
+            for tile in self._tiles:
+                self._tile_layout.removeWidget(tile)
+                tile.setVisible(False)
+            # Every row and column the grid has had or now needs: an empty grid
+            # reports one of each, and a column left at stretch 0 beside one at 1
+            # is squeezed to its tile's minimum size.
+            span = max(rows, cols, self._tile_layout.rowCount(), self._tile_layout.columnCount())
+            for i in range(span):
+                self._tile_layout.setRowStretch(i, 1 if i < rows else 0)
+                self._tile_layout.setColumnStretch(i, 1 if i < cols else 0)
+            for i in range(len(layers)):
+                self._tile_layout.addWidget(self._tiles[i], i // cols, i % cols)
+                self._tiles[i].setVisible(True)
+            self._tile_shape = (len(layers), cols)
+        self.view_stack.setCurrentWidget(self.tile_box)
+        selected = self.session.state.selected_layer()
+        for layer, tile in zip(layers, self._tiles, strict=False):
+            tile.plane = vp.plane
+            mark = "> " if selected is not None and selected.key == layer.key else ""
+            tile.caption = f"{mark}{layer.name}"
+            tile.set_pane(render_viewport(self.session, vp, solo_key=layer.key))
+
     def _reset_view(self) -> None:
         """Back to the whole plane. One key, because a lost view is a dead end."""
         if self._viewport() is not None:
@@ -781,7 +893,7 @@ class ImageWindow(QtWidgets.QWidget):
 
         nxt = next_outlines(self.session.state.surfaces_shown)
         self._dispatch(ShowSurfaces(nxt))
-        self.pane.show_toast(f"outlines: {nxt or 'off'}")
+        self._toast(f"outlines: {nxt or 'off'}")
 
     def _outline_width_by(self, factor: float) -> None:
         from fastfuncstuff.viewer.vocab import SetOutlineWidth
@@ -806,22 +918,22 @@ class ImageWindow(QtWidgets.QWidget):
             return
         n = self.session.surfaces.cortex_normal(mm)
         if n is None:
-            self.pane.show_toast("no cortex within 6 mm of the crosshair to tilt to")
+            self._toast("no cortex within 6 mm of the crosshair to tilt to")
             return
         fixed = plane_layout(state.grid.affine, vp.plane).fixed
         plane_normal = np.linalg.inv(state.grid.affine)[fixed, :3]
         now = tilt_matrix(vp)
         a = now @ (plane_normal / np.linalg.norm(plane_normal))
         if abs(float(a @ n)) < 0.05:
-            self.pane.show_toast("this slice already cuts the cortex square-on here")
+            self._toast("this slice already cuts the cortex square-on here")
             return
         r = section_tilt(now, plane_normal, n)
         if np.allclose(r, now):
-            self.pane.show_toast("the cortex lies in this slice here: try another plane")
+            self._toast("the cortex lies in this slice here: try another plane")
             return
         self._dispatch(SetViewTilt(self.vid, tuple(float(x) for x in r.ravel())))
         angle = np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1)))
-        self.pane.show_toast(f"tilted {angle:.0f} deg to cut the cortex square-on (T: untilt)")
+        self._toast(f"tilted {angle:.0f} deg to cut the cortex square-on (T: untilt)")
 
     def _tilt_by(self, about: int, degrees: float) -> None:
         """Tilt the slice about the pane's horizontal (0) or vertical (1) axis, by hand."""
@@ -927,6 +1039,7 @@ class ImageWindow(QtWidgets.QWidget):
         if vp is None:
             return
         self.pane.set_pane(render_viewport(self.session, vp))
+        self._redraw_tiles(vp)
         self._sync_opacity()
         state = self.session.state
         self._redraw_outlines(vp)
@@ -1012,7 +1125,7 @@ class ImageWindow(QtWidgets.QWidget):
             return
         n = 2 if vp.strip >= 8 or not vp.strip else vp.strip + 2
         self._set_strip(n)
-        self.pane.show_toast(f"strip: {n} slices")
+        self._toast(f"strip: {n} slices")
 
     def _strip_step_by(self, delta: int) -> None:
         from fastfuncstuff.viewer.strip import effective_step, slice_mm
@@ -1034,7 +1147,7 @@ class ImageWindow(QtWidgets.QWidget):
         now = effective_step(self.session, vp)
         mm = now * slice_mm(state.grid, plane_layout(state.grid.affine, vp.plane).fixed)
         auto = "auto, " if not vp.strip_step else ""
-        self.pane.show_toast(f"strip step: {auto}{now} slice{'s' * (now != 1)} ({mm:.1f} mm)")
+        self._toast(f"strip step: {auto}{now} slice{'s' * (now != 1)} ({mm:.1f} mm)")
 
     def _strip_zoom_by(self, factor: float) -> None:
         vp = self._viewport()
@@ -1238,7 +1351,7 @@ class ImageWindow(QtWidgets.QWidget):
             tool += f" {hemi} #{v}"
         self.pane.set_brush(self._brush_px(), f"{tool}  r={r:g} mm  {mode}")
         if note:
-            self.pane.show_toast(note)
+            self._toast(note)
 
     def _toggle_grab(self) -> None:
         state = self.session.state
@@ -1260,7 +1373,7 @@ class ImageWindow(QtWidgets.QWidget):
     def _move_highlight(self, surface: str, shift: float) -> None:
         from fastfuncstuff.viewer.ui.surfacewindow import move_highlight
 
-        move_highlight(self.session, self._dispatch, surface, shift, self.pane.show_toast)
+        move_highlight(self.session, self._dispatch, surface, shift, self._toast)
 
     def _step_by(self, factor: float) -> None:
         from fastfuncstuff.viewer.vocab import SetSurfaceStep
@@ -1330,7 +1443,7 @@ class ImageWindow(QtWidgets.QWidget):
         n = surfaces.surface_normal(grab.hemi, grab.surface, grab.vertex)
         away = float(n @ (h.states[grab.surface][grab.vertex] - np.asarray(grab.at_mm)))
         if abs(away) < 0.1:
-            self.pane.show_toast("nudge from beside the outline, on the side to push from")
+            self._toast("nudge from beside the outline, on the side to push from")
             return False
         drag = state.surface_step * np.sign(away) * n
         r, _, smooth, search, sign = state.surface_brush
@@ -1352,14 +1465,14 @@ class ImageWindow(QtWidgets.QWidget):
                 )
             )
         except ValueError as exc:
-            self.pane.show_toast(str(exc))
+            self._toast(str(exc))
             return False
         from fastfuncstuff.surface.edit import explain
 
         res = surfaces.last_result
         note = explain(res) if res is not None else ""
         if note:
-            self.pane.show_toast(note)
+            self._toast(note)
         return True
 
     def _nudge_again(self) -> None:
@@ -1560,7 +1673,7 @@ class ImageWindow(QtWidgets.QWidget):
         try:
             sampler = self.session.surface_sampler(state.surface_snap_key)
         except (ValueError, KeyError) as exc:
-            self.pane.show_toast(str(exc))
+            self._toast(str(exc))
             return
         surfaces.begin(grab, sampler, params)
         self._edit = (grab, np.asarray(grab.at_mm))
@@ -1595,7 +1708,7 @@ class ImageWindow(QtWidgets.QWidget):
             # switch mode, or move the other surface first.
             note = explain(res)
             if note:
-                self.pane.show_toast(note)
+                self._toast(note)
 
     def _edit_release(self) -> None:
         if getattr(self, "_marking", False):
@@ -1726,15 +1839,19 @@ class ImageWindow(QtWidgets.QWidget):
         surfaces = self.session.surfaces
         view = plane_view(state, vp)
         pos = self.pane.position
-        self.pane.set_outline_width(state.surface_outline_width)
+        panes = [self.pane, *self._active_tiles()]
+        for pane in panes:
+            pane.set_outline_width(state.surface_outline_width)
         if not surfaces.hemis or not state.surfaces_shown or view is None or pos is None:
-            self.pane.set_outlines([])
+            for pane in panes:
+                pane.set_outlines([])
             return
         assert state.grid is not None
-        self.pane.set_outlines(
-            surfaces.outlines(self._grid().affine, view, pos, state.surfaces_shown, only=only),
-            only=only,
+        outlines = surfaces.outlines(
+            self._grid().affine, view, pos, state.surfaces_shown, only=only
         )
+        for pane in panes:
+            pane.set_outlines(outlines, only=only)
 
     def redraw_crosshair(self) -> None:
         state = self.session.state
@@ -1752,7 +1869,13 @@ class ImageWindow(QtWidgets.QWidget):
         from fastfuncstuff.viewer.compose import tilt_matrix
 
         r = tilt_matrix(vp)
-        self.pane.set_tilt(float(np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1)))))
+        tilt = float(np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1, 1))))
+        self.pane.set_tilt(tilt)
+        for tile in self._active_tiles():
+            tile.set_layout(layout)
+            tile.set_crosshair(row, col)
+            tile.set_zoomed(not view.is_identity)
+            tile.set_tilt(tilt)
         self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
         self.pane.set_readout(self.session.overlay_readout())
         self.pane.set_handle(self._handle_position())

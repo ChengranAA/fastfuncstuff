@@ -209,6 +209,17 @@ class SetViewSolo(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewTiles(Command):
+    """One tile per visible image in this window, sharing its slice, zoom and pan."""
+
+    name = "SET_VIEW_TILES"
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
 class SetViewLocked(Command):
     """Whether this window follows the shared crosshair and time index."""
 
@@ -2455,6 +2466,11 @@ def install(
     def _set_view_solo(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetViewSolo)
         return _set_view(st, cmd.view, SetViewSolo.aspects, solo=bool(cmd.on))
+
+    @bus.handle(SetViewTiles.name)
+    def _set_view_tiles(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewTiles)
+        return _set_view(st, cmd.view, SetViewTiles.aspects, tiles=bool(cmd.on))
 
     @bus.handle(SetViewLocked.name)
     def _set_view_locked(cmd: Command, st: ViewerState) -> Aspect:

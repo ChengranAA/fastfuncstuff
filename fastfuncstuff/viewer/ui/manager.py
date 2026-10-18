@@ -154,6 +154,7 @@ class WindowManager(QtCore.QObject):
             win.painted.connect(self.painted)
             win.surfaces_previewed.connect(self._redraw_outlines)
             win.centre_all_requested.connect(self.centre_on_crosshair)
+            win.tiles_all_requested.connect(self.set_tiles)
         elif viewport.is_chedi:
             win = ChediWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.centre_requested.connect(self.centre_on_crosshair)
@@ -380,6 +381,15 @@ class WindowManager(QtCore.QObject):
                     win._centre_view()
             elif isinstance(win, SurfaceWindow):
                 win._centre_view()
+
+    def set_tiles(self, on: bool) -> None:
+        """Tile (or untile) every image window: one tile per visible image."""
+        for win in list(self.windows.values()):
+            if isinstance(win, ImageWindow):
+                win.set_tiled(on)
+
+    def any_tiled(self) -> bool:
+        return any(v.tiles for v in self.session.state.viewports.images)
 
     def _image_inputs_changed(self) -> bool:
         """Whether the image and graph viewports differ from the last time this was asked."""

@@ -1831,6 +1831,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("shift+c", "open a carpet plot", self._new_carpet, group="windows"),
                 Binding("shift+m", "open a correlation matrix", self._new_matrix, group="windows"),
                 Binding("f", "tile every window", self._tile, group="windows"),
+                Binding(
+                    "\\",
+                    "tile the images inside every image window (zoom shared per window)",
+                    lambda: self.manager.set_tiles(not self.manager.any_tiled()),
+                    group="windows",
+                ),
                 Binding("shift+f", "stagger every window", self._cascade, group="windows"),
                 Binding("r", "raise every window", self._raise_all, group="windows"),
                 Binding("d", "dark / light palette", self._toggle_theme, group="windows"),

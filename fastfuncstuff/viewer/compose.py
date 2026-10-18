@@ -349,15 +349,22 @@ def plane_view(state: ViewerState, viewport) -> PlaneView | None:
     )
 
 
-def render_viewport(session, viewport) -> PaneImage | None:
+def tile_layers(state) -> list:
+    """The images a tiled window shows, one per tile: every visible layer, in
+    stack order. Hiding a layer takes its tile away."""
+    return [ly for ly in state.layers.layers if ly.visible]
+
+
+def render_viewport(session, viewport, solo_key: str | None = None) -> PaneImage | None:
     """Render what one image window shows.
 
     The window's own settings -- which plane, and whether it is soloed -- are
     read here rather than by the widget, so a screenshot and the screen come
-    from the same call.
+    from the same call. ``solo_key`` draws that layer alone whatever the window's
+    solo says: one tile of a tiled window.
     """
-    solo = None
-    if viewport.solo:
+    solo = solo_key
+    if solo is None and viewport.solo:
         layer = session.state.selected_layer()
         solo = layer.key if layer is not None else None
         if solo is None:
@@ -410,6 +417,7 @@ __all__ = [
     "tilt_matrix",
     "view_grid",
     "render_all",
+    "tile_layers",
     "render_plane",
     "render_viewport",
 ]

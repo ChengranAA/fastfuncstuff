@@ -23,6 +23,7 @@ reconciles real windows against this list and owns no layout truth of its own.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
@@ -105,6 +106,12 @@ class Viewport:
     #: registration actually did. Composite (the default) is the ordinary
     #: underlay/overlay behaviour.
     solo: bool = False
+    #: One tile per visible image instead of the composite, each tile soloed on
+    #: its image and all of them on this window's slice, zoom and pan -- so a
+    #: zoom or a pan in any tile moves every tile. The way to compare versions
+    #: of the same data for a small effect: as if one window per image had been
+    #: opened and zoomed to the same spot by hand.
+    tiles: bool = False
     #: Neighbour strip under the image: how many cropped slices (0 = off,
     #: half each side), how many slices apart (0 = auto: span the edit brush
     #: while editing surfaces, else 1), and the crop's own zoom. Its own zoom
@@ -304,6 +311,8 @@ class Viewport:
             return f"depth · {self.depth_source}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
+        if self.tiles:
+            extra += " · tiles"
         if self.is_graph:
             extra = f" · {self.cells}"
         return f"{what}{extra}  [{self.id}]"
@@ -415,6 +424,15 @@ def clamp_grid(n: int) -> int:
     return max(MIN_GRID, min(int(n), MAX_GRID))
 
 
+def tile_grid(n: int) -> tuple[int, int]:
+    """(rows, cols) for ``n`` tiles: as square as it goes, wider than tall --
+    two side by side, three or four in a 2x2, five or six in 3x2."""
+    if n < 1:
+        return (0, 0)
+    cols = math.ceil(math.sqrt(n))
+    return (math.ceil(n / cols), cols)
+
+
 __all__ = [
     "MAX_GRID",
     "MAX_STRIP",
@@ -424,4 +442,5 @@ __all__ = [
     "Viewport",
     "ViewportSet",
     "clamp_grid",
+    "tile_grid",
 ]

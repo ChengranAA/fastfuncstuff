@@ -2992,3 +2992,39 @@ def test_every_window_offers_j(win, qapp):
     qapp.processEvents()
     for w in (win, *win.manager.windows.values()):
         assert "j" in [b.keys for b in w.help._bindings], type(w).__name__
+
+
+def test_tiles_show_each_image_on_one_shared_view(win, qapp):
+    """`\\` splits every image window into one tile per visible image, each tile
+    soloed on its image: a zoom in any tile is the window's zoom, so every tile
+    shows the same crop -- the point of comparing near-identical images -- and
+    untiling gives the single view and the window's size back."""
+    from fastfuncstuff.viewer.viewports import tile_grid
+
+    assert [tile_grid(n) for n in (1, 2, 3, 4, 5, 7)] == [
+        (1, 1), (1, 2), (2, 2), (2, 2), (2, 3), (3, 3)
+    ]  # fmt: skip
+    w = image_of(win, Plane.AXIAL)
+    size = w.size()
+    win.manager.set_tiles(True)
+    qapp.processEvents()
+    tiles = w._active_tiles()
+    assert len(tiles) == 2 and w.view_stack.currentWidget() is w.tile_box
+    # two equal halves, not a full tile and a sliver (a column left unstretched)
+    assert abs(tiles[0].width() - tiles[1].width()) <= 2 and tiles[1].width() > 50
+    assert all(image_of(win, p)._active_tiles() for p in Plane)  # every image window
+    names = [ly.name for ly in win.session.state.layers.layers]
+    assert [t.caption.lstrip("> ") for t in tiles] == names
+    a, b = (t._pane.rgba.cpu().numpy() for t in tiles)
+    assert a.shape == b.shape and not np.array_equal(a, b)  # each its own image
+
+    tiles[1].zoomed.emit(2.0)  # zoom in the second tile
+    qapp.processEvents()
+    assert win.session.state.viewports.find(w.vid).zoom == 2.0
+    za, zb = (t._pane.rgba.shape for t in w._active_tiles())
+    assert za == zb and za[0] < a.shape[0]  # both tiles cropped alike
+
+    win.manager.set_tiles(False)
+    qapp.processEvents()
+    assert w.view_stack.currentWidget() is w.pane and not w._active_tiles()
+    assert w.size() == size

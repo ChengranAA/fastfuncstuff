@@ -272,7 +272,7 @@ TUNING  (turning the knobs)
   -stride     smaller = denser, smoother field, more FFTs; ~patch/2 = NORDIC-style
               overlap. 8 default.
   -iters      more = better convergence for larger motion (flow AND phase), linear
-              cost; xcorr ignores it (single-shot).
+              cost; xcorr ignores it (single-shot). 8 default.
   -xcorr_step xcorr's sub-voxel knob (its answer to -iters): 0.5 default; 0.25 doubles
               the trials for a bit more precision. Peak is always 5-point-parabola fit.
   -levels     more pyramid levels handle bigger motion but risk aliasing on thin
@@ -286,7 +286,7 @@ ACCURACY  (trade time for exactness — all backends)
                          lanczos is 1-D only, so it is unavailable with two axes.
   -refine N              rebuild the reference from the corrected series (sharp, motion
                          removed) and re-register N more times; converges the template
-                         out of its bias (measurably tighter frame alignment).
+                         out of its bias (measurably tighter frame alignment). 1 default.
   -jacobian              conserve PE signal — stretched regions dim, compressed brighten
                          (J = det(I+grad disp)). Off by default; for data with real B0
                          pile-up, not a purely geometric shift.
@@ -757,7 +757,7 @@ def create_parser() -> argparse.ArgumentParser:
         " -backend qwarp. 'max' has no paired form — a max over one bin's frames is a noise"
         " envelope, not a template.\n"
         "Also selects the aggregation for -refine, and (when given explicitly) the qwarp"
-        " template. Default: max for rotation-aware mode, mean otherwise.",
+        " template. Default: max for rotation-aware mode, median otherwise.",
     )
     est.add_argument(
         "-first_n",
@@ -1020,13 +1020,16 @@ def create_parser() -> argparse.ArgumentParser:
     tune.add_argument(
         "-iters",
         type=int,
-        default=4,
+        default=8,
         help="[flow, phase] Refinement iterations INSIDE one estimate (not the outer"
         " -refine reference loop).\n"
         "  flow   LK warp-and-update passes per pyramid level.\n"
         "  phase  whole-field warp-and-re-read passes, which cancel the single-patch"
         " leakage bias.\n"
         "  xcorr  ignores it; it is single-shot.\n"
+        "Default 8: the coarse levels settle in 5-7, the finest level only circles at ~0.01 vox, "
+        "and 16 reproduces -superhard's field, which on near-zero motion is the estimator "
+        "fitting its own noise.\n"
         "More = better convergence for larger motion, at linear cost.\n"
         "The flow backend reports whether it settled, per pyramid level and coarsest "
         "first: `4 iters, conv @ 2,4,3` settled inside the cap; a starred level (`2,4*,3`) "
@@ -1300,10 +1303,10 @@ def create_parser() -> argparse.ArgumentParser:
     acc.add_argument(
         "-refine",
         type=int,
-        default=0,
+        default=1,
         metavar="ROUNDS",
         help="[plain path + -backend qwarp] Outer reference-refinement rounds (the max cap when "
-        "-converge is set). After the first estimate, rebuild the reference from the "
+        "-converge is set). Default 1: later passes moved the estimate < 0.01 vox. After the first estimate, rebuild the reference from the "
         "corrected series (motion removed → sharp, and aggregated per -ref: a max stays "
         "FoV-filled) and re-register the original frames against it. Each pass prints its "
         "step size (RMS displacement change, in-brain). 1–3 tightens the values; 0 = off. "
@@ -1913,12 +1916,12 @@ def create_parser() -> argparse.ArgumentParser:
 # field tests: bicubic warp (better for flow, neutral elsewhere), more convergence
 # iterations, reference-refinement rounds, and denser search.
 _PRESET_DEFAULTS = {
-    "iters": 4,
+    "iters": 8,
     "levels": 3,
     "stride": 8,
     "xcorr_step": 0.5,
     "warp_interp": "auto",
-    "refine": 0,
+    "refine": 1,
 }
 _PRESETS = {
     "workhard": {
@@ -4579,7 +4582,7 @@ def _run_multiecho(
         print(
             f"   ℹ️  refine=0: the reference ('{args.ref_label}') is built from the un-corrected "
             "frames, so it still carries the wiggle and biases displacement LOW — add "
-            "-refine 2/-workhard/-superhard for full magnitude."
+            "-refine 2/-superhard for full magnitude."
         )
 
     # What qwarp registers: the estimator's task-cut copy unless -qwarp_uncut. The
@@ -5186,7 +5189,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # tell "the user asked for this reference" from "nobody set one" via this flag.
     args.ref_explicit = args.ref is not None
     if args.ref is None:
-        args.ref = "max" if rotaware else "mean"
+        args.ref = "max" if rotaware else "median"
     # "paired[_stat]" selects the BINS; the statistic within a bin is an independent
     # axis, so it is split off here and the library keeps taking a plain ref_mode.
     # Same compound-name shape as the existing first_mean / first_median.
@@ -5659,7 +5662,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         # Rotation-aware converges via the anchor/fuse, not reference-refinement, so only
         # -refine / -jacobian (and the refine rounds inside the presets) are inert here.
         # The presets' extra iters / levels / search density DO feed the estimator.
-        if args.refine or args.jacobian or preset:
+        if args.refine not in (0, 1) or args.jacobian or preset:
             print(
                 "ℹ️  rotation-aware: -refine and -jacobian (and the refine rounds inside "
                 "-workhard/-superhard) don't apply — convergence is the anchor/fuse. The "

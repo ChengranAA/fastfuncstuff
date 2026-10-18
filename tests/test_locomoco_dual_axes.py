@@ -622,8 +622,8 @@ def test_cli_me_dual_writes_per_echo_axis_maps(tmp_path):
     )  # fmt: skip
     assert rc == 0
     for ei in (1, 2):
-        assert Path(f"{stem}_e{ei}_flow_pe1.nii.gz").exists()
-        assert Path(f"{stem}_e{ei}_flow_pe2.nii.gz").exists()
+        assert Path(f"{stem}.echo-{ei}_flow_pe1.nii.gz").exists()
+        assert Path(f"{stem}.echo-{ei}_flow_pe2.nii.gz").exists()
     assert Path(f"{stem}_locomoco_coupling.txt").exists()
     assert Path(f"{stem}_locomoco_sep.nii.gz").exists()
 

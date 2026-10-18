@@ -1685,3 +1685,19 @@ def test_warp3d_pull_honours_the_kernel_and_clamps_at_the_edge():
     out = torch.full_like(vol, 2.0)
     edge = _warp3d_pull(out, torch.full_like(vol, -3.0), dy * 0, dz * 0, mode="lanczos")
     assert torch.allclose(edge, out), "a pull past the edge zeroed the face"
+
+
+def test_defaults_are_one_refine_eight_iters_and_a_median_reference():
+    """Measured on A01D and a 1.25 mm run: 16 iterations with 2-3 refines (-superhard)
+    changed the corrected data by ~1% tSNR; the later refine passes moved the estimate
+    < 0.01 vox and the median reference made no measurable difference."""
+    from fastfuncstuff.cli.locomoco import _apply_preset, _parse
+
+    a = _parse(["-input", "x.nii.gz", "-pe_dir", "y"])
+    assert (a.iters, a.refine, a.ref) == (8, 1, None)  # None resolves to median (max if rotaware)
+    sup = _parse(["-input", "x.nii.gz", "-pe_dir", "y", "-superhard"])
+    _apply_preset(sup)
+    assert (sup.iters, sup.refine) == (16, 3)
+    mine = _parse(["-input", "x.nii.gz", "-pe_dir", "y", "-superhard", "-iters", "12"])
+    _apply_preset(mine)
+    assert (mine.iters, mine.refine) == (12, 3)  # an explicit flag still wins over the preset

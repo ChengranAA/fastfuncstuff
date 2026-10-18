@@ -701,7 +701,7 @@ def create_parser() -> argparse.ArgumentParser:
         "  flat         a field change (the same in Hz at every echo): field-blind.\n"
         "  flat_offset  that plus a change of the receiver phase at TE 0, which in Hz falls"
         " as 1/TE and would otherwise read as a TE-dependent shift. Needs 3+ echoes;"
-        " noisier local flow (27-50% in 4 of 8 pilot runs), so opt-in: worth a try when a"
+        " noisier local flow (27-50%% in 4 of 8 pilot runs), so opt-in: worth a try when a"
         " run's receiver offset drifts a lot.\n"
         "  auto         flat.",
     )

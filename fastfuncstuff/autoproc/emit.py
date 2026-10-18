@@ -3699,7 +3699,9 @@ def _final_me_jobs(plan: Plan, nwarp_flags: str) -> str:
 
 def _me_surface_args(plan: Plan) -> str:
     """Bash setting ``sa``: echo $e's surface read in its stage10 job (its own chain, an
-    .echo-N prefix); the geometry and QC are written once, by echo 1."""
+    .echo-N prefix). Every echo keeps the shared -surf_geom_prefix -- the geometry
+    depends only on subject and mesh, and without it ffs_nwarp writes a copy under each
+    echo's own stem; only the QC is echo 1's alone."""
     if not plan.options.surface_target:
         return '      sa=""\n'
     full = (
@@ -3707,7 +3709,7 @@ def _me_surface_args(plan: Plan) -> str:
         .replace('stage10s.surf.${FRAG[$k]}\\"', 'stage10s.surf.${FRAG[$k]}.echo-$e\\"')
         .replace("${SURFCHAIN[$k]}", "${SURFCHAIN[$k|$e]}")
     )
-    lean = full.replace(" -surf_geom_prefix stage10s.surf", "").replace(" -surf_qc", "")
+    lean = full.replace(" -surf_qc", "")
     return f'      sa="{lean}"; [ "$e" -eq 1 ] && sa="{full}"\n'
 
 

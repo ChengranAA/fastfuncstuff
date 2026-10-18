@@ -3513,6 +3513,11 @@ def test_multiecho_surface_reads_every_echo_and_combines_per_vertex(tmp_path):
     assert '-surf_prefix \\"stage10s.surf.${FRAG[$k]}.echo-$e\\"' in s
     assert '-surf_nwarp \\"${SURFCHAIN[$k|$e]}\\"' in s
     assert "$pe_args$sa" in s
+    # every echo shares one geometry copy; only echo 1 writes the QC
+    sa = next(ln for ln in s.splitlines() if ln.strip().startswith('sa="'))
+    lean, full = sa.split('; [ "$e" -eq 1 ] && sa=')
+    assert "-surf_geom_prefix stage10s.surf" in lean and "-surf_qc" not in lean
+    assert "-surf_geom_prefix stage10s.surf" in full
     assert (
         '-optcom "stage10s.surf.${FRAG[$k]}.native.lh.func.gii"' in s
         and '-optcom "stage10s.surf.${FRAG[$k]}.native.rh.func.gii"' in s

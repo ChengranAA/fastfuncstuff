@@ -1246,21 +1246,6 @@ def create_parser() -> argparse.ArgumentParser:
         "falls back to eager if inductor is unavailable.",
     )
     qw.add_argument(
-        "-qwarp_refine",
-        "-qwarp-refine",
-        type=int,
-        default=None,
-        dest="qwarp_refine",
-        help="Re-run the qwarp registration N extra times, each against a template rebuilt "
-        "from the previous pass's corrected series (re-solved from seed 0, never seeded "
-        "with the previous field). The first template is built from data that still "
-        "carries the distortion, so it is blurred by it and biases the field LOW — the "
-        "same reason the estimator has -refine. Defaults to -refine under -backend qwarp "
-        "(where no flow pass runs, so -refine has nothing else to do) and to 0 for the "
-        "-final_qwarp polish (whose template the flow refine already sharpened). Each "
-        "pass costs a full qwarp sweep.",
-    )
-    qw.add_argument(
         "-qwarp_uncut",
         "-qwarp-uncut",
         action="store_true",
@@ -1304,7 +1289,6 @@ def create_parser() -> argparse.ArgumentParser:
         "-refine",
         type=int,
         default=1,
-        action=_RecordGiven,
         metavar="ROUNDS",
         help="[plain path + -backend qwarp] Outer reference-refinement rounds (the max cap when "
         "-converge is set). Default 1: later passes moved the estimate < 0.01 vox. After the first estimate, rebuild the reference from the "
@@ -1312,9 +1296,11 @@ def create_parser() -> argparse.ArgumentParser:
         "FoV-filled) and re-register the original frames against it. Each pass prints its "
         "step size (RMS displacement change, in-brain). 1–3 tightens the values; 0 = off. "
         "Under -backend qwarp there is no flow pass, so this drives the QWARP passes "
-        "instead, but only when typed: the default 1 is the flow estimators' and adds no "
-        "extra qwarp pass (override with -qwarp_refine). -final_qwarp is one pass unless "
-        "-qwarp_refine asks for more.",
+        "instead: the first template is built from data that still carries the distortion, "
+        "so it is blurred by it and biases the field LOW, and each refine pass registers "
+        "every frame again to a template rebuilt from the corrected series (so the default "
+        "is two qwarp passes). The -final_qwarp polish is always ONE pass: it starts from "
+        "a template the estimator's own refine already sharpened.",
     )
     acc.add_argument(
         "-converge",
@@ -3496,15 +3482,6 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
     return cleaned
 
 
-class _RecordGiven(argparse.Action):
-    """Store the value and remember it was typed, for defaults that mean different
-    things to different backends (-refine: one flow pass, but no extra qwarp pass)."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        setattr(namespace, self.dest, values)
-        setattr(namespace, f"{self.dest}_given", True)
-
-
 def _qwarp_template_args(args, qwarp_backend: bool) -> tuple[str, int]:
     """``(ref_mode, refine)`` for the qwarp template — the two knobs it used to pin.
 
@@ -3513,17 +3490,11 @@ def _qwarp_template_args(args, qwarp_backend: bool) -> tuple[str, int]:
     rotation-aware) and a median template is the more robust choice for registration, so
     defaulting to ``args.ref`` would silently change every existing command. ``-refine``
     drives the qwarp passes under ``-backend qwarp``, where no flow pass runs and it is
-    otherwise inert; the ``-final_qwarp`` polish stays at one pass unless asked, since the
-    flow refine already sharpened the template it registers against.
+    otherwise inert; the ``-final_qwarp`` polish is always one pass, since the flow refine
+    already sharpened the template it registers against.
     """
     ref_mode = args.ref if getattr(args, "ref_explicit", False) else "median"
-    if args.qwarp_refine is not None:
-        refine = max(0, int(args.qwarp_refine))
-    else:
-        # Only a typed -refine: the default belongs to the flow estimators, and each extra
-        # qwarp pass registers every frame again.
-        typed = getattr(args, "refine_given", False)
-        refine = max(0, int(args.refine)) if qwarp_backend and typed else 0
+    refine = max(0, int(args.refine)) if qwarp_backend else 0
     return ref_mode, refine
 
 
@@ -4591,7 +4562,7 @@ def _run_multiecho(
         print(
             f"   ℹ️  qwarp refine=0: the template ('{qwarp_ref_mode}' of the uncorrected echoes) still "
             "carries the distortion, so it is blurred by it and biases the field LOW — add "
-            "-refine/-qwarp_refine 2 to rebuild it from the corrected series."
+            "-refine 1 (the default) or more to rebuild it from the corrected series."
         )
     if args.refine == 0 and not args.me_interecho and not qwarp_backend:
         print(

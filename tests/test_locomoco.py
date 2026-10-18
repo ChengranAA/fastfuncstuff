@@ -1703,20 +1703,19 @@ def test_defaults_are_one_refine_eight_iters_and_a_median_reference():
     assert (mine.iters, mine.refine) == (12, 3)  # an explicit flag still wins over the preset
 
 
-def test_only_a_typed_refine_adds_qwarp_passes():
-    """-refine's default (1) is the flow estimators'. The qwarp backend takes extra
-    passes only from a typed -refine or -qwarp_refine (each registers every frame
-    again), and the -final_qwarp polish is one pass unless -qwarp_refine asks for more."""
+def test_qwarp_backend_follows_refine_and_the_polish_is_one_pass():
+    """Under -backend qwarp -refine drives the qwarp passes (default 1: it registers to a
+    cleaned-up template, so two passes); the -final_qwarp polish is always one."""
     from fastfuncstuff.cli.locomoco import _parse, _qwarp_template_args
 
     def passes(*extra, backend=False):
         a = _parse(["-input", "x.nii.gz", "-pe_dir", "y", *extra])
         return _qwarp_template_args(a, backend)[1]
 
-    assert passes(backend=True) == 0  # default: one qwarp pass
-    assert passes("-refine", "1", backend=True) == 1  # typed, even if it equals the default
+    assert passes(backend=True) == 1  # initial + one refine pass
+    assert passes("-refine", "0", backend=True) == 0
     assert passes("-refine", "2", backend=True) == 2
-    assert passes("-refine", "2", "-qwarp_refine", "0", backend=True) == 0
     assert passes("-final_qwarp") == 0
     assert passes("-final_qwarp", "-refine", "3") == 0  # -refine never drives the polish
-    assert passes("-final_qwarp", "-qwarp_refine", "2") == 2
+    with pytest.raises(SystemExit):  # the separate flag is gone
+        _parse(["-input", "x.nii.gz", "-pe_dir", "y", "-qwarp_refine", "2"])

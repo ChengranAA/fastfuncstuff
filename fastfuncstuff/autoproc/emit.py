@@ -26,6 +26,7 @@ from fastfuncstuff.autoproc.plan import (
     Plan,
     PlanRun,
     effective_anat_source,
+    medic_owns_inplane,
     ref_anchor,
     run_average_chain,
     run_noise_vols,
@@ -2099,7 +2100,11 @@ def _locomoco_run_vars(plan: Plan) -> str:
             + phase
             # MEDIC already corrected each frame in-plane: only the TE-scaled partition
             # shift is left for the joint solve.
-            + ('    lm_pe="-pe_dir2 k"\n' if _medic_on(plan) else "")
+            + (
+                '    lm_pe="-pe_dir2 k"\n'
+                if _medic_on(plan) and medic_owns_inplane(plan.options)
+                else ""
+            )
             + "  fi"
         )
     return "\n".join(out)

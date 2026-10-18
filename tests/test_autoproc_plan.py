@@ -3659,3 +3659,26 @@ def test_me_combine_resumes_surfaces_on_their_own_and_fits_the_field_only_with_p
     assert "-phase" not in vol[0] and "-field_hz" not in vol[0]  # B has no phase
     assert any("stage10s.surf.A." in c for c in surf)  # A's surfaces still combined
     assert any("stage10s.surf.B." in c for c in surf)
+
+
+@pytest.mark.parametrize("acq_3d", [True, False])
+def test_medic_owns_inplane_unless_asked_to_keep_locomocos(acq_3d):
+    """-medic corrects in-plane frame by frame: 3-D locomoco keeps only the partition
+    shift, 2-D (no partition axis) skips locomoco -- chain, stage and lanes alike.
+    -medic_inplane_locomoco keeps the in-plane solve on top in both."""
+    r = _me_run("01", "foo", "1")
+    r.json["TotalReadoutTime"] = 0.0312
+    subj = Subject("X", [Session("01", [r])])
+    kw = dict(phase_proc=True, medic=True, locomoco=True, acq_3d=acq_3d, go_to_anat=False,
+              slicetiming_method="none" if acq_3d else "integrate")  # fmt: skip
+    plan = build_plan(subj, Options(**kw))
+    s = write_script(plan, "wd", bids_root="/bids")
+    keep = build_plan(subj, Options(medic_inplane_locomoco=True, **kw))
+    k = write_script(keep, "wd", bids_root="/bids")
+    if acq_3d:
+        assert "locomoco" in plan.runs[0].warp_chain
+        assert 'lm_pe="-pe_dir2 k"' in s and 'lm_pe="-pe_dir2 k"' not in k
+    else:
+        assert "locomoco" not in plan.runs[0].warp_chain and not plan.options.locomoco
+        assert "== stage03: locomoco ==" not in s
+        assert "locomoco" in keep.runs[0].warp_chain and "== stage03: locomoco ==" in k

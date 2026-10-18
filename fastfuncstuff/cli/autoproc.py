@@ -451,9 +451,15 @@ def build_parser() -> argparse.ArgumentParser:
         "moco reads, and a time-varying warp rightmost in every echo's chain, so stage10 "
         "still resamples once from the raw series. It IS the distortion correction: "
         "fieldmaps are not used, the SBRef is not the moco base (it has no per-frame "
-        "field), and 3-D multi-echo locomoco solves the partition axis only (MEDIC owns "
-        "in-plane). Needs TotalReadoutTime and PhaseEncodingDirection in every run's "
-        "sidecar.",
+        "field), and MEDIC owns the in-plane axis: 3-D locomoco solves the partition "
+        "shift only, and 2-D skips locomoco (see -medic_inplane_locomoco). Needs "
+        "TotalReadoutTime and PhaseEncodingDirection in every run's sidecar.",
+    )
+    g.add_argument(
+        "-medic_inplane_locomoco",
+        action="store_true",
+        help="with -medic and -locomoco: keep locomoco's in-plane solve on top of MEDIC "
+        "(3-D: in-plane + partition; 2-D: in-plane) instead of leaving in-plane to MEDIC.",
     )
     g.add_argument(
         "-no_phase_drift",
@@ -1532,6 +1538,11 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "-medic: the session fieldmaps are not used -- the per-frame field corrects "
             "the distortion, and a fieldmap would correct it twice."
         )
+    if opt.medic and opt.locomoco and not opt.acq_3d and not opt.medic_inplane_locomoco:
+        warnings.append(
+            "-medic with 2-D EPI: locomoco is skipped -- MEDIC corrects in-plane frame by "
+            "frame and 2-D has no partition axis (-medic_inplane_locomoco keeps it)."
+        )
     if opt.phase_proc:
         # Phase is carried per run, wherever a run has one: a session can mix
         # gradient-echo runs (with phase) and spin-echo runs (without).
@@ -2478,6 +2489,7 @@ def main(argv: list[str] | None = None) -> int:
         phase_proc=args.phase_proc,
         phase_drift=not args.no_phase_drift,
         medic=args.medic,
+        medic_inplane_locomoco=args.medic_inplane_locomoco,
         locomoco_phase=args.locomoco_phase,
         phasereg=args.phasereg,
         phasereg_opts=args.phasereg_opts,

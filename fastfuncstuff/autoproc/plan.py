@@ -204,6 +204,10 @@ class Options:
     # experiment that did not hold up: on the hardest 3-D run (1.25 mm, 3 echoes) it left
     # 2-4x more partition wiggle than magnitude alone at the later echo. Opt-in only.
     locomoco_phase: bool = False
+    # -medic corrects in-plane distortion frame by frame, so by default locomoco does not
+    # also solve the in-plane axis: 3-D keeps only the TE-scaled partition shift, and 2-D
+    # (no partition axis) skips locomoco altogether. True keeps the in-plane solve on top.
+    medic_inplane_locomoco: bool = False
     xrun_nonlin: bool = False
     xfmap_nonlin: bool = False
     xses_nonlin: bool = False
@@ -768,8 +772,18 @@ def _apply_in_source_swaps(tokens: list[str], opt) -> list[str]:
     return out
 
 
+def medic_owns_inplane(opt: Options) -> bool:
+    """-medic takes the in-plane axis from locomoco (unless asked to keep it)."""
+    return bool(opt.medic and opt.locomoco and not opt.medic_inplane_locomoco)
+
+
 def build_plan(subject: Subject, opt: Options) -> Plan:
     """Resolve references and build every run's warp chain."""
+    if medic_owns_inplane(opt) and not opt.acq_3d:
+        # 2-D: in-plane is MEDIC's and there is no partition axis, so locomoco has
+        # nothing left to estimate. Off here, once, so the chain, the lanes, stage03 and
+        # the GLM's locomoco regressors all agree (preflight makes every run -medic's).
+        opt = replace(opt, locomoco=False)
     ref_session = _resolve_ref_session(subject, opt)
     multi_session = len([s for s in subject.sessions if s.session is not None]) > 1
 

@@ -705,6 +705,18 @@ def create_parser() -> argparse.ArgumentParser:
         " run's receiver offset drifts a lot.\n"
         "  auto         flat.",
     )
+    mp.add_argument(
+        "-phase_weight",
+        choices=("noise", "romeo"),
+        default="noise",
+        help="[-phase] How much each voxel's PHASE is trusted:\n"
+        "  noise  by its frame-to-frame noise alone.\n"
+        "  romeo  that times ROMEO's voxel quality (phase coherence with the neighbours,"
+        " echo agreement, magnitude), from the inputs' temporal means. A spatially"
+        " incoherent phase (dephasing, partial volume, the head's edge) has a gradient"
+        " that does not say how it moves, and its noise does not show it; down-weighted,"
+        " the magnitude carries that voxel. Needs 2+ echoes and warpkit.",
+    )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
         "-backend",
@@ -4126,6 +4138,8 @@ def _magphase_arg_error(args, *, dual: bool, slicewise: bool) -> str | None:
         return "-phase_mag_nuisance s0r2 fits two terms per voxel and needs 3+ echoes."
     if args.phase_field_nuisance == "flat_offset" and n < 3:
         return "-phase_field_nuisance flat_offset fits two terms per voxel and needs 3+ echoes."
+    if n == 1 and args.phase_weight == "romeo":
+        return "-phase_weight romeo scores echo agreement and needs 2+ echoes."
     if n == 1 and args.phase_field_nuisance != "auto":
         return "a single echo has no per-voxel field term; leave -phase_field_nuisance at auto."
     if n == 1 and args.phase_hpf is not None and args.phase_hpf <= 0:
@@ -4195,6 +4209,18 @@ def _load_magphase(args, datas) -> list:
             "echo) and check -phase_units."
         )
     return out
+
+
+def _magphase_quality(args, mags, phases_hz):
+    """-phase_weight romeo: ROMEO's voxel quality of the inputs, else None."""
+    if args.phase_weight != "romeo":
+        return None
+    import numpy as np
+
+    from fastfuncstuff.processing.phase_unwrap import romeo_voxel_quality
+
+    rad = [2 * np.pi * p * (te / 1000.0) for p, te in zip(phases_hz, args.echo_times, strict=True)]
+    return romeo_voxel_quality(mags, rad, args.echo_times)
 
 
 def _magphase_hz(args, phases) -> list:
@@ -4585,6 +4611,7 @@ def _run_multiecho(
             phase_hpf_sigma=_magphase_hpf_vox(args, affine, len(datas)),
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
+            phase_quality=_magphase_quality(args, est_datas, phases_hz),
             device=device,
         )
         del phases_hz

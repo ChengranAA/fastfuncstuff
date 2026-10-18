@@ -179,6 +179,31 @@ def _romeo_volume(
     return u, se_mask, np.zeros(se_mask.shape, np.float32)
 
 
+def romeo_voxel_quality(
+    mags: Sequence[np.ndarray], phases_rad: Sequence[np.ndarray], tes: Sequence[float]
+) -> np.ndarray:
+    """ROMEO's per-voxel quality, ``(x, y, z)`` in [0, 1], of a multi-echo series.
+
+    Scored on the temporal means (magnitude, and the unwrapped phase -- the score reads
+    only wrapped neighbour differences, so it is re-wrapped first): phase coherence with
+    the neighbours, agreement of the phase gradient across echoes, and magnitude
+    coherence. High where the phase is spatially smooth and echo-consistent; low where
+    dephasing, partial volume or a steep field leave it incoherent -- exactly where a
+    phase gradient cannot be trusted to say how the phase moves when the tissue does.
+    """
+    from warpkit.warpkit_cpp import romeo_voxelquality
+
+    if len(mags) < 2:
+        raise ValueError("ROMEO's voxel quality needs 2+ echoes.")
+    mag = np.stack([np.asarray(m, np.float32).mean(axis=3) for m in mags], axis=3)
+    ph = np.stack([np.asarray(p, np.float32).mean(axis=3) for p in phases_rad], axis=3)
+    ph = np.angle(np.exp(1j * ph)).astype(np.float32)
+    q = romeo_voxelquality(
+        np.ascontiguousarray(ph), np.asarray(tes, np.float32), np.ascontiguousarray(mag)
+    )
+    return np.clip(np.nan_to_num(np.asarray(q, np.float32)), 0.0, 1.0)
+
+
 def unwrap_reference(
     ref_phase: np.ndarray,
     ref_mag: np.ndarray,

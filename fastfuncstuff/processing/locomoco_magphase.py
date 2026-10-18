@@ -153,6 +153,7 @@ def estimate_partition_flow_magphase(
     warp_interp: str = "lanczos",
     warp_radius: int = 3,
     inplane_axis: int | None = None,
+    phase_quality: np.ndarray | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MagPhaseFlow:
@@ -182,6 +183,13 @@ def estimate_partition_flow_magphase(
     constancy on the un-projected log-magnitude (as plain locomoco's in-plane estimate
     does), ``w`` from the joint projected solve, alternating per iteration (the two
     axes' derivatives are only weakly coupled). Returned as ``u_field``.
+
+    ``phase_quality``: ``(nx, ny, nz)`` in [0, 1], multiplying the phase's noise weight
+    per voxel (e.g. ROMEO's voxel quality). The noise weight sees only how much a
+    voxel's phase fluctuates; where the phase is spatially incoherent its gradient is a
+    poor model of how it moves, which no temporal variance reveals. Down-weighted, the
+    magnitude carries that voxel -- or nothing does; no field is borrowed from
+    neighbours beyond the solve's own window.
     """
     from .locomoco import _blur3d_b, _shift3d_axis
     from .mask import automask
@@ -306,6 +314,9 @@ def estimate_partition_flow_magphase(
         wt = 1.0 / var.clamp_min(float(var.median()) * 1e-3)
         if ch == "hz":
             wt = wt * valid_in_brain[None]
+            if phase_quality is not None:
+                q = torch.from_numpy(np.asarray(phase_quality, np.float32)[brain_np])
+                wt = wt * q.to(device).clamp(0.0, 1.0)[None]
         weights[ch] = wt
     w_raw = None
     if inplane_axis is not None:
@@ -379,7 +390,8 @@ def estimate_partition_flow_magphase(
             f"🧲 mag+phase (experimental): {e} echo{'es' if e > 1 else ''}, mag nuisance {mag_nuisance}, "
             f"phase {'field-blind' if e > 1 else 'high-passed'}"
             f"{f' (hpf σ {phase_hpf_sigma:.2g} vox)' if phase_hpf_sigma > 0 else ''}; "
-            f"phase valid in {int(valid_np.sum())}/{int(brain_np.sum())} brain voxels, "
+            f"phase valid in {int(valid_np.sum())}/{int(brain_np.sum())} brain voxels"
+            f"{', weighted by voxel quality' if phase_quality is not None else ''}, "
             f"median phase share of information {float(share[torch.from_numpy(brain_np)].median()):.2f}; "
             f"|w| median {float(ap.median()):.4f} vox (echo {e}: x{float(alpha[-1]):.2f})"
         )

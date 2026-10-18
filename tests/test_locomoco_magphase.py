@@ -211,6 +211,9 @@ def test_cli_phase_validation_single_echo():
             setattr(args, name, None)
     assert _magphase_mag_nuisance(args) == "none"
     assert _magphase_arg_error(args, dual=False, slicewise=False) is None
+    args.phase_weight = "romeo"
+    assert "2+ echoes" in _magphase_arg_error(args, dual=False, slicewise=False)
+    args.phase_weight = "noise"
     args.echo_times = None
     assert "-echo_times" in _magphase_arg_error(args, dual=False, slicewise=False)
 
@@ -469,3 +472,39 @@ def test_cli_detask_fit_cuts_mag_and_phase_alike_and_outputs_stay_raw(tmp_path, 
     )
     assert abs(amp(out_ph) - 4.0) < 0.3  # the injected 4 Hz, intact in the output
     assert abs(amp(seen["phase"][inner].mean(0))) < 0.5  # ... and (mostly) gone from the fit
+
+
+def test_phase_quality_scales_only_the_phase_channel():
+    """Quality 1 is the plain noise weighting; quality 0 takes the phase out entirely,
+    so what the phase contains no longer matters and the magnitude carries the field."""
+    mags, phs, _w, _head = _scene()
+    plain = _run(mags, phs, refine_rounds=0)
+    ones = _run(mags, phs, refine_rounds=0, phase_quality=np.ones(SHAPE, np.float32))
+    assert torch.equal(plain.w_field, ones.w_field)
+
+    zero = np.zeros(SHAPE, np.float32)
+    rng = np.random.default_rng(5)
+    junk = [p + rng.normal(0, 20, p.shape).astype(np.float32) for p in phs]
+    a = _run(mags, phs, refine_rounds=0, phase_quality=zero)
+    b = _run(mags, junk, refine_rounds=0, phase_quality=zero)
+    assert torch.allclose(a.w_field, b.w_field, atol=1e-6)
+    assert float(a.phase_share.max()) < 1e-6
+    assert not torch.allclose(a.w_field, plain.w_field, atol=1e-4)
+
+
+def test_romeo_quality_ranks_coherent_phase_above_incoherent():
+    pytest.importorskip("warpkit")
+    from fastfuncstuff.processing.phase_unwrap import romeo_voxel_quality
+
+    rng = np.random.default_rng(2)
+    shape = (24, 24, 12, 4)
+    field = np.broadcast_to(np.linspace(0, 40, 24)[:, None, None, None], shape)  # Hz
+    tes = [10.0, 20.0, 30.0]
+    phs = [2 * np.pi * field * te / 1000 for te in tes]
+    # one half's phase is incoherent noise, different at every echo
+    for p in phs:
+        p[12:] = rng.uniform(-np.pi, np.pi, p[12:].shape)
+    mags = [np.full(shape, 100.0, np.float32) for _ in tes]
+    q = romeo_voxel_quality(mags, [p.astype(np.float32) for p in phs], tes)
+    assert q.shape == shape[:3]
+    assert np.median(q[2:10, 2:-2, 2:-2]) > 0.8 > 0.3 > np.median(q[14:22, 2:-2, 2:-2])

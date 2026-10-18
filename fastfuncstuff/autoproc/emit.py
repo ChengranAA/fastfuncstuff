@@ -324,7 +324,15 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt, echo: int | None = None) 
         if tok == "moco":
             return [_run_stem(pr, "moco") + f".echo-{echo}.aff12.1D"]
         if tok == "locomoco":
-            return [_run_stem(pr, "nlmoco") + f".echo-{echo}_warp{fmt}"]
+            # One shared warp (ffs_locomoco -me_shared_warp, echo 1's field); echo e's is
+            # it with the partition (k) displacement times TE_e/TE_1 -- the TE law is
+            # fixed (-me_fixed_scaling), so the factor is known here. ffs_nwarp's VSCALE
+            # scales along the warp's voxel axes, exact on an oblique slab.
+            warp = _run_stem(pr, "nlmoco") + f"_warp{fmt}"
+            tes = pr.bold.echo_tes
+            if echo == 1:
+                return [warp]
+            return [f"VSCALE:1,1,{tes[echo - 1] / tes[0]:.6g}:{warp}"]
     if tok == "mni_nl":
         # .gz, not $FMT: every backend takes the warp's extension from its -prefix,
         # and that prefix is the whole-brain MNI underlay, which has to be openable
@@ -2096,7 +2104,8 @@ def _locomoco_run_vars(plan: Plan) -> str:
             # The TE law fixed, not learned: learned on A01D (magnitude only) it came out
             # non-physical (1, 1.24, 0.78, 0.42, 0.36 against TE ratios to 7.9; linear-in-TE
             # r2 -2.7), and the learning pass holds a field per axis per echo.
-            '    lm_me="-me_3depi -echo_times ${TES[$k]} -me_fixed_scaling"\n'
+            # -me_shared_warp: one warp for the run; each echo's chain scales it (VSCALE).
+            '    lm_me="-me_3depi -echo_times ${TES[$k]} -me_fixed_scaling -me_shared_warp"\n'
             + phase
             # MEDIC already corrected each frame in-plane: only the TE-scaled partition
             # shift is left for the joint solve.

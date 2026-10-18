@@ -3346,11 +3346,13 @@ def test_multiecho_estimates_from_echo1_warps_each_echo_and_combines(tmp_path, a
         assert "-shift_table" in s and "-stretch_table" in s
         # phase into locomoco is an opt-in experiment: not passed by default
         assert (
-            'lm_me="-me_3depi -echo_times ${TES[$k]} -me_fixed_scaling"' in s
+            'lm_me="-me_3depi -echo_times ${TES[$k]} -me_fixed_scaling -me_shared_warp"' in s
             and "-phase$lm_ph" not in s
         )
         assert "stage02.moco.ses-01.task-foo.run-1.echo-3.aff12.1D" in s  # echo 3's matrices
-        assert "stage03.nlmoco.ses-01.task-foo.run-1.echo-3_warp" in s  # echo 3's warp
+        # one shared locomoco warp; echo 3 scales its partition displacement by TE3/TE1
+        assert "VSCALE:1,1,4.71053:stage03.nlmoco.ses-01.task-foo.run-1_warp" in s
+        assert "nlmoco.ses-01.task-foo.run-1.echo-" not in s
         assert 'ln -sf "${mstem}.echo-1_${which}.nii$FMT"' in s
     else:
         assert "-me_3depi" not in s and "-save_partition_shift" not in s
@@ -3509,7 +3511,7 @@ def test_multiecho_surface_reads_every_echo_and_combines_per_vertex(tmp_path):
     )
     surf = {ln.split("=", 1)[0]: ln for ln in s.splitlines() if ln.startswith("SURFCHAIN[")}
     assert "SURFCHAIN['01:foo:1|3']" in surf
-    assert ".echo-3_warp" in surf["SURFCHAIN['01:foo:1|3']"]  # echo 3's own locomoco warp
+    assert "VSCALE:1,1,4.71053:stage03.nlmoco" in surf["SURFCHAIN['01:foo:1|3']"]  # echo 3
     assert '-surf_prefix \\"stage10s.surf.${FRAG[$k]}.echo-$e\\"' in s
     assert '-surf_nwarp \\"${SURFCHAIN[$k|$e]}\\"' in s
     assert "$pe_args$sa" in s

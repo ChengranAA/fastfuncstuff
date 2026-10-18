@@ -27,8 +27,12 @@ DEFAULT_OPTS: dict[str, str] = {
     # per-volume optimizer — do NOT use it here). -twopass = coarse-blur then fine
     # pass for robustness to larger motion; independent of the cost, stays batched.
     "moco": "-cost wls -twopass",
-    # residual PE-axis nonlinear motion (locomoco).
-    "locomoco": "-backend flow -superhard -no_movie -ref mean -want_pcs 3",
+    # residual PE-axis nonlinear motion (locomoco). One refine pass at 8 iterations
+    # against a median reference: on the 1.25 mm 3-echo run and on A01D, 16 iterations
+    # with 2-3 refines (-superhard) changed the corrected data by ~1% tSNR and nothing in
+    # partition wiggle; the later refine passes moved the estimate < 0.01 voxel. The
+    # median reference made no measurable difference and is the safer one to outliers.
+    "locomoco": "-backend flow -refine 1 -iters 8 -ref median -no_movie -want_pcs 3",
     # fieldmap distortion (blipflip); the 9-level "standard" ladder by default.
     "blip": "-workhard",
     # measured GRE fieldmap (b0fmap). Defaults are the tool's own — the field

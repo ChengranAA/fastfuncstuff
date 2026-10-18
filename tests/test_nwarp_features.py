@@ -1045,3 +1045,69 @@ def test_checking_a_warps_shape_reads_only_its_header(tmp_path, monkeypatch):
 
     monkeypatch.setattr(afni, "load_nifti", no_full_load)
     assert _is_time_varying_warp(tv) and not _is_time_varying_warp(still)
+
+
+# --------------------------------------------------------------------------
+# VSCALE: one warp scaled along its voxel axes (multi-echo locomoco's echoes)
+# --------------------------------------------------------------------------
+
+
+def _oblique_affine() -> np.ndarray:
+    th = np.deg2rad(20.0)  # tilt about x: a shift along voxel k mixes y and z in mm
+    r = np.array([[1, 0, 0], [0, np.cos(th), -np.sin(th)], [0, np.sin(th), np.cos(th)]])
+    a = np.eye(4)
+    a[:3, :3] = r @ np.diag([2.0, 2.0, 2.5])
+    a[:3, 3] = [-8.0, -9.0, -7.0]
+    return a
+
+
+@pytest.mark.parametrize("as_5d", [True, False])
+def test_vscale_token_equals_the_scaled_warp_written_out(tmp_path, as_5d):
+    """``VSCALE:1,1,a:warp`` must resample exactly as a warp written with the partition
+    (k) displacement already multiplied by a and the in-plane (j) one untouched -- on an
+    OBLIQUE grid, where k mixes the mm components, so per-mm scaling would be wrong."""
+    from fastfuncstuff.cli.nwarp import main
+    from fastfuncstuff.processing.medic import save_medic_warp
+
+    rng = np.random.default_rng(3)
+    shape, nt, a = (10, 12, 9), 3, 2.5
+    aff = _oblique_affine()
+    data = (rng.random((*shape, nt)) * 100 + 50).astype(np.float32)
+    src = tmp_path / "src.nii"
+    nib.Nifti1Image(data, aff).to_filename(str(src))
+    u = torch.from_numpy(rng.normal(0, 0.3, (*shape, nt)).astype(np.float32))  # in-plane, j
+    w = torch.from_numpy(rng.normal(0, 0.2, (*shape, nt)).astype(np.float32))  # partition, k
+    if not as_5d:
+        u, w = u[..., :1], w[..., :1]
+    one = save_medic_warp(u, 1, aff, str(tmp_path / "one"), ".nii", as_5d=as_5d,
+                          extra_components=[(w, 2)])  # fmt: skip
+    scaled = save_medic_warp(u, 1, aff, str(tmp_path / "scaled"), ".nii", as_5d=as_5d,
+                             extra_components=[(a * w, 2)])  # fmt: skip
+
+    def run(spec, name):
+        out = tmp_path / name
+        # -master pins the grid: the auto-pad is data-dependent and could pick another
+        main(["-source", str(src), "-nwarp", spec, "-prefix", str(out), "-interp", "linear",
+              "-master", str(src), "-device", "cpu", "-quiet"])  # fmt: skip
+        return np.asarray(nib.load(str(out)).dataobj, np.float32)
+
+    got = run(f"VSCALE:1,1,{a}:{one}", "v.nii")
+    want = run(str(scaled), "s.nii")
+    assert np.abs(got - want).max() < 1e-3 * np.abs(want).max()
+    plain = run(str(one), "p.nii")
+    assert np.abs(plain - want).max() > 1e-2 * np.abs(want).max()  # the scaling mattered
+
+
+def test_vscale_refuses_what_it_cannot_scale(tmp_path):
+    from fastfuncstuff.processing.nwarpforge import split_vscale
+
+    assert split_vscale("w.nii") == ("w.nii", None)
+    assert split_vscale("VSCALE:1,1,2.85:d/w.nii.zst") == ("d/w.nii.zst", (1.0, 1.0, 2.85))
+    with pytest.raises(ValueError, match="malformed"):
+        split_vscale("VSCALE:1,2:w.nii")
+    aff = tmp_path / "id.aff12.1D"
+    _write_aff1d(aff, [_IDENT12])
+    src = tmp_path / "src.nii"
+    nib.Nifti1Image(np.ones((6, 6, 6), np.float32), _diag_affine(2.0)).to_filename(str(src))
+    with pytest.raises(ValueError, match="affine"):
+        nwarpforge(str(src), [f"VSCALE:1,1,2:{aff}"], str(tmp_path / "o.nii"), device=DEV, verb=0)

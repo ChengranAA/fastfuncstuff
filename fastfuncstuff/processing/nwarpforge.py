@@ -623,6 +623,57 @@ def load_time_varying_warp_from_files(
     return warp
 
 
+VSCALE_PREFIX = "VSCALE:"
+
+
+def split_vscale(spec: str) -> tuple[str, tuple[float, float, float] | None]:
+    """``VSCALE:si,sj,sk:warp.nii`` -> ``("warp.nii", (si, sj, sk))``; else ``(spec, None)``.
+
+    The chain token for a warp whose displacement is the file's, scaled along the
+    warp grid's own VOXEL axes i, j, k. Multi-echo locomoco's echoes differ only so:
+    the in-plane field is the same at every echo and the partition one scales with
+    TE, so echo e is ``VSCALE:1,1,TE_e/TE_1:shared_warp`` -- one warp on disk, not
+    one per echo. Voxel axes, not mm: on an oblique slab a shift along k mixes all
+    three mm components, which per-mm-component factors (AFNI's FAC:) cannot express.
+    """
+    if not spec.startswith(VSCALE_PREFIX):
+        return spec, None
+    try:
+        factors, path = spec[len(VSCALE_PREFIX) :].split(":", 1)
+        si, sj, sk = (float(f) for f in factors.split(","))
+    except ValueError as exc:
+        raise ValueError(f"malformed {spec!r}: expected VSCALE:si,sj,sk:warp") from exc
+    return path, (si, sj, sk)
+
+
+def apply_vscale(xform, scales: tuple[float, float, float]) -> None:
+    """Scale a loaded warp's displacement along its grid's voxel axes, in place.
+
+    The warp holds NIfTI-mm vectors and its file affine ``A``; with ``R = A[:3, :3]``
+    the voxel-axis scaling is the constant ``M = R diag(s) R^-1`` on every vector --
+    exact whatever the obliquity. A time-varying warp is done frame by frame, so the
+    5-D field is never duplicated.
+    """
+    if getattr(xform, "units", "nifti_mm") != "nifti_mm":
+        raise ValueError("VSCALE: needs a warp in mm (the default)")
+    r = np.asarray(xform.header_info["affine"], dtype=np.float64)[:3, :3]
+    m = (r @ np.diag(scales) @ np.linalg.inv(r)).astype(np.float32).tolist()
+
+    def mix(x: Tensor, y: Tensor, z: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        return (
+            m[0][0] * x + m[0][1] * y + m[0][2] * z,
+            m[1][0] * x + m[1][1] * y + m[1][2] * z,
+            m[2][0] * x + m[2][1] * y + m[2][2] * z,
+        )
+
+    if isinstance(xform, TimeVaryingWarp):
+        for t in range(xform.xd.shape[0]):
+            nx_, ny_, nz_ = mix(xform.xd[t], xform.yd[t], xform.zd[t])
+            xform.xd[t], xform.yd[t], xform.zd[t] = nx_, ny_, nz_
+    else:
+        xform.xd, xform.yd, xform.zd = mix(xform.xd, xform.yd, xform.zd)
+
+
 def parse_nwarp_string(nwarp_str: str) -> list[str]:
     """Parse -nwarp argument into list of file paths.
 
@@ -1478,7 +1529,7 @@ def _first_nonlinear_warp_grid(
     import glob as _glob
 
     for spec in nwarp_specs:
-        s = spec
+        s = split_vscale(spec)[0]
         if any(c in s for c in "*?[") and not Path(s).exists():
             matches = sorted(_glob.glob(s))
             if not matches:
@@ -2248,6 +2299,7 @@ def nwarpforge(
     max_time_points = 1
 
     for _i_spec, spec in enumerate(nwarp_specs):
+        spec, vscale = split_vscale(spec)
         # A glob token (e.g. 'warp_*.nii.gz') expands, sorted, to one warp per
         # frame -> a single time-varying slot in the chain. A pattern matching
         # exactly one file falls through to normal single-warp handling.
@@ -2264,12 +2316,16 @@ def nwarpforge(
                         matches, device=torch.device("cpu"), debug=debug
                     )
                 tv.device = device
+                if vscale is not None:
+                    apply_vscale(tv, vscale)
                 transforms.append(tv)
                 max_time_points = max(max_time_points, tv.n_time)
                 continue
             spec = matches[0]
 
         kind = identify_transform_type(spec)
+        if kind == "affine" and vscale is not None:
+            raise ValueError(f"VSCALE: scales a warp's displacement; {spec} is an affine")
 
         if kind == "affine":
             with progress_context(f"Loading affine {spec}"):
@@ -2288,11 +2344,15 @@ def nwarpforge(
             with progress_context(f"Loading time-varying warp {spec}"):
                 tv = load_time_varying_warp(spec, device=torch.device("cpu"), debug=debug)
             tv.device = device
+            if vscale is not None:
+                apply_vscale(tv, vscale)
             transforms.append(tv)
             max_time_points = max(max_time_points, tv.n_time)
         else:
             with progress_context(f"Loading nonlinear warp {spec}"):
                 xform = load_warp(spec, device=device, debug=debug)
+            if vscale is not None:
+                apply_vscale(xform, vscale)
             transforms.append(xform)
             if debug:
                 print("  [DEBUG] Warp displacement ranges:")

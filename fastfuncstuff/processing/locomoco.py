@@ -5910,7 +5910,11 @@ def estimate_residual_flow_multiecho(
         )
 
     te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
-    vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
+    # Wrapped, not copied: the NIfTI loader hands over Fortran-ordered arrays, and
+    # ascontiguousarray duplicated every echo while the caller still held the original
+    # (7.8 GB on a 1.25 mm 3-echo run). A frame [..., t] of a Fortran array is one
+    # contiguous block; each is made C-contiguous on the device as it is read.
+    vols = [torch.from_numpy(np.asarray(d, dtype=np.float32)) for d in datas]
 
     # Estimation prep: optional spatial high-pass (raw kept for the resample), then the
     # existing estimation blur. Identity when both sigmas are 0. v is a single (X,Y,Z) vol.
@@ -5977,7 +5981,7 @@ def estimate_residual_flow_multiecho(
             for t in tqdm(
                 range(nt), desc=f"me {tag} e{j + 1}/{e}", unit="frame", leave=True, disable=nt < 3
             ):
-                mv = vols[j][..., t].to(device)
+                mv = vols[j][..., t].to(device).contiguous()
                 mvb = _prep(mv)
                 fields = flow3d([cur_refs[j][None]], [mvb[None]])
                 for k in range(n_ax):
@@ -5993,7 +5997,7 @@ def estimate_residual_flow_multiecho(
         out = [torch.zeros(nx, ny, nz, nt) for _ in axes]
         conv_acc: list[torch.Tensor] = []
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
-            movs = [_prep(vols[j][..., t].to(device)) for j in range(e)]
+            movs = [_prep(vols[j][..., t].to(device).contiguous()) for j in range(e)]
             sep_acc: list[torch.Tensor] | None = [] if (dual and sep_field is not None) else None
             fields = optical_flow_lk_3d_axes(
                 [r[None] for r in cur_refs],
@@ -6025,7 +6029,7 @@ def estimate_residual_flow_multiecho(
         nonlocal have_pooled_conf, corr_curve, corr_offsets
         out = [torch.zeros(nx, ny, nz, nt) for _ in axes]
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
-            movs = [_prep(vols[j][..., t].to(device)) for j in range(e)]
+            movs = [_prep(vols[j][..., t].to(device).contiguous()) for j in range(e)]
             # The correlation landscape is a single-axis concept; under alternation each
             # axis has one per pass, so it is captured only for the one-axis case.
             curve_acc: list[torch.Tensor] | None = [] if (t == curve_frame and not dual) else None
@@ -6077,7 +6081,7 @@ def estimate_residual_flow_multiecho(
         out = torch.zeros(nx, ny, nz, nt)
         for t in range(nt):
             out[..., t] = _shift3d_axes(
-                vols[j][..., t].to(device)[None],
+                vols[j][..., t].to(device).contiguous()[None],
                 [float(alphas[k, j]) * cur_w[k][..., t].to(device)[None] for k in range(n_ax)],
                 axes,
                 mode=warp_interp,

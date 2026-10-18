@@ -510,6 +510,17 @@ def create_parser() -> argparse.ArgumentParser:
         "and is the reference for the linear-in-TE diagnostic.",
     )
     me.add_argument(
+        "-me_shared_warp",
+        action="store_true",
+        help="Write ONE warp and one set of flow maps -- the shared field, echo 1's "
+        "(alpha 1 on every axis) -- under the run's names ({prefix}_warp, _flow*) instead "
+        "of one per echo. Every echo's field is the shared one with the partition axis "
+        "scaled by its alpha (written to {prefix}_locomoco_alpha.1D), so apply echo e as "
+        "ffs_nwarp 'VSCALE:1,1,alpha_e:{prefix}_warp' (k the partition axis). At 1.25 mm "
+        "each per-echo warp was 3.1 GB and ~27 s to write. The corrected series stay "
+        "per echo.",
+    )
+    me.add_argument(
         "-me_fixed_scaling",
         action="store_true",
         help="Enforce TE-linearity (alpha_e = TE_e/TE_1, not learned) while pooling ALL echoes "
@@ -4881,7 +4892,11 @@ def _run_multiecho(
     echo_corrected: list[torch.Tensor] = []
     for j, res in enumerate(result.per_echo):
         estem = entity_stem(stem, echo=j + 1)
-        if not args.no_warp:
+        # -me_shared_warp: the fields are written once, from echo 1 (alpha 1), under the
+        # run's own names; every other echo's is that one scaled by its alpha.
+        fstem = stem if args.me_shared_warp else estem
+        write_fields = j == 0 or not args.me_shared_warp
+        if not args.no_warp and write_fields:
             from fastfuncstuff.processing.medic import save_medic_warp
 
             # EVERY component, exactly as the single-echo path does. A dual-encode or
@@ -4889,12 +4904,12 @@ def _run_multiecho(
             # warp that silently omits one of them -- the corrected series would be
             # right while the saved warp, the thing applied to other data, is not.
             (primary_axis, primary_disp), *rest = res.warp_components()
-            with spinner(f"Writing {Path(estem).name}_warp{ext}"):
+            with spinner(f"Writing {Path(fstem).name}_warp{ext}"):
                 save_medic_warp(
                     primary_disp,
                     primary_axis,
                     affine,
-                    estem,
+                    fstem,
                     nii_ext=ext,
                     as_5d=as_5d,
                     extra_components=[(d, a) for a, d in rest],
@@ -4949,14 +4964,14 @@ def _run_multiecho(
                             out_path,
                             affine=affine,
                         )
-        if not args.no_flow:
+        if not args.no_flow and write_fields:
             if res.pe_axis2 is not None:
                 for label, _axis, field in res.pe_displacements():
-                    fpath = f"{estem}_flow_{label}{ext}"
+                    fpath = f"{fstem}_flow_{label}{ext}"
                     with spinner(f"Writing {Path(fpath).name}"):
                         save_nifti(field.numpy(), fpath, affine=affine, tr=out_tr)
             else:
-                flow_path = f"{estem}_flow{ext}"
+                flow_path = f"{fstem}_flow{ext}"
                 with spinner(f"Writing {Path(flow_path).name}"):
                     save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine, tr=out_tr)
         if _want_qc(args):
@@ -5066,7 +5081,7 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         return []
     stem, ext = _split_prefix(args.prefix)
     inputs = args.input if isinstance(args.input, list) else [args.input]
-    if args.me_3depi or len(inputs) > 1:
+    if (args.me_3depi or len(inputs) > 1) and not getattr(args, "me_shared_warp", False):
         # multi-echo writes one warp per echo (each TE-scaled), none for the run
         outs = [entity_stem(stem, echo=j + 1) + f"_warp{ext}" for j in range(len(inputs))]
     else:
@@ -5177,6 +5192,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # Multi-echo 3-D EPI is a single 3-D-acquired solve, so (like -is_3dacq) the PE
     # direction is allowed to coincide with the slice axis.
     me_mode = args.me_3depi or len(args.input) > 1
+    if args.me_shared_warp and not me_mode:
+        print("❌ -me_shared_warp shares one field across echoes; it needs multi-echo input.",
+              file=sys.stderr)  # fmt: skip
+        return 2
 
     # Rotation-aware mode (both raw + matrices) defaults its reference to the temporal
     # MAX (fills FoV dropout, high-signal anchor); the plain path stays on the mean.

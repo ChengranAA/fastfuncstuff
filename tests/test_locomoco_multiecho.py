@@ -1251,3 +1251,54 @@ def test_echoes_share_one_field_and_differ_by_alpha():
     assert torch.allclose(f3, f1 * (tes[2] / tes[0]), atol=1e-6)
     stored = [r.u_canon if r.pe_flow_is_u else r.v_canon for r in res.per_echo]
     assert len({t.untyped_storage().data_ptr() for t in stored}) == 1  # one field in memory
+
+
+def test_cli_shared_warp_plus_vscale_applies_exactly_like_the_per_echo_warp(tmp_path):
+    """-me_shared_warp writes the fields once (echo 1's, alpha 1) instead of per echo,
+    and ffs_nwarp 'VSCALE:1,1,alpha_e:<prefix>_warp' applies echo e exactly as that
+    echo's own warp did -- the per-echo warps were alpha-scaled copies of one field."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+    from fastfuncstuff.cli.nwarp import main as nwarp
+    from fastfuncstuff.processing.locomoco import _shift3d_axes
+
+    tes = [12.0, 30.0]
+    base = torch.from_numpy(_phantom())
+    amps = [0.0, 0.8, -0.6, 0.5, -0.7]
+    paths = []
+    for e, te in enumerate(tes):
+        a = te / tes[0]
+        frames = [
+            _shift3d_axes(base[None], [torch.full_like(base, a * s)[None]], [PE])[0] for s in amps
+        ]
+        p = tmp_path / f"e{e + 1}.nii.gz"
+        nib.save(nib.Nifti1Image(torch.stack(frames, -1).numpy(), np.eye(4)), str(p))
+        paths.append(str(p))
+
+    def run(stem, *extra):
+        argv = [
+            "-input", *paths, "-prefix", str(tmp_path / stem), "-pe_dir2", "IS",
+            "-me_3depi", "-is_3dacq", "-echo_times", *[str(t) for t in tes],
+            "-me_fixed_scaling", "-device", "cpu", "-no_movie", "-allow_neg",
+            "-warp_format", "5d", *extra,
+        ]  # fmt: skip
+        assert main(argv) == 0
+
+    run("each")
+    run("shared", "-me_shared_warp")
+    assert (tmp_path / "shared_warp.nii.gz").exists() and (tmp_path / "shared_flow.nii.gz").exists()
+    assert not list(tmp_path.glob("shared.echo-*_warp*")) and not list(
+        tmp_path.glob("shared.echo-*_flow*")
+    )
+    assert (tmp_path / "shared.echo-2_locomoco.nii.gz").exists()  # series stay per echo
+
+    def apply(spec, name):
+        out = tmp_path / name
+        nwarp(["-source", paths[1], "-nwarp", spec, "-prefix", str(out), "-interp", "linear",
+               "-master", paths[1], "-device", "cpu", "-quiet"])  # fmt: skip
+        return np.asarray(nib.load(str(out)).dataobj, np.float32)
+
+    own = apply(str(tmp_path / "each.echo-2_warp.nii.gz"), "own.nii.gz")
+    scaled = apply(f"VSCALE:1,1,{tes[1] / tes[0]}:{tmp_path / 'shared_warp.nii.gz'}", "vs.nii.gz")
+    assert np.abs(own - scaled).max() < 1e-3 * np.abs(own).max()

@@ -4128,6 +4128,11 @@ def _magphase_arg_error(args, *, dual: bool, slicewise: bool) -> str | None:
         return "-phase_field_nuisance flat_offset fits two terms per voxel and needs 3+ echoes."
     if n == 1 and args.phase_weight == "romeo":
         return "-phase_weight romeo scores echo agreement and needs 2+ echoes."
+    if args.phase_weight == "romeo":
+        try:  # say so before loading the data, not after
+            import warpkit.warpkit_cpp  # noqa: F401
+        except ImportError:
+            return "-phase_weight romeo needs warpkit (ROMEO's voxel quality)."
     if n == 1 and args.phase_field_nuisance != "auto":
         return "a single echo has no per-voxel field term; leave -phase_field_nuisance at auto."
     if n == 1 and args.phase_hpf is not None and args.phase_hpf <= 0:
@@ -4207,8 +4212,14 @@ def _magphase_quality(args, mags, phases_hz):
 
     from fastfuncstuff.processing.phase_unwrap import romeo_voxel_quality
 
-    rad = [2 * np.pi * p * (te / 1000.0) for p, te in zip(phases_hz, args.echo_times, strict=True)]
-    return romeo_voxel_quality(mags, rad, args.echo_times)
+    # Temporal means first (the score reads only those): converting every full series to
+    # radians would copy each echo's whole phase stack just to average it.
+    mean_mag = [np.asarray(m, np.float32).mean(axis=3, keepdims=True) for m in mags]
+    mean_rad = [
+        2 * np.pi * (te / 1000.0) * np.asarray(p, np.float32).mean(axis=3, keepdims=True)
+        for p, te in zip(phases_hz, args.echo_times, strict=True)
+    ]
+    return romeo_voxel_quality(mean_mag, mean_rad, args.echo_times)
 
 
 def _magphase_hz(args, phases) -> list:
@@ -5617,6 +5628,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             refine_rounds=args.refine,
             mag_nuisance="none",
             phase_hpf_sigma=_magphase_hpf_vox(args, affine, 1),
+            converge=args.converge,
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             device=device,

@@ -796,6 +796,9 @@ def test_phase_proc_unwraps_then_rides_the_final_resample(tmp_path, nordic, stc,
     if nordic:
         # NORDIC already wrote the denoised pair AND trimmed the noise volumes.
         assert 'ph="stage00.nordic.${FRAG[$k]}.part-phase.nii$FMT"' in s
+        # resume: NORDIC is done only when its phase output exists too (a dir from
+        # before the .part-phase name has _phase, and the unwrap would not find it)
+        assert '[ -f "$outf" ] && { [ -z "$ph" ] || [ -f "$phout" ]; } && continue' in s
         assert s.index("stage00: NORDIC") < s.index("stage00: phase unwrap")
     else:
         # No NORDIC: noise volumes come off BOTH before unwrapping, as a selector

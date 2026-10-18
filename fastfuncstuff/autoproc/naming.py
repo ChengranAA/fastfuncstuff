@@ -64,8 +64,8 @@ STAGE_NUMBERS: dict[str, int] = {
     "unwrap": 0,  # ffs_phase_unwrap: unwrapped phase, radians
     "unwrapdrift": 0,  # ...minus per-slice field wobble (ffs_phasedrift)
     "tshift": 1,
-    # -medic: undistorted echoes + time-varying warp. Shares stage 1 with tshift, which
-    # multi-echo runs never use up front (slice timing integrates at stage10).
+    # -medic: undistorted echoes + time-varying warp. Shares stage 1 with up-front
+    # slice timing; under -medic that runs first, on every echo, and MEDIC reads it.
     "medic": 1,
     "moco": 2,
     "nlmoco": 3,

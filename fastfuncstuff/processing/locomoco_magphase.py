@@ -396,7 +396,9 @@ def estimate_partition_flow_magphase(
                 print(f"   refine pass {rnd}/{refine_rounds}: step {step:.4f} vox (in-brain)")
             if converge > 0 and step < converge:
                 if verbose:
-                    print(f"   converged (step < {converge:g} vox): stopping after pass {rnd + 1}")
+                    print(
+                        f"   converged (step < {converge:g} vox): no more refining after this pass"
+                    )
                 break
 
     if verbose:

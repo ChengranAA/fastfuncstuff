@@ -1712,7 +1712,7 @@ def _stage_nordic(plan: Plan) -> str:
     # path needs nothing extra here.
     phase_note = (
         "\n# -phase_proc: the denoised phase lands beside the magnitude as\n"
-        "# stage00.nordic.<frag>_phase (noise volumes already trimmed);\n"
+        "# stage00.nordic.<frag>.part-phase (noise volumes already trimmed);\n"
         "# stage00 unwrap picks it up.\n"
         if _phase_on(plan)
         else ""
@@ -1763,8 +1763,10 @@ for k in "${{RUN_KEYS[@]}}"; do
   ev="${{EVENTS[$k]:-}}"   # unset for a run whose events did not resolve; set -u
   {_ECHO_LOOP}
     outf="stage00.nordic.${{FRAG[$k]}}${{esfx}}.nii{_nordic_fmt(plan)}"
-    [ "$skip_nordic" -eq 1 ] && [ -f "$outf" ] && continue
     mag="{_ECHO_MAG}"; ph="{_ECHO_PHASE}"
+    # with phase, done means its .part-phase too (a dir from before that name has _phase)
+    phout="stage00.nordic.${{FRAG[$k]}}${{esfx}}.part-phase.nii{_nordic_fmt(plan)}"
+    [ "$skip_nordic" -eq 1 ] && [ -f "$outf" ] && {{ [ -z "$ph" ] || [ -f "$phout" ]; }} && continue
     if [ -n "$ph" ]; then phase_arg=(-input_phase "$ph"); else phase_arg=(-magnitude-only); fi
 {_indent(nordic_cmd, 2)}
   done
@@ -4605,10 +4607,13 @@ def _stage_phasereg(plan: Plan, bids_root: str | None = None) -> str:
             pr_cmd = pr_call(mags, phs, f"{d}/task-{task}")
             commands.append(pr_cmd)
             body.append(pr_cmd)
+        # per-echo mode writes one r2 map per echo; echo 1's stands for the task
+        per_echo = prs[0].bold.is_multiecho and not _phasereg_field_on(plan)
+        r2 = f"{d}/task-{task}" + (".echo-1" if per_echo else "") + "_r2.nii$FINAL_FMT"
         qc.append(
             f'qc_tcat "{d}/QC.task-{task}.nii.gz" "before after r2" '
             f'"stage10.final.{_frag(prs[0])}.nii$FINAL_FMT[0]" '
-            f'"{_phasereg_corrected(task, 1)}[0]" "{d}/task-{task}_r2.nii$FINAL_FMT"'
+            f'"{_phasereg_corrected(task, 1)}[0]" "{r2}"'
         )
     out += _phasereg_dir_block(_phasereg_settings(opt, tasks, commands))
     out += body

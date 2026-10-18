@@ -1304,6 +1304,7 @@ def create_parser() -> argparse.ArgumentParser:
         "-refine",
         type=int,
         default=1,
+        action=_RecordGiven,
         metavar="ROUNDS",
         help="[plain path + -backend qwarp] Outer reference-refinement rounds (the max cap when "
         "-converge is set). Default 1: later passes moved the estimate < 0.01 vox. After the first estimate, rebuild the reference from the "
@@ -1311,7 +1312,9 @@ def create_parser() -> argparse.ArgumentParser:
         "FoV-filled) and re-register the original frames against it. Each pass prints its "
         "step size (RMS displacement change, in-brain). 1–3 tightens the values; 0 = off. "
         "Under -backend qwarp there is no flow pass, so this drives the QWARP passes "
-        "instead (override with -qwarp_refine).",
+        "instead, but only when typed: the default 1 is the flow estimators' and adds no "
+        "extra qwarp pass (override with -qwarp_refine). -final_qwarp is one pass unless "
+        "-qwarp_refine asks for more.",
     )
     acc.add_argument(
         "-converge",
@@ -3493,6 +3496,15 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
     return cleaned
 
 
+class _RecordGiven(argparse.Action):
+    """Store the value and remember it was typed, for defaults that mean different
+    things to different backends (-refine: one flow pass, but no extra qwarp pass)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"{self.dest}_given", True)
+
+
 def _qwarp_template_args(args, qwarp_backend: bool) -> tuple[str, int]:
     """``(ref_mode, refine)`` for the qwarp template — the two knobs it used to pin.
 
@@ -3508,7 +3520,10 @@ def _qwarp_template_args(args, qwarp_backend: bool) -> tuple[str, int]:
     if args.qwarp_refine is not None:
         refine = max(0, int(args.qwarp_refine))
     else:
-        refine = max(0, int(args.refine)) if qwarp_backend else 0
+        # Only a typed -refine: the default belongs to the flow estimators, and each extra
+        # qwarp pass registers every frame again.
+        typed = getattr(args, "refine_given", False)
+        refine = max(0, int(args.refine)) if qwarp_backend and typed else 0
     return ref_mode, refine
 
 

@@ -177,7 +177,7 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
     hinged = QtCore.Signal(float)
     #: Ctrl+shift+drag sideways: push the hemispheres apart by this many mm.
     spread = QtCore.Signal(float)
-    #: Paint mode: a drag over (hemi, vertex); the bool is "erase" (ctrl held).
+    #: Paint mode: a drag over (hemi, vertex); the bool is "erase" (right button).
     painted = QtCore.Signal(str, int, bool)
     #: A vertex picked while tracing an outline (shown as it is drawn).
     traced = QtCore.Signal(str, int)
@@ -876,24 +876,31 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self._moved = False
         self._grabbed = None
         self._outline = None
-        if self.paint_mode and event.button() == QtCore.Qt.MouseButton.LeftButton:
+        if self.paint_mode and self._paints(event.button(), event.modifiers()):
+            erase = event.button() == QtCore.Qt.MouseButton.RightButton
             if event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier:
                 # Shift: trace a shape whose inside fills on release.
-                erase = bool(
-                    event.modifiers()
-                    & (
-                        QtCore.Qt.KeyboardModifier.ControlModifier
-                        | QtCore.Qt.KeyboardModifier.MetaModifier
-                    )
-                )
                 self._outline = (None, [], erase)
                 self._trace(event)
                 return
-            self._paint(event)
+            self._paint(event, erase)
             return
         if event.modifiers() & QtCore.Qt.KeyboardModifier.AltModifier:
             hit = self._hit(event.position())
             self._grabbed = None if hit is None else hit[0]
+
+    def _paints(self, button, mods) -> bool:
+        """Paint mode: left paints, right erases, ctrl+left drag zooms instead.
+
+        Right is the erase button because ctrl+click is a right-button press on
+        macOS and used to land in the zoom drag instead of erasing.
+        """
+        if button == QtCore.Qt.MouseButton.RightButton:
+            return True
+        ctrl = mods & (
+            QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier
+        )
+        return button == QtCore.Qt.MouseButton.LeftButton and not ctrl
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
         if self.paint_mode:
@@ -903,13 +910,16 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
             return
         d = event.position() - self._last
         self._last = event.position()
-        if self.paint_mode and event.buttons() & QtCore.Qt.MouseButton.LeftButton:
-            self._moved = True
-            if self._outline is not None:
-                self._trace(event)
-            else:
-                self._paint(event)
-            return
+        if self.paint_mode:
+            held = event.buttons()
+            for b in (QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.RightButton):
+                if held & b and self._paints(b, event.modifiers()):
+                    self._moved = True
+                    if self._outline is not None:
+                        self._trace(event)
+                    else:
+                        self._paint(event, b == QtCore.Qt.MouseButton.RightButton)
+                    return
         if self._press is not None and (event.position() - self._press).manhattanLength() > 3:
             self._moved = True
         h = max(self.height(), 1)
@@ -919,6 +929,10 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         ctrl = mods & (
             QtCore.Qt.KeyboardModifier.ControlModifier | QtCore.Qt.KeyboardModifier.MetaModifier
         )
+        if self.paint_mode and ctrl and buttons & QtCore.Qt.MouseButton.LeftButton:
+            self.camera.zoom(float(np.exp(d.y() / 150.0)))
+            self.update()
+            return
         if ctrl and buttons & QtCore.Qt.MouseButton.LeftButton:
             if not self._moved:
                 return  # a ctrl+click that jittered is still a seed, not a hinge
@@ -985,16 +999,9 @@ class SurfaceCanvas(QtWidgets.QRhiWidget):
         self.camera.zoom(0.9**steps)
         self.update()
 
-    def _paint(self, event: QtGui.QMouseEvent) -> None:
+    def _paint(self, event: QtGui.QMouseEvent, erase: bool) -> None:
         hit = self.pick_vertex(event.position())
         if hit is not None:
-            erase = bool(
-                event.modifiers()
-                & (
-                    QtCore.Qt.KeyboardModifier.ControlModifier
-                    | QtCore.Qt.KeyboardModifier.MetaModifier
-                )
-            )
             self.painted.emit(hit[0], hit[1], erase)
 
     def _trace(self, event: QtGui.QMouseEvent) -> None:
@@ -1284,7 +1291,7 @@ class SurfaceWindow(QtWidgets.QWidget):
             bar,
             "PAINT",
             "p",
-            "Paint mode: drag highlights cortex, ctrl+drag erases, shift+drag fills a drawn shape",
+            "Paint mode: drag highlights cortex, right-drag erases, ctrl+drag zooms, shift+drag fills a drawn shape",
             self._toggle_paint,
             checkable=True,
         )
@@ -1403,8 +1410,8 @@ class SurfaceWindow(QtWidgets.QWidget):
                 Key("ctrl+drag", "swing open: right nose to nose, left occipital to occipital", None, group="hemispheres"),
                 Key("ctrl+shift+drag", "push the hemispheres apart / together", None, group="hemispheres"),
                 Key("o", "open: closed, nose to nose, occipital to occipital", self._cycle_hinge, group="hemispheres"),
-                Key("p", "paint mode: drag highlights cortex (ctrl+drag erases)", self._toggle_paint, group="highlight"),
-                Key("shift+drag", "in paint mode: draw a shape, its inside fills (ctrl+shift erases)", None, group="highlight"),
+                Key("p", "paint mode: drag highlights cortex (right-drag erases, ctrl+drag zooms)", self._toggle_paint, group="highlight"),
+                Key("shift+drag", "in paint mode: draw a shape, its inside fills (right button erases)", None, group="highlight"),
                 Key("s", "save the highlight as an ROI: ?h.label + the volume it spans", self._save_roi, group="highlight"),
                 Key("l", "load ROI labels into the highlight", self._load_roi, group="highlight"),
                 Key("shift+p", "clear the highlight", self._clear_highlight, group="highlight"),
@@ -1508,7 +1515,7 @@ class SurfaceWindow(QtWidgets.QWidget):
         self.canvas.brush_mm = r
         self._sync_buttons()
         self.depth_label.setText(
-            f"paint r={r:g} mm (ctrl erases)" if self.canvas.paint_mode else "paint off"
+            f"paint r={r:g} mm (right-drag erases)" if self.canvas.paint_mode else "paint off"
         )
 
     def _brush_by(self, factor: float) -> None:

@@ -416,3 +416,62 @@ def test_scratch_is_returned_clean_so_perms_do_not_contaminate():
     assert first is not None
     for k, v in first.items():
         np.testing.assert_array_equal(v, again[k])
+
+
+# ---------------------------------------------------------------------------
+# Batch kernel (all perms, threaded) against the scipy oracle
+# ---------------------------------------------------------------------------
+
+
+def _oracle_sided(stat3d, c, nn, sided):
+    if sided == "1-sided":
+        return _scipy_max_extent(stat3d, c, nn)
+    if sided == "2-sided":
+        return _scipy_max_extent(np.abs(stat3d), c, nn)
+    return max(_scipy_max_extent(stat3d, c, nn), _scipy_max_extent(-stat3d, c, nn))
+
+
+@pytest.mark.parametrize("smooth", [0.0, 1.5])  # rough data: the two tails touch
+@pytest.mark.parametrize(
+    "nns,sideds",
+    [
+        ((1, 2, 3), ("1-sided", "2-sided", "bi-sided")),
+        ((2,), ("2-sided",)),
+        ((1, 3), ("bi-sided", "1-sided")),
+    ],
+)
+def test_batch_kernel_matches_scipy_oracle(smooth, nns, sideds):
+    # The fused kernel skips the sort, walks the three connectivities at once,
+    # merges the 1-sided and positive-tail walks, and replaces the |t| walk with
+    # the max of the tails when they do not touch. Every one of those must give
+    # exactly the per-threshold max extent a plain threshold-and-label gives.
+    from scipy.ndimage import gaussian_filter
+
+    from fastfuncstuff.stats.cluster_fast import cluster_extent_null_batch
+
+    rng = np.random.default_rng(7)
+    shape = (14, 12, 10)
+    mask = np.zeros(shape, bool)
+    mask[1:-1, 2:-1, 1:-2] = True
+    mask[5:8, 5:8, :] = False  # a hole, so the mask edge is not just the box
+    n_perm = 12
+    maps = rng.standard_normal((n_perm, *shape)).astype(np.float32)
+    if smooth:
+        maps = np.stack([gaussian_filter(m, smooth) for m in maps])
+        maps /= maps.std()
+    t_pv = maps[:, mask].astype(np.float32)
+    pthr_t = {
+        "1-sided": np.array([1.6, 0.4, 1.0, 2.2]),  # deliberately unsorted
+        "2-sided": np.array([1.9, 0.8, 1.3, 2.5]),
+        "bi-sided": np.array([1.9, 0.8, 1.3, 2.5]),
+    }
+    tc = {s: pthr_t[s] for s in sideds}
+    got = cluster_extent_null_batch(t_pv, mask, nns, sideds, tc, n_threads=3)
+    assert set(got) == {(s, nn) for s in sideds for nn in nns}
+    for q in range(n_perm):
+        stat3d = np.zeros(shape, np.float32)
+        stat3d[mask] = t_pv[q]
+        for s in sideds:
+            for nn in nns:
+                want = [_oracle_sided(stat3d, c, nn, s) for c in tc[s]]
+                assert got[(s, nn)][q].tolist() == want, (q, s, nn)

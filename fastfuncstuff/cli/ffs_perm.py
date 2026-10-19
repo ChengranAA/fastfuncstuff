@@ -265,8 +265,9 @@ def build_parser() -> argparse.ArgumentParser:
         "-j",
         type=int,
         default=None,
-        help="Process-pool workers for the cluster null pass.  "
-        "Default: os.cpu_count() - 1.  Set 1 to disable parallelism.",
+        help="Threads for the cluster null pass (process-pool workers under "
+        "-with-mass).  Default: all CPUs (os.cpu_count() - 1 under -with-mass).  "
+        "Set 1 to disable parallelism.",
     )
     add_verbose_arg(misc)
 

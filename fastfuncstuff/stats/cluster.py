@@ -519,12 +519,38 @@ def accumulate_cluster_null(
     dof : int
         Degrees of freedom of the underlying t distribution.
     n_jobs : int or None
-        Worker count.  ``None`` → ``os.cpu_count() - 1`` (capped at P).
-        ``1`` runs single-process for debuggability.
+        ``fast``: Numba threads (``None`` → all of them).  Otherwise process-pool
+        workers (``None`` → ``os.cpu_count() - 1``, capped at P; ``1`` runs
+        single-process for debuggability).
     """
     n_perms, _ = t.shape
     null = ClusterNull(pthr=pthr, athr=athr, nns=nns, sideds=sideds)
     null.init_storage(n_perms)
+
+    if fast:
+        # One threaded Numba pass (cluster_fast.cluster_extent_null_batch): the
+        # same tables as the per-perm workers below, without the process pool.
+        # Called in slices only so the bar moves.
+        from fastfuncstuff.stats.cluster_fast import cluster_extent_null_batch
+
+        tcrits = {
+            s: (
+                np.asarray(tcrits_override[s], dtype=np.float64)
+                if tcrits_override is not None
+                else np.array([_t_critical(p, dof, s) for p in pthr], dtype=np.float64)
+            )
+            for s in sideds
+        }
+        step = max(1, -(-n_perms // 20))
+        bar = tqdm(total=n_perms, desc="cluster null", leave=True, disable=not verbose)
+        for p0 in range(0, n_perms, step):
+            p1 = min(p0 + step, n_perms)
+            res = cluster_extent_null_batch(t[p0:p1], mask, nns, sideds, tcrits, n_threads=n_jobs)
+            for k, v in res.items():
+                null.max_extent[k][p0:p1] = v
+            bar.update(p1 - p0)
+        bar.close()
+        return null
 
     if n_jobs is None:
         n_jobs = max(1, (os.cpu_count() or 2) - 1)

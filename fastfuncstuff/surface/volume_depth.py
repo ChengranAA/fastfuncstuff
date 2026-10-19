@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
@@ -55,6 +56,9 @@ class RibbonSurfaces:
     faces: np.ndarray
     #: Cortex vertex mask (``?h.cortex.label``); the medial wall is excluded.
     cortex: np.ndarray | None = None
+    #: tkregister -> scanner RAS of a FreeSurfer mesh (None for GIfTI), so a
+    #: ``.label``'s tkregister coordinates can be checked against this mesh.
+    tkr_to_scanner: np.ndarray | None = None
 
     @classmethod
     def from_hemisphere(cls, hemi, white: str = "white", pial: str = "pial") -> RibbonSurfaces:
@@ -62,7 +66,10 @@ class RibbonSurfaces:
         for state in (white, pial):
             if state not in hemi.states:
                 raise KeyError(f"{hemi.name} has no '{state}' surface")
-        return cls(hemi.name, hemi.states[white], hemi.states[pial], hemi.faces, hemi.cortex)
+        return cls(
+            hemi.name, hemi.states[white], hemi.states[pial], hemi.faces, hemi.cortex,
+            hemi.tkr_to_scanner,
+        )  # fmt: skip
 
 
 @dataclass
@@ -95,6 +102,12 @@ class DepthVolumes:
     n_medial: int = 0
     #: GM voxels claimed by two hemispheres, or by one's GM and the other's WM.
     n_overlap: int = 0
+    #: With ``owners=True``: each GM voxel's column -- the index into ``surfaces``
+    #: and the vertex owning it, by :mod:`surface.ribbon`'s rule (heaviest corner of
+    #: the closest midthickness point), so a vertex set maps to the same voxels here
+    #: as in the projection and the viewer.
+    owner_hemi: np.ndarray | None = None
+    owner_vertex: np.ndarray | None = None
 
     @property
     def n_gm(self) -> int:
@@ -295,6 +308,7 @@ def cortical_depth_volumes(
     column_voxels: float = 64.0,
     thick_limit: float = 6.0,
     k: int = 24,
+    owners: bool = False,
     device: torch.device | None = None,
     verbose: bool = False,
 ) -> DepthVolumes:
@@ -308,6 +322,7 @@ def cortical_depth_volumes(
     column_voxels : voxels per smoothed column for equivolume (volume_quantile_depth).
     thick_limit : GM voxels thicker than this (mm) are counted and located.
     k : candidate faces per voxel for the CPU distance search (see MeshDistance).
+    owners : also record each GM voxel's owning vertex (one more distance search).
     """
     device = device or torch.device("cpu")
     shape = tuple(int(s) for s in shape)
@@ -357,26 +372,45 @@ def cortical_depth_volumes(
         rho = (dw / thick.clamp_min(1e-9)).clamp_(0.0, 1.0)
         del dw
         idx_t = torch.as_tensor(idx, device=device)
+        if owners:
+            ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float64)
+            pts = ijk @ affine[:3, :3].T + affine[:3, 3]
+            near = MeshDistance(0.5 * (s.white + s.pial), s.faces, k)(
+                pts, device, brick_mm=brick_mm
+            )
+            del ijk, pts
+            vertex = np.asarray(s.faces, np.int64)[near.face, np.argmax(near.bary, axis=1)]
+            owner_v = torch.as_tensor(vertex, device=device)
+            del near, vertex
+        else:
+            owner_v = torch.zeros(idx.size, dtype=torch.long, device=device)
         if s.cortex is not None:
             cortex = torch.as_tensor(s.cortex, dtype=torch.float32, device=device)
             vf = torch.as_tensor(s.faces, device=device)[face]
             keep = (cortex[vf] * bary).sum(1) >= 0.5
             del vf
             flat_owner[idx[~keep.cpu().numpy()]] = -1
-            idx_t, rho, thick, face, bary = (a[keep] for a in (idx_t, rho, thick, face, bary))
+            idx_t, rho, thick, face, bary, owner_v = (
+                a[keep] for a in (idx_t, rho, thick, face, bary, owner_v)
+            )
         equivol = volume_quantile_depth(rho, face, bary, s.faces, len(s.white), column_voxels)
         del face, bary
-        per_hemi.append((idx_t, rho, equivol, thick))
+        owner_h = torch.full_like(owner_v, h, dtype=torch.int8)
+        per_hemi.append((idx_t, rho, equivol, thick, owner_h, owner_v))
         log(f"{s.name}: depth metrics")
 
     if per_hemi:
         gm_idx = torch.cat([p[0] for p in per_hemi])
         gm_idx, order = torch.sort(gm_idx)
-        rho, equivol, thick = (torch.cat([p[i] for p in per_hemi])[order] for i in (1, 2, 3))
+        rho, equivol, thick, owner_h, owner_v = (
+            torch.cat([p[i] for p in per_hemi])[order] for i in (1, 2, 3, 4, 5)
+        )
         del order
     else:
         gm_idx = torch.zeros(0, dtype=torch.long, device=device)
         rho = equivol = thick = torch.zeros(0, dtype=torch.float32, device=device)
+        owner_h = torch.zeros(0, dtype=torch.int8, device=device)
+        owner_v = torch.zeros(0, dtype=torch.long, device=device)
     del per_hemi
 
     owner_t = torch.as_tensor(flat_owner, device=device)
@@ -411,6 +445,8 @@ def cortical_depth_volumes(
         thick_limit=float(thick_limit),
         n_medial=int((flat_owner == -1).sum()),
         n_overlap=n_overlap,
+        owner_hemi=host(owner_h) if owners else None,
+        owner_vertex=host(owner_v) if owners else None,
     )
 
 
@@ -519,10 +555,138 @@ def export_depth_volumes(
     return out, affine, written
 
 
+def _by_hemi(paths: list[str], what: str) -> dict[str, Path]:
+    """Files keyed by the hemisphere their names say; unnamed ones take lh, rh in order.
+
+    One path that names no hemisphere and does not exist is a stem for both:
+    ``surf/smoothwm`` finds ``surf/lh.smoothwm`` and ``surf/rh.smoothwm``.
+    """
+    from fastfuncstuff.io.freesurfer import infer_label
+
+    if len(paths) == 1 and infer_label(paths[0])[0] is None and not Path(paths[0]).exists():
+        stem = Path(paths[0])
+        found = {h: stem.parent / f"{h}.{stem.name}" for h in ("lh", "rh")}
+        found = {h: f for h, f in found.items() if f.exists()}
+        if not found:
+            raise ValueError(f"{what}: neither {paths[0]} nor lh./rh.{stem.name} beside it exists")
+        return found
+    if len(paths) > 2:
+        raise ValueError(f"{what}: at most one file per hemisphere, got {len(paths)}")
+    named = [infer_label(p)[0] for p in paths]
+    if any(h is None for h in named):
+        if any(h is not None for h in named):
+            raise ValueError(f"{what}: name every file's hemisphere (lh./rh.) or none")
+        named = ["lh", "rh"][: len(paths)]
+    if len(set(named)) != len(named):
+        raise ValueError(f"{what}: two files for {named[0]}")
+    return {str(h): Path(p) for h, p in zip(named, paths, strict=True)}
+
+
+def _cortex_mask(label, n_vertices: int) -> np.ndarray:
+    import nibabel.freesurfer as nfs
+
+    ids = nfs.read_label(str(label))
+    mask = np.zeros(n_vertices, bool)
+    mask[ids[(ids >= 0) & (ids < n_vertices)]] = True
+    return mask
+
+
+def resolve_ribbon_surfaces(
+    fs_subj=None,
+    white: str = "white",
+    pial: str = "pial",
+    white_mesh: list[str] | None = None,
+    pial_mesh: list[str] | None = None,
+    cortex_label: list[str] | None = None,
+    hemi: str = "both",
+    log=None,
+) -> list[RibbonSurfaces]:
+    """White/pial pairs from a FreeSurfer subject (``surf/?h.<white>``) or loose files.
+
+    The one reading of the ``-fs_subj -white -pial -white_mesh -pial_mesh
+    -cortex_label -hemi`` flags, shared by ffs_util_surf2layers and the ROI depth
+    sampling. ``log`` (a print-like callable) hears what was skipped. Raises
+    ``ValueError`` on anything inconsistent.
+    """
+    from fastfuncstuff.io.freesurfer import (
+        load_hemisphere,
+        read_scanner_surface,
+        read_surface,
+        tkr_to_scanner,
+    )
+
+    subj = Path(fs_subj) if fs_subj is not None else None
+    meshes = white_mesh is not None or pial_mesh is not None
+    if subj is None and not meshes:
+        raise ValueError("give -fs_subj, or -white_mesh and -pial_mesh")
+    if meshes:
+        if white_mesh is None or pial_mesh is None:
+            raise ValueError("-white_mesh and -pial_mesh go together")
+        wfiles, pfiles = _by_hemi(white_mesh, "-white_mesh"), _by_hemi(pial_mesh, "-pial_mesh")
+        if wfiles.keys() != pfiles.keys():
+            raise ValueError(
+                f"-white_mesh covers {', '.join(sorted(wfiles))} but -pial_mesh "
+                f"covers {', '.join(sorted(pfiles))}"
+            )
+        labels = _by_hemi(cortex_label, "-cortex_label") if cortex_label else {}
+        if labels.keys() - wfiles.keys():
+            raise ValueError("-cortex_label names a hemisphere with no meshes")
+        hemis = [h for h in ("lh", "rh") if h in wfiles and hemi in ("both", h)]
+        if not hemis:
+            raise ValueError(f"-hemi {hemi}: no meshes given for it")
+        out = []
+        for h in hemis:
+            try:
+                w, faces = read_scanner_surface(wfiles[h])
+                p, pfaces = read_scanner_surface(pfiles[h])
+            except OSError as err:
+                raise ValueError(str(err)) from err
+            if w.shape != p.shape or not np.array_equal(faces, pfaces):
+                raise ValueError(
+                    f"{wfiles[h].name} and {pfiles[h].name} are not the same mesh "
+                    f"({w.shape[0]:,} vs {p.shape[0]:,} vertices): depth pairs them by vertex"
+                )
+            label = labels.get(h)
+            if label is None and subj is not None:
+                found = subj / "label" / f"{h}.cortex.label"
+                label = found if found.exists() else None
+            if label is None and log:
+                log(f"  {h}: no cortex label -- medial wall kept")
+            tkr = None
+            if not wfiles[h].name.lower().endswith(".gii"):
+                tkr = tkr_to_scanner(read_surface(wfiles[h]).volume_info)
+            cortex = None if label is None else _cortex_mask(label, w.shape[0])
+            out.append(RibbonSurfaces(h, w, p, faces, cortex, tkr))
+        return out
+
+    assert subj is not None
+    if not (subj / "surf").is_dir():
+        raise ValueError(f"{subj} has no surf/ directory; is it a FreeSurfer subject?")
+    out = []
+    for h in ("lh", "rh") if hemi == "both" else (hemi,):
+        if not (subj / "surf" / f"{h}.white").exists():
+            if hemi != "both":
+                raise ValueError(f"{subj}/surf/{h}.white not found")
+            continue
+        # load_hemisphere requires white and pial whichever pair is asked for.
+        states = tuple(dict.fromkeys(("white", "pial", white, pial)))
+        hm = load_hemisphere(subj, h, states=states, morph=(), patches=False)
+        for state in (white, pial):
+            if state not in hm.states:
+                raise ValueError(f"{subj}/surf/{h}.{state} not found")
+        if hm.cortex is None and log:
+            log(f"  {h}: no label/{h}.cortex.label -- medial wall kept")
+        out.append(RibbonSurfaces.from_hemisphere(hm, white, pial))
+    if not out:
+        raise ValueError(f"{subj}/surf has no ?h.white")
+    return out
+
+
 __all__ = [
     "OUTPUT_TAGS",
     "DepthVolumes",
     "RibbonSurfaces",
+    "resolve_ribbon_surfaces",
     "cortical_depth_volumes",
     "crop_to_points",
     "export_depth_volumes",

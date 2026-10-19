@@ -555,7 +555,7 @@ def save_medic_warp(
     """
     import os
 
-    from ..io.afni import save_nifti
+    from ..io.afni import fill_layout, save_nifti
     from .io import save_warp_field
     from .nwarpforge import compute_cardinal_affine
 
@@ -566,14 +566,17 @@ def save_medic_warp(
     if as_5d:
         # Direct 5D write (no save_warp_field): convert RAS-mm -> DICOM-mm inline.
         # RAS-mm = cardinal[pe,pe]*disp; DICOM negates x,y (feed_sign).
-        warp = np.zeros((nx, ny, nz, nt, 3), dtype=np.float32)
+        # Built in file (F) order, each component scaled straight into its slab: a
+        # C-order warp cost a scaled temporary per axis plus a full transposed copy in
+        # save_nifti (3.1 GB per 1.25 mm run, twice over).
+        warp = np.zeros((nx, ny, nz, nt, 3), dtype=np.float32, order="F")
         for comp, axis in [
             (disp_np, pe_nifti_axis),
             *[(c.detach().cpu().numpy(), a) for c, a in (extra_components or [])],
         ]:
             feed_sign = -1.0 if axis in (0, 1) else 1.0
             rpp = float(cardinal[axis, axis])  # signed voxel mm on this axis
-            warp[..., axis] = rpp * feed_sign * comp
+            fill_layout(warp[..., axis], comp, scale=rpp * feed_sign)
         path = f"{prefix_stem}_warp{nii_ext}"
         save_nifti(warp, path, affine=cardinal)
         return path

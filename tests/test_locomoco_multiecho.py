@@ -16,7 +16,9 @@ import torch
 from fastfuncstuff.processing.locomoco import (
     _fourier_shifter,
     _shift1d_windowed_sinc,
+    _nonzero_median,
     _shift3d_axis,
+    echo_mean,
     estimate_residual_flow_me_interecho,
     estimate_residual_flow_me_scaled,
     estimate_residual_flow_multiecho,
@@ -1302,3 +1304,22 @@ def test_cli_shared_warp_plus_vscale_applies_exactly_like_the_per_echo_warp(tmp_
     own = apply(str(tmp_path / "each.echo-2_warp.nii.gz"), "own.nii.gz")
     scaled = apply(f"VSCALE:1,1,{tes[1] / tes[0]}:{tmp_path / 'shared_warp.nii.gz'}", "vs.nii.gz")
     assert np.abs(own - scaled).max() < 1e-3 * np.abs(own).max()
+
+
+def test_echo_mean_matches_stacked_mean_exactly():
+    # Accumulated one echo at a time to avoid an E-fold stack; must not change a bit.
+    rng = np.random.default_rng(0)
+    datas = [rng.normal(100, 10, (6, 5, 4, 7)).astype(np.float32) for _ in range(5)]
+    datas[1] = np.asfortranarray(datas[1])  # loader hands over F-order arrays
+    assert np.array_equal(echo_mean(datas), np.mean(np.stack(datas), axis=0))
+    assert echo_mean(datas[:1]) is datas[0]
+
+
+def test_nonzero_median_subsamples_large_fields_without_bias():
+    # A printed diagnostic: past the cap it samples, and must stay close to exact.
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(80, 80, 40, 30, generator=g)
+    x[:, :, :10] = 0.0  # masked-out background must not drag the median down
+    exact = float(x.abs()[x != 0].median())
+    assert abs(_nonzero_median(x) - exact) < 0.01 * exact
+    assert _nonzero_median(torch.zeros(3, 3)) == 0.0

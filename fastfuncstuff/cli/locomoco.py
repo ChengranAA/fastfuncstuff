@@ -3862,8 +3862,18 @@ def _write_warp_pcs(
 
 
 def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
-    """Clamp negatives in a magnitude image unless -allow_neg (sinc resampling rings)."""
-    return arr if allow_neg else np.clip(arr, 0.0, None)
+    """Clamp negatives in a magnitude image unless -allow_neg (sinc resampling rings).
+
+    Clipped straight into file (F) order: a series bound for save_nifti would otherwise
+    be clipped into one full copy and then transposed into a second.
+    """
+    if allow_neg:
+        return arr
+    from fastfuncstuff.io.afni import fill_layout
+
+    out = np.empty(arr.shape, dtype=arr.dtype, order="F")
+    fill_layout(out, arr, clip_min=0.0)
+    return out
 
 
 def _save_echo_corr(datas, corrected, stem, ext, affine, args, tr, device) -> None:
@@ -4875,7 +4885,9 @@ def _run_multiecho(
     # The echo MEAN, for the same reason the task diagnostic below uses it: the brain
     # mask this derives is a tissue mask, and the shortest echo gives the weakest
     # contrast to build it from.
-    echo_mean = datas[0] if len(datas) == 1 else np.mean(np.stack(datas), axis=0)
+    from fastfuncstuff.processing.locomoco import echo_mean as _echo_mean
+
+    echo_mean = _echo_mean(datas)
     _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args, echo_mean)
 
     if _task_stage_on(args) and tr_sec:

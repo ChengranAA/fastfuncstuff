@@ -20,6 +20,7 @@ import torch
 from fastfuncstuff.io.afni import (
     _peek_run_length,
     _to_file_order,
+    fill_layout,
     _voxel_major_cuda,
     _voxel_major_masked_numpy,
     _voxel_major_numpy,
@@ -228,6 +229,20 @@ def test_to_file_order_preserves_values(tmp_path):
     # and an already-F array is passed straight through, no copy
     f_arr = np.asfortranarray(arr)
     assert _to_file_order(f_arr, n_threads=3) is f_arr
+
+
+def test_fill_layout_scales_and_clips_into_any_layout():
+    # The fused scale/clip must equal doing it in C order and then transposing, on a
+    # strided destination slab too (the 5-D warp writes one component into [..., axis]).
+    rng = np.random.default_rng(5)
+    src = rng.normal(0, 1, (7, 5, 4, 6)).astype(np.float32)
+    dst = np.zeros((7, 5, 4, 6, 3), dtype=np.float32, order="F")
+    fill_layout(dst[..., 1], src, scale=-2.5, n_threads=3)
+    assert np.array_equal(dst[..., 1], np.float32(-2.5) * src)
+    assert not dst[..., 0].any() and not dst[..., 2].any()
+    out = np.empty(src.shape, dtype=np.float32, order="F")
+    fill_layout(out, src, clip_min=0.0, n_threads=4)
+    assert np.array_equal(out, np.clip(src, 0.0, None))
 
 
 def test_save_nifti_roundtrip_is_exact_for_c_order(tmp_path):

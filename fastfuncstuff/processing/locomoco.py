@@ -4876,22 +4876,17 @@ def _run_3dacq_plain(
     v_canon = by_axis.get(a0, zero)
     if verbose:
         for k, ax in enumerate(axes):
-            ap = disp[k].abs()
-            sel = ap[ap > 0]
-            med = float(sel.median()) if sel.numel() else 0.0
+            med = _nonzero_median(disp[k])
+            amax = _abs_max(disp[k])
             if null_axis is not None and k == len(axes) - 1:
                 # The size of the spurious trace, which is the whole point of solving
                 # for it: a null channel reading near zero says the encoded axes had
                 # little to inherit, and a large one says they did.
-                enc_med = []
-                for kk in range(n_encoded):
-                    e = disp[kk].abs()
-                    e = e[e > 0]
-                    enc_med.append(float(e.median()) if e.numel() else 0.0)
+                enc_med = [_nonzero_median(disp[kk]) for kk in range(n_encoded)]
                 worst = max(enc_med) if enc_med else 0.0
                 print(
                     f"🚫 locomoco NULL axis {ax} (un-encoded, never applied): "
-                    f"|disp| median {med:.3f} vox, max {float(ap.max()):.3f} vox "
+                    f"|disp| median {med:.3f} vox, max {amax:.3f} vox "
                     f"— regressed out of the encode axes"
                 )
                 # The null channel should be SMALLER than the encode axes: it has no
@@ -4911,13 +4906,13 @@ def _run_3dacq_plain(
             print(
                 f"🌀 locomoco 3D-acq: {nt} frames, {label} axis {ax}, backend={backend}, "
                 f"ref={ref_mode} (single 3-D solve, no slicing); |disp| median {med:.3f} vox, "
-                f"max {float(ap.max()):.3f} vox"
+                f"max {amax:.3f} vox"
             )
         if sep_field is not None:
-            s = sep_field[sep_field > 0]
-            if s.numel():
+            sep_med = _nonzero_median(sep_field)
+            if sep_med > 0:
                 print(
-                    f"   axis separability: median {float(s.median()):.3f} "
+                    f"   axis separability: median {sep_med:.3f} "
                     f"(1 = axes cleanly separable, 0 = aperture-ambiguous)"
                 )
     return LocomocoResult(
@@ -5980,7 +5975,7 @@ def estimate_residual_flow_multiecho(
     # Confidence map from the pooled searchlight (fixed/flat-scaling xcorr path only — the
     # LK and learn-alpha paths have no single per-voxel searchlight quality). Filled by the
     # final _pooled_xcorr call and surfaced on the result for a `-save_confidence` diag.
-    pooled_conf = torch.zeros(nx, ny, nz, nt)
+    pooled_conf: torch.Tensor | None = None  # allocated by the first _pooled_xcorr
     have_pooled_conf = False
     # Per-voxel separability of the two axes (flow backend only) — see optical_flow_lk_3d_axes.
     sep_field = torch.zeros(nx, ny, nz, nt) if (dual and backend == "flow") else None
@@ -6043,7 +6038,9 @@ def estimate_residual_flow_multiecho(
         return out
 
     def _pooled_xcorr(cur_refs: list[torch.Tensor], tag: str) -> list[torch.Tensor]:
-        nonlocal have_pooled_conf, corr_curve, corr_offsets
+        nonlocal pooled_conf, have_pooled_conf, corr_curve, corr_offsets
+        if pooled_conf is None:
+            pooled_conf = torch.zeros(nx, ny, nz, nt)
         out = [torch.zeros(nx, ny, nz, nt) for _ in axes]
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
             movs = [_prep(vols[j][..., t].to(device).contiguous()) for j in range(e)]
@@ -6156,7 +6153,7 @@ def estimate_residual_flow_multiecho(
     soft_xyz = None
     if automask:
         # One shared mask from the across-echo mean (all echoes share geometry).
-        mean_series = np.mean(np.stack([np.asarray(d) for d in datas], 0), 0)
+        mean_series = echo_mean(datas)
         soft = _build_soft_mask(
             mean_series,
             disp_slice,
@@ -6169,12 +6166,15 @@ def estimate_residual_flow_multiecho(
             # 2-D multi-slice: margin/feather are in-plane concepts, per slice.
             in_plane=slicewise,
         )
+        del mean_series
         soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
 
     def _gate_me(fields: list[torch.Tensor]) -> list[torch.Tensor]:
-        if soft_xyz is None:
-            return fields
-        return [f * soft_xyz[..., None] for f in fields]
+        # In place: every caller hands over a freshly solved field it does not keep.
+        if soft_xyz is not None:
+            for f in fields:
+                f.mul_(soft_xyz[..., None])
+        return fields
 
     w = _gate_me(w)
     if verbose and conv_note["txt"]:
@@ -6190,7 +6190,9 @@ def estimate_residual_flow_multiecho(
         # State is w itself (corrected is derived per echo on demand); the shared engine
         # carries corrected == w. brain is None until w has signal, so brain_rms falls
         # back to the whole field. Each solve's tqdm label tracks the pass number.
-        tot = torch.stack([f.abs() for f in w], 0).sum(0)
+        tot = w[0].abs()
+        for f in w[1:]:
+            tot.add_(f.abs())
         brain = _brain_mask_from(tot.mean(dim=3)) if float(tot.max()) > 0 else None
         del tot
         _pass = {"n": 0}
@@ -6280,9 +6282,7 @@ def estimate_residual_flow_multiecho(
         r2 = 1.0
 
     if verbose:
-        ap = w[-1].abs()
-        sel = ap[ap > 0]
-        med = float(sel.median()) if sel.numel() else 0.0
+        med = _nonzero_median(w[-1])
         a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
         te_str = ", ".join(f"{float(x):.0f}" for x in te)
         if learn:
@@ -6294,22 +6294,20 @@ def estimate_residual_flow_multiecho(
         which = f"partition axis {pe_axis2}" if dual else f"PE axis {pe_axis}"
         print(
             f"🌀 locomoco ME-3D: {e} echoes (TE {te_str} ms), {nt} frames, {which}, "
-            f"backend={backend}; shared |w| median {med:.3f} vox, max {float(ap.max()):.3f} vox"
+            f"backend={backend}; shared |w| median {med:.3f} vox, max {_abs_max(w[-1]):.3f} vox"
         )
         print(f"   alpha (÷echo1) = [{a_str}]  {tag}")
         if dual:
-            p1 = w[0].abs()
-            s1 = p1[p1 > 0]
             print(
                 f"   primary PE axis {pe_axis} (alpha pinned FLAT, TE-independent): "
-                f"|w| median {float(s1.median()) if s1.numel() else 0.0:.3f} vox, "
-                f"max {float(p1.max()):.3f} vox"
+                f"|w| median {_nonzero_median(w[0]):.3f} vox, "
+                f"max {_abs_max(w[0]):.3f} vox"
             )
             if sep_field is not None:
-                sv = sep_field[sep_field > 0]
-                if sv.numel():
+                sep_med = _nonzero_median(sep_field)
+                if sep_med > 0:
                     print(
-                        f"   axis separability: median {float(sv.median()):.3f} "
+                        f"   axis separability: median {sep_med:.3f} "
                         f"(multi-echo separates the axes by their differing TE laws)"
                     )
 
@@ -6486,16 +6484,14 @@ def estimate_residual_flow_me_scaled(
         )
 
     if verbose:
-        ap = w.abs()
-        sel = ap[ap > 0]
-        med = float(sel.median()) if sel.numel() else 0.0
+        med = _nonzero_median(w)
         te_str = ", ".join(f"{float(x):.0f}" for x in te)
         a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
         scale_note = "FLAT (alpha=1, all echoes equal)" if flat_scaling else "TE-linear"
         print(
             f"🌀 locomoco ME-3D (scaled from echo {estimate_idx + 1}, "
             f"TE {float(te[estimate_idx]):.0f} ms): {e} echoes (TE {te_str} ms), {nt} frames; "
-            f"|w| median {med:.3f} vox, max {float(ap.max()):.3f} vox"
+            f"|w| median {med:.3f} vox, max {_abs_max(w):.3f} vox"
         )
         print(f"   alpha (÷echo1) = [{a_str}]  ·  {scale_note} scaling applied (not fitted)")
 
@@ -6951,9 +6947,7 @@ def polish_me_result(
         )
 
     if verbose:
-        rr = r_axes[-1].abs()
-        sel = rr[rr > 0]
-        med = float(sel.median()) if sel.numel() else 0.0
+        med = _nonzero_median(r_axes[-1])
         tag = "field |w|" if full else "residual |r|"
         mp_txt = "/".join(str(v) for v in mp)
         geom = (
@@ -6963,7 +6957,7 @@ def polish_me_result(
         )
         print(
             f"🪄 qwarp {'backend' if full else 'polish'}: {tag} median {med:.3f} vox, "
-            f"max {float(rr.max()):.3f} vox ({geom}, {n_levels} levels, "
+            f"max {_abs_max(r_axes[-1]):.3f} vox ({geom}, {n_levels} levels, "
             f"{cost}/{optimizer if cost == 'ncc' else 'adam'})"
         )
 
@@ -7241,12 +7235,10 @@ def estimate_residual_flow_me_interecho(
         )
 
     if verbose:
-        ap = w.abs()
-        sel = ap[ap > 0]
-        med = float(sel.median()) if sel.numel() else 0.0
+        med = _nonzero_median(w)
         te_str = ", ".join(f"{float(x):.0f}" for x in te)
         a_str = ", ".join(f"{float(x):.2f}" for x in alpha)
-        amax = float(ap.max())
+        amax = _abs_max(w)
         print(
             f"🌀 locomoco ME-3D inter-echo: {e} echoes (TE {te_str} ms), {nt} frames, "
             f"PE axis {pe_axis}, backend={backend}; echo1→echo2 step |w| median {med:.3f} vox, "
@@ -7271,10 +7263,44 @@ def estimate_residual_flow_me_interecho(
     )
 
 
-def _nonzero_median(mag: torch.Tensor) -> float:
-    """Median of the non-zero entries — a magnitude summary a masked-out field can't dilute."""
-    sel = mag[mag > 0]
-    return float(sel.median()) if sel.numel() else 0.0
+# A printed summary needs three decimals, not every voxel. The exact masked median of a
+# 1.25 mm series (abs copy, mask, gather, sort) was the multi-echo run's RAM peak.
+_SUMMARY_SAMPLE = 4_000_000
+
+
+def echo_mean(datas: Sequence[np.ndarray]) -> np.ndarray:
+    """Mean over echoes, accumulated one echo at a time: ``np.stack`` held every echo a
+    second time just to average them. Same float32 sum order as ``np.mean(stack, 0)``."""
+    if len(datas) == 1:
+        return np.asarray(datas[0])
+    acc = np.array(datas[0], dtype=np.float32, order="K")
+    for d in datas[1:]:
+        acc += d
+    acc /= len(datas)
+    return acc
+
+
+def _nonzero_median(x: torch.Tensor) -> float:
+    """Median of the non-zero ``|x|`` — a magnitude summary a masked-out field can't dilute.
+
+    Past ``_SUMMARY_SAMPLE`` entries it is the median of a strided subsample (a view
+    strided along every axis, so it neither copies the field nor aliases with one axis).
+    """
+    n = x.numel()
+    if n > _SUMMARY_SAMPLE:
+        s = int(np.ceil((n / _SUMMARY_SAMPLE) ** (1.0 / x.ndim)))
+        x = x[(slice(None, None, s),) * x.ndim]
+    v = x.abs()
+    v = v[v > 0]
+    return float(v.median()) if v.numel() else 0.0
+
+
+def _abs_max(x: torch.Tensor) -> float:
+    """``max |x|`` without materializing ``|x|``."""
+    if not x.numel():
+        return 0.0
+    lo, hi = torch.aminmax(x)
+    return max(float(hi), -float(lo))
 
 
 def _affine_in_te_r2(disps: torch.Tensor, te: torch.Tensor) -> float:
@@ -7607,8 +7633,8 @@ def refine_interecho_temporally(
     if verbose:
         a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
         for j in range(e):
-            ie_med = _nonzero_median((result.alpha[j] * result.w_field).abs())
-            tot_med = _nonzero_median(totals[j].abs())
+            ie_med = abs(float(result.alpha[j])) * _nonzero_median(result.w_field)
+            tot_med = _nonzero_median(totals[j])
             print(
                 f"   echo {j + 1}: |disp| median {ie_med:.3f} → {tot_med:.3f} vox "
                 f"(max {float(totals[j].abs().max()):.3f})"

@@ -3497,26 +3497,55 @@ def _to_file_order(data: np.ndarray, n_threads: int | None = None) -> np.ndarray
     if data.nbytes > get_available_memory(torch.device("cpu")):
         return data
 
+    out = np.empty(data.shape, dtype=data.dtype, order="F")
+    fill_layout(out, data, n_threads=n_threads)
+    return out
+
+
+def fill_layout(
+    dst: np.ndarray,
+    src: np.ndarray,
+    *,
+    scale: float | None = None,
+    clip_min: float | None = None,
+    n_threads: int | None = None,
+) -> None:
+    """``dst[...] = max(scale * src, clip_min)`` across threads, whatever the two layouts.
+
+    The transposing copy :func:`_to_file_order` does, made available to callers that
+    would otherwise scale or clip into a C-order temporary first and then pay for the
+    reorder on top: building the result straight into an F-order ``dst`` is one copy,
+    not two.
+    """
     if n_threads is None:
         n_cpu, _ = resolve_cpu_threads()
         n_threads = min(8, max(1, n_cpu))
-    if n_threads <= 1:
-        return np.asfortranarray(data)
 
-    out = np.empty(data.shape, dtype=data.dtype, order="F")
+    def _fill(d: np.ndarray, s: np.ndarray) -> None:
+        if scale is None and clip_min is None:
+            np.copyto(d, s)
+            return
+        if scale is not None:
+            np.multiply(s, scale, out=d, casting="unsafe")
+            s = d
+        if clip_min is not None:
+            np.maximum(s, clip_min, out=d, casting="unsafe")
+
+    if n_threads <= 1 or src.ndim < 1:
+        _fill(dst, src)
+        return
     # Any single axis gives the workers disjoint blocks in both layouts; the
     # longest one keeps them all busy.
-    axis = int(np.argmax(data.shape))
-    bounds = np.linspace(0, data.shape[axis], n_threads + 1).astype(int)
+    axis = int(np.argmax(src.shape))
+    bounds = np.linspace(0, src.shape[axis], n_threads + 1).astype(int)
 
     def _copy_block(k: int) -> None:
-        sl = [slice(None)] * data.ndim
+        sl = [slice(None)] * src.ndim
         sl[axis] = slice(int(bounds[k]), int(bounds[k + 1]))
-        np.copyto(out[tuple(sl)], data[tuple(sl)])
+        _fill(dst[tuple(sl)], src[tuple(sl)])
 
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
         list(pool.map(_copy_block, range(n_threads)))
-    return out
 
 
 def _nib_save_chunked(img, path: str) -> None:

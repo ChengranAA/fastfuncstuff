@@ -3410,6 +3410,7 @@ def parse_hrf_model_args(
     is_fir_model = hrf_model_name in ("FIR", "TENT", "TENTZERO")
     is_spm_deriv = hrf_model_name in ("SPMG2", "SPMG3")  # SPM with derivatives
 
+    lag_times = None
     if is_fir_model:
         # For FIR/TENT, determine window from durations or params
         window_source = "durations"
@@ -3499,6 +3500,7 @@ def parse_hrf_model_args(
         "fir_top": fir_top,
         "n_basis": n_basis,
         "condition_labels_full": condition_labels_full,
+        "lag_times": lag_times,
     }
 
 

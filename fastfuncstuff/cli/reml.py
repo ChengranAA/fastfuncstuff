@@ -93,6 +93,7 @@ try:
         replace_afni_extension,
         save_nifti,
     )
+    from fastfuncstuff.processing.roi_collapse import add_roi_args, build_roi_set
     from fastfuncstuff.utils import (
         configure_torch_backends,
         gaussian_blur_3d,
@@ -719,6 +720,19 @@ Examples:
         help="Use double precision (float64) - matches AFNI exactly, ~2x memory, ~1.5x slower",
     )
     proc_opts.add_argument("-mask", help="Mask file to restrict analysis")
+    add_roi_args(proc_opts)
+    proc_opts.add_argument(
+        "-roi_maps",
+        "-roi-maps",
+        dest="roi_maps",
+        action="store_true",
+        help=(
+            "With -atlas/-rois: ALSO write the usual voxel volumes (-Rbuck, -Rvar, ...), each "
+            "ROI's value painted into its voxels (a display aid; there is no within-ROI "
+            "structure).  Needs a single 3-D label map.  Without it ROI mode writes only "
+            "{Rbuck stem}_roi.tsv and the text response curves."
+        ),
+    )
 
     # ── Missing-data handling ────────────────────────────────────────────────
     # A voxel can be in-mask and still be dead in some runs (coverage that moves
@@ -1800,6 +1814,99 @@ def print_output_summary(args):
     print()
 
 
+# Options that only make sense on a voxel grid or per voxel.  ROI mode fits a handful of
+# ROI-mean series, so these are refused up front, not half-honoured.
+_ROI_INCOMPATIBLE = {
+    "handle_missing": "-handle_missing",
+    "dsort": "-dsort",
+    "slibase": "-slibase",
+    "slibase_sm": "-slibase_sm",
+    "save_grandmean": "-save_grandmean",
+    "save_tsnr": "-save_tsnr",
+    "save_acf": "-save_acf",
+    "clustsim": "-clustsim",
+    "save_mask": "-save_mask",
+    "save_runmask": "-save_runmask",
+    "save_dofloss": "-save_dofloss",
+    "single_trials": "-single_trials",
+    "hrfopt_prefix": "-hrfopt_prefix",
+    "hrf_opt": "-hrf_opt",
+    "xval_r2": "-xval_r2",
+    "cache": "-cache",
+    "test": "-test",
+    "Obuck": "-Obuck",
+    "Obeta": "-Obeta",
+    "Onuisance": "-Onuisance",
+    "Oerrts": "-Oerrts",
+    "Ofitts": "-Ofitts",
+    "load_Rvar": "-load_Rvar",
+}
+
+
+def _refuse_roi_incompatible(args, surface_input: bool) -> None:
+    bad = [flag for attr, flag in _ROI_INCOMPATIBLE.items() if getattr(args, attr, None)]
+    if surface_input:
+        bad.append("GIfTI surface input")
+    if bad:
+        print(
+            f"❌ ERROR: -atlas/-rois fits ROI means, which {', '.join(bad)} cannot work with "
+            "(they are per-voxel or need the voxel grid).  -do_blur and -blur_to_* are fine: "
+            "they run on the voxels before the ROIs are averaged.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.roi_maps and not (args.Rbuck or args.Rvar or args.Rbeta or args.Rfitts or args.Rerrts):
+        print("❌ ERROR: -roi_maps has nothing to paint without an -R* output.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry):
+    """Average the resident ``(n_voxels, T)`` series within each ROI, inside the mask in effect.
+
+    Runs after the blur / scaling / missing-data guard, so ``args.mask`` already names
+    the voxels the analysis would have used (the user's, or the guard's).  Returns the
+    ROI set and the ``(n_rois, 1, 1, T)`` pseudo-volume the fit runs on.
+    """
+    from fastfuncstuff.io.afni import load_afni_mask
+
+    mask = load_afni_mask(args.mask).reshape(tuple(volume_shape)) if args.mask else None
+    try:
+        roi_set = build_roi_set(args.atlas, tuple(volume_shape), mask=mask)
+    except ValueError as exc:
+        print(f"❌ ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if args.roi_maps and not roi_set.disjoint:
+        print(
+            "❌ ERROR: -roi_maps needs a single 3-D label map; overlapping or weighted ROIs "
+            "cannot be painted back onto voxels.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print("\n🧩 Fitting ROI means (averaged BEFORE the fit)")
+    for line in roi_set.describe():
+        print(f"   {line}")
+    series = roi_set.collapse(torch.from_numpy(data[roi_set.rows.reshape(-1)])).numpy()
+    return roi_set, series.reshape(roi_set.n_rois, 1, 1, series.shape[1])
+
+
+def _write_roi_outputs(args, results, design_info, roi_set, fitted_labels, hrf_info) -> None:
+    """The ROI-mode result: ``{stem}_roi.tsv`` (the -Rbuck columns, one row per ROI) and one
+    ``{stem}_iresp_<condition>.tsv`` per FIR/TENT condition."""
+    from fastfuncstuff.glm.roi_outputs import roi_bucket_columns, roi_response_curves
+
+    stem = _resolve_xval_prefix(args)
+    Path(stem).parent.mkdir(parents=True, exist_ok=True)
+    contrast_names = getattr(results, "contrast_labels", None)
+    table = roi_set.write_table(
+        f"{stem}_roi.tsv", roi_bucket_columns(results, fitted_labels, contrast_names)
+    )
+    print(f"  • Wrote {table} ({roi_set.n_rois} ROIs)")
+    lag_times = (hrf_info or {}).get("lag_times")
+    for cond, (lags, curves) in roi_response_curves(results, design_info, lag_times).items():
+        path = roi_set.write_timecourses(f"{stem}_iresp_{cond}.tsv", lags, curves)
+        print(f"  • Wrote {path}")
+
+
 def main():
     # Pre-extract -a_grid / -b_grid before argparse sees them.
     # argparse cannot handle values like "-0.9,0.9,65" (starts with '-' but not a
@@ -2185,6 +2292,11 @@ def main():
         # The guard's own mask keeps every voxel with a signal, air included, and
         # white noise there would drag the measured smoothness down.
         print(f"❌ ERROR: {blurs[0]} on volume data needs -mask (the brain).", file=sys.stderr)
+        sys.exit(1)
+    if args.atlas:
+        _refuse_roi_incompatible(args, surface_input)
+    elif args.roi_maps:
+        print("❌ ERROR: -roi_maps needs -atlas/-rois.", file=sys.stderr)
         sys.exit(1)
     if surface_input:
         # Surface data run as AFNI's 1-D volume (V, 1, 1, T); the GLM itself does
@@ -3358,7 +3470,10 @@ def main():
         or args.do_scale
         or want_diag
         or guard_enabled
+        or bool(args.atlas)
     )
+    roi_set = None
+    roi_geometry = None
     # Set by the guard block below, then handed to analyze_from_design_matrix so
     # -handle_missing can partition the salvageable voxels into families.
     guard_validity = None
@@ -3631,7 +3746,18 @@ def main():
 
         # Reshape back to 4D for analyze_from_design_matrix
         total_tps = fmri_data_preprocessed.shape[1]
-        fmri_data_preprocessed = fmri_data_preprocessed.reshape(*volume_shape, total_tps)
+        if args.atlas:
+            roi_geometry = dict(preproc_cached_metadata)
+            roi_set, fmri_data_preprocessed = _collapse_preprocessed_to_rois(
+                args, fmri_data_preprocessed, volume_shape, roi_geometry
+            )
+            # The fit sees a (n_rois, 1, 1) grid with no mask: x is the ROI index.
+            volume_shape = fmri_data_preprocessed.shape[:3]
+            preproc_cached_metadata = {"affine": np.eye(4), "volume_shape": volume_shape}
+            args.mask = None
+            guard_validity = None
+        else:
+            fmri_data_preprocessed = fmri_data_preprocessed.reshape(*volume_shape, total_tps)
 
         print(f"  ✓ Preprocessing complete: {volume_shape} × {total_tps} timepoints")
         print()
@@ -4087,6 +4213,25 @@ def main():
         # All columns were fitted
         fitted_labels = full_labels
         stim_indices = stim_column_indices if stim_column_indices else list(range(len(full_labels)))
+
+    if roi_set is not None:
+        _write_roi_outputs(
+            args, results, design_info, roi_set, fitted_labels, locals().get("hrf_info")
+        )
+        if not args.roi_maps:
+            print("\n✅ ROI mode complete (volume outputs need -roi_maps).")
+            return
+        from fastfuncstuff.glm.roi_outputs import expand_to_voxels
+
+        assert roi_geometry is not None
+        expand_to_voxels(
+            results,
+            roi_set,
+            volume_shape=roi_geometry["volume_shape"],
+            affine=roi_geometry["affine"],
+            nifti_header=roi_geometry.get("nifti_header"),
+        )
+        print("  • -roi_maps: ROI values painted into their voxels for the volume writers")
 
     # Voxel-wise (-dsort) coefficients are appended as trailing beta/t-stat
     # sub-bricks (AFNI places them last). The bucket/beta writers read

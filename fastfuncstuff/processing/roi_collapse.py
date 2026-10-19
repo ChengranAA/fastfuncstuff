@@ -252,21 +252,141 @@ class RoiSet:
         self, path: str | Path, times: np.ndarray, values: np.ndarray | Tensor
     ) -> str:
         """Plain text, time down the rows and one column per ROI (``values``: ROI x time)."""
+        return self.write_rows(path, {"time": [f"{float(t):.6g}" for t in times]}, values)
+
+    def write_rows(
+        self, path: str | Path, index: dict[str, list], values: np.ndarray | Tensor
+    ) -> str:
+        """Plain text, one row per entry of *index*'s columns, then one column per ROI.
+
+        ``values`` is ``(n_rois, n_rows)``: response curves (rows = lags), single-trial
+        betas (rows = trials).
+        """
         vals = np.asarray(values.cpu() if isinstance(values, Tensor) else values)
+        keys = list(index)
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh, delimiter="\t")
-            w.writerow(["time", *("_".join(n.split()) for n in self.names)])
-            for t, col in zip(times, vals.T, strict=True):
-                w.writerow([f"{float(t):.6g}", *(f"{x:.6g}" for x in col)])
+            w.writerow([*keys, *("_".join(n.split()) for n in self.names)])
+            for r, col in enumerate(vals.T):
+                w.writerow([*(index[k][r] for k in keys), *(f"{x:.6g}" for x in col)])
         return str(path)
 
 
 def _stem(path: str) -> str:
     name = Path(path.split("[")[0]).name
-    for ext in (".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh"):
+    for ext in (
+        ".nii.gz", ".nii.zst", ".nii", ".mgz", ".mgh",
+        ".label.gii", ".shape.gii", ".func.gii", ".gii", ".label", ".annot",
+    ):  # fmt: skip
         if name.endswith(ext):
             return name[: -len(ext)]
     return Path(name).stem
+
+
+_FREESURFER_ROI = (".label", ".annot")
+
+
+def _surface_reference(header, path) -> dict | None:
+    """Mesh identity of the data an ROI must match: None for volume data."""
+    from fastfuncstuff.io.freesurfer import infer_label
+    from fastfuncstuff.io.gifti import surface_meta
+
+    meta = None if header is None else surface_meta(header)
+    if meta is None:
+        return None
+    hemi = infer_label(str(path))[0] if path else None
+    return {"fingerprint": meta.get("mesh_fingerprint"), "hemi": hemi}
+
+
+def _load_roi_file(f: str, shape3: tuple, surface: dict | None):
+    """``(array, label table, note)`` for one ROI source, checked against the data.
+
+    Surface data take GIfTI (``.label.gii`` / ``.shape.gii``) and FreeSurfer
+    ``.label`` / ``.annot`` files; volume data take NIfTI. A GIfTI that names its
+    mesh must name the data's; FreeSurfer files carry no mesh identity, so only the
+    vertex count and the lh/rh in the file names can be checked.
+    """
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.freesurfer import infer_label
+    from fastfuncstuff.io.gifti import is_gifti, surface_meta
+    from fastfuncstuff.io.labels import LabelEntry, label_table
+
+    plain = f.split("[")[0]
+    is_fs = plain.lower().endswith(_FREESURFER_ROI)
+    on_surface = is_fs or is_gifti(plain)
+    if on_surface != (surface is not None):
+        data_kind = "surface" if surface is not None else "volume"
+        raise ValueError(f"{f}: a {'surface' if on_surface else 'volume'} ROI for {data_kind} data")
+    note = None
+    if surface is not None:
+        hemi = infer_label(plain)[0]
+        if hemi and surface["hemi"] and hemi != surface["hemi"]:
+            raise ValueError(f"{f}: a {hemi} ROI for {surface['hemi']} data")
+
+    if is_fs:
+        import nibabel.freesurfer as nfs
+
+        n_vert = shape3[0]
+        if plain.lower().endswith(".annot"):
+            from fastfuncstuff.io.freesurfer import NOT_A_REGION, read_annotation
+
+            annot = read_annotation(plain, n_vertices=n_vert)
+            real = [k for k, n in enumerate(annot.names) if n not in NOT_A_REGION]
+            flat = np.zeros(n_vert, dtype=np.int64)
+            for k in real:
+                flat[annot.labels == k] = k + 1  # 0 stays background
+            table = {
+                k + 1: LabelEntry(k + 1, annot.names[k], tuple(int(c) for c in annot.rgba[k, :3]))
+                for k in real
+            }
+        else:
+            ids = np.asarray(nfs.read_label(plain), dtype=np.int64)
+            if ids.size and (ids.min() < 0 or ids.max() >= n_vert):
+                raise ValueError(f"{f}: vertex ids reach {ids.max()}, the mesh has {n_vert}")
+            flat = np.zeros(n_vert, dtype=np.int64)
+            flat[ids] = 1
+            table = {}
+        note = f"{Path(plain).name}: FreeSurfer file, mesh checked by vertex count only"
+        return flat.reshape(shape3), table, note
+
+    img = load_nifti(f)
+    arr = np.asanyarray(img.dataobj)
+    if arr.ndim == 4 and arr.shape[3] == 1:
+        arr = arr[..., 0]
+    if arr.ndim not in (3, 4):
+        raise ValueError(f"{f}: ROI files must be 3-D or 4-D, got {arr.ndim}-D")
+    if arr.shape[:3] != shape3:
+        what = "vertex count" if surface is not None else "grid"
+        raise ValueError(
+            f"{f}: ROI {what} {arr.shape[:3]} does not match the data's {shape3}"
+            + ("" if surface is not None else "; resample it first (ffs_util_resample)")
+        )
+    table = label_table(f, img) if arr.ndim == 3 else {}
+    if surface is not None:
+        mine = (surface_meta(img.header) or {}).get("mesh_fingerprint")
+        if mine and surface["fingerprint"] and mine != surface["fingerprint"]:
+            raise ValueError(f"{f}: drawn on a different mesh from the data")
+        if not mine:
+            note = f"{Path(plain).name}: no mesh fingerprint, checked by vertex count only"
+        if not table:
+            table = _gifti_label_table(plain)
+    return arr, table, note
+
+
+def _gifti_label_table(path: str) -> dict:
+    """A ``.label.gii``'s own LabelTable (``gifti_as_nifti`` keeps only the values)."""
+    import nibabel as nib
+
+    from fastfuncstuff.io.labels import LabelEntry
+
+    img = nib.load(path)
+    entries = getattr(getattr(img, "labeltable", None), "labels", None) or []
+    out = {}
+    for e in entries:
+        if int(e.key) != 0 and e.label:
+            rgb = None if e.red is None else tuple(int(round(255 * c)) for c in e.rgba[:3])
+            out[int(e.key)] = LabelEntry(int(e.key), str(e.label), rgb)
+    return out
 
 
 def build_roi_set(
@@ -275,6 +395,8 @@ def build_roi_set(
     mask: np.ndarray | None = None,
     *,
     restrict_to_rois: bool = True,
+    reference_header=None,
+    reference_path: str | None = None,
 ) -> RoiSet:
     """Resolve ROI files against *volume_shape* and an optional analysis *mask*.
 
@@ -282,31 +404,25 @@ def build_roi_set(
     voxels some ROI actually uses are ever loaded. Without it (``ffs_varpart``, whose
     data are already in memory) the rows are the mask itself and uncovered voxels hold
     slot ``-1``. ROIs that the mask empties are dropped and reported, not silently kept.
-    """
-    from fastfuncstuff.io.afni import load_nifti
-    from fastfuncstuff.io.labels import label_table
 
+    ``reference_header`` (the data's header) and ``reference_path`` make surface data
+    recognisable: then ROIs must be surface files on the same mesh and hemisphere.
+    """
     files = [paths] if isinstance(paths, str) else list(paths)
     if not files:
         raise ValueError("no ROI files given")
     shape3 = tuple(volume_shape[:3])
     mask3 = None if mask is None else np.asarray(mask).astype(bool).reshape(shape3)
 
-    # (name, label-or-None, array) per source; arrays kept as loaded.
-    loaded = []
+    surface = _surface_reference(reference_header, reference_path)
+    # (file, array, label table) per source; arrays kept as loaded.
+    loaded, file_notes = [], []
     for f in files:
-        img = load_nifti(f)
-        arr = np.asanyarray(img.dataobj)
-        if arr.ndim == 4 and arr.shape[3] == 1:
-            arr = arr[..., 0]
-        if arr.ndim not in (3, 4):
-            raise ValueError(f"{f}: ROI files must be 3-D or 4-D, got {arr.ndim}-D")
-        if arr.shape[:3] != shape3:
-            raise ValueError(
-                f"{f}: ROI grid {arr.shape[:3]} does not match the data grid {shape3}; "
-                "resample it first (ffs_util_resample)"
-            )
-        loaded.append((f, arr, label_table(f, img) if arr.ndim == 3 else {}))
+        arr, table, note = _load_roi_file(f, shape3, surface)
+        loaded.append((f, arr, table))
+        if note:
+            file_notes.append(note)
+    unit = "vertices" if surface is not None else "voxels"
 
     cover = np.zeros(shape3, dtype=bool)
     for _, arr, _ in loaded:
@@ -315,11 +431,11 @@ def build_roi_set(
     if n_cover == 0:
         raise ValueError("the ROI file(s) contain no non-zero voxels")
 
-    notes = [f"ROI cover: {n_cover:,} voxels"]
+    notes = [*file_notes, f"ROI cover: {n_cover:,} {unit}"]
     if mask3 is not None:
         n_in = int((cover & mask3).sum())
         notes.append(
-            f"intersected with -mask: {n_in:,} of {n_cover:,} ROI voxels are inside it "
+            f"intersected with -mask: {n_in:,} of {n_cover:,} ROI {unit} are inside it "
             f"({n_cover - n_in:,} dropped)"
         )
         if n_in == 0:
@@ -402,8 +518,10 @@ def add_roi_args(group) -> None:
             "Fit ROI MEANS instead of voxels.  Each ROI's voxel timeseries is "
             "averaged BEFORE the fit.  Each file is a 3-D integer label map (one "
             "ROI per value), a 3-D binary mask (one ROI, named after the file) or a "
-            "4-D stack (one weight volume per ROI; may overlap).  Several files "
-            "stack into one set.  Intersected with -mask when one is given.  "
+            "4-D stack (one weight volume per ROI; may overlap).  Surface (.gii) data "
+            "take surface ROIs on the same mesh: .label.gii / .shape.gii, or "
+            "FreeSurfer .label / .annot.  Several files stack into one set.  "
+            "Intersected with -mask when one is given.  "
             "Writes a per-ROI stats table and plain-text response curves; with a "
             "single label map, also paints each ROI's value back into its voxels."
         ),

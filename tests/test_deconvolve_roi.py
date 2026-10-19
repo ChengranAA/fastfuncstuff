@@ -134,3 +134,32 @@ def test_overlapping_rois_cannot_be_painted(monkeypatch, tmp_path, capsys):
     assert _run(monkeypatch, runs, timing, prefix, "-rois", *rois) == 0
     _, rows = _table(f"{prefix}_roi.tsv")
     assert [r[1] for r in rows] == ["a", "b"]
+
+
+def test_surface_runs_with_a_freesurfer_label(monkeypatch, tmp_path):
+    from fastfuncstuff.io.freesurfer import write_label
+    from fastfuncstuff.io.gifti import save_gifti_data
+
+    rng = np.random.default_rng(8)
+    t = np.arange(N_TP) * TR
+    n_vert, runs, rows = 200, [], []
+    for r in range(2):
+        onsets = np.sort(rng.choice(np.arange(3, 105), 14, replace=False)) * TR
+        data = 100 + rng.normal(0, 1, (n_vert, N_TP))
+        data[:30] += 10 * _bold(rng, onsets, t)
+        path = tmp_path / f"lh.run{r}.func.gii"
+        meta = {"TR_seconds": str(TR), "mesh_fingerprint": "M"}
+        save_gifti_data(path, data.astype(np.float32), meta)
+        runs.append(str(path))
+        rows.append(" ".join(f"{o:.2f}" for o in onsets))
+    (tmp_path / "stim.1D").write_text("\n".join(rows) + "\n")
+    write_label(tmp_path / "lh.V1.label", np.arange(30), np.zeros((30, 3)), np.ones(30))
+    write_label(tmp_path / "lh.far.label", np.arange(150, 200), np.zeros((50, 3)), np.ones(50))
+    labels = [str(tmp_path / "lh.V1.label"), str(tmp_path / "lh.far.label")]
+
+    prefix = str(tmp_path / "out")
+    assert _run(monkeypatch, runs, str(tmp_path / "stim.1D"), prefix, "-rois", *labels) == 0
+    header, table = _table(f"{prefix}_roi.tsv")
+    assert [r[1] for r in table] == ["lh.V1", "lh.far"]
+    r2 = [float(r[header.index("r2")]) for r in table]
+    assert r2[0] > 5 * r2[1]

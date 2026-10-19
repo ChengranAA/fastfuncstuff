@@ -113,3 +113,70 @@ def test_write_table_and_timecourses(labels, tmp_path):
     rows = open(txt).read().splitlines()
     assert rows[0].split("\t") == ["time", "3", "7"]
     assert rows[2].split("\t") == ["2", "1", "3"]
+
+
+# -- surface ROIs ----------------------------------------------------------------
+N_VERT = 30
+
+
+@pytest.fixture
+def lh_data(tmp_path):
+    from fastfuncstuff.io.gifti import gifti_as_nifti, save_gifti_data
+
+    path = tmp_path / "lh.bold.func.gii"
+    save_gifti_data(path, np.zeros((N_VERT, 3), np.float32), {"mesh_fingerprint": "M1"})
+    return str(path), gifti_as_nifti(path).header
+
+
+def _shape_gii(tmp_path, name, values, fingerprint="M1"):
+    from fastfuncstuff.io.gifti import save_gifti_data
+
+    meta = {"mesh_fingerprint": fingerprint} if fingerprint else {}
+    save_gifti_data(tmp_path / name, np.asarray(values, np.float32), meta, time_series=False)
+    return str(tmp_path / name)
+
+
+def _surface_set(paths, data):
+    path, header = data
+    return build_roi_set(paths, (N_VERT, 1, 1), reference_header=header, reference_path=path)
+
+
+def test_surface_label_map_on_the_same_mesh(tmp_path, lh_data):
+    lab = np.zeros(N_VERT)
+    lab[:10], lab[10:15] = 1, 2
+    roi = _surface_set(_shape_gii(tmp_path, "lh.parc.shape.gii", lab), lh_data)
+    assert roi.ids == [1, 2] and roi.sizes.tolist() == [10.0, 5.0]
+    assert any("vertices" in n for n in roi.notes)
+
+
+def test_surface_roi_on_another_mesh_or_a_volume_roi_is_refused(tmp_path, lh_data, labels):
+    other = _shape_gii(tmp_path, "lh.x.shape.gii", np.ones(N_VERT), fingerprint="M2")
+    with pytest.raises(ValueError, match="different mesh"):
+        _surface_set(other, lh_data)
+    with pytest.raises(ValueError, match="volume ROI for surface data"):
+        _surface_set(labels, lh_data)
+    with pytest.raises(ValueError, match="surface ROI for volume data"):
+        build_roi_set(other, SHAPE)
+
+
+def test_freesurfer_label_and_annot(tmp_path, lh_data):
+    import nibabel.freesurfer as nfs
+
+    from fastfuncstuff.io.freesurfer import write_label
+
+    ids = np.array([2, 3, 4])
+    write_label(tmp_path / "V1.lh.label", ids, np.zeros((3, 3)), np.ones(3))
+    roi = _surface_set(str(tmp_path / "V1.lh.label"), lh_data)
+    assert roi.names == ["V1.lh"] and roi.rows.reshape(-1)[ids].all()
+    assert any("vertex count only" in n for n in roi.notes)
+
+    write_label(tmp_path / "rh.MT.label", ids, np.zeros((3, 3)), np.ones(3))
+    with pytest.raises(ValueError, match="a rh ROI for lh data"):
+        _surface_set(str(tmp_path / "rh.MT.label"), lh_data)
+
+    annot_lab = np.zeros(N_VERT, np.int32)  # 0 = "unknown", not a region
+    annot_lab[5:9], annot_lab[20:] = 1, 2
+    ctab = np.array([[0, 0, 0, 0, 0], [255, 0, 0, 0, 1], [0, 255, 0, 0, 2]], np.int32)
+    nfs.write_annot(str(tmp_path / "lh.aparc.annot"), annot_lab, ctab, ["unknown", "V1", "MT"])
+    roi = _surface_set(str(tmp_path / "lh.aparc.annot"), lh_data)
+    assert roi.names == ["V1", "MT"] and roi.sizes.tolist() == [4.0, 10.0]

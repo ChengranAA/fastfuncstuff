@@ -1194,7 +1194,10 @@ def _resolve_xval_prefix(args) -> str:
         return str(args.prefix)
     for candidate in (args.Rbuck, args.Obuck, args.Rbeta, args.Obeta):
         if candidate:
-            return replace_afni_extension(str(candidate), "").rsplit(".nii", 1)[0]
+            stem = replace_afni_extension(str(candidate), "").rsplit(".nii", 1)[0]
+            for ext in (".func.gii", ".shape.gii", ".gii"):  # a surface bucket's name
+                stem = stem.removesuffix(ext)
+            return stem
     return "ffs_reml"
 
 
@@ -1828,7 +1831,7 @@ _ROI_INCOMPATIBLE = {
     "save_mask": "-save_mask",
     "save_runmask": "-save_runmask",
     "save_dofloss": "-save_dofloss",
-    "single_trials": "-single_trials",
+    "beta_cv": "-beta_cv / -cv_design single",
     "hrfopt_prefix": "-hrfopt_prefix",
     "hrf_opt": "-hrf_opt",
     "xval_r2": "-xval_r2",
@@ -1843,10 +1846,8 @@ _ROI_INCOMPATIBLE = {
 }
 
 
-def _refuse_roi_incompatible(args, surface_input: bool) -> None:
+def _refuse_roi_incompatible(args) -> None:
     bad = [flag for attr, flag in _ROI_INCOMPATIBLE.items() if getattr(args, attr, None)]
-    if surface_input:
-        bad.append("GIfTI surface input")
     if bad:
         print(
             f"❌ ERROR: -atlas/-rois fits ROI means, which {', '.join(bad)} cannot work with "
@@ -1860,7 +1861,7 @@ def _refuse_roi_incompatible(args, surface_input: bool) -> None:
         sys.exit(1)
 
 
-def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry):
+def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry, input_path):
     """Average the resident ``(n_voxels, T)`` series within each ROI, inside the mask in effect.
 
     Runs after the blur / scaling / missing-data guard, so ``args.mask`` already names
@@ -1871,7 +1872,13 @@ def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry):
 
     mask = load_afni_mask(args.mask).reshape(tuple(volume_shape)) if args.mask else None
     try:
-        roi_set = build_roi_set(args.atlas, tuple(volume_shape), mask=mask)
+        roi_set = build_roi_set(
+            args.atlas,
+            tuple(volume_shape),
+            mask=mask,
+            reference_header=geometry.get("nifti_header"),
+            reference_path=str(input_path),
+        )
     except ValueError as exc:
         print(f"❌ ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -1901,6 +1908,11 @@ def _write_roi_outputs(args, results, design_info, roi_set, fitted_labels, hrf_i
         f"{stem}_roi.tsv", roi_bucket_columns(results, fitted_labels, contrast_names)
     )
     print(f"  • Wrote {table} ({roi_set.n_rois} ROIs)")
+    if args.single_trials:
+        from fastfuncstuff.glm.roi_outputs import write_roi_single_trials
+
+        for path in write_roi_single_trials(results, design_info, roi_set, stem):
+            print(f"  • Wrote {path}")
     lag_times = (hrf_info or {}).get("lag_times")
     for cond, (lags, curves) in roi_response_curves(results, design_info, lag_times).items():
         path = roi_set.write_timecourses(f"{stem}_iresp_{cond}.tsv", lags, curves)
@@ -2294,7 +2306,7 @@ def main():
         print(f"❌ ERROR: {blurs[0]} on volume data needs -mask (the brain).", file=sys.stderr)
         sys.exit(1)
     if args.atlas:
-        _refuse_roi_incompatible(args, surface_input)
+        _refuse_roi_incompatible(args)
     elif args.roi_maps:
         print("❌ ERROR: -roi_maps needs -atlas/-rois.", file=sys.stderr)
         sys.exit(1)
@@ -3749,7 +3761,7 @@ def main():
         if args.atlas:
             roi_geometry = dict(preproc_cached_metadata)
             roi_set, fmri_data_preprocessed = _collapse_preprocessed_to_rois(
-                args, fmri_data_preprocessed, volume_shape, roi_geometry
+                args, fmri_data_preprocessed, volume_shape, roi_geometry, input_files[0]
             )
             # The fit sees a (n_rois, 1, 1) grid with no mask: x is the ROI index.
             volume_shape = fmri_data_preprocessed.shape[:3]

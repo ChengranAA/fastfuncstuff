@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.glm.arma import OLS_VOXEL_SCATTER_ATTRS, VOXEL_SCATTER_ATTRS
-from fastfuncstuff.glm.outputs import _bucket_subbricks, _ensure_numpy
+from fastfuncstuff.glm.outputs import _bucket_subbricks, _ensure_numpy, single_trial_order
 
 
 def roi_bucket_columns(
@@ -62,6 +62,33 @@ def roi_response_curves(
             cols = [position[c] for c in cols]
         out[label] = (lags, betas[:, cols])
     return out
+
+
+def write_roi_single_trials(results, design_info: dict, roi_set, stem: str) -> list[str]:
+    """``{stem}_single_trials.tsv`` (betas) and ``_single_trials_tstat.tsv``: one row per
+    trial in presentation order, one column per ROI -- the ROI twin of
+    ``reml_<label>_single.nii.gz``, ordered by the same rule."""
+    stim = list(design_info.get("stim_indices") or [])
+    labels = design_info.get("column_labels")
+    if not stim or getattr(results, "betas", None) is None:
+        return []
+    n_keep = len(stim) - len(design_info.get("stim_vec_indices") or [])
+    order, names, onsets, cols = single_trial_order(
+        design_info["matrix"], stim, [labels[i] for i in stim] if labels else None, n_keep
+    )
+    index = {
+        "trial": [str(k + 1) for k in range(len(order))],
+        "label": names or [str(cols[i]) for i in order],
+        "onset_tr": [str(onsets[i]) for i in order],
+    }
+    written = []
+    for suffix, attr in (("", "betas"), ("_tstat", "tstats")):
+        value = getattr(results, attr, None)
+        if value is not None:
+            # Task columns lead the design, so value column i is stimulus column i.
+            path = f"{stem}_single_trials{suffix}.tsv"
+            written.append(roi_set.write_rows(path, index, _ensure_numpy(value)[:, order]))
+    return written
 
 
 def expand_to_voxels(results, roi_set, *, volume_shape, affine, nifti_header) -> None:

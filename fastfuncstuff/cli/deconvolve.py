@@ -1157,13 +1157,20 @@ def main(argv: list[str] | None = None):
     mask_array_for_load = None
     if args.atlas:
         from fastfuncstuff.io.afni import load_afni_mask, load_nifti
+        from fastfuncstuff.io.gifti import is_gifti
 
-        grid = tuple(load_nifti(input_files[0]).shape[:3])
+        first = load_nifti(input_files[0])
+        # The loader takes no bare mask array for a surface (it has no mesh identity),
+        # so there the rows stay -mask's and the collapse picks the ROI vertices out.
+        on_surface = is_gifti(str(input_files[0]).split("[")[0])
         try:
             roi_set = build_roi_set(
                 args.atlas,
-                grid,
+                tuple(first.shape[:3]),
                 mask=load_afni_mask(args.mask) if args.mask else None,
+                restrict_to_rois=not on_surface,
+                reference_header=first.header,
+                reference_path=str(input_files[0]),
             )
         except ValueError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -1175,7 +1182,9 @@ def main(argv: list[str] | None = None):
                 file=sys.stderr,
             )
             return 1
-        mask_file_for_load, mask_array_for_load = None, roi_set.rows
+        if not on_surface:
+            mask_file_for_load, mask_array_for_load = None, roi_set.rows
+        del first
         if args.verb >= 1:
             print("\n🧩 Fitting ROI means (averaged BEFORE the fit)")
             for line in roi_set.describe():

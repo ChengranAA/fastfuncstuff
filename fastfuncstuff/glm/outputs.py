@@ -65,6 +65,29 @@ def extract_onset_times_from_design(
     return onset_times
 
 
+def single_trial_order(
+    design_matrix: np.ndarray,
+    stim_indices: list[int],
+    stim_labels: list[str] | None,
+    n_stim_keep: int | None = None,
+) -> tuple[list[int], list[str] | None, list[int], list[int]]:
+    """Trial columns in presentation order: ``(order, labels, onsets, stim_indices)``.
+
+    ``order`` indexes the (truncated) stimulus columns; ``labels`` is already
+    reordered, ``onsets`` (TR of first non-zero) and ``stim_indices`` are not.
+    Ties keep column order. ``n_stim_keep`` drops trailing non-trial columns, as in
+    :func:`write_single_trials_output`.
+    """
+    if n_stim_keep is not None:
+        stim_indices = list(stim_indices)[:n_stim_keep]
+        if stim_labels is not None:
+            stim_labels = list(stim_labels)[:n_stim_keep]
+    onset_times = extract_onset_times_from_design(design_matrix, stim_indices)
+    order = sorted(range(len(onset_times)), key=lambda i: (onset_times[i], i))
+    labels = [stim_labels[i] for i in order] if stim_labels else None
+    return order, labels, onset_times, list(stim_indices)
+
+
 def write_single_trials_output(
     results: ResultsLike,
     output_path: str | Path,
@@ -100,25 +123,15 @@ def write_single_trials_output(
     output_path : Path
         Path to written file
     """
-    if n_stim_keep is not None:
-        stim_indices = list(stim_indices)[:n_stim_keep]
-        if stim_labels is not None:
-            stim_labels = list(stim_labels)[:n_stim_keep]
-
-    # Extract onset times for each stimulus column
-    onset_times = extract_onset_times_from_design(design_matrix, stim_indices)
-
-    # Create sort order (sorts by onset time, maintaining stable order for ties)
-    sort_indices = sorted(range(len(onset_times)), key=lambda i: (onset_times[i], i))
+    sort_indices, labels_reordered, onset_times, stim_indices = single_trial_order(
+        design_matrix, stim_indices, stim_labels, n_stim_keep
+    )
 
     # Reorder betas by onset time
     # Task columns lead the design, so beta column i is stim column i whether
     # `results` holds the full beta set or only the stimulus ones.
     betas_np = _ensure_numpy(results.betas)
     betas_reordered = betas_np[:, sort_indices]  # (n_voxels, n_stimuli)
-
-    # Reorder labels
-    labels_reordered = [stim_labels[i] for i in sort_indices] if stim_labels else None
 
     # Reshape to volume
     affine = getattr(results, "affine", np.eye(4))

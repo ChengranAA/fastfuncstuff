@@ -33,10 +33,10 @@ def study(tmp_path):
     return tmp_path, arr
 
 
-def _reml(tmp_path, bold, *extra, expect=0):
+def _reml(tmp_path, bold, *extra, expect=0, hrf="TENT(0,12,5)"):
     res = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "fastfuncstuff.cli.reml", "-input", str(bold)]
-        + ["-events", str(tmp_path / "ev.tsv"), "-TR", str(TR), "-hrf_model", "TENT(0,12,5)"]
+        + ["-events", str(tmp_path / "ev.tsv"), "-TR", str(TR), "-hrf_model", hrf]
         + ["-tout", "-fout", "-device", "cpu", *extra],
         capture_output=True,
         text=True,
@@ -112,3 +112,56 @@ def test_voxel_only_options_are_refused(study):
     res = _reml(tmp_path, tmp_path / "run.nii.gz", "-atlas", str(tmp_path / "atlas.nii.gz"),
                 "-clustsim", "-Rbuck", str(tmp_path / "out"), expect=1)  # fmt: skip
     assert "-clustsim" in res.stderr
+
+
+def test_single_trials_per_roi_match_the_roi_mean_series(study):
+    tmp_path, arr = study
+    _reml(tmp_path, tmp_path / "run.nii.gz", "-atlas", str(tmp_path / "atlas.nii.gz"),
+          "-Rbuck", str(tmp_path / "out"), "-single_trials", "st", hrf="spmg1")  # fmt: skip
+    header, rows = _table(tmp_path / "out_single_trials.tsv")
+    assert header == ["trial", "label", "onset_tr", "1", "2"]
+    assert len(rows) == 10 and [int(r[2]) for r in rows] == sorted(int(r[2]) for r in rows)
+    assert (tmp_path / "out_single_trials_tstat.tsv").exists()
+    got = np.array([float(r[3]) for r in rows])
+
+    mean = arr[:2].reshape(-1, N_TP).mean(axis=0).reshape(1, 1, 1, N_TP).astype(np.float32)
+    nib.save(nib.Nifti1Image(mean, np.diag([3, 3, 3, 1])), tmp_path / "mean.nii.gz")
+    _reml(tmp_path, tmp_path / "mean.nii.gz", "-Rbuck", str(tmp_path / "ref"),
+          "-single_trials", "ref", hrf="spmg1")  # fmt: skip
+    want = nib.load(tmp_path / "reml_ref_single.nii.gz").get_fdata().reshape(-1)
+    np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
+
+
+def test_surface_data_with_a_surface_roi(tmp_path):
+    from fastfuncstuff.io.freesurfer import write_label
+    from fastfuncstuff.io.gifti import load_gifti_data, save_gifti_data
+
+    rng = np.random.default_rng(2)
+    n_vert = 300
+    t = np.arange(N_TP) * TR
+    data = 100 + rng.normal(0, 1, (n_vert, N_TP))
+    data[:40] += 6 * sum(_hrf(t - o) for o in ONSETS["a"])
+    save_gifti_data(tmp_path / "lh.bold.func.gii", data.astype(np.float32),
+                    {"TR_seconds": str(TR), "mesh_fingerprint": "M"})  # fmt: skip
+    lab = np.zeros(n_vert)
+    lab[:40], lab[40:100] = 1, 2
+    save_gifti_data(tmp_path / "lh.parc.shape.gii", lab.astype(np.float32),
+                    {"mesh_fingerprint": "M"}, time_series=False)  # fmt: skip
+    write_label(tmp_path / "lh.V1.label", np.arange(40), np.zeros((40, 3)), np.ones(40))
+    rows = [(o, k) for k, v in ONSETS.items() for o in v]
+    ev = "onset\tduration\ttrial_type\n" + "\n".join(f"{o}\t1\t{k}" for o, k in sorted(rows))
+    (tmp_path / "ev.tsv").write_text(ev + "\n")
+
+    bold = tmp_path / "lh.bold.func.gii"
+    _reml(tmp_path, bold, "-atlas", str(tmp_path / "lh.parc.shape.gii"),
+          "-Rbuck", str(tmp_path / "s.func.gii"), "-roi_maps")  # fmt: skip
+    header, table = _table(tmp_path / "s_roi.tsv")
+    fstat = [float(r[header.index("Full_Fstat")]) for r in table]
+    assert fstat[0] > 3 * fstat[1]
+    stats, meta = load_gifti_data(tmp_path / "s.func.gii")
+    assert meta["mesh_fingerprint"] == "M"
+    assert np.ptp(stats[:40], axis=0).max() < 1e-5 and not stats[100:].any()
+
+    _reml(tmp_path, bold, "-rois", str(tmp_path / "lh.V1.label"), "-Rbuck", str(tmp_path / "v"))
+    _, table = _table(tmp_path / "v_roi.tsv")
+    assert [r[1] for r in table] == ["lh.V1"]

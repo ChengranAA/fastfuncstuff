@@ -98,6 +98,8 @@ class _Cell(QtWidgets.QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(4)
         self.caption = QtWidgets.QLabel(label.upper())
+        # A button already says what it is; a caption beside it just repeats it.
+        self.caption.setVisible(bool(label))
         h.addWidget(self.caption)
         h.addWidget(body, 1)
         policy = self.sizePolicy()
@@ -193,7 +195,7 @@ class ControlPanel(QtWidgets.QWidget):
             if used and (spec.newline or used + span > ROW_UNITS):
                 self._close_row(row, used)
                 row, used = self._new_row(), 0
-            cell = _Cell(spec.label, body)
+            cell = _Cell("" if isinstance(spec, ActionControl) else spec.label, body)
             if spec.help:
                 cell.setToolTip(spec.help)
                 body.setToolTip(spec.help)

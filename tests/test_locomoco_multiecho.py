@@ -15,8 +15,9 @@ import torch
 
 from fastfuncstuff.processing.locomoco import (
     _fourier_shifter,
-    _shift1d_windowed_sinc,
     _nonzero_median,
+    _select_over_time,
+    _shift1d_windowed_sinc,
     _shift3d_axis,
     echo_mean,
     estimate_residual_flow_me_interecho,
@@ -1323,3 +1324,16 @@ def test_nonzero_median_subsamples_large_fields_without_bias():
     exact = float(x.abs()[x != 0].median())
     assert abs(_nonzero_median(x) - exact) < 0.01 * exact
     assert _nonzero_median(torch.zeros(3, 3)) == 0.0
+
+
+def test_select_over_time_slabs_match_whole_series(monkeypatch):
+    # Slab-wise median/max must pick the same value per voxel as the whole-series op,
+    # on an F-ordered (loader-layout) series and for a non-last reduction axis.
+    import fastfuncstuff.processing.locomoco as lm
+
+    monkeypatch.setattr(lm, "_SELECT_SLAB_BYTES", 600)  # a few slabs on a toy series
+    rng = np.random.default_rng(1)
+    v = torch.from_numpy(np.asfortranarray(rng.normal(0, 1, (9, 7, 5, 12)).astype(np.float32)))
+    for dim in (3, 0):
+        assert torch.equal(_select_over_time(v, dim, "median"), v.median(dim=dim).values)
+        assert torch.equal(_select_over_time(v, dim, "max"), v.amax(dim=dim))

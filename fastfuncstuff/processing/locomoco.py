@@ -4127,15 +4127,38 @@ def _time_window(series: torch.Tensor, dim: int, first_n: int | None) -> torch.T
     return series
 
 
+_SELECT_SLAB_BYTES = 256 << 20
+
+
+def _select_over_time(v: torch.Tensor, dim: int, op: str) -> torch.Tensor:
+    """``median`` / ``max`` over ``dim``, slab by slab along the longest other axis.
+
+    A whole-series CPU median copies the series into a time-contiguous layout and sorts
+    it with scratch beside it (~4.6x one echo measured, per echo). Both ops pick a value
+    per voxel, so the slabs give the identical result at a fraction of the footprint.
+    """
+    other = [d for d in range(v.ndim) if d != dim]
+    ax = max(other, key=lambda d: v.shape[d])
+    per = max(1, v.numel() // max(v.shape[ax], 1) * v.element_size())
+    step = max(1, _SELECT_SLAB_BYTES // per)
+    if step >= v.shape[ax]:
+        return v.median(dim=dim).values if op == "median" else v.amax(dim=dim)
+    parts = []
+    for i in range(0, v.shape[ax], step):
+        sl = v.narrow(ax, i, min(step, v.shape[ax] - i))
+        parts.append(sl.median(dim=dim).values if op == "median" else sl.amax(dim=dim))
+    return torch.cat(parts, dim=ax if ax < dim else ax - 1)
+
+
 def _select_ref_vol(vol4d: torch.Tensor, ref_mode: str, first_n: int | None = None) -> torch.Tensor:
     """Reduce a ``(nx,ny,nz,T)`` series to a single reference volume per ``ref_mode``."""
     v = _time_window(vol4d, 3, first_n)
     if ref_mode in ("mean", "first_mean"):
         return v.mean(dim=3)
     if ref_mode in ("median", "first_median"):
-        return v.median(dim=3).values
+        return _select_over_time(v, 3, "median")
     if ref_mode == "max":
-        return v.max(dim=3).values
+        return _select_over_time(v, 3, "max")
     if ref_mode == "first":
         return v[..., 0]
     return vol4d[..., int(ref_mode)]  # explicit index ignores first_n
@@ -4153,9 +4176,9 @@ def _refine_reduce(
     """
     c = _time_window(corrected, dim, first_n)
     if ref_mode in ("median", "first_median"):
-        return c.median(dim=dim).values
+        return _select_over_time(c, dim, "median")
     if ref_mode == "max":
-        return c.max(dim=dim).values
+        return _select_over_time(c, dim, "max")
     return c.mean(dim=dim)
 
 

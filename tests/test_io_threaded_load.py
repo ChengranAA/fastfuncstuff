@@ -20,10 +20,10 @@ import torch
 from fastfuncstuff.io.afni import (
     _peek_run_length,
     _to_file_order,
-    fill_layout,
     _voxel_major_cuda,
     _voxel_major_masked_numpy,
     _voxel_major_numpy,
+    fill_layout,
     from_voxel_major,
     load_and_concatenate_runs,
     resolve_load_threads,

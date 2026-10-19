@@ -77,6 +77,7 @@ import torch
 from tqdm.auto import tqdm
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.processing.roi_collapse import add_roi_args, build_roi_set
 from fastfuncstuff.unique import sorted_unique
 
 try:
@@ -921,23 +922,7 @@ def create_parser() -> argparse.ArgumentParser:
         "-tr", type=float, default=None, help="TR in seconds; read from header if omitted."
     )
     proc.add_argument("-mask", default=None, help="Brain mask NIfTI.")
-    proc.add_argument(
-        "-atlas",
-        default=None,
-        metavar="LABELS",
-        help=(
-            "Integer label volume, aligned to -input.  Averages each parcel's "
-            "voxel timeseries and fits ONE timeseries per parcel instead of "
-            "one per voxel.  Averaging BEFORE the fit (not after) is the "
-            "point: the delay search itself sees the sqrt(N)-cleaner signal, "
-            "rather than smoothing noisy per-voxel estimates afterwards.  "
-            "Results are painted back into every voxel of their parcel, so "
-            "all the usual maps still come out, plus a per-parcel TSV.  "
-            "Turns a 292k-voxel fit into a few hundred rows, so sweeps over "
-            "-tau-max / -delay-prior-sd become interactive.  Currently "
-            "-parametrization shift only."
-        ),
-    )
+    add_roi_args(proc)
     proc.add_argument(
         "-do_blur",
         "-do-blur",
@@ -1918,8 +1903,7 @@ def _run_shift_mode(
     device: torch.device,
     nii_ext: str,
     extra_regs_per_run: list[torch.Tensor] | None = None,
-    parcel_of_voxel: np.ndarray | None = None,
-    parcel_labels: list[int] | None = None,
+    roi_set=None,
 ) -> int:
     """-parametrization shift: per-block amplitude + bounded latency.
 
@@ -2124,11 +2108,8 @@ def _run_shift_mode(
         # With -atlas the rows are parcels, not voxels: paint each parcel's
         # value into every voxel that belongs to it.  Voxels the atlas did not
         # label stay zero.
-        if parcel_of_voxel is not None:
-            ok = parcel_of_voxel >= 0
-            painted = np.zeros((parcel_of_voxel.size,) + tuple(masked.shape[1:]), dtype=np.float32)
-            painted[ok] = masked[parcel_of_voxel[ok]]
-            masked = painted
+        if roi_set is not None:
+            masked = roi_set.paint(masked)
         out_shape = (nx, ny, nz) + tuple(masked.shape[1:])
         out = np.zeros(out_shape, dtype=np.float32)
         if mask is not None:
@@ -2137,31 +2118,20 @@ def _run_shift_mode(
             out = masked.reshape(out_shape)
         return out
 
-    if parcel_of_voxel is not None and parcel_labels:
+    if roi_set is not None:
         # The parcel-level numbers are the actual estimates; the painted maps
         # are a convenience view of them.  Ship them as a table too.
-        tsv = f"{args.prefix}_fitbasis_shift_parcels.tsv"
-        hdr = ["label", "n_voxels", "r2", "r2_tau0", "fstat", "amp_lambda", "mean_delay"]
-        rows = []
-        for i, lab in enumerate(parcel_labels):
-            rows.append(
-                [
-                    lab,
-                    int((parcel_of_voxel == i).sum()),
-                    float(fit.r2[i]),
-                    float(fit.r2_fixed[i]),
-                    float(fit.fstat[i]),
-                    float(fit.amp_lambda[i]),
-                    float(fit.delays[i].mean()),
-                ]
-            )
-        with open(tsv, "w") as fh:
-            fh.write("\t".join(hdr) + "\n")
-            for r in rows:
-                fh.write(
-                    "\t".join(f"{v:.6g}" if isinstance(v, float) else str(v) for v in r) + "\n"
-                )
-        print(f"  Wrote {tsv}  ({len(rows)} parcels)")
+        tsv = roi_set.write_table(
+            f"{args.prefix}_fitbasis_shift_parcels.tsv",
+            {
+                "r2": fit.r2,
+                "r2_tau0": fit.r2_fixed,
+                "fstat": fit.fstat,
+                "amp_lambda": fit.amp_lambda,
+                "mean_delay": np.asarray(fit.delays).reshape(roi_set.n_rois, -1).mean(axis=1),
+            },
+        )
+        print(f"  Wrote {tsv}  ({roi_set.n_rois} parcels)")
 
     # ── Held-out validation first, so it can ride inside the buckets ──
     xval_maps: list[tuple[str, np.ndarray]] = []
@@ -2568,8 +2538,7 @@ def main() -> int:
     # Collapse to one timeseries per atlas label BEFORE fitting.  Everything
     # downstream then works on parcels; ``parcel_of_voxel`` paints the results
     # back so the output maps keep their usual voxel geometry.
-    parcel_of_voxel: np.ndarray | None = None
-    parcel_labels: list[int] = []
+    roi_set = None
     if args.atlas:
         if args.parametrization != "shift":
             print(
@@ -2577,39 +2546,14 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        from fastfuncstuff.io.afni import load_nifti
-
-        atlas_img = load_nifti(args.atlas)
-        atlas = np.asarray(atlas_img.dataobj)
-        if atlas.shape[:3] != tuple(volume_shape):
-            print(
-                f"ERROR: -atlas shape {atlas.shape[:3]} does not match the "
-                f"input grid {tuple(volume_shape)}.  Resample it first "
-                f"(ffs_util_resample).",
-                file=sys.stderr,
-            )
+        try:
+            roi_set = build_roi_set(args.atlas, volume_shape, mask=mask, restrict_to_rois=False)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
             return 1
-        lab_v = (atlas[mask] if mask is not None else atlas.reshape(-1)).astype(np.int64)
-        parcel_labels = [int(x) for x in sorted_unique(lab_v) if x > 0]
-        if not parcel_labels:
-            print("ERROR: -atlas contains no positive labels inside the mask.", file=sys.stderr)
-            return 1
-        lut = {lab: i for i, lab in enumerate(parcel_labels)}
-        parcel_of_voxel = np.full(lab_v.shape, -1, dtype=np.int64)
-        for lab, i in lut.items():
-            parcel_of_voxel[lab_v == lab] = i
-        pdata = torch.zeros((len(parcel_labels), data.shape[1]), dtype=data.dtype)
-        counts = []
-        for i in range(len(parcel_labels)):
-            sel = parcel_of_voxel == i
-            counts.append(int(sel.sum()))
-            pdata[i] = data[torch.from_numpy(np.flatnonzero(sel))].mean(dim=0)
-        data = pdata
-        print(
-            f"  Atlas: {len(parcel_labels)} parcel(s) from {args.atlas} — "
-            f"{int((parcel_of_voxel >= 0).sum()):,}/{n_voxels:,} masked voxels assigned, "
-            f"median parcel {int(np.median(counts))} voxels"
-        )
+        data = roi_set.collapse(data)
+        for line in roi_set.describe():
+            print(f"  Atlas: {line}")
         print(
             "  Fitting one timeseries PER PARCEL; maps are painted back into "
             "every voxel of their parcel."
@@ -2807,8 +2751,7 @@ def main() -> int:
             device=device,
             nii_ext=nii_ext,
             extra_regs_per_run=extra_regs_per_run,
-            parcel_of_voxel=parcel_of_voxel,
-            parcel_labels=parcel_labels,
+            roi_set=roi_set,
         )
 
     # ── Per-voxel HRF shape (shared by both parametrisations) ──────

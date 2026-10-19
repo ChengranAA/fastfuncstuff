@@ -32,11 +32,9 @@ try:
     )
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.io.gifti import is_gifti, surface_meta
+    from fastfuncstuff.processing.roi_collapse import add_roi_args, build_roi_set
     from fastfuncstuff.stats.variance_partition import (
         anova_partition,
-        build_roi_weights,
-        collapse_to_rois,
-        paint_rois_to_voxels,
         partition_variance,
         permutation_test,
     )
@@ -591,15 +589,7 @@ mapping back to the original labels is written to {prefix}_varpart.json).
         ),
     )
     opt.add_argument("-mask", default=None, help="Restrict to voxels inside this mask")
-    opt.add_argument(
-        "-atlas",
-        default=None,
-        help=(
-            "Collapse to ROIs before partitioning. 3-D integer label map (one ROI per "
-            "non-zero value) or 4-D stack (one volume per ROI; binary or weighted, may "
-            "overlap). Writes a per-ROI table plus a parcel-painted volume for figures."
-        ),
-    )
+    add_roi_args(opt)
     opt.add_argument(
         "-max_rank",
         "-max-rank",
@@ -936,17 +926,19 @@ def main() -> int:
     print(f"   {vol_shape} x {n_trials} trials; {betas.shape[0]:,} voxels in mask")
 
     roi_ids: list | None = None
-    roi_spec: np.ndarray | None = None
+    roi_set = None
     if args.atlas:
-        check_domain(args.atlas)
-        atlas = np.asanyarray(load_nifti(args.atlas).dataobj)
-        if atlas.shape[:3] != vol_shape:
-            raise SystemExit(f"❌ atlas grid {atlas.shape[:3]} does not match betas {vol_shape}")
-        roi_spec, roi_ids, roi_sizes = build_roi_weights(atlas, mask=mask)
-        betas = collapse_to_rois(betas, roi_spec, roi_sizes, device=device).cpu()
-        kind = "label map" if atlas.ndim == 3 else "4-D masks"
-        print(f"\n🧩 Atlas ({kind}): collapsed to {betas.shape[0]} ROIs")
-        print(f"   ROI sizes: min {roi_sizes.min():.0f}, median {np.median(roi_sizes):.0f}")
+        for path in args.atlas:
+            check_domain(path)
+        try:
+            roi_set = build_roi_set(args.atlas, vol_shape, mask=mask, restrict_to_rois=False)
+        except ValueError as exc:
+            raise SystemExit(f"❌ {exc}") from exc
+        roi_ids = roi_set.ids
+        betas = roi_set.collapse(betas, device=device).cpu()
+        print(f"\n🧩 ROIs: collapsed to {betas.shape[0]} ROIs")
+        for line in roi_set.describe():
+            print(f"   {line}")
 
     print("\n🔬 Partitioning...")
     res = partition_variance(
@@ -1327,7 +1319,7 @@ def main() -> int:
         # structure. Same sub-bricks and grid as voxel mode, so figures and overlays
         # work identically either way.
         for i, name in enumerate(names):
-            painted = paint_rois_to_voxels(maps[name], roi_spec, int(mask.sum()))
+            painted = roi_set.paint(maps[name])
             vol = np.zeros(vol_shape, dtype=np.float32)
             vol[mask] = painted
             stacked[..., i] = vol

@@ -815,7 +815,7 @@ def test_rank_masking_can_be_disabled():
 
 class TestRoiCollapse:
     def test_label_map_groups_by_value(self):
-        from fastfuncstuff.stats.variance_partition import build_roi_weights, collapse_to_rois
+        from fastfuncstuff.processing.roi_collapse import build_roi_weights, collapse_to_rois
 
         atlas = np.array([[[1, 1, 2, 0]]])  # 1x1x4, one voxel unassigned
         spec, ids, sizes = build_roi_weights(atlas)
@@ -829,7 +829,7 @@ class TestRoiCollapse:
         torch.testing.assert_close(out[1], torch.tensor([10.0, 20.0]))
 
     def test_label_map_respects_mask(self):
-        from fastfuncstuff.stats.variance_partition import build_roi_weights
+        from fastfuncstuff.processing.roi_collapse import build_roi_weights
 
         atlas = np.array([[[1, 1, 2, 2]]])
         mask = np.array([[[True, False, True, True]]])
@@ -838,7 +838,7 @@ class TestRoiCollapse:
         assert sizes.tolist() == [1.0, 2.0]
 
     def test_4d_atlas_allows_overlap_and_weights(self):
-        from fastfuncstuff.stats.variance_partition import build_roi_weights, collapse_to_rois
+        from fastfuncstuff.processing.roi_collapse import build_roi_weights, collapse_to_rois
 
         # two ROIs sharing voxel 1; second ROI is weighted, not binary
         atlas = np.zeros((1, 1, 3, 2), dtype=np.float32)
@@ -854,7 +854,7 @@ class TestRoiCollapse:
         torch.testing.assert_close(out[1], torch.tensor([4.0]))  # (2*3+2*5)/4
 
     def test_rejects_empty_or_wrong_dimensionality(self):
-        from fastfuncstuff.stats.variance_partition import build_roi_weights
+        from fastfuncstuff.processing.roi_collapse import build_roi_weights
 
         with pytest.raises(ValueError, match="no non-zero labels"):
             build_roi_weights(np.zeros((2, 2, 2), dtype=int))
@@ -864,7 +864,7 @@ class TestRoiCollapse:
     @pytest.mark.gpu
     def test_collapsing_raises_the_noise_ceiling(self):
         """The point of -atlas beyond speed: averaging lifts ncsnr past the rank floor."""
-        from fastfuncstuff.stats.variance_partition import build_roi_weights, collapse_to_rois
+        from fastfuncstuff.processing.roi_collapse import build_roi_weights, collapse_to_rois
 
         rng = np.random.default_rng(31)
         factors, rep, run = make_crossed_table()
@@ -890,14 +890,14 @@ class TestRoiCollapse:
 
 class TestPaintRoisToVoxels:
     def test_label_map_broadcasts_and_fills_unassigned(self):
-        from fastfuncstuff.stats.variance_partition import paint_rois_to_voxels
+        from fastfuncstuff.processing.roi_collapse import paint_rois_to_voxels
 
         spec = np.array([0, 0, 1, -1])
         out = paint_rois_to_voxels(np.array([2.5, 7.0]), spec, n_voxels=4)
         assert out.tolist() == [2.5, 2.5, 7.0, 0.0]
 
     def test_overlap_resolves_by_weighted_average(self):
-        from fastfuncstuff.stats.variance_partition import paint_rois_to_voxels
+        from fastfuncstuff.processing.roi_collapse import paint_rois_to_voxels
 
         # voxel 1 belongs to both ROIs (weights 1 and 3), voxel 2 to neither
         w = np.array([[1.0, 1.0, 0.0], [0.0, 3.0, 0.0]])
@@ -908,14 +908,14 @@ class TestPaintRoisToVoxels:
 
     def test_disjoint_binary_4d_is_exact(self):
         """Painting must not smear values where coverage is disjoint."""
-        from fastfuncstuff.stats.variance_partition import paint_rois_to_voxels
+        from fastfuncstuff.processing.roi_collapse import paint_rois_to_voxels
 
         w = np.array([[1.0, 0.0], [0.0, 1.0]])
         out = paint_rois_to_voxels(np.array([1.5, -2.0]), w, n_voxels=2)
         assert out.tolist() == [1.5, -2.0]
 
     def test_roundtrip_collapse_then_paint_is_the_roi_mean(self):
-        from fastfuncstuff.stats.variance_partition import (
+        from fastfuncstuff.processing.roi_collapse import (
             build_roi_weights,
             collapse_to_rois,
             paint_rois_to_voxels,

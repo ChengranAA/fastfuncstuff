@@ -107,7 +107,8 @@ try:
     from fastfuncstuff.glm.core import fit_glm
     from fastfuncstuff.glm.xval import compute_r2_metric
     from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.processing.roi_collapse import add_roi_args, build_roi_set
+    from fastfuncstuff.processing.roi_collapse import add_roi_args
+    from fastfuncstuff.surface.ribbon_args import add_depth_args, depth_requested
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -362,6 +363,7 @@ def parse_args():
     )
 
     add_roi_args(proc_opts)
+    add_depth_args(parser.add_argument_group("ROI depth sampling (with -atlas/-rois)"))
 
     proc_opts.add_argument(
         "-labels",
@@ -1155,24 +1157,32 @@ def main(argv: list[str] | None = None):
     roi_set = None
     mask_file_for_load = args.mask
     mask_array_for_load = None
+    if depth_requested(args) and not args.atlas:
+        print(
+            "ERROR: -fs_subj / -white_mesh sample ROIs by depth: give -atlas/-rois", file=sys.stderr
+        )
+        return 1
     if args.atlas:
         from fastfuncstuff.io.afni import load_afni_mask, load_nifti
         from fastfuncstuff.io.gifti import is_gifti
+        from fastfuncstuff.processing.roi_depth import roi_set_from_args
 
         first = load_nifti(input_files[0])
         # The loader takes no bare mask array for a surface (it has no mesh identity),
         # so there the rows stay -mask's and the collapse picks the ROI vertices out.
         on_surface = is_gifti(str(input_files[0]).split("[")[0])
         try:
-            roi_set = build_roi_set(
-                args.atlas,
+            roi_set = roi_set_from_args(
+                args,
                 tuple(first.shape[:3]),
+                first.affine,
                 mask=load_afni_mask(args.mask) if args.mask else None,
+                header=first.header,
+                input_path=str(input_files[0]),
                 restrict_to_rois=not on_surface,
-                reference_header=first.header,
-                reference_path=str(input_files[0]),
+                device=device,
             )
-        except ValueError as exc:
+        except (OSError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         if args.roi_maps and not roi_set.disjoint:

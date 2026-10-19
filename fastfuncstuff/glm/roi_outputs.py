@@ -82,12 +82,12 @@ def write_roi_single_trials(results, design_info: dict, roi_set, stem: str) -> l
         "onset_tr": [str(onsets[i]) for i in order],
     }
     written = []
-    for suffix, attr in (("", "betas"), ("_tstat", "tstats")):
+    for suffix, attr, name in (("", "betas", "beta"), ("_tstat", "tstats", "tstat")):
         value = getattr(results, attr, None)
         if value is not None:
             # Task columns lead the design, so value column i is stimulus column i.
             path = f"{stem}_single_trials{suffix}.tsv"
-            written.append(roi_set.write_rows(path, index, _ensure_numpy(value)[:, order]))
+            written.append(roi_set.write_rows(path, index, _ensure_numpy(value)[:, order], name))
     return written
 
 

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import scipy.sparse as sp
 import torch
 from torch import Tensor
 
@@ -116,6 +117,22 @@ def collapse_to_rois(
             out.index_add_(0, slot[keep], betas[c0 : c0 + chunk_size].to(device)[keep].float())
         return out / sizes[:, None]
 
+    if sp.issparse(roi_spec):
+        # Depth sampling: a few nonzeros per row out of the whole ribbon's voxels.
+        coo = sp.coo_matrix(roi_spec)
+        w = torch.sparse_coo_tensor(
+            np.vstack([coo.row, coo.col]),
+            coo.data.astype(np.float32),
+            coo.shape,
+            device=device,
+            check_invariants=False,
+        )
+        n_vox = coo.shape[1]
+        for c0 in range(0, n_cols, chunk_size):
+            c1 = min(c0 + chunk_size, n_cols)
+            out[:, c0:c1] = torch.sparse.mm(w, betas[:, c0:c1].to(device).float())
+        return out / sizes[:, None]
+
     w_full = torch.as_tensor(roi_spec, dtype=torch.float32)
     n_vox = w_full.shape[1]
     for c0 in range(0, n_vox, chunk_size):
@@ -146,6 +163,8 @@ def paint_rois_to_voxels(
     vals = np.asarray(values.cpu() if isinstance(values, Tensor) else values, dtype=np.float64)
     trailing = vals.shape[1:]
 
+    if sp.issparse(roi_spec):
+        raise ValueError("depth-sampled ROIs share voxels across depths; they cannot be painted")
     if roi_spec.ndim == 1:
         out = np.full((n_voxels, *trailing), fill, dtype=np.float32)
         assigned = roi_spec >= 0
@@ -182,6 +201,13 @@ class RoiSet:
     rows: np.ndarray  # (X, Y, Z) bool
     sources: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: Extra per-row columns written after ``name`` (depth sampling: hemi, depth, ...).
+    index: dict[str, list] = field(default_factory=dict)
+    #: Header of the ``sizes`` column.
+    size_name: str = "n_voxels"
+    #: Row files (curves, trials) one line per entry x ROI -- tidy -- rather than one
+    #: column per ROI. Depth sampling turns it on: ROI x depth is too wide to read.
+    long_rows: bool = False
 
     @property
     def n_rois(self) -> int:
@@ -194,7 +220,7 @@ class RoiSet:
     @property
     def disjoint(self) -> bool:
         """A grouped-mean label map: the only case that paints back faithfully."""
-        return self.spec.ndim == 1
+        return not sp.issparse(self.spec) and self.spec.ndim == 1
 
     @property
     def n_voxels(self) -> np.ndarray:
@@ -222,12 +248,19 @@ class RoiSet:
 
     def describe(self) -> list[str]:
         sz = self.sizes
-        kind = "label map" if self.disjoint else "weighted/overlapping masks"
+        if sp.issparse(self.spec):
+            kind, unit = "ROI x depth rows", "mm3"
+        else:
+            kind = "label map" if self.disjoint else "weighted/overlapping masks"
+            unit = "voxels"
         return [
             *self.notes,
-            f"{self.n_rois} ROI(s) from {', '.join(self.sources)} ({kind}): "
-            f"min {sz.min():.0f}, median {np.median(sz):.0f}, max {sz.max():.0f} voxels",
+            f"{self.n_rois} {kind} from {', '.join(self.sources)}: "
+            f"min {sz.min():.0f}, median {np.median(sz):.0f}, max {sz.max():.0f} {unit}",
         ]
+
+    def _row_keys(self, i: int) -> list:
+        return [self.ids[i], self.names[i], *(self.index[k][i] for k in self.index)]
 
     def write_table(self, path: str | Path, columns: dict[str, np.ndarray | Tensor]) -> str:
         """One row per ROI: id, name, size, then each named column."""
@@ -235,37 +268,55 @@ class RoiSet:
             k: np.asarray(v.cpu() if isinstance(v, Tensor) else v).reshape(self.n_rois, -1)
             for k, v in columns.items()
         }
-        header = ["roi", "name", "n_voxels"]
+        header = ["roi", "name", *self.index, self.size_name]
         for k, v in cols.items():
             header += [k] if v.shape[1] == 1 else [f"{k}_{j}" for j in range(v.shape[1])]
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh, delimiter="\t")
             w.writerow(header)
-            for i, rid in enumerate(self.ids):
-                row = [rid, self.names[i], f"{self.sizes[i]:.6g}"]
+            for i in range(self.n_rois):
+                row = [*self._row_keys(i), f"{self.sizes[i]:.6g}"]
                 for v in cols.values():
                     row += [f"{x:.6g}" for x in v[i]]
                 w.writerow(row)
         return str(path)
 
     def write_timecourses(
-        self, path: str | Path, times: np.ndarray, values: np.ndarray | Tensor
+        self,
+        path: str | Path,
+        times: np.ndarray,
+        values: np.ndarray | Tensor,
+        value_name: str = "beta",
     ) -> str:
         """Plain text, time down the rows and one column per ROI (``values``: ROI x time)."""
-        return self.write_rows(path, {"time": [f"{float(t):.6g}" for t in times]}, values)
+        times_txt = [f"{float(t):.6g}" for t in times]
+        return self.write_rows(path, {"time": times_txt}, values, value_name)
 
     def write_rows(
-        self, path: str | Path, index: dict[str, list], values: np.ndarray | Tensor
+        self,
+        path: str | Path,
+        index: dict[str, list],
+        values: np.ndarray | Tensor,
+        value_name: str = "value",
     ) -> str:
         """Plain text, one row per entry of *index*'s columns, then one column per ROI.
 
         ``values`` is ``(n_rois, n_rows)``: response curves (rows = lags), single-trial
-        betas (rows = trials).
+        betas (rows = trials). With :attr:`long_rows`, one line per entry per ROI
+        instead -- *index*, then the ROI's own columns, then ``value_name`` -- which
+        pandas / seaborn take as is.
         """
         vals = np.asarray(values.cpu() if isinstance(values, Tensor) else values)
         keys = list(index)
         with open(path, "w", newline="") as fh:
             w = csv.writer(fh, delimiter="\t")
+            if self.long_rows:
+                w.writerow([*keys, "roi", "name", *self.index, value_name])
+                for i in range(self.n_rois):
+                    roi = self._row_keys(i)
+                    for r in range(vals.shape[1]):
+                        w.writerow([*(index[k][r] for k in keys), *roi, f"{vals[i, r]:.6g}"])
+                return str(path)
             w.writerow([*keys, *("_".join(n.split()) for n in self.names)])
             for r, col in enumerate(vals.T):
                 w.writerow([*(index[k][r] for k in keys), *(f"{x:.6g}" for x in col)])
@@ -521,7 +572,10 @@ def add_roi_args(group) -> None:
             "4-D stack (one weight volume per ROI; may overlap).  Surface (.gii) data "
             "take surface ROIs on the same mesh: .label.gii / .shape.gii, or "
             "FreeSurfer .label / .annot.  Several files stack into one set.  "
-            "Intersected with -mask when one is given.  "
+            "Intersected with -mask when one is given.  With surfaces (-fs_subj, or "
+            "-white_mesh/-pial_mesh) volume data are read along the cortical ribbon "
+            "instead: one row per ROI per depth (-depths, -equivolume), from surface "
+            "ROIs or volume ROIs mapped to their columns.  "
             "Writes a per-ROI stats table and plain-text response curves; with a "
             "single label map, also paints each ROI's value back into its voxels."
         ),

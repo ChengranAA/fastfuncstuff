@@ -93,7 +93,8 @@ try:
         replace_afni_extension,
         save_nifti,
     )
-    from fastfuncstuff.processing.roi_collapse import add_roi_args, build_roi_set
+    from fastfuncstuff.processing.roi_collapse import add_roi_args
+    from fastfuncstuff.surface.ribbon_args import add_depth_args, depth_requested
     from fastfuncstuff.utils import (
         configure_torch_backends,
         gaussian_blur_3d,
@@ -721,6 +722,7 @@ Examples:
     )
     proc_opts.add_argument("-mask", help="Mask file to restrict analysis")
     add_roi_args(proc_opts)
+    add_depth_args(parser.add_argument_group("ROI depth sampling (with -atlas/-rois)"))
     proc_opts.add_argument(
         "-roi_maps",
         "-roi-maps",
@@ -1873,7 +1875,7 @@ def _refuse_roi_incompatible(args) -> None:
         sys.exit(1)
 
 
-def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry, input_path):
+def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry, input_path, device=None):
     """Average the resident ``(n_voxels, T)`` series within each ROI, inside the mask in effect.
 
     Runs after the blur / scaling / missing-data guard, so ``args.mask`` already names
@@ -1881,17 +1883,20 @@ def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry, input_pat
     ROI set and the ``(n_rois, 1, 1, T)`` pseudo-volume the fit runs on.
     """
     from fastfuncstuff.io.afni import load_afni_mask
+    from fastfuncstuff.processing.roi_depth import roi_set_from_args
 
     mask = load_afni_mask(args.mask).reshape(tuple(volume_shape)) if args.mask else None
     try:
-        roi_set = build_roi_set(
-            args.atlas,
+        roi_set = roi_set_from_args(
+            args,
             tuple(volume_shape),
+            geometry.get("affine"),
             mask=mask,
-            reference_header=geometry.get("nifti_header"),
-            reference_path=str(input_path),
+            header=geometry.get("nifti_header"),
+            input_path=str(input_path),
+            device=device,
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
         print(f"❌ ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
     if args.roi_maps and not roi_set.disjoint:
@@ -1971,7 +1976,9 @@ def _write_roi_beta_cv(
     }
     return {
         "beta_cv_table": roi_set.write_table(f"{stem}_beta_cv.tsv", columns),
-        "single_trials_table": roi_set.write_rows(f"{stem}_single_trials.tsv", index, betas),
+        "single_trials_table": roi_set.write_rows(
+            f"{stem}_single_trials.tsv", index, betas, "beta"
+        ),
     }
 
 
@@ -2365,6 +2372,12 @@ def main():
         _refuse_roi_incompatible(args)
     elif args.roi_maps:
         print("❌ ERROR: -roi_maps needs -atlas/-rois.", file=sys.stderr)
+        sys.exit(1)
+    if depth_requested(args) and not args.atlas:
+        print(
+            "❌ ERROR: -fs_subj / -white_mesh sample ROIs by depth: give -atlas/-rois.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if surface_input:
         # Surface data run as AFNI's 1-D volume (V, 1, 1, T); the GLM itself does
@@ -3616,7 +3629,7 @@ def main():
         if args.atlas:
             roi_geometry = dict(preproc_cached_metadata)
             roi_set, fmri_data_preprocessed = _collapse_preprocessed_to_rois(
-                args, fmri_data_preprocessed, volume_shape, roi_geometry, input_files[0]
+                args, fmri_data_preprocessed, volume_shape, roi_geometry, input_files[0], device
             )
             # The fit sees a (n_rois, 1, 1) grid with no mask: x is the ROI index.
             volume_shape = fmri_data_preprocessed.shape[:3]

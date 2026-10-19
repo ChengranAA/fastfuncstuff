@@ -287,6 +287,7 @@ def test_instapca_decomposes_inside_a_painted_mask(tmp_path):
         key = _stroke(s, [(10, 10, 6)])
         painted = int((_labels(s, key) > 0).sum())
         s.do(SetMode("instapca"))
+        s.do(SetModeParam("live", "1"))
         s.do(SetModeParam("mask", key))
         s.do(SetModeParam("n_components", "3"))
         assert int(s.mode._result.mask.sum()) == painted

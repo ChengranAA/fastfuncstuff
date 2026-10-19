@@ -118,6 +118,8 @@ class InstaGLMMode(Mode):
         self._source_key: str | None = None
         #: The blur the prepared run was gathered at, so a change is detectable.
         self._blur = 0.0
+        #: ``(first, last, run length)`` the prepared run was cut from.
+        self._cut: tuple[int, int, int] = (0, 0, 0)
         self._source_name = ""
         self._tr = 0.0
         self._hrf: np.ndarray | None = None
@@ -297,6 +299,7 @@ class InstaGLMMode(Mode):
                 help="Principal components of the noise pool -- bright voxels the task "
                 "explains no better than chance -- added as regressors, GLMdenoise style.",
             ),
+            *self.time_cut_controls(),
             PathListControl(
                 name="ortvec",
                 label="ortvec",
@@ -346,6 +349,8 @@ class InstaGLMMode(Mode):
                 "blur",
                 "ortvec",
                 "pcs",
+                "drop_first",
+                "drop_last",
             }
         )
 
@@ -412,7 +417,11 @@ class InstaGLMMode(Mode):
         # design, so it has to drop the prepared run and not merely the fit --
         # otherwise moving the slider refits smoothed betas onto unsmoothed
         # data and nothing on screen says which one you are looking at.
-        if self._prepared is not None and float(self.params.get("blur") or 0.0) != self._blur:
+        if self._prepared is not None and (
+            float(self.params.get("blur") or 0.0) != self._blur
+            or self._cut[:2]
+            != (int(self.params.get("drop_first") or 0), int(self.params.get("drop_last") or 0))
+        ):
             self._prepared = None
             self._fit = None
         if self._prepared is None and not self._gather(device, progress):
@@ -454,6 +463,13 @@ class InstaGLMMode(Mode):
         # needed, and says so in those terms.
         tr = float(self.session.store.get(layer.key).info.tr)
         data = self.session.store.ensure_ram(layer.key)
+        try:
+            window = self.time_window(data.shape[-1])
+        except ValueError as exc:
+            self._message = str(exc)
+            return False
+        self._cut = (window.start, data.shape[-1] - window.stop, data.shape[-1])
+        data = data[..., window]
         self._prepared = engine.prepare(
             data,
             affine=np.asarray(layer.affine, dtype=float),
@@ -471,13 +487,19 @@ class InstaGLMMode(Mode):
     def _build_model(self, device: torch.device, progress: ProgressFn | None) -> engine.Model:
         assert self._prepared is not None
         n_time, tr = self._prepared.n_time, self._prepared.tr
+        # Timing and ortvec files describe the whole run. The task is convolved
+        # over all of it and cut afterwards, so events just before the first kept
+        # volume still leave their hemodynamic tail in it.
+        first, last, n_full = self._cut
+        keep = slice(first, n_full - last)
 
         task, task_labels = None, []
         events_path = str(self.params.get("events") or "").strip()
         if events_path:
-            task, task_labels = self._task_block(events_path, n_time, tr, device, progress)
+            task, task_labels = self._task_block(events_path, n_full, tr, device, progress)
+            task = task[keep]
 
-        ort, ort_labels = self._ort_block(n_time, tr)
+        ort, ort_labels = self._ort_block(n_time, tr, keep, n_full)
 
         polort = int(self.params.get("polort", 2))
         n_pcs = int(self.params.get("pcs", 0))
@@ -514,7 +536,9 @@ class InstaGLMMode(Mode):
             pcs=pcs,
         )
 
-    def _ort_block(self, n_time: int, tr: float) -> tuple[np.ndarray | None, list[str]]:
+    def _ort_block(
+        self, n_time: int, tr: float, keep: slice, n_full: int
+    ) -> tuple[np.ndarray | None, list[str]]:
         """Every ticked ortvec entry, read, transformed and laid side by side.
 
         Concatenated rather than fitted one entry at a time, because the whole
@@ -531,9 +555,14 @@ class InstaGLMMode(Mode):
         for path, ops in parsed:
             if path not in files:
                 columns, names = ortvec.read_columns(path)
-                if columns.shape[0] != n_time:
+                # A file made from the cut run (InstaPCA's ortvec) is already the
+                # right length; one made from the whole run is cut here.
+                if columns.shape[0] == n_full:
+                    columns = columns[keep]
+                elif columns.shape[0] != n_time:
                     raise ValueError(
-                        f"{path} has {columns.shape[0]} rows but the run has {n_time} volumes"
+                        f"{path} has {columns.shape[0]} rows but the run has {n_full} volumes"
+                        + (f" ({n_time} after the cut)" if n_time != n_full else "")
                     )
                 files[path] = (columns, _short_labels(path, names, distinguish=distinguish))
             columns, names = ortvec.apply_ops(*files[path], ops, tr)

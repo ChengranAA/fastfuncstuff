@@ -521,6 +521,7 @@ def test_the_mode_survives_displacing_its_own_source(corr_session):
     key = corr_session.state.layers.find_by_source("mode:instacorr").key
     before = corr_session.store.get(key).array[..., 0].copy()
 
+    corr_session.set_mode_param("live", "1")
     corr_session.set_mode_param("blur", "6.0")  # forces a full re-prepare
     after = corr_session.store.get(key).array[..., 0]
     assert not np.allclose(before, after), "re-prepare found no source"
@@ -533,6 +534,7 @@ def test_changing_a_preparation_parameter_changes_the_map(corr_session):
     key = corr_session.state.layers.find_by_source("mode:instacorr").key
     before = corr_session.store.get(key).array[..., 0].copy()
 
+    corr_session.set_mode_param("live", "1")
     corr_session.set_mode_param("blur", "6.0")
     after = corr_session.store.get(key).array[..., 0]
     assert not np.allclose(before, after), "blur change did not re-prepare"
@@ -958,3 +960,47 @@ def test_ica_noise_with_nothing_labelled_says_so_at_the_button(tmp_path):
             s.do(ModeAction("apply"))
     finally:
         s.close()
+
+
+def test_instacorr_waits_for_go_and_cuts_volumes(corr_session):
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.do(SetSeed(3, 4, 2))
+    s.set_mode_param("drop_first", "4")
+    assert s.mode.pending and s.mode._prepared.shape[-1] == 60
+    s.mode.action("go")
+    assert not s.mode.pending and s.mode._prepared.shape[-1] == 56
+
+
+def test_instacorr_seed_roi_follows_a_stroke(corr_session):
+    from fastfuncstuff.viewer.paint import encode_points
+    from fastfuncstuff.viewer.vocab import NewPaintLayer, PaintStroke
+
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.do(SetSeed(3, 4, 2))
+    s.do(NewPaintLayer("P1", "roi"))
+    s.set_mode_param("seed_roi", "P1 roi")
+    key = s.state.layers.find_by_source("mode:instacorr").key
+    affine = np.asarray(s.state.grid.affine, dtype=float)
+
+    def mm(ijk) -> tuple[float, ...]:
+        return tuple((affine @ np.array([*ijk, 1.0]))[:3])
+
+    def stroke(mm) -> np.ndarray:
+        s.do(
+            PaintStroke(
+                key="P1",
+                value=1,
+                radius=2.0,
+                brush="sphere",
+                plane="axial",
+                overwrite=True,
+                points=encode_points(np.array([mm], dtype=float)),
+            )
+        )
+        return s.store.get(key).array[..., 0].copy()
+
+    first = stroke(mm((3, 4, 2)))
+    second = stroke(mm((8, 10, 6)))
+    assert not np.allclose(first, second)

@@ -387,6 +387,10 @@ class Mode(ABC):
     #: another -- so two modes could silently disagree about what they were
     #: looking at, and neither could be told otherwise.
     input_kind: ClassVar[str] = "4d"
+    #: Whether a change to a :meth:`preparation_params` entry waits for GO
+    #: unless ``live`` is ticked. For modes whose preparation is seconds of work:
+    #: a spinner tapped three times should be one decomposition, not three.
+    gated: ClassVar[bool] = False
 
     #: Set by a UI that runs preparation on a worker. When true, a refresh
     #: that would need the slow path does nothing instead, and the UI is
@@ -400,11 +404,14 @@ class Mode(ABC):
         self._preparing = False
         self.params: dict[str, Any] = {c.name: getattr(c, "default", None) for c in self.controls()}
         self._dirty = True
+        #: Preparation parameters changed since the last preparation, waiting for GO.
+        self._held = False
 
     # -- lifecycle -----------------------------------------------------
     def attach(self, session: ViewerSession) -> None:
         self.session = session
         self._dirty = True
+        self._held = False
 
     def detach(self) -> None:
         """Let go of the session. The output layer stays where it is.
@@ -453,6 +460,8 @@ class Mode(ABC):
 
     def action(self, name: str, progress: ProgressFn | None = None) -> Aspect:
         """Run one declared action on the GUI thread; return what it dirtied."""
+        if name == "go" and self.gated:
+            return self._go()
         if name == "keep" and self.produces_overlay:
             if self.session is None:
                 return Aspect.NOTHING
@@ -464,9 +473,92 @@ class Mode(ABC):
         if self.params.get(name) == value:
             return Aspect.NOTHING
         self.params[name] = value
+        if name == "live" and self.gated:
+            return self._go() if value and self._held else Aspect.GRAPH
         if name in self.preparation_params():
-            self.invalidate()
+            return self.stale()
         return self.refresh()
+
+    def stale(self) -> Aspect:
+        """What a parameter (or painted ROI) that the preparation reads just changed.
+
+        Gated and not live: remembered for GO, and nothing runs. Otherwise
+        re-prepared now.
+        """
+        if self.gated and not self.params.get("live"):
+            self._held = True
+            return Aspect.GRAPH  # the status line says changes are waiting
+        self.invalidate()
+        return self.refresh()
+
+    def _go(self) -> Aspect:
+        self.invalidate()
+        return self.refresh() | Aspect.GRAPH
+
+    @property
+    def pending(self) -> bool:
+        """Whether parameters are waiting for GO."""
+        return self._held
+
+    def gate_controls(self) -> tuple[Control, ...]:
+        """The ``live`` box and GO button of a gated mode, to place in its panel."""
+        return (
+            BoolControl(
+                name="live",
+                label="live",
+                default=False,
+                span=THIRD,
+                newline=True,
+                help="Re-run as soon as a setting changes. Off: changes wait for GO, so "
+                "several can be made without a run after each.",
+            ),
+            ActionControl(
+                name="go",
+                label="go",
+                span=THIRD,
+                help="Apply the settings changed since the last run.",
+            ),
+        )
+
+    def time_cut_controls(self) -> tuple[Control, ...]:
+        """Volumes to leave out at either end of the run: ``drop first`` / ``drop last``."""
+        return (
+            IntControl(
+                name="drop_first",
+                label="drop first",
+                lo=0,
+                hi=999,
+                default=0,
+                span=HALF,
+                newline=True,
+                help="Volumes cut from the start of the run before anything is computed "
+                "(non-steady-state volumes, a scanner artefact).",
+            ),
+            IntControl(
+                name="drop_last",
+                label="drop last",
+                lo=0,
+                hi=999,
+                default=0,
+                span=HALF,
+                help="Volumes cut from the end of the run.",
+            ),
+        )
+
+    def time_window(self, n_time: int) -> slice:
+        """The volumes kept after ``drop first`` / ``drop last``.
+
+        Refuses a cut that leaves fewer than three volumes: a correlation or a
+        decomposition of two points is arithmetic, not a map.
+        """
+        first = max(0, int(self.params.get("drop_first") or 0))
+        last = max(0, int(self.params.get("drop_last") or 0))
+        if n_time - first - last < 3:
+            raise ValueError(
+                f"drop first {first} + drop last {last} leaves under 3 of the run's "
+                f"{n_time} volumes"
+            )
+        return slice(first, n_time - last)
 
     def preparation_params(self) -> frozenset[str]:
         """Parameters whose change forces the slow path.
@@ -479,6 +571,17 @@ class Mode(ABC):
     def invalidate(self) -> None:
         """Mark cached preparation stale, so the next refresh redoes it."""
         self._dirty = True
+        # Whatever was waiting for GO is in force from the next preparation on.
+        self._held = False
+
+    def pending_note(self) -> str:
+        return "  ·  changes pending: press GO (or tick live)" if self._held else ""
+
+    def roi_stroke(self, cmd: Command, key: str | None) -> bool:
+        """Whether ``cmd`` edited the painted layer ``key``: a finished stroke or an undo."""
+        from fastfuncstuff.viewer.vocab import PaintStroke, PaintUndo
+
+        return bool(key) and isinstance(cmd, PaintStroke | PaintUndo) and cmd.key == key
 
     def accepts(self, layer: Any) -> bool:
         """Whether this mode could read that layer. Drives the input picker.

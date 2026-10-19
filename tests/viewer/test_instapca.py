@@ -185,6 +185,7 @@ def test_more_components_keep_labels_and_a_new_polort_drops_them(pca_session):
     s = pca_session
     s.do(SetMode("instapca"))
     s.mode.labels = {0: "noise", 9: "noise"}
+    s.set_mode_param("live", "1")
     s.set_mode_param("n_components", "5")
     assert s.mode.labels == {0: "noise"}
     s.set_mode_param("polort", "3")
@@ -204,7 +205,71 @@ def test_a_mask_file_restricts_the_decomposition(pca_session):
     s = pca_session
     s.do(SetMode("instapca"))
     auto = int(s.mode._result.mask.sum())
+    s.set_mode_param("live", "1")
     s.set_mode_param("mask", str(s.tmp / "mask.nii.gz"))
     assert int(s.mode._result.mask.sum()) == 8 * 8 * 6
     assert s.mode._result.mask_source == "mask.nii.gz"
     assert auto > 0
+
+
+def test_changes_wait_for_go_unless_live(pca_session):
+    s = pca_session
+    s.do(SetMode("instapca"))
+    first = s.mode._result
+    s.set_mode_param("n_components", "4")
+    assert s.mode.pending and not s.mode.needs_prepare
+    assert s.mode._result is first
+    s.mode.action("go")
+    assert not s.mode.pending
+    assert s.mode._result.n_components == 4
+    # Ticking live with a change waiting applies it.
+    s.set_mode_param("n_components", "3")
+    assert s.mode._result.n_components == 4
+    s.set_mode_param("live", "1")
+    assert s.mode._result.n_components == 3
+    s.set_mode_param("n_components", "2")
+    assert s.mode._result.n_components == 2
+
+
+def test_drop_first_and_last_cut_the_decomposed_volumes(pca_session):
+    s = pca_session
+    s.do(SetMode("instapca"))
+    s.set_mode_param("drop_first", "2")
+    s.set_mode_param("drop_last", "3")
+    s.mode.action("go")
+    assert s.mode._result.timecourses.shape[0] == N_TIME - 5
+    s.set_mode_param("drop_first", "999")
+    with pytest.raises(ValueError, match="under 3"):
+        s.mode.time_window(N_TIME)
+
+
+def test_a_painted_roi_is_the_mask_and_follows_the_brush(pca_session):
+    from fastfuncstuff.viewer.vocab import NewPaintLayer, PaintStroke
+
+    s = pca_session
+    s.do(SetMode("instapca"))
+    s.do(NewPaintLayer("P1", "roi"))
+    s.set_mode_param("live", "1")
+    s.set_mode_param("roi", "P1 roi")
+    # Nothing painted yet: an empty mask is refused, the old result stays.
+    centre = np.array([[4.5, 4.5, 10.5]])
+    from fastfuncstuff.viewer.paint import encode_points
+
+    def stroke(radius: float) -> None:
+        s.do(
+            PaintStroke(
+                key="P1",
+                value=1,
+                radius=radius,
+                brush="sphere",
+                plane="axial",
+                overwrite=True,
+                points=encode_points(centre),
+            )
+        )
+
+    stroke(4.0)
+    small = int(s.mode._result.mask.sum())
+    assert 0 < small < 8 * 8 * 6
+    stroke(9.0)
+    assert int(s.mode._result.mask.sum()) > small

@@ -279,6 +279,11 @@ def test_switching_to_a_mode_renders_its_declared_controls(win, qapp):
         "ftop",
         "blur",
         "seed_radius",
+        "seed_roi",
+        "drop_first",
+        "drop_last",
+        "live",
+        "go",
         "action:keep",
     }
 

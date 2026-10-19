@@ -23,6 +23,7 @@ import torch
 
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.modes.base import (
+    ChoiceControl,
     ComputedOverlay,
     Control,
     IntControl,
@@ -42,15 +43,18 @@ class InstaCorrMode(Mode):
     label = "InstaCorr"
     tag = "ICORR"
     overlay_kind = OverlayKind.CORRELATION
+    gated = True
 
     def controls(self) -> tuple[Control, ...]:
         # Defaults are deliberately minimal: detrend only. Bandpass and blur
         # change what the correlation means, so they are opt-in and visibly off
         # rather than quietly applied.
         return (
+            *self.time_cut_controls(),
             IntControl(
                 name="polort",
                 label="detrend",
+                newline=True,
                 lo=-1,
                 hi=6,
                 default=2,
@@ -89,6 +93,7 @@ class InstaCorrMode(Mode):
                 unit=" mm",
                 help="Spatial smoothing applied before correlating.",
             ),
+            *self.gate_controls(),
             OptionalFloatControl(
                 name="seed_radius",
                 on_value=6.0,
@@ -100,12 +105,35 @@ class InstaCorrMode(Mode):
                 unit=" mm",
                 help="Average the seed over a sphere. Off means a single voxel.",
             ),
+            ChoiceControl(
+                name="seed_roi",
+                label="seed ROI",
+                choices=("crosshair", *self._roi_choices()),
+                default="crosshair",
+                help="A painted (or loaded ROI) layer as the seed: the mean time course of "
+                "its voxels, updated as you paint. Replaces the crosshair seed and radius.",
+            ),
         )
+
+    def _roi_choices(self) -> list[str]:
+        if self.session is None:
+            return []
+        return [
+            f"{ly.key} {ly.name}"
+            for ly in self.session.state.layers
+            if ly.roi or self.session.painter.owns(ly.key)
+        ]
+
+    def _roi_key(self) -> str | None:
+        text = str(self.params.get("seed_roi") or "crosshair").split(" ", 1)[0]
+        if text == "crosshair" or self.session is None:
+            return None
+        return text if self.session.state.layers.find(text) is not None else None
 
     def preparation_params(self) -> frozenset[str]:
         # seed_radius only affects which columns are averaged at compute time,
         # so changing it must not trigger a multi-second re-preparation.
-        return frozenset({"polort", "fbot", "ftop", "blur"})
+        return frozenset({"polort", "fbot", "ftop", "blur", "drop_first", "drop_last"})
 
     def __init__(self) -> None:
         self._prepared: torch.Tensor | None = None
@@ -115,6 +143,8 @@ class InstaCorrMode(Mode):
         self._source: np.ndarray | None = None
         self._source_key: str | None = None
         self._tr = 0.0
+        self._window = slice(0, None)
+        self._roi_message = ""
         self._zooms = (1.0, 1.0, 1.0)
         super().__init__()
 
@@ -184,7 +214,15 @@ class InstaCorrMode(Mode):
                 progress(fraction, message)
 
         device = self.session.store.device if self.session is not None else torch.device("cpu")
-        nx, ny, nz, nt = self._source.shape
+        nx, ny, nz, nt_full = self._source.shape
+        try:
+            self._window = self.time_window(nt_full)
+        except ValueError as exc:
+            self._roi_message = str(exc)
+            self._dirty = False
+            return False
+        source = self._source[..., self._window]
+        nt = source.shape[-1]
 
         blur = float(self.params.get("blur") or 0.0)
         if blur > 0:
@@ -192,7 +230,7 @@ class InstaCorrMode(Mode):
             from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox, gaussian3d_batched
 
             sigma = fwhm_mm_to_sigma_vox(blur, self._zooms)
-            vol = torch.as_tensor(self._source, dtype=torch.float32)
+            vol = torch.as_tensor(source, dtype=torch.float32)
             vol = gaussian3d_batched(vol.permute(3, 0, 1, 2).to(device), sigma)
             # The blur keeps its input's strides, so this is still the store's
             # (X,Y,Z,T) layout under a (T,X,Y,Z) view: permuting back to
@@ -202,7 +240,7 @@ class InstaCorrMode(Mode):
             # The store keeps the array C-contiguous, so this is a free view of
             # data that is already resident -- no copy, no upload on CPU.
             step(0.1, "arranging")
-            data = torch.as_tensor(self._source, dtype=torch.float32).reshape(-1, nt)
+            data = torch.as_tensor(source, dtype=torch.float32).reshape(-1, nt)
             if device.type != "cpu":
                 step(0.2, "to device")
                 data = data.to(device)
@@ -277,6 +315,9 @@ class InstaCorrMode(Mode):
         data, valid = self._prepared, self._valid
         if data is None or valid is None or self.session is None:
             return None
+        roi_key = self._roi_key()
+        if roi_key is not None:
+            return self._roi_timecourse(roi_key)
         if self.session.state.seed is None:
             return None
         seed_ijk = self._to_source(self.session.state.seed)
@@ -311,6 +352,26 @@ class InstaCorrMode(Mode):
         n = seed.norm()
         return seed / n if float(n) > 1e-9 else None
 
+    def _roi_timecourse(self, key: str) -> torch.Tensor | None:
+        """The mean prepared time course of a painted ROI's voxels, unit length."""
+        data, valid = self._prepared, self._valid
+        if self.session is None:
+            return None
+        like = self.session.state.layers.find(self._source_key or "")
+        if data is None or valid is None or like is None:
+            return None
+        inside = self.session.mask_from_layer(key, like).reshape(-1)
+        flat = torch.as_tensor(np.flatnonzero(inside), device=data.device)
+        flat = flat[valid[flat]]
+        if flat.numel() == 0:
+            self._roi_message = "the seed ROI has no voxels inside the brain yet"
+            return None
+        self._roi_message = f"seed ROI {key}: {int(flat.numel())} voxels"
+        seed = data[flat].mean(0)
+        seed = seed - seed.mean()
+        n = seed.norm()
+        return seed / n if float(n) > 1e-9 else None
+
     # -- production ----------------------------------------------------
     def compute(self) -> ComputedOverlay | None:
         if self._prepared is None or self._affine is None:
@@ -334,6 +395,9 @@ class InstaCorrMode(Mode):
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:
         if isinstance(cmd, SetSeed):
             return self.refresh()
+        # Only the cheap half: a stroke changes the seed, not the prepared run.
+        if self.roi_stroke(cmd, self._roi_key()):
+            return self.refresh()
         return Aspect.NOTHING
 
     def series(self, ijk: tuple[int, int, int]) -> list[Trace]:
@@ -356,7 +420,7 @@ class InstaCorrMode(Mode):
                     label="source",
                     key="source",
                     short="icorr source",
-                    values=np.asarray(self._source[i, j, k, :], dtype=np.float32),
+                    values=np.asarray(self._source[i, j, k, self._window], dtype=np.float32),
                     x_label="TR",
                 )
             )
@@ -392,9 +456,13 @@ class InstaCorrMode(Mode):
             return "instacorr: needs a 4-D dataset"
         if self._preparing:
             return "instacorr: preparing…"
+        if self._held:
+            return f"instacorr: {self.pending_note().lstrip(' ·')}"
         if self._prepared is None:
-            return "instacorr: ready to prepare"
+            return f"instacorr: {self._roi_message or 'ready to prepare'}"
         where = self.residency()
+        if self._roi_key() is not None:
+            return f"instacorr: {self._roi_message or 'paint the seed ROI'}  ·  {where}"
         if self.session is None or self.session.state.seed is None:
             return f"instacorr: ctrl-click to set a seed  ·  {where}"
         return f"instacorr: seed {self.session.state.seed}  ·  {where}"

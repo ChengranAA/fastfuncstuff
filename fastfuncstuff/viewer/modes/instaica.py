@@ -48,20 +48,21 @@ class InstaICAMode(InstaPCAMode):
                     "order. Each is one IC. More splits noise finer; too many splits "
                     "real networks.",
                 )
+            elif c.name == "live":
+                # With the other settings GO applies, ahead of the GO row.
+                out.append(
+                    IntControl(
+                        name="seed",
+                        label="seed",
+                        lo=0,
+                        hi=999,
+                        default=0,
+                        span=HALF,
+                        help="FastICA's starting rotation. A component that changes with "
+                        "the seed is not a stable one.",
+                    )
+                )
             out.append(c)
-        out.append(
-            IntControl(
-                name="seed",
-                label="seed",
-                lo=0,
-                hi=999,
-                default=0,
-                span=HALF,
-                newline=True,
-                help="FastICA's starting rotation. A component that changes with the "
-                "seed is not a stable one.",
-            )
-        )
         return tuple(out)
 
     def preparation_params(self) -> frozenset[str]:

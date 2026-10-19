@@ -34,9 +34,11 @@ def study(tmp_path):
 
 
 def _reml(tmp_path, bold, *extra, expect=0, hrf="TENT(0,12,5)"):
+    runs = [str(b) for b in (bold if isinstance(bold, list) else [bold])]
     res = subprocess.run(  # noqa: S603
-        [sys.executable, "-m", "fastfuncstuff.cli.reml", "-input", str(bold)]
-        + ["-events", str(tmp_path / "ev.tsv"), "-TR", str(TR), "-hrf_model", hrf]
+        [sys.executable, "-m", "fastfuncstuff.cli.reml", "-input", *runs, "-events"]
+        + [str(tmp_path / "ev.tsv")] * len(runs)
+        + ["-TR", str(TR), "-hrf_model", hrf]
         + ["-tout", "-fout", "-device", "cpu", *extra],
         capture_output=True,
         text=True,
@@ -165,3 +167,63 @@ def test_surface_data_with_a_surface_roi(tmp_path):
     _reml(tmp_path, bold, "-rois", str(tmp_path / "lh.V1.label"), "-Rbuck", str(tmp_path / "v"))
     _, table = _table(tmp_path / "v_roi.tsv")
     assert [r[1] for r in table] == ["lh.V1"]
+
+
+@pytest.fixture
+def two_runs(study):
+    """The study twice over (independent noise), so leave-one-run-out has folds."""
+    tmp_path, arr = study
+    rng = np.random.default_rng(5)
+    arr2 = (arr + rng.normal(0, 1, arr.shape)).astype(np.float32)
+    nib.save(nib.Nifti1Image(arr2, np.diag([3, 3, 3, 1])), tmp_path / "run2.nii.gz")
+    return tmp_path, [arr, arr2]
+
+
+def _two(tmp_path, *extra, data=None, **kw):
+    return _reml(
+        tmp_path, data or [tmp_path / "run.nii.gz", tmp_path / "run2.nii.gz"], *extra, **kw
+    )
+
+
+def _save_means(tmp_path, arrs):
+    paths = []
+    for k, a in enumerate(arrs):
+        mean = a[:2].reshape(-1, N_TP).mean(axis=0).reshape(1, 1, 1, N_TP).astype(np.float32)
+        paths.append(tmp_path / f"mean{k}.nii.gz")
+        nib.save(nib.Nifti1Image(mean, np.diag([3, 3, 3, 1])), paths[-1])
+    return paths
+
+
+def test_xval_r2_lands_in_the_roi_table_and_matches_the_mean_series(two_runs):
+    tmp_path, arrs = two_runs
+    _two(tmp_path, "-atlas", str(tmp_path / "atlas.nii.gz"), "-Rbuck", str(tmp_path / "out"),
+         "-xval_r2", "-roi_maps")  # fmt: skip
+    header, rows = _table(tmp_path / "out_roi.tsv")
+    assert "xval_R2" in header
+    r2 = [float(r[header.index("xval_R2")]) for r in rows]
+    assert r2[0] > 0.2 and r2[0] > r2[1]
+    painted = nib.load(tmp_path / "out_xval_r2.nii.gz").get_fdata()
+    np.testing.assert_allclose(painted[0, 0, 0].reshape(-1)[0], r2[0], rtol=1e-4)
+
+    _two(tmp_path, "-Rbuck", str(tmp_path / "ref"), "-xval_r2", data=_save_means(tmp_path, arrs))
+    want = nib.load(tmp_path / "ref_xval_r2.nii.gz").get_fdata().reshape(-1)[0]
+    np.testing.assert_allclose(r2[0], want, rtol=1e-3, atol=1e-4)
+
+
+def test_beta_cv_per_roi_matches_the_mean_series(two_runs):
+    tmp_path, arrs = two_runs
+    _two(tmp_path, "-atlas", str(tmp_path / "atlas.nii.gz"), "-Rbuck", str(tmp_path / "out"),
+         "-beta_cv", hrf="spmg1")  # fmt: skip
+    header, rows = _table(tmp_path / "out_beta_cv.tsv")
+    assert header == ["roi", "name", "n_voxels", "beta_cv_R2", "a_mean_beta", "b_mean_beta"]
+    st_hdr, trials = _table(tmp_path / "out_single_trials.tsv")
+    assert st_hdr == ["trial", "label", "condition", "run", "1", "2"] and len(trials) == 20
+    assert not list(tmp_path.glob("out*.nii*"))
+    got = np.array([float(r[4]) for r in trials])
+
+    _two(tmp_path, "-Rbuck", str(tmp_path / "ref"), "-beta_cv", hrf="spmg1",
+         data=_save_means(tmp_path, arrs))  # fmt: skip
+    want = nib.load(tmp_path / "ref_single_trial_betas.nii.gz").get_fdata().reshape(-1)
+    np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
+    want_r2 = nib.load(tmp_path / "ref_single_trial_xval_r2.nii.gz").get_fdata().reshape(-1)[0]
+    np.testing.assert_allclose(float(rows[0][3]), want_r2, rtol=1e-3, atol=1e-4)

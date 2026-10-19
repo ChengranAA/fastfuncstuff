@@ -1201,11 +1201,15 @@ def _resolve_xval_prefix(args) -> str:
     return "ffs_reml"
 
 
-def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=None) -> None:
+def _run_condition_xval(
+    args, results, design_info, fmri_data, device, geometry=None, write=True
+) -> list:
     """Held-out R2 on the condition design, plus its ceiling, written as maps.
 
     Kept out of ``main`` because it is self-contained: everything it needs is
     already computed by the time it runs, and it writes its own outputs.
+    Returns the ``[(map, label), ...]`` layers (empty when skipped); ROI mode
+    passes ``write=False`` and puts them in its table instead.
     """
     import torch as _torch
 
@@ -1215,12 +1219,12 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
     arma_params = getattr(results, "arma_params", None)
     if arma_params is None:
         print("  ⚠️  -xval_r2 needs ARMA parameters; skipped (OLS-only run).")
-        return
+        return []
 
     run_starts = list(design_info.get("run_starts") or [0])
     if len(run_starts) < 2:
         print("  ⚠️  -xval_r2 needs at least 2 runs; skipped.")
-        return
+        return []
 
     if not isinstance(fmri_data, (np.ndarray, _torch.Tensor)):
         # The data would have to be re-read from disk, and the fit has already
@@ -1230,7 +1234,7 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
             "load path did not keep. Re-run without -no_guard (the default keeps "
             "it) to enable cross-validation."
         )
-        return
+        return []
 
     data = _torch.as_tensor(np.asarray(fmri_data))
     if data.ndim == 4:
@@ -1252,7 +1256,7 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
     )
     if len(run_starts) < 2:
         print("  ⚠️  -xval_r2 needs at least 2 runs with uncensored TRs; skipped.")
-        return
+        return []
 
     strategy = parse_cv_strategy(str(args.cv_strategy))
     cv_splits = generate_cv_splits(len(run_starts), strategy=strategy)
@@ -1279,7 +1283,6 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
             f"  Median xval R²: {finite.median():.4f}  (positive in {(finite > 0).float().mean() * 100:.1f}% of voxels)"
         )
 
-    prefix = _resolve_xval_prefix(args)
     geometry = geometry or {}
     volume_shape = geometry.get("volume_shape") or getattr(results, "original_shape", None)
     if volume_shape is not None:
@@ -1311,6 +1314,15 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
                 (ceiling.explainable_r2(xval_r2), "explainable_R2"),
             ]
 
+    layers = [(xval_r2, "xval_R2"), *ceiling_layers]
+    if write:
+        mask_flat = None if voxel_mask is None else np.asarray(voxel_mask).reshape(-1)
+        _write_xval_stack(args, layers, volume_shape, affine, header, mask_flat)
+    return layers
+
+
+def _write_xval_stack(args, layers, volume_shape, affine, header, mask_flat) -> None:
+    prefix = _resolve_xval_prefix(args)
     # One stack, so the R2 can never be read without the ceiling that scales it.
     if volume_shape is None:
         print("  ⚠️  no volume geometry available; xval_r2 not written")
@@ -1318,11 +1330,11 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
         from fastfuncstuff.cli_utils import save_r2_ceiling_stack
 
         path = save_r2_ceiling_stack(
-            [(xval_r2, "xval_R2"), *ceiling_layers],
+            layers,
             f"{prefix}_xval_r2.nii.gz",
             volume_shape,
             affine,
-            mask_flat=None if voxel_mask is None else np.asarray(voxel_mask).reshape(-1),
+            mask_flat=mask_flat,
             header=header,
         )
         print(f"  • xval_r2: {path}")
@@ -1831,10 +1843,8 @@ _ROI_INCOMPATIBLE = {
     "save_mask": "-save_mask",
     "save_runmask": "-save_runmask",
     "save_dofloss": "-save_dofloss",
-    "beta_cv": "-beta_cv / -cv_design single",
     "hrfopt_prefix": "-hrfopt_prefix",
     "hrf_opt": "-hrf_opt",
-    "xval_r2": "-xval_r2",
     "cache": "-cache",
     "test": "-test",
     "Obuck": "-Obuck",
@@ -1856,7 +1866,9 @@ def _refuse_roi_incompatible(args) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    if args.roi_maps and not (args.Rbuck or args.Rvar or args.Rbeta or args.Rfitts or args.Rerrts):
+    if args.roi_maps and not (
+        args.Rbuck or args.Rvar or args.Rbeta or args.Rfitts or args.Rerrts or args.beta_cv
+    ):
         print("❌ ERROR: -roi_maps has nothing to paint without an -R* output.", file=sys.stderr)
         sys.exit(1)
 
@@ -1896,17 +1908,32 @@ def _collapse_preprocessed_to_rois(args, data, volume_shape, geometry, input_pat
     return roi_set, series.reshape(roi_set.n_rois, 1, 1, series.shape[1])
 
 
-def _write_roi_outputs(args, results, design_info, roi_set, fitted_labels, hrf_info) -> None:
-    """The ROI-mode result: ``{stem}_roi.tsv`` (the -Rbuck columns, one row per ROI) and one
-    ``{stem}_iresp_<condition>.tsv`` per FIR/TENT condition."""
+def _roi_rows(values, voxel_mask, n_rois: int) -> torch.Tensor:
+    """Per-fitted-row *values* on all ``n_rois`` rows (NaN for any the fit dropped)."""
+    values = torch.as_tensor(values).detach().cpu().float()
+    if values.shape[0] == n_rois or voxel_mask is None:
+        return values
+    full = torch.full((n_rois, *values.shape[1:]), float("nan"))
+    full[torch.as_tensor(np.asarray(voxel_mask)).reshape(-1).bool()] = values
+    return full
+
+
+def _write_roi_outputs(
+    args, results, design_info, roi_set, fitted_labels, hrf_info, xval_layers=()
+) -> None:
+    """The ROI-mode result: ``{stem}_roi.tsv`` (the -Rbuck columns, one row per ROI, plus
+    -xval_r2's held-out R2 and ceiling) and one ``{stem}_iresp_<condition>.tsv`` per
+    FIR/TENT condition."""
     from fastfuncstuff.glm.roi_outputs import roi_bucket_columns, roi_response_curves
 
     stem = _resolve_xval_prefix(args)
     Path(stem).parent.mkdir(parents=True, exist_ok=True)
     contrast_names = getattr(results, "contrast_labels", None)
-    table = roi_set.write_table(
-        f"{stem}_roi.tsv", roi_bucket_columns(results, fitted_labels, contrast_names)
-    )
+    columns = roi_bucket_columns(results, fitted_labels, contrast_names)
+    voxel_mask = getattr(results, "voxel_mask", None)
+    for values, label in xval_layers:
+        columns[label] = _roi_rows(values, voxel_mask, roi_set.n_rois)
+    table = roi_set.write_table(f"{stem}_roi.tsv", columns)
     print(f"  • Wrote {table} ({roi_set.n_rois} ROIs)")
     if args.single_trials:
         from fastfuncstuff.glm.roi_outputs import write_roi_single_trials
@@ -1917,6 +1944,35 @@ def _write_roi_outputs(args, results, design_info, roi_set, fitted_labels, hrf_i
     for cond, (lags, curves) in roi_response_curves(results, design_info, lag_times).items():
         path = roi_set.write_timecourses(f"{stem}_iresp_{cond}.tsv", lags, curves)
         print(f"  • Wrote {path}")
+
+
+def _write_roi_beta_cv(
+    args, roi_set, results_st, betas, r2, trial_labels, cond_ids, run_ids, condition_labels
+) -> dict[str, str]:
+    """-beta_cv in ROI mode: ``{stem}_beta_cv.tsv`` (beta-space R2 and the condition-mean
+    betas, one row per ROI) and ``{stem}_single_trials.tsv`` (trials down, ROIs across)."""
+    from fastfuncstuff.glm.outputs import condition_average_betas
+
+    stem = _resolve_xval_prefix(args)
+    Path(stem).parent.mkdir(parents=True, exist_ok=True)
+    mask = getattr(results_st, "voxel_mask", None)
+    betas = _roi_rows(betas, mask, roi_set.n_rois)
+    cond_means = condition_average_betas(betas, cond_ids)
+    columns = {"beta_cv_R2": _roi_rows(r2, mask, roi_set.n_rois)}
+    for c, name in enumerate(condition_labels[: cond_means.shape[1]]):
+        columns[f"{name}_mean_beta"] = cond_means[:, c]
+    runs = run_ids.cpu().tolist()
+    conds = cond_ids.cpu().tolist()
+    index = {
+        "trial": [str(k + 1) for k in range(len(trial_labels))],
+        "label": list(trial_labels),
+        "condition": [condition_labels[c] for c in conds],
+        "run": [str(r + 1) for r in runs],
+    }
+    return {
+        "beta_cv_table": roi_set.write_table(f"{stem}_beta_cv.tsv", columns),
+        "single_trials_table": roi_set.write_rows(f"{stem}_single_trials.tsv", index, betas),
+    }
 
 
 def main():
@@ -2979,208 +3035,6 @@ def main():
         print("=" * 70)
         print()
 
-    # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
-    if args.beta_cv:
-        from fastfuncstuff.glm.outputs import save_single_trial_results
-        from fastfuncstuff.glm.ridge import create_single_trial_design
-        from fastfuncstuff.glm.xval import compute_xval_r2_single_trials, generate_cv_splits
-
-        print()
-        print("=" * 70)
-        print("Using beta-space cross-validation with ARMA(1,1) prewhitening")
-        print("=" * 70)
-        print()
-
-        # Validate that we're in onset-based mode
-        if not args.onsets:
-            print("ERROR: -beta_cv requires -onsets (not -matrix)")
-            sys.exit(1)
-
-        # 1. Build single-trial design
-        print("Building single-trial design...")
-        st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = (
-            create_single_trial_design(
-                onsets_by_condition=all_onsets,
-                # canonical-hrf: this design carries no library, so the boxcar
-                # is not already inside the response and the PHYSICAL duration
-                # is the right one.  -beta_cv with -hrfopt_prefix is refused in
-                # preflight, so no library can be in play here.
-                durations=durations,
-                run_starts=run_starts,
-                tr=args.tr,
-                n_timepoints=n_timepoints,
-                microtime_dt=args.microtime_dt,
-                condition_labels=condition_labels,
-                device=device,
-                microtime_onset=microtime_onset_bin,
-            )
-        )
-        print(f"  Single-trial design: {st_design.shape}")
-        n_trials = st_design.shape[1]
-
-        # Stim vectors ride along in the task block so the background is
-        # modelled rather than left in the residual, but they are not trials:
-        # the beta-space CV and the saved outputs only ever see the first
-        # n_trials columns.
-        st_vec_blocks = collect_stim_vec_blocks(
-            args, run_starts, n_timepoints, trim=trim, verbose=True
-        )
-        st_vec_labels: list[str] = []
-        if st_vec_blocks:
-            st_hrf_bases, _st_hrf_note = resolve_stim_vec_hrf(
-                hrf_model_name,
-                is_fir_model=is_fir_model,
-                n_basis=n_basis,
-                microtime_dt=args.microtime_dt,
-                device=device,
-            )
-            st_vec_design, st_vec_labels, _ = build_stim_vec_design(
-                st_vec_blocks,
-                n_timepoints=n_timepoints,
-                tr=args.tr,
-                microtime_dt=args.microtime_dt,
-                hrf_bases=st_hrf_bases,
-                run_starts=run_starts,
-                device=device,
-                microtime_onset=microtime_onset_bin,
-            )
-            st_design = torch.cat([st_design, st_vec_design], dim=1)
-            print(f"  + {len(st_vec_labels)} stim vector column(s)")
-
-        # 2. Build wide design: [single_trial | nuisance]
-        # Note: design_info was already created with condition-level design
-        # We need to rebuild it with single-trial design
-        print("Building nuisance regressors for single-trial design...")
-        nuisance_blocks_st = collect_nuisance_blocks(
-            args,
-            run_starts,
-            n_timepoints,
-            verbose=False,
-        )
-        nuisance_design_st = build_nuisance_block_diag(
-            run_starts=run_starts,
-            n_timepoints=n_timepoints,
-            polort=polort,
-            device=device,
-            blocks=nuisance_blocks_st,
-            verbose=True,
-        )
-
-        full_design_st = torch.cat([st_design, nuisance_design_st], dim=1)
-        n_task_st = st_design.shape[1]
-        task_indices_st = list(range(n_task_st))
-        nuisance_indices_st = list(range(n_task_st, full_design_st.shape[1]))
-
-        print(f"  Full design (wide): {full_design_st.shape}")
-        print(f"    Task columns (single-trial): {n_trials}")
-        print(f"    Nuisance columns: {len(nuisance_indices_st)}")
-
-        # 3. Run ARMA(1,1) analysis on wide design
-        print()
-        print("Running ARMA(1,1) analysis on single-trial design...")
-
-        # Build nuisance labels: per-run poly + per-block column names.
-        nuisance_labels_st: list[str] = []
-        for run_idx in range(n_runs):
-            for p in range(polort + 1):
-                nuisance_labels_st.append(f"r{run_idx + 1:02d}_poly{p}")
-        for block in nuisance_blocks_st:
-            nuisance_labels_st.extend(block.get_column_names())
-        # Pad if rounding/widening mismatch (shouldn't happen, but be safe).
-        while len(nuisance_labels_st) < len(nuisance_indices_st):
-            nuisance_labels_st.append(f"nuisance_{len(nuisance_labels_st)}")
-        nuisance_labels_st = nuisance_labels_st[: len(nuisance_indices_st)]
-
-        # Create a temporary design_info for single-trial mode (schema matches
-        # read_afni_design_matrix()'s return dict, since analyze_from_design_matrix
-        # only accepts a design_info dict, not raw matrix/indices kwargs).
-        design_info_st = {
-            "matrix": full_design_st.cpu().numpy(),
-            "column_labels": trial_labels + st_vec_labels + nuisance_labels_st,
-            "stim_bots": task_indices_st,
-            "stim_tops": task_indices_st,
-            "run_starts": run_starts,
-            "n_timepoints": full_design_st.shape[0],
-            "n_regressors": full_design_st.shape[1],
-            "tr": args.tr,
-        }
-
-        # Load and prepare fMRI data
-        # Note: Single-trial mode doesn't use preprocessing caching, just pass input files
-        fmri_data_st = input_files
-
-        # Call analyze_from_design_matrix with single-trial design
-        # This will fit ARMA(1,1), prewhiten, and return single-trial betas
-        results_st, _ = analyze_from_design_matrix(
-            fmri_data=fmri_data_st,
-            design_info=design_info_st,
-            method="arma11",
-            arma_a_grid=a_grid,
-            arma_b_grid=b_grid,
-            device=device,
-            mask_file=args.mask,
-            voxel_chunk_size=args.batch_size,
-            use_double=args.use_double,
-        )
-
-        # 4. Extract single-trial betas
-        assert results_st.betas is not None
-        # Drop the stim-vector columns: everything downstream is indexed by
-        # trial (trial_cond_ids / trial_run_ids / trial_labels).
-        st_betas = results_st.betas[:, :n_trials]  # (n_voxels, n_trials)
-        print(f"  Single-trial betas: {st_betas.shape}")
-
-        # 5. Beta-space CV
-        print()
-        print("Computing beta-space cross-validated R²...")
-        cv_splits = generate_cv_splits(n_runs, strategy=1)  # LORO
-        xval = compute_xval_r2_single_trials(
-            st_betas,
-            trial_cond_ids,
-            trial_run_ids,
-            cv_splits,
-            metric="cod",
-            device=device,
-            verbose=True,
-        )
-
-        # 6. Save outputs
-        print()
-        print("Saving single-trial outputs...")
-
-        # Get spatial metadata
-        volume_shape = results_st.original_shape
-        affine = results_st.affine
-        voxel_mask = getattr(results_st, "voxel_mask", None)
-
-        output_files = save_single_trial_results(
-            betas=st_betas,
-            xval_r2=xval["r2"],
-            trial_labels=trial_labels,
-            trial_condition_ids=trial_cond_ids,
-            trial_run_ids=trial_run_ids,
-            condition_labels=condition_labels,
-            output_prefix=args.prefix,
-            volume_shape=volume_shape,
-            affine=affine,
-            voxel_mask=voxel_mask,
-        )
-
-        print()
-        print("=" * 70)
-        print("✅ ffs_reml (single-trial mode) Complete!")
-        print("=" * 70)
-        assert isinstance(xval["r2"], torch.Tensor)
-        print(f"  Median beta-space R²: {xval['r2'].median():.4f}")
-        print(f"  {xval['n_test_trials_total']} test trials across {xval['n_splits']} folds")
-        print()
-        for key, path in output_files.items():
-            print(f"  {key}: {path}")
-        print("=" * 70)
-
-        # Early exit - don't run standard pipeline
-        return
-
     # Setup OLS write callback if any OLS output is requested
     _ols_write_callback = None
     if want_ols:
@@ -3486,6 +3340,7 @@ def main():
     )
     roi_set = None
     roi_geometry = None
+    xval_layers: list = []
     # Set by the guard block below, then handed to analyze_from_design_matrix so
     # -handle_missing can partition the salvageable voxels into families.
     guard_validity = None
@@ -3807,6 +3662,227 @@ def main():
             # Will create cache after loading data
             print(f"📝 Cache not found or invalid - will create: {args.cache}")
 
+    # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
+    if args.beta_cv:
+        from fastfuncstuff.glm.outputs import save_single_trial_results
+        from fastfuncstuff.glm.ridge import create_single_trial_design
+        from fastfuncstuff.glm.xval import compute_xval_r2_single_trials, generate_cv_splits
+
+        print()
+        print("=" * 70)
+        print("Using beta-space cross-validation with ARMA(1,1) prewhitening")
+        print("=" * 70)
+        print()
+
+        # Validate that we're in onset-based mode
+        if not (args.onsets or args.events):
+            print("ERROR: -beta_cv requires -onsets or -events (not -matrix)")
+            sys.exit(1)
+
+        # 1. Build single-trial design
+        print("Building single-trial design...")
+        st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = (
+            create_single_trial_design(
+                onsets_by_condition=all_onsets,
+                # canonical-hrf: this design carries no library, so the boxcar
+                # is not already inside the response and the PHYSICAL duration
+                # is the right one.  -beta_cv with -hrfopt_prefix is refused in
+                # preflight, so no library can be in play here.
+                durations=durations,
+                run_starts=run_starts,
+                tr=args.tr,
+                n_timepoints=n_timepoints,
+                microtime_dt=args.microtime_dt,
+                condition_labels=condition_labels,
+                device=device,
+                microtime_onset=microtime_onset_bin,
+            )
+        )
+        print(f"  Single-trial design: {st_design.shape}")
+        n_trials = st_design.shape[1]
+
+        # Stim vectors ride along in the task block so the background is
+        # modelled rather than left in the residual, but they are not trials:
+        # the beta-space CV and the saved outputs only ever see the first
+        # n_trials columns.
+        st_vec_blocks = collect_stim_vec_blocks(
+            args, run_starts, n_timepoints, trim=trim, verbose=True
+        )
+        st_vec_labels: list[str] = []
+        if st_vec_blocks:
+            st_hrf_bases, _st_hrf_note = resolve_stim_vec_hrf(
+                hrf_model_name,
+                is_fir_model=is_fir_model,
+                n_basis=n_basis,
+                microtime_dt=args.microtime_dt,
+                device=device,
+            )
+            st_vec_design, st_vec_labels, _ = build_stim_vec_design(
+                st_vec_blocks,
+                n_timepoints=n_timepoints,
+                tr=args.tr,
+                microtime_dt=args.microtime_dt,
+                hrf_bases=st_hrf_bases,
+                run_starts=run_starts,
+                device=device,
+                microtime_onset=microtime_onset_bin,
+            )
+            st_design = torch.cat([st_design, st_vec_design], dim=1)
+            print(f"  + {len(st_vec_labels)} stim vector column(s)")
+
+        # 2. Build wide design: [single_trial | nuisance]
+        # Note: design_info was already created with condition-level design
+        # We need to rebuild it with single-trial design
+        print("Building nuisance regressors for single-trial design...")
+        nuisance_blocks_st = collect_nuisance_blocks(
+            args,
+            run_starts,
+            n_timepoints,
+            verbose=False,
+        )
+        nuisance_design_st = build_nuisance_block_diag(
+            run_starts=run_starts,
+            n_timepoints=n_timepoints,
+            polort=polort,
+            device=device,
+            blocks=nuisance_blocks_st,
+            verbose=True,
+        )
+
+        full_design_st = torch.cat([st_design, nuisance_design_st], dim=1)
+        n_task_st = st_design.shape[1]
+        task_indices_st = list(range(n_task_st))
+        nuisance_indices_st = list(range(n_task_st, full_design_st.shape[1]))
+
+        print(f"  Full design (wide): {full_design_st.shape}")
+        print(f"    Task columns (single-trial): {n_trials}")
+        print(f"    Nuisance columns: {len(nuisance_indices_st)}")
+
+        # 3. Run ARMA(1,1) analysis on wide design
+        print()
+        print("Running ARMA(1,1) analysis on single-trial design...")
+
+        # Build nuisance labels: per-run poly + per-block column names.
+        nuisance_labels_st: list[str] = []
+        for run_idx in range(n_runs):
+            for p in range(polort + 1):
+                nuisance_labels_st.append(f"r{run_idx + 1:02d}_poly{p}")
+        for block in nuisance_blocks_st:
+            nuisance_labels_st.extend(block.get_column_names())
+        # Pad if rounding/widening mismatch (shouldn't happen, but be safe).
+        while len(nuisance_labels_st) < len(nuisance_indices_st):
+            nuisance_labels_st.append(f"nuisance_{len(nuisance_labels_st)}")
+        nuisance_labels_st = nuisance_labels_st[: len(nuisance_indices_st)]
+
+        # Create a temporary design_info for single-trial mode (schema matches
+        # read_afni_design_matrix()'s return dict, since analyze_from_design_matrix
+        # only accepts a design_info dict, not raw matrix/indices kwargs).
+        design_info_st = {
+            "matrix": full_design_st.cpu().numpy(),
+            "column_labels": trial_labels + st_vec_labels + nuisance_labels_st,
+            "stim_bots": task_indices_st,
+            "stim_tops": task_indices_st,
+            "run_starts": run_starts,
+            "n_timepoints": full_design_st.shape[0],
+            "n_regressors": full_design_st.shape[1],
+            "tr": args.tr,
+        }
+
+        # The resident, preprocessed data when there is one (blur, scaling, the
+        # guard's mask -- or the ROI means), else the files.
+        results_st, _ = analyze_from_design_matrix(
+            fmri_data=fmri_data_to_use if fmri_data_to_use is not None else input_files,
+            design_info=design_info_st,
+            method="arma11",
+            arma_a_grid=a_grid,
+            arma_b_grid=b_grid,
+            device=device,
+            mask_file=args.mask,
+            cached_metadata=cache_metadata,
+            voxel_chunk_size=args.batch_size,
+            use_double=args.use_double,
+        )
+
+        # 4. Extract single-trial betas
+        assert results_st.betas is not None
+        # Drop the stim-vector columns: everything downstream is indexed by
+        # trial (trial_cond_ids / trial_run_ids / trial_labels).
+        st_betas = results_st.betas[:, :n_trials]  # (n_voxels, n_trials)
+        print(f"  Single-trial betas: {st_betas.shape}")
+
+        # 5. Beta-space CV
+        print()
+        print("Computing beta-space cross-validated R²...")
+        cv_splits = generate_cv_splits(n_runs, strategy=1)  # LORO
+        xval = compute_xval_r2_single_trials(
+            st_betas,
+            trial_cond_ids,
+            trial_run_ids,
+            cv_splits,
+            metric="cod",
+            device=device,
+            verbose=True,
+        )
+
+        # 6. Save outputs
+        print()
+        print("Saving single-trial outputs...")
+
+        # Get spatial metadata
+        volume_shape = results_st.original_shape
+        affine = results_st.affine
+        voxel_mask = getattr(results_st, "voxel_mask", None)
+        nifti_header = None
+        st_r2 = xval["r2"]
+        assert isinstance(st_r2, torch.Tensor)
+        r2_median = float(st_r2.median())
+
+        output_files = {}
+        if roi_set is not None:
+            output_files = _write_roi_beta_cv(
+                args, roi_set, results_st, st_betas, st_r2, trial_labels,
+                trial_cond_ids, trial_run_ids, condition_labels,
+            )  # fmt: skip
+            st_betas = _roi_rows(st_betas, voxel_mask, roi_set.n_rois)
+            st_r2 = _roi_rows(st_r2, voxel_mask, roi_set.n_rois)
+            if args.roi_maps:
+                assert roi_geometry is not None
+                st_betas = torch.from_numpy(roi_set.paint(st_betas))
+                st_r2 = torch.from_numpy(roi_set.paint(st_r2))
+                volume_shape = roi_geometry["volume_shape"]
+                affine = roi_geometry["affine"]
+                nifti_header = roi_geometry.get("nifti_header")
+                voxel_mask = torch.from_numpy(roi_set.rows.reshape(-1))
+
+        if roi_set is None or args.roi_maps:
+            output_files |= save_single_trial_results(
+                betas=st_betas,
+                xval_r2=st_r2,
+                trial_labels=trial_labels,
+                trial_condition_ids=trial_cond_ids,
+                trial_run_ids=trial_run_ids,
+                condition_labels=condition_labels,
+                output_prefix=_resolve_xval_prefix(args),
+                volume_shape=volume_shape,
+                affine=affine,
+                voxel_mask=voxel_mask,
+                nifti_header=nifti_header,
+            )
+
+        print()
+        print("=" * 70)
+        print("✅ ffs_reml (single-trial mode) Complete!")
+        print("=" * 70)
+        print(f"  Median beta-space R²: {r2_median:.4f}")
+        print(f"  {xval['n_test_trials_total']} test trials across {xval['n_splits']} folds")
+        print()
+        for key, path in output_files.items():
+            print(f"  {key}: {path}")
+        print("=" * 70)
+
+        # Early exit - don't run standard pipeline
+        return
+
     # Run analysis
     try:
         # Determine analysis method from requested outputs
@@ -3970,13 +4046,14 @@ def main():
         # the betas are refitted per fold. See glm/reml_xval.py for why that
         # trade is the right one.
         if args.xval_r2:
-            _run_condition_xval(
+            xval_layers = _run_condition_xval(
                 args,
                 results,
                 design_info,
                 fmri_data_to_use,
                 device,
                 geometry=preproc_cached_metadata or cache_metadata or {},
+                write=roi_set is None,
             )
 
         # ── Missing-data bookkeeping ─────────────────────────────────────────
@@ -4228,8 +4305,27 @@ def main():
 
     if roi_set is not None:
         _write_roi_outputs(
-            args, results, design_info, roi_set, fitted_labels, locals().get("hrf_info")
+            args,
+            results,
+            design_info,
+            roi_set,
+            fitted_labels,
+            locals().get("hrf_info"),
+            xval_layers,
         )
+        if args.roi_maps and xval_layers:
+            assert roi_geometry is not None
+            _write_xval_stack(
+                args,
+                [
+                    (roi_set.paint(_roi_rows(v, results.voxel_mask, roi_set.n_rois)), lab)
+                    for v, lab in xval_layers
+                ],
+                tuple(roi_geometry["volume_shape"]),
+                roi_geometry["affine"],
+                roi_geometry.get("nifti_header"),
+                roi_set.rows.reshape(-1),
+            )
         if not args.roi_maps:
             print("\n✅ ROI mode complete (volume outputs need -roi_maps).")
             return

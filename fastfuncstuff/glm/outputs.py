@@ -1598,6 +1598,17 @@ def write_partial_r2_with_labels(
     return output_path
 
 
+def condition_average_betas(betas: torch.Tensor, trial_condition_ids: torch.Tensor) -> torch.Tensor:
+    """``(n_voxels, n_conditions)`` mean single-trial beta per condition (0 where none)."""
+    n_conditions = int(trial_condition_ids.max().item()) + 1
+    out = torch.zeros(betas.shape[0], n_conditions, dtype=torch.float32, device=betas.device)
+    for c in range(n_conditions):
+        mask = trial_condition_ids == c
+        if mask.sum() > 0:
+            out[:, c] = betas[:, mask].mean(dim=1)
+    return out
+
+
 def save_single_trial_results(
     betas: torch.Tensor,
     xval_r2: torch.Tensor,
@@ -1701,11 +1712,7 @@ def save_single_trial_results(
     print(f"  Saved: {xval_path}")
 
     # 3. Condition-average betas (4D)
-    condition_betas = torch.zeros(n_voxels, n_conditions, dtype=torch.float32, device=betas.device)
-    for c in range(n_conditions):
-        mask = trial_condition_ids == c
-        if mask.sum() > 0:
-            condition_betas[:, c] = betas[:, mask].mean(dim=1)
+    condition_betas = condition_average_betas(betas, trial_condition_ids)
 
     cond_path = f"{output_prefix}_single_trial_condition_betas{nii_ext}"
     save_nifti(

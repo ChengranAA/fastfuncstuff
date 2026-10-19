@@ -107,6 +107,7 @@ try:
     from fastfuncstuff.glm.core import fit_glm
     from fastfuncstuff.glm.xval import compute_r2_metric
     from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.processing.roi_collapse import add_roi_args, build_roi_set
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -360,6 +361,8 @@ def parse_args():
         help="Brain mask file (restricts analysis to brain voxels)",
     )
 
+    add_roi_args(proc_opts)
+
     proc_opts.add_argument(
         "-labels",
         nargs="+",
@@ -429,6 +432,19 @@ def parse_args():
         dest="save_betas",
         action="store_true",
         help="Save beta coefficients as 4D NIfTI file",
+    )
+
+    out_opts.add_argument(
+        "-roi_maps",
+        "-roi-maps",
+        dest="roi_maps",
+        action="store_true",
+        help=(
+            "With -atlas/-rois: ALSO write the usual voxel volumes, each ROI's value "
+            "painted into its voxels (a display aid; there is no within-ROI structure). "
+            "Needs a single 3-D label map -- overlapping ROIs have no faithful painting. "
+            "Without it, ROI mode writes only {prefix}_roi.tsv and the text curves."
+        ),
     )
 
     out_opts.add_argument(
@@ -984,7 +1000,13 @@ def _announce_written(paths: list[str] | str, elapsed: float, verb: int) -> None
     if verb < 1:
         return
     for p in [paths] if isinstance(paths, str) else paths:
-        print(f"  ✓ {p}  ({elapsed:.1f}s)")
+        if Path(p).exists():  # ROI mode skips the volume writes it was not asked for
+            print(f"  ✓ {p}  ({elapsed:.1f}s)")
+
+
+def _curve_times(n_points: int, bot: float, top: float) -> np.ndarray:
+    """Seconds after onset of each point of a saved response curve."""
+    return np.linspace(bot, top, n_points) if n_points > 1 else np.array([bot])
 
 
 def _compute_xval_r2_map(
@@ -1126,6 +1148,42 @@ def main(argv: list[str] | None = None):
         ortvec_files=None,
     )
 
+    # ── ROIs (-atlas / -rois) ────────────────────────────────────────────────
+    # Resolved BEFORE the load so only the voxels some ROI uses are decoded;
+    # -mask is intersected with the ROIs here, not applied twice.  -do_blur still
+    # sees the whole volume: the loader blurs before it crops.
+    roi_set = None
+    mask_file_for_load = args.mask
+    mask_array_for_load = None
+    if args.atlas:
+        from fastfuncstuff.io.afni import load_afni_mask, load_nifti
+
+        grid = tuple(load_nifti(input_files[0]).shape[:3])
+        try:
+            roi_set = build_roi_set(
+                args.atlas,
+                grid,
+                mask=load_afni_mask(args.mask) if args.mask else None,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if args.roi_maps and not roi_set.disjoint:
+            print(
+                "ERROR: -roi_maps needs a single 3-D label map; overlapping or weighted "
+                "ROIs cannot be painted back onto voxels",
+                file=sys.stderr,
+            )
+            return 1
+        mask_file_for_load, mask_array_for_load = None, roi_set.rows
+        if args.verb >= 1:
+            print("\n🧩 Fitting ROI means (averaged BEFORE the fit)")
+            for line in roi_set.describe():
+                print(f"   {line}")
+    elif args.roi_maps:
+        print("ERROR: -roi_maps needs -atlas/-rois", file=sys.stderr)
+        return 1
+
     # ── Load data ────────────────────────────────────────────────────────────
     # Shared loader: threaded decode (-load_threads), optional per-run blur
     # (-do_blur) before masking, percent-signal scaling (-do_scale) and
@@ -1134,7 +1192,8 @@ def main(argv: list[str] | None = None):
     load_result = load_and_preprocess_runs(
         input_files=input_files,
         tr=args.tr,
-        mask_file=args.mask,
+        mask_file=mask_file_for_load,
+        mask_array=mask_array_for_load,
         blur_fwhm=args.do_blur,
         do_scale=args.do_scale,
         device=device,
@@ -1157,6 +1216,8 @@ def main(argv: list[str] | None = None):
     # shrink of *data* can actually free the pre-mask copy.
     del load_result
     n_timepoints_per_run = run_lengths_from_starts(run_starts, n_timepoints)
+    if roi_set is not None:
+        data = roi_set.collapse(data)  # (n_rois, T): every row below is an ROI, not a voxel
     n_voxels_loaded = data.shape[0]
 
     # Timing describes the file on disk; shift it onto the retained window
@@ -1231,8 +1292,23 @@ def main(argv: list[str] | None = None):
     # this costs nothing until pack_for_shared_task_glm concatenates.
     data_list = [data[:, s : s + n] for s, n in zip(run_starts, n_timepoints_per_run, strict=True)]
 
+    # Volume outputs: always without ROIs; with them only on -roi_maps.  The
+    # table and text curves are the ROI-mode result, written at the end.
+    _volumes = roi_set is None or args.roi_maps
+    roi_columns: dict[str, np.ndarray] = {}
+
+    def _save_nifti(*a, **k):
+        return save_nifti(*a, **k) if _volumes else None
+
+    def _save_iresp(*a, **k):
+        return save_iresp(*a, **k) if _volumes else []
+
     def _to_volume(masked: np.ndarray) -> np.ndarray:
-        """Place (n_voxels_loaded, ...) values back into the full 3-D volume."""
+        """Place (n_voxels_loaded, ...) values (ROI values, with -atlas) into the 3-D volume."""
+        if not _volumes:  # ROI mode without -roi_maps: nothing will be written
+            return np.zeros((nx, ny, nz) + tuple(masked.shape[1:]), dtype=np.float32)
+        if roi_set is not None:
+            masked = roi_set.paint(masked)
         out_shape = (nx, ny, nz) + tuple(masked.shape[1:])
         if mask is not None:
             out = np.zeros(out_shape, dtype=np.float32)
@@ -1574,7 +1650,7 @@ def main(argv: list[str] | None = None):
             r2_path = f"{args.prefix}_flobs_r2{suffix}{_nii_ext}"
             t_write = time.perf_counter()
             with spinner(f"Writing {Path(r2_path).name}", enabled=args.verb >= 1, leave=False):
-                save_nifti(
+                _save_nifti(
                     _to_volume(r2_arr[:, None]).squeeze(-1),
                     output_path=r2_path,
                     reference_img=input_files[0],
@@ -1598,7 +1674,7 @@ def main(argv: list[str] | None = None):
                     enabled=args.verb >= 1,
                     leave=False,
                 ):
-                    iresp_files = save_iresp(
+                    iresp_files = _save_iresp(
                         iresp=iresp_vol,
                         output_prefix=f"{args.prefix}_flobs",
                         condition_labels=[f"{lbl}{fit_suffix}" for lbl in condition_labels],
@@ -1624,8 +1700,8 @@ def main(argv: list[str] | None = None):
                 with spinner(
                     f"Writing FLOBS maps: {label}{suffix}", enabled=args.verb >= 1, leave=False
                 ):
-                    save_nifti(weights_4d, output_path=weights_path, reference_img=input_files[0])
-                    save_nifti(amp_3d, output_path=amp_path, reference_img=input_files[0])
+                    _save_nifti(weights_4d, output_path=weights_path, reference_img=input_files[0])
+                    _save_nifti(amp_3d, output_path=amp_path, reference_img=input_files[0])
                 _announce_written(
                     [weights_path, amp_path], time.perf_counter() - t_write, args.verb
                 )
@@ -1862,7 +1938,7 @@ def main(argv: list[str] | None = None):
         r2_bw_file = f"{args.prefix}_r2_by_window{_nii_ext}"
         t_write = time.perf_counter()
         with spinner(f"Writing {Path(r2_bw_file).name}", enabled=args.verb >= 1, leave=False):
-            save_nifti(_to_volume(r2_bw), r2_bw_file, reference_img=input_files[0])
+            _save_nifti(_to_volume(r2_bw), r2_bw_file, reference_img=input_files[0])
         _announce_written(r2_bw_file, time.perf_counter() - t_write, args.verb)
         del r2_bw
 
@@ -1872,7 +1948,7 @@ def main(argv: list[str] | None = None):
         ws_file = f"{args.prefix}_windowsize{_nii_ext}"
         t_write = time.perf_counter()
         with spinner(f"Writing {Path(ws_file).name}", enabled=args.verb >= 1, leave=False):
-            save_nifti(_to_volume(ws).squeeze(-1), ws_file, reference_img=input_files[0])
+            _save_nifti(_to_volume(ws).squeeze(-1), ws_file, reference_img=input_files[0])
         _announce_written(ws_file, time.perf_counter() - t_write, args.verb)
         del ws
 
@@ -1886,7 +1962,7 @@ def main(argv: list[str] | None = None):
             xr2_file = f"{args.prefix}_xval_r2{_nii_ext}"
             t_write = time.perf_counter()
             with spinner(f"Writing {Path(xr2_file).name}", enabled=args.verb >= 1, leave=False):
-                save_nifti(_to_volume(xr2).squeeze(-1), xr2_file, reference_img=input_files[0])
+                _save_nifti(_to_volume(xr2).squeeze(-1), xr2_file, reference_img=input_files[0])
             _announce_written(xr2_file, time.perf_counter() - t_write, args.verb)
             del xr2
             if args.verb >= 1:
@@ -1996,7 +2072,7 @@ def main(argv: list[str] | None = None):
                 enabled=args.verb >= 1,
                 leave=False,
             ):
-                files = save_iresp(
+                files = _save_iresp(
                     iresp=iresp_cond,
                     output_prefix=args.prefix,
                     condition_labels=[condition_labels[cond_idx]],
@@ -2461,6 +2537,8 @@ def main(argv: list[str] | None = None):
         )
 
     # ── R² maps ──────────────────────────────────────────────────────────────
+    if roi_set is not None and results.r2 is not None:
+        roi_columns["r2"] = results.r2.cpu().numpy()  # in-sample, full model
     if args.save_r2:
         if results.r2 is None:
             print("WARNING: fit_glm returned no R²; skipping -save-r2", file=sys.stderr)
@@ -2469,7 +2547,7 @@ def main(argv: list[str] | None = None):
             r2_vol = _to_volume(results.r2.cpu().numpy().reshape(-1, 1)).squeeze(-1)
             t_write = time.perf_counter()
             with spinner(f"Writing {Path(r2_file).name}", enabled=args.verb >= 1, leave=False):
-                save_nifti(r2_vol, r2_file, reference_img=input_files[0])
+                _save_nifti(r2_vol, r2_file, reference_img=input_files[0])
             _announce_written(r2_file, time.perf_counter() - t_write, args.verb)
             if args.verb >= 1:
                 print(f"      in-sample, mean R² = {float(results.r2.mean()):.4f}")
@@ -2485,13 +2563,15 @@ def main(argv: list[str] | None = None):
         if smooth_arma is not None:
             maps.append(("smooth_arma", smooth_arma))
         for name, values in maps:
+            if roi_set is not None:
+                roi_columns[name] = values.numpy().reshape(roi_set.n_rois, -1)
             path = f"{args.prefix}_{name}{_nii_ext}"
             t_write = time.perf_counter()
             vol = _to_volume(values.numpy().reshape(values.shape[0], -1))
             if vol.shape[-1] == 1:
                 vol = vol[..., 0]
             with spinner(f"Writing {Path(path).name}", enabled=args.verb >= 1, leave=False):
-                save_nifti(vol, path, reference_img=input_files[0])
+                _save_nifti(vol, path, reference_img=input_files[0])
             _announce_written(path, time.perf_counter() - t_write, args.verb)
 
     if args.save_xval_r2:
@@ -2551,11 +2631,13 @@ def main(argv: list[str] | None = None):
                 file=sys.stderr,
             )
         else:
+            if roi_set is not None:
+                roi_columns["xval_r2"] = np.asarray(xval_r2_map).reshape(roi_set.n_rois)
             xr2_file = f"{args.prefix}_xval_r2{_nii_ext}"
             xr2_vol = _to_volume(xval_r2_map.reshape(-1, 1)).squeeze(-1)
             t_write = time.perf_counter()
             with spinner(f"Writing {Path(xr2_file).name}", enabled=args.verb >= 1, leave=False):
-                save_nifti(xr2_vol, xr2_file, reference_img=input_files[0])
+                _save_nifti(xr2_vol, xr2_file, reference_img=input_files[0])
             _announce_written(xr2_file, time.perf_counter() - t_write, args.verb)
             if args.verb >= 1:
                 print(
@@ -2574,13 +2656,15 @@ def main(argv: list[str] | None = None):
         if args.per_run_lambda == "run":
             run_maps.append(("perrun_log10lambda", per_run_fit.log10_lambda, run_tags))
         for name, values, labels in run_maps:
+            if roi_set is not None:
+                roi_columns[name] = values.numpy().reshape(roi_set.n_rois, -1)
             path = f"{args.prefix}_{name}{_nii_ext}"
             vol = _to_volume(values.numpy().reshape(values.shape[0], -1))
             if vol.shape[-1] == 1:
                 vol = vol[..., 0]
             t_write = time.perf_counter()
             with spinner(f"Writing {Path(path).name}", enabled=args.verb >= 1, leave=False):
-                save_nifti(vol, path, reference_img=input_files[0], brick_labels=labels)
+                _save_nifti(vol, path, reference_img=input_files[0], brick_labels=labels)
             _announce_written(path, time.perf_counter() - t_write, args.verb)
         if (
             per_run_fit.xval_r2 is not None
@@ -2638,6 +2722,20 @@ def main(argv: list[str] | None = None):
                 raise RuntimeError("tent_windows should not be None for TENT/TENTzero model")
             bot_for_save, top_for_save = tent_windows[cond_idx]
 
+        if roi_set is not None:
+            curves_roi = betas_cond
+            if model in ("TENTzero", "CSPLINzero"):
+                curves_roi = np.pad(curves_roi, ((0, 0), (1, 1)))
+            lag_t = _curve_times(curves_roi.shape[1], bot_for_save, top_for_save)
+            txt = roi_set.write_timecourses(
+                f"{args.prefix}_iresp_{condition_labels[cond_idx]}.tsv", lag_t, curves_roi
+            )
+            output_files.append(txt)
+            peak = np.argmax(np.abs(curves_roi), axis=1)
+            label = condition_labels[cond_idx]
+            roi_columns[f"{label}_peak"] = curves_roi[np.arange(len(peak)), peak]
+            roi_columns[f"{label}_time_to_peak"] = lag_t[peak]
+
         # Save this condition
         t_write = time.perf_counter()
         with spinner(
@@ -2645,7 +2743,7 @@ def main(argv: list[str] | None = None):
             enabled=args.verb >= 1,
             leave=False,
         ):
-            files = save_iresp(
+            files = _save_iresp(
                 iresp=iresp_cond,
                 output_prefix=args.prefix,
                 condition_labels=[condition_labels[cond_idx]],
@@ -2674,7 +2772,15 @@ def main(argv: list[str] | None = None):
                     f"Writing {Path(stem).name}_run*", enabled=args.verb >= 1, leave=False
                 ):
                     for r, path in enumerate(paths):
-                        save_nifti(
+                        if roi_set is not None:
+                            output_files.append(
+                                roi_set.write_timecourses(
+                                    f"{stem}_{run_tags[r]}.tsv",
+                                    _curve_times(curves.shape[2], bot_for_save, top_for_save),
+                                    curves[:, r],
+                                )
+                            )
+                        _save_nifti(
                             _to_volume(curves[:, r]), path, reference_img=input_files[0], tr=tr
                         )
                 if args.verb >= 1:
@@ -2701,8 +2807,13 @@ def main(argv: list[str] | None = None):
         beta_file = f"{args.prefix}_betas{_nii_ext}"
         t_write = time.perf_counter()
         with spinner(f"Writing {Path(beta_file).name}", enabled=args.verb >= 1, leave=False):
-            save_nifti(betas_4d, beta_file, reference_img=input_files[0])
+            _save_nifti(betas_4d, beta_file, reference_img=input_files[0])
         _announce_written(beta_file, time.perf_counter() - t_write, args.verb)
+
+    if roi_set is not None:
+        roi_columns = {k: v for k, v in roi_columns.items() if v is not None}
+        tsv = roi_set.write_table(f"{args.prefix}_roi.tsv", roi_columns)
+        print(f"Wrote {tsv} ({roi_set.n_rois} ROIs x {len(roi_columns)} measures)")
 
     # Done
     if args.verb >= 1:

@@ -897,83 +897,23 @@ def _inject_fdr_curves(
         add_fdrcurves_to_nifti(nifti_path, curves)
 
 
-def write_glm_bucket_as_nifti(
+def _bucket_subbricks(
     results: ResultsLike,
-    output_path: str | Path,
-    condition_names: Sequence[str] | None = None,
-    contrast_names: Sequence[str] | None = None,
-    contrast_results: dict | None = None,
-    volume_shape: Sequence[int] | None = None,
-    affine: np.ndarray | None = None,
-    voxel_size: Sequence[float] = (2.0, 2.0, 2.0),
-    dtype: np.dtype | str = np.float32,
-    apply_afni_metadata: bool = True,
-    compress_output: bool = True,
-    output_format: str | None = None,
-    add_fdr: bool = False,
-) -> Path:
+    condition_names: Sequence[str] | None,
+    contrast_names: Sequence[str] | None,
+    contrast_results: dict | None,
+    volume_shape: Sequence[int],
+    voxel_mask: np.ndarray | None,
+    dtype: np.dtype,
+) -> tuple[list[np.ndarray], list[str], list[str], list[str] | None, int, bool]:
+    """The sub-bricks of a stats bucket, in AFNI order, with their labels.
+
+    Returns ``(subbricks, labels, condition_names, contrast_names, n_regressors,
+    has_tstats)``; the names come back resolved (defaults filled in, contrast
+    labels read off *results*) because the metadata pass needs the same lists.
+    Shared by the volume writer and the per-ROI table, so a bucket and its ROI
+    twin can never disagree on what a column is called.
     """
-    Write GLM results as a 4D output file (NIfTI) with AFNI-style sub-bricks.
-
-    Creates a single 4D NIfTI file with sub-bricks in AFNI order:
-    1. Overall F-statistic
-    2. For each condition: Beta coefficient, then T-statistic
-    3. For each contrast: Beta coefficient, then T-statistic
-
-    This matches AFNI's 3dDeconvolve output format. The output is always NIfTI
-    (.nii or .nii.gz), as AFNI reads NIfTI files natively and this preserves
-    metadata better than writing .BRIK files from Python.
-
-    Parameters
-    ----------
-    results : GLMResults or ARMA11Results
-        GLM fitting results
-    output_path : str or Path
-        Output file path. If an AFNI extension (.HEAD, .BRIK) is provided,
-        it will be replaced with .nii.gz and a warning will be issued.
-    condition_names : sequence of str, optional
-        Names for each condition/regressor
-    contrast_names : sequence of str, optional
-        Names for each contrast
-    contrast_results : dict, optional
-        Output from compute_contrasts() containing:
-        - 'contrast_betas': (n_voxels, n_contrasts)
-        - 'contrast_tstats': (n_voxels, n_contrasts)
-    volume_shape : tuple, optional
-        Spatial dimensions (nx, ny, nz)
-    affine : np.ndarray, optional
-        4x4 affine transformation matrix
-    voxel_size : tuple of float
-        Voxel dimensions in mm
-    dtype : numpy dtype
-        Output data type
-    apply_afni_metadata : bool, default=True
-        If True, automatically run 3drefit to apply AFNI metadata:
-        - Sub-brick labels (-relabel_all_str)
-        - Statistical parameters (-substatpar) for F-stats and t-stats
-        Requires AFNI to be installed. Gracefully skips if not available.
-    compress_output : bool, default=True
-        If True, compress final output (.nii.gz).
-    output_format : str, optional
-        Ignored (always NIfTI). Retained for compatibility.
-
-    Returns
-    -------
-    output_path : Path
-        Path to written file (usually .nii.gz)
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    volume_shape = _resolve_shape(results, volume_shape)
-    # Try to get affine from results if not provided
-    if affine is None and hasattr(results, "affine") and results.affine is not None:
-        affine = results.affine
-    affine_mat = _build_affine(affine, voxel_size)
-    dtype = np.dtype(dtype)
-    tr = getattr(results, "tr", None)
-    voxel_mask = _get_voxel_mask(results)
-
     # Get betas and t-stats
     betas_np = _ensure_numpy(results.betas)
     betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
@@ -1098,6 +1038,98 @@ def write_glm_bucket_as_nifti(
                 )
                 subbricks.append(cr2semi_vol.astype(dtype, copy=False))
                 labels.append(f"{name}#0_R2semi")
+
+    return subbricks, labels, list(condition_names), contrast_names, n_regressors, has_tstats
+
+
+def write_glm_bucket_as_nifti(
+    results: ResultsLike,
+    output_path: str | Path,
+    condition_names: Sequence[str] | None = None,
+    contrast_names: Sequence[str] | None = None,
+    contrast_results: dict | None = None,
+    volume_shape: Sequence[int] | None = None,
+    affine: np.ndarray | None = None,
+    voxel_size: Sequence[float] = (2.0, 2.0, 2.0),
+    dtype: np.dtype | str = np.float32,
+    apply_afni_metadata: bool = True,
+    compress_output: bool = True,
+    output_format: str | None = None,
+    add_fdr: bool = False,
+) -> Path:
+    """
+    Write GLM results as a 4D output file (NIfTI) with AFNI-style sub-bricks.
+
+    Creates a single 4D NIfTI file with sub-bricks in AFNI order:
+    1. Overall F-statistic
+    2. For each condition: Beta coefficient, then T-statistic
+    3. For each contrast: Beta coefficient, then T-statistic
+
+    This matches AFNI's 3dDeconvolve output format. The output is always NIfTI
+    (.nii or .nii.gz), as AFNI reads NIfTI files natively and this preserves
+    metadata better than writing .BRIK files from Python.
+
+    Parameters
+    ----------
+    results : GLMResults or ARMA11Results
+        GLM fitting results
+    output_path : str or Path
+        Output file path. If an AFNI extension (.HEAD, .BRIK) is provided,
+        it will be replaced with .nii.gz and a warning will be issued.
+    condition_names : sequence of str, optional
+        Names for each condition/regressor
+    contrast_names : sequence of str, optional
+        Names for each contrast
+    contrast_results : dict, optional
+        Output from compute_contrasts() containing:
+        - 'contrast_betas': (n_voxels, n_contrasts)
+        - 'contrast_tstats': (n_voxels, n_contrasts)
+    volume_shape : tuple, optional
+        Spatial dimensions (nx, ny, nz)
+    affine : np.ndarray, optional
+        4x4 affine transformation matrix
+    voxel_size : tuple of float
+        Voxel dimensions in mm
+    dtype : numpy dtype
+        Output data type
+    apply_afni_metadata : bool, default=True
+        If True, automatically run 3drefit to apply AFNI metadata:
+        - Sub-brick labels (-relabel_all_str)
+        - Statistical parameters (-substatpar) for F-stats and t-stats
+        Requires AFNI to be installed. Gracefully skips if not available.
+    compress_output : bool, default=True
+        If True, compress final output (.nii.gz).
+    output_format : str, optional
+        Ignored (always NIfTI). Retained for compatibility.
+
+    Returns
+    -------
+    output_path : Path
+        Path to written file (usually .nii.gz)
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    volume_shape = _resolve_shape(results, volume_shape)
+    # Try to get affine from results if not provided
+    if affine is None and hasattr(results, "affine") and results.affine is not None:
+        affine = results.affine
+    affine_mat = _build_affine(affine, voxel_size)
+    dtype = np.dtype(dtype)
+    tr = getattr(results, "tr", None)
+    voxel_mask = _get_voxel_mask(results)
+
+    subbricks, labels, condition_names, contrast_names, n_regressors, has_tstats = (
+        _bucket_subbricks(
+            results,
+            condition_names,
+            contrast_names,
+            contrast_results,
+            volume_shape,
+            voxel_mask,
+            dtype,
+        )
+    )
 
     # Stack all sub-bricks
     bucket_data = np.stack(subbricks, axis=-1)

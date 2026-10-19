@@ -728,7 +728,13 @@ def undistort_series(
     wfun = warp_image_wsinc5 if interp == "wsinc5" else warp_image_linear
     cdev = device if device is not None else series.device
     nt = series.shape[-1]
-    out = torch.empty_like(series)  # follows series' device (host for a big series)
+    # Follows series' device (host for a big series). Strided x-fastest, the NIfTI file
+    # order: each frame lands as one contiguous block, and save_nifti then writes the
+    # series as is rather than transposing a full copy of it first.
+    nx, ny, nz = series.shape[:3]
+    out = torch.empty_strided(
+        series.shape, (1, nx, nx * ny, nx * ny * nz), dtype=series.dtype, device=series.device
+    )
     it = tqdm(range(nt), desc=desc, disable=not verbose or nt == 1, leave=True)
     for t in it:
         # (nx,ny,nz) NIfTI order -> (nz,ny,nx) for the warp kernels; stream to cdev.

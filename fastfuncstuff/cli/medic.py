@@ -475,10 +475,12 @@ def _load_cached_volume(path: str, expected_shape: tuple[int, ...], device):
 
 def _load_echoes(paths: list[str]) -> tuple[np.ndarray, np.ndarray, object]:
     """Load per-echo 4D files into (nx, ny, nz, ne, t); return data + affine + header."""
-    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.afni import fill_layout, load_nifti
     from fastfuncstuff.io.headers import parse_subbrick_selector
 
-    vols = []
+    # Each echo is copied into its slot as it loads and then dropped: np.stack over a
+    # list of loaded echoes held every echo twice.
+    stacked = None
     affine = np.eye(4)
     header: object = None
     for i, p in enumerate(paths):
@@ -488,15 +490,20 @@ def _load_echoes(paths: list[str]) -> tuple[np.ndarray, np.ndarray, object]:
         data = np.asarray(img.dataobj, dtype=np.float32)
         if data.ndim == 3:
             data = data[..., None]
-        if i == 0:
+        if stacked is None:
             affine = img.affine
             header = img.header
-        vols.append(data)
-    shapes = {v.shape for v in vols}
-    if len(shapes) != 1:
-        raise ValueError(f"All echo files must share a shape; got {shapes}")
-    stacked = np.stack(vols, axis=3)  # (nx, ny, nz, ne, t)
-    return stacked, affine, header
+            nx, ny, nz, nt = data.shape
+            stacked = np.empty((nx, ny, nz, len(paths), nt), dtype=np.float32)
+        elif data.shape != stacked[:, :, :, 0, :].shape:
+            raise ValueError(
+                f"All echo files must share a shape; got {stacked[:, :, :, 0, :].shape} "
+                f"and {data.shape}"
+            )
+        fill_layout(stacked[:, :, :, i, :], data)
+        del data, img
+    assert stacked is not None
+    return stacked, affine, header  # (nx, ny, nz, ne, t)
 
 
 class _Precomputed:
@@ -656,7 +663,12 @@ def main(argv: list[str] | None = None) -> int:
 
     with spinner(f"Loading {len(args.magnitude)} magnitude echo(es)"):
         mag, affine, _ = _load_echoes(args.magnitude)
-    if args.phase is not None and need_phase:
+    # With the field given, the phase is only resampled at the end, one echo at a time;
+    # unwrapped phase needs no global wrap range, so each echo is read then instead of
+    # holding the whole stack through the run. Wrapped phase still loads up front for
+    # its range across echoes.
+    lazy_phase = precomputed and args.apply_phase and args.phase_is_unwrapped
+    if args.phase is not None and need_phase and not lazy_phase:
         with spinner(f"Loading {len(args.phase)} phase echo(es)"):
             phase, _, _ = _load_echoes(args.phase)
         if mag.shape != phase.shape:
@@ -949,9 +961,22 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  3ddebug echo {e + 1} {tag} ({wlabel} {frac:.3f}): {out_path}")
 
     if args.apply_phase:
-        ph_lo, ph_hi = float(phase.min()), float(phase.max())
+        if not lazy_phase:
+            ph_lo, ph_hi = float(phase.min()), float(phase.max())
         for e in range(ne):
-            ph_rad = phase[:, :, :, e, :].astype(np.float32)
+            if lazy_phase:
+                one, _, _ = _load_echoes([args.phase[e]])
+                if one.shape[:3] != (nx, ny, nz) or one.shape[4] != nt_full:
+                    print(
+                        f"ERROR: phase {args.phase[e]} is {one.shape[:3] + one.shape[4:]}, "
+                        f"the magnitude is {(nx, ny, nz, nt_full)}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                ph_rad = one[:, :, :, 0, t0 : t0 + nt]
+                del one
+            else:
+                ph_rad = phase[:, :, :, e, :].astype(np.float32)
             if not args.phase_is_unwrapped:
                 ph_rad = rescale_phase_to_radians(ph_rad, ph_lo, ph_hi)
             series = torch.from_numpy(np.ascontiguousarray(ph_rad))

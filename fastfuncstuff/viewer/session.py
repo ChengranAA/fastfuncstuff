@@ -149,10 +149,7 @@ def _overlay_array(overlay: ComputedOverlay) -> tuple[np.ndarray, tuple[int, int
 
 def _overlay_cut(overlay: ComputedOverlay) -> dict[str, object]:
     """Layer fields that say where this overlay's threshold reads from."""
-    if overlay.threshold_values is None:
-        # Back to cutting on what is shown. Said explicitly because a layer
-        # that was two volumes a moment ago still points at sub-brick 1.
-        return {"threshold_index": None, "threshold_follow": "same", "stataux": {}}
+    one_volume = overlay.threshold_values is None
     stataux: dict[int, tuple[int, tuple[float, ...]]] = {}
     if overlay.threshold_stat is not None:
         from fastfuncstuff.io.afni import stat_type_to_stataux
@@ -160,9 +157,13 @@ def _overlay_cut(overlay: ComputedOverlay) -> dict[str, object]:
         name, params = overlay.threshold_stat
         flat = () if params is None else (params if isinstance(params, tuple) else (params,))
         try:
-            stataux[1] = stat_type_to_stataux(name, flat)
+            stataux[0 if one_volume else 1] = stat_type_to_stataux(name, flat)
         except ValueError:
             stataux = {}
+    if one_volume:
+        # Back to cutting on what is shown. Said explicitly because a layer
+        # that was two volumes a moment ago still points at sub-brick 1.
+        return {"threshold_index": None, "threshold_follow": "same", "stataux": stataux}
     # ``fixed``, not ``next``: the threshold brick is where the mode put it,
     # and the shown brick never moves off 0, so following would be a rule
     # describing something that cannot happen.

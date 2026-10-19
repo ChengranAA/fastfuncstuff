@@ -32,6 +32,7 @@ from fastfuncstuff.viewer.modes.base import (
     OverlayKind,
     ProgressFn,
     Trace,
+    correlation_stat,
     mode,
 )
 from fastfuncstuff.viewer.vocab import SetSeed
@@ -389,7 +390,32 @@ class InstaCorrMode(Mode):
             colormap="redblue",
             display_range=(-1.0, 1.0),
             threshold=0.3,
+            threshold_stat=correlation_stat(self._effective_samples(), self._polort()),
         )
+
+    def _polort(self) -> int:
+        return int(self.params.get("polort", 2))
+
+    def _effective_samples(self) -> float:
+        """Volumes' worth of independent samples left after the band is cut.
+
+        A bandpass keeps a fraction of the spectrum, and the samples it leaves
+        are that fraction of the run, not all of them. Approximate -- the
+        filter's edges are not sharp -- but the alternative, quoting a p on
+        every volume, is wrong by a factor of several for a typical 0.01-0.1 Hz.
+        """
+        nt = int(self._prepared.shape[-1]) if self._prepared is not None else 0
+        fbot = float(self.params.get("fbot") or 0.0)
+        ftop = float(self.params.get("ftop") or 0.0)
+        if (fbot <= 0.0 and ftop <= 0.0) or self._tr <= 0.0 or nt < 2:
+            return float(nt)
+        freqs = np.fft.rfftfreq(nt, d=self._tr)[1:]
+        keep = np.ones(freqs.shape, dtype=bool)
+        if fbot > 0:
+            keep &= freqs >= fbot
+        if ftop > 0:
+            keep &= freqs <= ftop
+        return float(nt) * float(keep.mean()) if freqs.size else float(nt)
 
     # -- reaction ------------------------------------------------------
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:

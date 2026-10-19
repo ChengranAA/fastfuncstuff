@@ -198,7 +198,7 @@ class Layer:
 
     def stat_spec(
         self, index: int | None = None
-    ) -> tuple[str, float | tuple[float, float] | None] | None:
+    ) -> tuple[str, float | tuple[float, ...] | None] | None:
         """``("fitt", dof)`` for a sub-brick that is a statistic, else ``None``.
 
         ``None`` is the honest answer for a plain intensity map, and it is what
@@ -220,8 +220,9 @@ class Layer:
             return (name, float(params[0])) if params else None
         if name == "fizt":
             return (name, None)
-        # A code we can name but cannot convert -- correlation, chi-squared and
-        # the rest. Saying so beats quoting a p from the wrong distribution.
+        if name == "fico":
+            return (name, tuple(float(v) for v in params[:3])) if len(params) >= 3 else None
+        # A code we can name but cannot convert -- chi-squared and the rest. Saying so beats quoting a p from the wrong distribution.
         return None
 
     def sub_brick(self, index: int | None = None) -> str:

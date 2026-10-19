@@ -35,6 +35,7 @@ from fastfuncstuff.viewer.modes.base import (
     OverlayKind,
     PathListControl,
     ProgressFn,
+    correlation_stat,
     mode,
 )
 
@@ -57,6 +58,7 @@ class TCorrMode(Mode):
         self._zooms = (1.0, 1.0, 1.0)
         self._maps: torch.Tensor | None = None  # (nx, ny, nz, P), CPU
         self._pairs: list[tuple[int, int]] = []
+        self._n_time = 0
         self._message = ""
         super().__init__()
 
@@ -201,6 +203,7 @@ class TCorrMode(Mode):
         rule = {"all": "all", "adjacent": "adjacent", "first": "ref:1"}[
             str(self.params.get("pairs", "all"))
         ]
+        self._n_time = int(series[0].shape[-1])
         self._pairs = pair_list(n, rule)
         step(0.8, f"correlating {len(self._pairs)} pair(s)")
         self._maps = paired_voxel_correlation(
@@ -262,6 +265,7 @@ class TCorrMode(Mode):
             colormap="redblue",
             display_range=(-1.0, 1.0),
             threshold=0.2,
+            threshold_stat=correlation_stat(self._n_time, int(self.params.get("polort", 2))),
         )
 
     def status(self) -> str:

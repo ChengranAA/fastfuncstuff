@@ -36,6 +36,7 @@ from fastfuncstuff.viewer.modes.base import (
     PathControl,
     ProgressFn,
     Trace,
+    correlation_stat,
     mode,
 )
 
@@ -346,6 +347,11 @@ class InstaPCAMode(Mode):
             threshold=top * 0.4 if top > 0 else 0.0,
             volume_labels=(f"{self.component_word} {k} {kind} ({pct:.1f}%)",),
             rescale=rescale,
+            threshold_stat=(
+                correlation_stat(self._result.timecourses.shape[0], self._result.polort)
+                if kind == "correlation"
+                else None
+            ),
         )
 
     # -- actions -------------------------------------------------------

@@ -1004,3 +1004,34 @@ def test_instacorr_seed_roi_follows_a_stroke(corr_session):
     first = stroke(mm((3, 4, 2)))
     second = stroke(mm((8, 10, 6)))
     assert not np.allclose(first, second)
+
+
+def test_a_correlation_map_carries_its_dof_so_it_earns_a_p(corr_session):
+    from scipy import stats
+
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.do(SetSeed(3, 4, 2))
+    layer = s.state.layers.find_by_source("mode:instacorr")
+    code, dof = layer.stat_spec()
+    # 60 volumes, polort 2: one seed regressor, three drift columns.
+    assert code == "fico" and dof == (60.0, 1.0, 3.0)
+    from fastfuncstuff.stats.fdr import pvalue_to_stat, stat_value_to_pvalue
+
+    r = 0.3
+    nu = 60 - 1 - 3
+    t = r * np.sqrt(nu / (1 - r * r))
+    assert stat_value_to_pvalue(r, code, dof) == pytest.approx(2 * stats.t.sf(t, nu), rel=1e-6)
+    p = 0.001
+    assert stat_value_to_pvalue(pvalue_to_stat(p, code, dof), code, dof) == pytest.approx(p)
+
+
+def test_a_bandpass_shrinks_the_samples_the_p_counts(corr_session):
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.set_mode_param("live", "1")
+    s.do(SetSeed(3, 4, 2))
+    s.set_mode_param("fbot", "0.05")
+    s.set_mode_param("ftop", "0.2")
+    n = s.state.layers.find_by_source("mode:instacorr").stat_spec()[1][0]
+    assert 0 < n < 60

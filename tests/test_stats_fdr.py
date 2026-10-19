@@ -177,4 +177,19 @@ class TestPValueToStat:
         from fastfuncstuff.stats.fdr import pvalue_to_stat
 
         with pytest.raises(ValueError, match="Unsupported stat_code"):
-            pvalue_to_stat(0.01, "fico", 50.0)
+            pvalue_to_stat(0.01, "fict", 4.0)
+
+
+def test_correlation_p_matches_the_student_t_it_reduces_to():
+    from scipy import stats
+
+    from fastfuncstuff.stats.fdr import pvalue_to_stat, stat_value_to_pvalue
+
+    n, nort, r = 120.0, 3.0, 0.25
+    nu = n - 1 - nort
+    t = r * (nu / (1 - r * r)) ** 0.5
+    p = stat_value_to_pvalue(r, "fico", (n, 1.0, nort))
+    assert p == pytest.approx(2 * stats.t.sf(t, nu), rel=1e-6)
+    assert pvalue_to_stat(p, "fico", (n, 1.0, nort)) == pytest.approx(r, rel=1e-6)
+    with pytest.raises(ValueError, match="requires dof"):
+        stat_value_to_pvalue(r, "fico", 50.0)

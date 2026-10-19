@@ -303,7 +303,7 @@ class ComputedOverlay:
     #: ``("fitt", dof)`` for the threshold volume, in the same shape
     #: :meth:`Layer.stat_spec` returns, so a computed t map earns the p
     #: spinner a loaded one gets. ``None`` when the cut is on a plain value.
-    threshold_stat: tuple[str, float | tuple[float, float] | None] | None = None
+    threshold_stat: tuple[str, float | tuple[float, ...] | None] | None = None
     #: Whether this output means something different from the last one, so the
     #: colour scale must follow it. Off by default, because the usual update is
     #: the *same* quantity recomputed -- the next seed, the next component --
@@ -356,6 +356,18 @@ class Trace:
     @property
     def legend(self) -> str:
         return self.short or self.label
+
+
+def correlation_stat(n_time: float, polort: int) -> tuple[str, tuple[float, float, float]]:
+    """The ``threshold_stat`` of a map of correlations with one time course.
+
+    AFNI's ``Correl(n, nfit, nort)``: one fitted regressor, and ``polort + 1``
+    drift columns projected out first (just the mean when detrending is off), so
+    the p comes from ``n - 2 - polort`` degrees of freedom. Nominal: it assumes
+    independent samples, which fMRI is not, and says nothing about a regressor
+    chosen because it fits the data.
+    """
+    return ("fico", (float(n_time), 1.0, float(max(polort, 0) + 1)))
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +756,7 @@ __all__ = [
     "ChoiceControl",
     "ComputedOverlay",
     "Control",
+    "correlation_stat",
     "DialogSpec",
     "FloatControl",
     "IntControl",

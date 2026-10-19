@@ -147,7 +147,7 @@ def test_an_f_brick_reports_both_degrees_of_freedom(session):
 def test_a_code_we_cannot_convert_reports_nothing(session):
     """Naming a distribution is not the same as being able to invert it."""
     layer = _overlay(session)
-    session.state.layers.update(layer.key, stataux={0: (2, (100.0, 1.0, 3.0))})  # fico
+    session.state.layers.update(layer.key, stataux={0: (6, (4.0,))})  # fict
     assert _overlay(session).stat_spec() is None
 
 

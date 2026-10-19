@@ -27,7 +27,7 @@ import torch
 # Two-sided z for q: z = qginv(q/2) where qginv = inverse upper-tail Gaussian.
 # Implemented via scipy.stats.norm.isf for the curve build (CPU, 101 points).
 try:
-    from scipy.special import betaincinv, ndtr, ndtri
+    from scipy.special import betainc, betaincinv, ndtr, ndtri
     from scipy.stats import f as _scipy_f
     from scipy.stats import t as _scipy_t
 except ImportError as _err:  # pragma: no cover
@@ -99,17 +99,33 @@ def stat_to_pvalue(
 #: Which stat codes are two-tailed. F is one-tailed by construction -- its
 #: large values are the extreme ones and there is no other end -- so a p quoted
 #: for an F is the upper-tail area and nothing is being halved.
-TWO_SIDED_CODES = frozenset({"fitt", "fizt"})
+TWO_SIDED_CODES = frozenset({"fitt", "fizt", "fico"})
 
 
 def is_two_sided(stat_code: str) -> bool:
     return stat_code.lower() in TWO_SIDED_CODES
 
 
+def _correl_betas(dof: object) -> tuple[float, float]:
+    """The beta parameters of a correlation's null from AFNI's ``(n, nfit, nort)``.
+
+    ``P(|r| > r0) = I_{1-r0^2}((n - nfit - nort) / 2, nfit / 2)`` -- AFNI's
+    ``correl_t2p``. With one fitted regressor it is the two-sided Student t on
+    ``n - 1 - nort`` degrees of freedom, so a seed correlation of a series
+    detrended with ``polort + 1`` columns has ``n - 2 - polort`` of them.
+    """
+    if not isinstance(dof, tuple) or len(dof) != 3:
+        raise ValueError("stat_code='fico' requires dof=(n, nfit, nort)")
+    n, nfit, nort = (float(v) for v in dof)
+    if nfit < 1 or n - nfit - nort <= 0:
+        raise ValueError(f"correlation on n={n:g}, nfit={nfit:g}, nort={nort:g} has no dof")
+    return (n - nfit - nort) / 2.0, nfit / 2.0
+
+
 def pvalue_to_stat(
     p: float,
     stat_code: str,
-    dof: float | tuple[float, float] | None = None,
+    dof: float | tuple[float, ...] | None = None,
 ) -> float:
     """The statistic whose p-value is ``p``. Inverse of :func:`stat_to_pvalue`.
 
@@ -137,13 +153,17 @@ def pvalue_to_stat(
         return dfd / dfn * (1.0 / x - 1.0) if x > 0 else float("inf")
     if code == "fizt":
         return float(-ndtri(p / 2.0))
+    if code == "fico":
+        a, b = _correl_betas(dof)
+        # |r| from p = I_{1-r^2}(a, b)
+        return float(np.sqrt(max(0.0, 1.0 - betaincinv(a, b, p))))
     raise ValueError(f"Unsupported stat_code: {stat_code!r}")
 
 
 def stat_value_to_pvalue(
     value: float,
     stat_code: str,
-    dof: float | tuple[float, float] | None = None,
+    dof: float | tuple[float, ...] | None = None,
 ) -> float:
     """One statistic's p, with the same sidedness as :func:`stat_to_pvalue`.
 
@@ -166,6 +186,9 @@ def stat_value_to_pvalue(
         return float(_scipy_f.sf(v, dfn=float(dof[0]), dfd=float(dof[1])))
     if code == "fizt":
         return float(min(1.0, 2.0 * ndtr(-abs(v))))
+    if code == "fico":
+        a, b = _correl_betas(dof)
+        return float(betainc(a, b, min(1.0, max(0.0, 1.0 - v * v))))
     raise ValueError(f"Unsupported stat_code: {stat_code!r}")
 
 

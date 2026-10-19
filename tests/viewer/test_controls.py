@@ -401,3 +401,26 @@ def test_a_focused_combo_still_follows_state(qapp):
     qapp.processEvents()
     panel.rebuild([spec], {"a": "y"})
     assert panel._widgets["a"].currentText() == "y"
+
+
+def test_arrow_keys_step_a_focused_spin_box_not_the_crosshair(qapp):
+    from PySide6 import QtCore, QtTest, QtWidgets
+
+    from fastfuncstuff.viewer.ui import shortcuts
+
+    host = QtWidgets.QWidget()
+    spin = QtWidgets.QSpinBox(host)
+    spin.setRange(0, 50)
+    nudges: list[int] = []
+    shortcuts.install(
+        host, [shortcuts.Binding("Up", "nudge", lambda: nudges.append(1), group="navigate")]
+    )
+    host.show()
+    spin.setFocus()
+    qapp.processEvents()
+    QtTest.QTest.keyClick(spin, QtCore.Qt.Key.Key_Up)
+    assert spin.value() == 1 and not nudges
+    spin.clearFocus()
+    QtTest.QTest.keyClick(host, QtCore.Qt.Key.Key_Up)
+    assert nudges == [1]
+    host.close()

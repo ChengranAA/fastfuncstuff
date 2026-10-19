@@ -76,6 +76,48 @@ def jump_back_key(dispatch: Callable[[Command], object]) -> Binding:
     )
 
 
+_STEP_KEYS = frozenset(
+    {
+        QtCore.Qt.Key.Key_Up,
+        QtCore.Qt.Key.Key_Down,
+        QtCore.Qt.Key.Key_PageUp,
+        QtCore.Qt.Key.Key_PageDown,
+    }
+)
+
+
+class _StepKeys(QtCore.QObject):
+    """Let a focused spin box or slider keep Up / Down.
+
+    Qt offers a key to the focused widget before a window shortcut gets it
+    (``ShortcutOverride``), and a spin box's line edit declines the arrows, so
+    the crosshair nudge took them: click into a number, press Up, and the slice
+    moved instead of the number.
+    """
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt)
+        if event.type() == QtCore.QEvent.Type.ShortcutOverride and event.key() in _STEP_KEYS:
+            # The focus widget is a spin box's inner line edit, one level down.
+            widget = obj if isinstance(obj, QtWidgets.QWidget) else None
+            for _ in range(2):
+                if isinstance(widget, QtWidgets.QAbstractSpinBox | QtWidgets.QAbstractSlider):
+                    event.accept()
+                    break
+                widget = widget.parentWidget() if widget is not None else None
+        return False
+
+
+_step_keys: _StepKeys | None = None
+
+
+def _keep_step_keys() -> None:
+    global _step_keys
+    app = QtWidgets.QApplication.instance()
+    if app is not None and _step_keys is None:
+        _step_keys = _StepKeys(app)
+        app.installEventFilter(_step_keys)
+
+
 def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:
     """Register every binding on ``widget`` as a window-level shortcut.
 
@@ -86,6 +128,7 @@ def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:
     overload to stderr where nobody reads it. Five pairs were written that way
     before anyone tried them. Uppercase means ``shift+d``, spelled out.
     """
+    _keep_step_keys()
     seen: dict[str, str] = {}
     for binding in bindings:
         for spelling in (binding.keys, *binding.aliases):

@@ -17,7 +17,7 @@ def phase_to_hz(phase: np.ndarray, te_ms: float, units: str) -> np.ndarray:
     if units == "hz":
         return phase.astype(np.float32, copy=False)
     if units == "rad":
-        return (phase / (2.0 * np.pi * te_ms * 1e-3)).astype(np.float32)
+        return (phase / (2.0 * np.pi * te_ms * 1e-3)).astype(np.float32, copy=False)
     raise ValueError(f"unknown phase units {units!r} (hz or rad)")
 
 

@@ -4201,14 +4201,13 @@ def _load_magphase(args, datas) -> list:
     import torch
 
     from fastfuncstuff.cli_utils import spinner
-    from fastfuncstuff.io.afni import load_nifti
     from fastfuncstuff.processing.mask import automask
     from fastfuncstuff.processing.phase_input import phase_input_problem, wrap_period
 
     out = []
     for j, path in enumerate(args.phase):
         with spinner(f"Loading {Path(path).name}"):
-            ph = np.asarray(load_nifti(path).get_fdata(dtype=np.float32))
+            ph = _read_phase(path)
         if ph.shape != datas[j].shape:
             raise ValueError(f"{path} is {ph.shape}, its magnitude is {datas[j].shape}.")
         out.append(ph)
@@ -4223,6 +4222,15 @@ def _load_magphase(args, datas) -> list:
             "echo) and check -phase_units."
         )
     return out
+
+
+def _read_phase(path):
+    """One -phase series in input units, exactly as :func:`_load_magphase` reads it."""
+    import numpy as np
+
+    from fastfuncstuff.io.afni import load_nifti
+
+    return np.asarray(load_nifti(path).get_fdata(dtype=np.float32))
 
 
 def _magphase_quality(args, mags, phases_hz):
@@ -4393,6 +4401,11 @@ def _run_multiecho(
             print(f"❌ -phase: {exc}", file=sys.stderr)
             return 2
         phases_hz = _magphase_hz(args, phases_in)
+        # Only the corrected-phase write needs the input-unit arrays, and the multi-echo
+        # path never alters them (no -inject_jitter here): re-read each echo then rather
+        # than hold the whole stack through the solve -- next to its Hz copy in rad
+        # units, and next to its task-cut copy under -detask.
+        phases_in = None
 
     est_datas, notch_note = datas, None
     if _detask_pre_estimation(args):
@@ -5042,11 +5055,13 @@ def _run_multiecho(
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
     if magphase_flow is not None:
+        # One echo at a time, both sides: an echo's components are scaled copies of the
+        # shared field, and its phase is re-read from disk.
         _write_magphase_outputs(
             magphase_flow,
             args,
-            [res.warp_components() for res in result.per_echo],
-            phases_in,
+            (res.warp_components() for res in result.per_echo),
+            (_read_phase(path) for path in args.phase),
             stem,
             ext,
             affine,

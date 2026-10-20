@@ -9,6 +9,7 @@ tiles the ribbon and never decides depth.
 
 import numpy as np
 import pytest
+import torch
 
 from fastfuncstuff.surface.slab import patch_faces, ribbon_cells
 from fastfuncstuff.surface.volume_depth import RibbonSurfaces
@@ -76,3 +77,47 @@ def test_a_patch_holds_every_cell_its_columns_own():
     np.testing.assert_allclose(
         patch.volume[np.isin(patch.vertex, cap)].sum(), whole.volume[in_cap].sum(), rtol=1e-9
     )
+
+
+def test_equivolume_cells_beat_equidistant_on_bok_truth_with_pial_slide():
+    """Folded sphere, parallel surfaces, pial vertices slid ~1 mm; truth is the volume
+    fraction below each point, integrated from offset-mesh areas (Bok's constant-volume
+    columns). Cells whose volume sits at a few discrete depths made the column CDF a
+    staircase and equivolume bins 4-9% off; the error against truth must stay far below
+    equidistant's."""
+    from fastfuncstuff.surface.mesh import MeshTopology, vertex_areas, vertex_normals
+    from fastfuncstuff.surface.slab import equivolume_metric, tile_surface
+    from fastfuncstuff.surface.voxelize import MeshDistance
+
+    R, T, K = 12.0, 1.5, 4
+    u, f = icosphere(4)
+    f = f.astype(np.int64)
+    x, y, z = u.T
+    bump = np.sin(5.0 * np.arctan2(y, x)) * np.sin(4.0 * np.arccos(np.clip(z, -1, 1)))
+    white = u * (R + 0.8 * bump)[:, None]
+    n = vertex_normals(white, MeshTopology.from_faces(f, len(white)))
+    pial = white + T * n
+    ts = np.linspace(0, T, 16)
+    area = np.stack([vertex_areas(white + t * n, f, len(white)) for t in ts], 1)
+    cum = np.concatenate(
+        [np.zeros((len(white), 1)), np.cumsum((area[:, 1:] + area[:, :-1]) / 2 * np.diff(ts), 1)], 1
+    )
+    cum /= cum[:, -1:]
+    slide = np.sin(pial @ np.random.default_rng(0).normal(size=(3, 3)) * 0.5) * 1.2
+    slide -= (slide * n).sum(1, keepdims=True) * n
+    foot = MeshDistance(pial, f)(pial + slide, torch.device("cpu"))
+    slid = np.stack([foot.interpolate(f, pial[:, k]) for k in range(3)], 1)
+    surf = RibbonSurfaces("lh", white, slid, f)
+
+    tiling = tile_surface(surf, np.arange(len(f)), 0.5, K)
+    t = np.clip(tiling.rho, 0, 1) * (len(ts) - 1)
+    i0 = np.minimum(t.astype(int), len(ts) - 2)
+    fr = t - i0
+    fv = f[tiling.foot_face]
+    truth = sum(
+        tiling.foot_bary[:, k] * (cum[fv[:, k], i0] * (1 - fr) + cum[fv[:, k], i0 + 1] * fr)
+        for k in range(3)
+    )
+    err_equidist = np.abs(tiling.rho - truth).mean()
+    err_equivol = np.abs(equivolume_metric(tiling, surf, 1) - truth).mean()
+    assert err_equivol < 0.25 * err_equidist, (err_equivol, err_equidist)

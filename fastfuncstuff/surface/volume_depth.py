@@ -248,6 +248,7 @@ def column_depth_cdf(
     bins: int = 64,
     weight: torch.Tensor | None = None,
     rho_hi: torch.Tensor | None = None,
+    rounds: int | None = None,
 ) -> torch.Tensor:
     """Each column's volume CDF over equidistant depth, ``(V, bins + 1)``.
 
@@ -255,8 +256,9 @@ def column_depth_cdf(
     are not equal-volume voxels: ``weight`` is each sample's volume, and with
     ``rho_hi`` a sample is a piece of ribbon spread evenly over depths ``[rho,
     rho_hi]``. Samples that sit at a few discrete depths (cells of a tiling) need
-    that: as points they make every column's CDF a staircase. The smoothing still
-    counts samples, not volume -- it is there for counting noise.
+    that: as points they make every column's CDF a staircase. ``rounds`` of 1-ring mesh
+    smoothing pool each column with its neighbours (default: enough that a column
+    holds ~``column_voxels`` samples, for counting noise -- samples, not volume).
     """
     device = rho.device
     f = torch.as_tensor(faces, device=device)[face]  # (N, 3) vertex ids
@@ -281,7 +283,9 @@ def column_depth_cdf(
             hist.index_add_(0, fv[:, k] * bins + b, wb[:, k])
     hist = hist.view(n_vertices, bins)
     per_vertex = rho.numel() / max(int((hist.sum(1) > 0).sum()), 1)
-    n_iter = int(np.clip(np.ceil(column_voxels / per_vertex), 1, 500))
+    n_iter = (
+        int(np.clip(np.ceil(column_voxels / per_vertex), 1, 500)) if rounds is None else int(rounds)
+    )
     # (V, bins) is small; the sparse smoothing stays with scipy.
     smooth = _smooth_on_mesh(hist.cpu().numpy(), faces, n_iter)
     total = smooth.sum(1, keepdims=True)

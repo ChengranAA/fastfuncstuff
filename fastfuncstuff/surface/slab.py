@@ -32,7 +32,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-__all__ = ["RibbonCells", "patch_faces", "ribbon_cells"]
+__all__ = [
+    "RibbonCells",
+    "Tiling",
+    "equivolume_metric",
+    "patch_faces",
+    "ribbon_cells",
+    "tile_surface",
+]
 
 #: Nodes generated per batch: bounds the (faces, sub-triangles, sheets, 3) arrays.
 _BATCH_NODES = 1 << 22
@@ -159,6 +166,134 @@ def _wedges(
         yield nodes, centres, vol
 
 
+@dataclass
+class Tiling:
+    """One surface's cells before any depth metric: the nodes (cell faces, ``S + 1``
+    to a wedge column), each cell's lower node ``lo_i`` (upper is ``lo_i + 1``), and
+    what the meshes say about the nodes -- equidistant depth ``rho`` and the white
+    foot (``foot_face``, ``foot_bary``) -- and about the cells (owner, ``keep``)."""
+
+    centre: np.ndarray
+    volume: np.ndarray
+    lo_i: np.ndarray
+    rho: np.ndarray
+    foot_face: np.ndarray
+    foot_bary: np.ndarray
+    owner: np.ndarray
+    keep: np.ndarray
+    inverted_mm3: float
+
+
+def tile_surface(
+    surf,
+    face_idx: np.ndarray,
+    step: float,
+    n_depths: int = 1,
+    *,
+    max_level: int = 32,
+    max_sheets: int = 512,
+    device=None,
+    log: Callable[[str], None] | None = None,
+) -> Tiling | None:
+    """Cut the ribbon over ``face_idx`` of one surface into cells; see :func:`ribbon_cells`."""
+    import torch
+
+    from fastfuncstuff.surface.voxelize import MeshDistance
+
+    device = device or torch.device("cpu")
+    faces = np.asarray(surf.faces, np.int64)
+    white = np.asarray(surf.white, np.float64)
+    pial = np.asarray(surf.pial, np.float64)
+    fv = faces[np.asarray(face_idx, np.int64)]
+    if fv.size == 0:
+        return None
+    cw, cp = white[fv], pial[fv]
+    level = np.clip(np.ceil(np.sqrt(np.maximum(_area(cw), _area(cp))) / step), 1, max_level).astype(
+        np.int64
+    )
+    tau = np.linalg.norm(cp - cw, axis=2).max(axis=1)
+    sheets = np.clip(np.maximum(np.ceil(tau / (0.5 * step)), 2 * n_depths), 2, max_sheets).astype(
+        np.int64
+    )
+    nodes, centres, vols, lo_idx = [], [], [], []
+    n_nodes = 0
+    for key in np.unique(level * (max_sheets + 1) + sheets):
+        lv, sh = divmod(int(key), max_sheets + 1)
+        sel = np.flatnonzero((level == lv) & (sheets == sh))
+        for nd, ce, vo in _wedges(cw[sel], cp[sel] - cw[sel], lv, sh):
+            nf, nt = vo.shape[:2]
+            base = n_nodes + (np.arange(nf * nt) * (sh + 1))[:, None] + np.arange(sh)
+            nodes.append(nd.reshape(-1, 3))
+            centres.append(ce.reshape(-1, 3))
+            vols.append(vo.reshape(-1))
+            lo_idx.append(base.reshape(-1))
+            n_nodes += nd.shape[0] * nd.shape[1] * nd.shape[2]
+    node_xyz = np.concatenate(nodes)
+    centre = np.concatenate(centres)
+    vol = np.concatenate(vols)
+    lo_i = np.concatenate(lo_idx)
+    del nodes, centres, vols, lo_idx
+    if vol.sum() < 0:  # faces wound inward
+        vol = -vol
+    bad = vol < 0
+    inverted = float(-vol[bad].sum())
+    vol = np.where(bad, 0.0, vol)
+    if log:
+        log(
+            f"{surf.name}: {fv.shape[0]:,} faces -> {vol.size:,} cells "
+            f"({int(level.min())}-{int(level.max())} cuts along, "
+            f"{int(sheets.min())}-{int(sheets.max())} through)"
+        )
+
+    brick = 4.0 * step
+    near_w = MeshDistance(white, faces)(node_xyz, device, brick_mm=brick)
+    dp = MeshDistance(pial, faces)(node_xyz, device, brick_mm=brick).distance
+    dw = near_w.distance
+    rho = np.clip(dw / np.maximum(dw + dp, 1e-9), 0.0, 1.0).astype(np.float32)
+    del dp, node_xyz
+    near_m = MeshDistance(0.5 * (white + pial), faces)(centre, device, brick_mm=brick)
+    owner = faces[near_m.face, np.argmax(near_m.bary, axis=1)]
+    del near_m
+    keep = vol > 0
+    if surf.cortex is not None:
+        keep &= np.asarray(surf.cortex, bool)[owner]
+    return Tiling(centre, vol, lo_i, rho, near_w.face, near_w.bary, owner, keep, inverted)
+
+
+def equivolume_metric(t: Tiling, surf, smooth_rounds: int = 1, device=None) -> np.ndarray:
+    """Equivolume depth at every node of a tiling: the volume quantile within columns.
+
+    Each cell's volume goes into its two end nodes' columns (half each), spread over
+    the cell's own depth range -- as points at a few discrete depths the column CDF is
+    a staircase. See :func:`surface.volume_depth.volume_quantile_depth` for the column.
+
+    ``smooth_rounds`` pools each column's volume profile with its neighbours' (1-ring
+    rounds). Against a folded synthetic with Bok's exact volumes and FreeSurfer-sized
+    pial slide, 1-2 rounds are the most accurate (error 0.0022, equidistant 0.0259, no
+    pooling 0.0155 although its bins are perfectly equal-volume). On real cortex every
+    round moves the outer bin lighter (~5% at 2), probably pooling across abrupt folding.
+    """
+    import torch
+
+    from fastfuncstuff.surface.volume_depth import column_depth_cdf, column_quantile
+
+    device = device or torch.device("cpu")
+    faces = np.asarray(surf.faces, np.int64)
+    ends = np.r_[t.lo_i, t.lo_i + 1]
+    other = np.r_[t.lo_i + 1, t.lo_i]
+
+    def dev(a):
+        return torch.as_tensor(a, device=device)
+
+    cdf = column_depth_cdf(
+        dev(t.rho[ends]), dev(t.foot_face[ends]), dev(t.foot_bary[ends]), faces,
+        len(surf.white), weight=dev(np.r_[t.volume, t.volume] * 0.5),
+        rho_hi=dev(t.rho[other]), rounds=smooth_rounds,
+    )  # fmt: skip
+    q = column_quantile(cdf, dev(t.rho), dev(t.foot_face), dev(t.foot_bary), faces)
+    return q.cpu().numpy()
+
+
 def ribbon_cells(
     surfaces,
     faces_of: dict[int, np.ndarray],
@@ -166,7 +301,7 @@ def ribbon_cells(
     n_depths: int = 1,
     method: str = "equidistant",
     *,
-    column_voxels: float = 64.0,
+    smooth_rounds: int = 1,
     max_level: int = 32,
     max_sheets: int = 512,
     device=None,
@@ -178,107 +313,32 @@ def ribbon_cells(
     most ``step / 2`` and there are at least two cells per bin. ``surfaces`` are
     :class:`surface.volume_depth.RibbonSurfaces`.
     """
-    import torch
-
-    from fastfuncstuff.surface.volume_depth import column_depth_cdf, column_quantile
-    from fastfuncstuff.surface.voxelize import MeshDistance
-
     if method not in ("equidistant", "equivolume"):
         raise ValueError(f"depth method must be equidistant or equivolume, not {method!r}")
-    device = device or torch.device("cpu")
-    step = float(step)
     parts = []
     inverted = 0.0
     for h, face_idx in faces_of.items():
-        surf = surfaces[h]
-        faces = np.asarray(surf.faces, np.int64)
-        white = np.asarray(surf.white, np.float64)
-        pial = np.asarray(surf.pial, np.float64)
-        fv = faces[np.asarray(face_idx, np.int64)]
-        if fv.size == 0:
+        t = tile_surface(
+            surfaces[h], face_idx, float(step), n_depths,
+            max_level=max_level, max_sheets=max_sheets, device=device, log=log,
+        )  # fmt: skip
+        if t is None:
             continue
-        cw, cp = white[fv], pial[fv]
-        level = np.clip(
-            np.ceil(np.sqrt(np.maximum(_area(cw), _area(cp))) / step), 1, max_level
-        ).astype(np.int64)
-        tau = np.linalg.norm(cp - cw, axis=2).max(axis=1)
-        sheets = np.clip(
-            np.maximum(np.ceil(tau / (0.5 * step)), 2 * n_depths), 2, max_sheets
-        ).astype(np.int64)
-        nodes, centres, vols, lo_idx = [], [], [], []
-        n_nodes = 0
-        for key in np.unique(level * (max_sheets + 1) + sheets):
-            lv, sh = divmod(int(key), max_sheets + 1)
-            sel = np.flatnonzero((level == lv) & (sheets == sh))
-            for nd, ce, vo in _wedges(cw[sel], cp[sel] - cw[sel], lv, sh):
-                nf, nt = vo.shape[:2]
-                base = n_nodes + (np.arange(nf * nt) * (sh + 1))[:, None] + np.arange(sh)
-                nodes.append(nd.reshape(-1, 3))
-                centres.append(ce.reshape(-1, 3))
-                vols.append(vo.reshape(-1))
-                lo_idx.append(base.reshape(-1))
-                n_nodes += nd.shape[0] * nd.shape[1] * nd.shape[2]
-        node_xyz = np.concatenate(nodes)
-        centre = np.concatenate(centres)
-        vol = np.concatenate(vols)
-        lo_i = np.concatenate(lo_idx)
-        del nodes, centres, vols, lo_idx
-        if vol.sum() < 0:  # faces wound inward
-            vol = -vol
-        bad = vol < 0
-        inverted += float(-vol[bad].sum())
-        vol = np.where(bad, 0.0, vol)
-        if log:
-            log(
-                f"{surf.name}: {fv.shape[0]:,} faces -> {vol.size:,} cells "
-                f"({int(level.min())}-{int(level.max())} cuts along, "
-                f"{int(sheets.min())}-{int(sheets.max())} through)"
-            )
-
-        brick = 4.0 * step
-        near_w = MeshDistance(white, faces)(node_xyz, device, brick_mm=brick)
-        dp = MeshDistance(pial, faces)(node_xyz, device, brick_mm=brick).distance
-        dw = near_w.distance
-        rho = np.clip(dw / np.maximum(dw + dp, 1e-9), 0.0, 1.0).astype(np.float32)
-        del dp, node_xyz
-        if method == "equivolume":
-            # Each cell's volume spread over its depth range, half on the white foot of
-            # each of its two faces.
-            ends = np.r_[lo_i, lo_i + 1]
-            other = np.r_[lo_i + 1, lo_i]
-
-            def dev(a):
-                return torch.as_tensor(a, device=device)
-
-            cdf = column_depth_cdf(
-                dev(rho[ends]), dev(near_w.face[ends]), dev(near_w.bary[ends]), faces,
-                len(white), column_voxels, weight=dev(np.r_[vol, vol] * 0.5),
-                rho_hi=dev(rho[other]),
-            )  # fmt: skip
-            metric = (
-                column_quantile(cdf, dev(rho), dev(near_w.face), dev(near_w.bary), faces)
-                .cpu()
-                .numpy()
-            )
-            del cdf, ends, other
-        else:
-            metric = rho
-        del near_w
-
-        near_m = MeshDistance(0.5 * (white + pial), faces)(centre, device, brick_mm=brick)
-        owner = faces[near_m.face, np.argmax(near_m.bary, axis=1)]
-        del near_m
-        keep = vol > 0
-        if surf.cortex is not None:
-            keep &= np.asarray(surf.cortex, bool)[owner]
+        inverted += t.inverted_mm3
+        metric = (
+            equivolume_metric(t, surfaces[h], smooth_rounds, device)
+            if method == "equivolume"
+            else t.rho
+        )
+        k = t.keep
         parts.append(
             RibbonCells(
-                centre[keep],
-                vol[keep],
-                metric[lo_i[keep]],
-                metric[lo_i[keep] + 1],
-                np.full(int(keep.sum()), h, np.int16),
-                owner[keep],
+                t.centre[k],
+                t.volume[k],
+                metric[t.lo_i[k]],
+                metric[t.lo_i[k] + 1],
+                np.full(int(k.sum()), h, np.int16),
+                t.owner[k],
             )  # fmt: skip
         )
     if not parts:

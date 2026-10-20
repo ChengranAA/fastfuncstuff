@@ -46,7 +46,7 @@ def add_ribbon_args(group, *, hemi: bool = True) -> None:
 
 
 def add_depth_args(group) -> None:
-    """Ribbon flags plus ``-depths -equidistant/-equivolume -depth_dxyz -depth_interp``.
+    """Ribbon flags plus ``-depths -equidistant/-equivolume -depth_dxyz -depth_smooth -depth_interp``.
 
     Giving surfaces is what switches depth sampling on: the ROI means are then read
     along the cortical ribbon, one per ROI per depth, instead of over ROI voxels.
@@ -85,6 +85,16 @@ def add_depth_args(group) -> None:
         help="Read spacing along the surface, mm.  The ribbon is cut into cells this "
         "wide, and at most half this thick through the depth with at least 2 per depth "
         "bin.  Each cell counts by its exact volume.  Default: the data's voxel size",
+    )
+    group.add_argument(
+        "-depth_smooth",
+        type=int,
+        default=1,
+        metavar="N",
+        help="With -equivolume: rounds of 1-ring mesh smoothing of each cortical column's "
+        "volume profile.  0 keeps every vertex column on its own (exactly equal-volume bins "
+        "per column, but noisier depths); more pools across neighbours, which cuts noise but "
+        "blurs across abrupt folding (outer bin ~5% light at 2 on real cortex)",
     )
     group.add_argument(
         "-depth_interp",

@@ -41,7 +41,8 @@ class DepthOptions:
     #: Read spacing along the surface, mm (half that through the depth); None is the
     #: data's voxel size.
     dxyz: float | None = None
-    column_voxels: float = 64.0
+    #: Rounds of mesh smoothing of each column's volume profile (equivolume).
+    smooth: int = 1
     #: How each read interpolates the data grid (:data:`READ_KERNELS`).
     interp: str = "cubic"
 
@@ -350,6 +351,8 @@ def build_depth_roi_set(
     files = [paths] if isinstance(paths, str) else list(paths)
     if opts.n_depths < 1:
         raise ValueError("-depths must be at least 1")
+    if opts.smooth < 0:
+        raise ValueError("-depth_smooth must be 0 or more")
     if opts.method not in ("equidistant", "equivolume"):
         raise ValueError(f"depth method must be equidistant or equivolume, not {opts.method!r}")
     if opts.interp not in READ_KERNELS:
@@ -378,7 +381,7 @@ def build_depth_roi_set(
     log: list[str] = []
     cells = ribbon_cells(
         surfaces, faces_of, step, n_depths, opts.method,
-        column_voxels=opts.column_voxels, device=device, log=log.append,
+        smooth_rounds=opts.smooth, device=device, log=log.append,
     )  # fmt: skip
     owned = np.zeros(len(cells), bool)
     for i, m in members.items():
@@ -490,6 +493,7 @@ def options_from_args(args) -> DepthOptions:
         method=str(args.depth_method),
         dxyz=args.depth_dxyz,
         interp=str(getattr(args, "depth_interp", "cubic")),
+        smooth=int(getattr(args, "depth_smooth", 1)),
     )
 
 

@@ -633,3 +633,48 @@ def test_blur_is_recorded_in_the_script(glm_session):
     glm_session.do(SetModeParam("blur", "4"))
     assert "SET_MODE_PARAM blur 4" in glm_session.to_script()
     assert glm_session.mode.params["blur"] == 4.0
+
+
+# -- ROI mode ---------------------------------------------------------------
+
+
+def _rois(tmp_path, shape=(9, 10, 7)):
+    lab = np.zeros(shape, np.int16)
+    lab[2:5, 2:8, 1:6] = 1  # two halves of the bright box
+    lab[5:7, 2:8, 1:6] = 2
+    return str(_write(tmp_path, "rois.nii.gz", lab))
+
+
+def test_roi_mode_paints_each_rois_value_over_its_voxels_and_clears_back(glm_session):
+    mode = _enter(glm_session, show="R2", polort=1)
+    n_vox = mode._fit.prepared.n_voxels
+    glm_session.set_mode_param("rois", _rois(glm_session.tmp))
+    mode = glm_session.mode
+    assert mode._fit is not None and mode._fit.prepared.roi_names is not None
+    assert mode._fit.prepared.n_voxels == 2 < n_vox
+    vol = _map(glm_session)
+    lab = np.asarray(nib.load(_rois(glm_session.tmp)).dataobj)
+    for k in (1, 2):
+        assert np.ptp(vol[lab == k]) == 0.0
+    assert (vol[lab == 0] == 0).all()
+    assert "2 ROIs" in mode.status()
+    glm_session.set_mode_param("rois", "")  # back to voxels
+    assert glm_session.mode._fit.prepared.roi_names is None
+    assert glm_session.mode._fit.prepared.n_voxels == n_vox
+
+
+def test_the_roi_series_is_what_a_click_inside_the_roi_shows(glm_session):
+    _enter(glm_session, polort=1)
+    glm_session.set_mode_param("rois", _rois(glm_session.tmp))
+    lines_a = glm_session.mode.series((3, 3, 2))
+    lines_b = glm_session.mode.series((4, 6, 4))  # the same ROI, elsewhere in it
+    data_a = next(t.values for t in lines_a if t.key == "data")
+    data_b = next(t.values for t in lines_b if t.key == "data")
+    np.testing.assert_allclose(data_a, data_b)
+
+
+def test_an_roi_file_on_the_wrong_grid_is_reported_not_raised(glm_session):
+    _enter(glm_session)
+    glm_session.set_mode_param("rois", _rois(glm_session.tmp, shape=(4, 4, 4)))
+    mode = glm_session.mode
+    assert mode._fit is None and mode._message

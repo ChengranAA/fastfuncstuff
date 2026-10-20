@@ -118,6 +118,8 @@ class InstaGLMMode(Mode):
         self._source_key: str | None = None
         #: The blur the prepared run was gathered at, so a change is detectable.
         self._blur = 0.0
+        #: The ROI file the prepared run was averaged over ("" for voxels).
+        self._rois = ""
         #: ``(first, last, run length)`` the prepared run was cut from.
         self._cut: tuple[int, int, int] = (0, 0, 0)
         self._source_name = ""
@@ -205,6 +207,17 @@ class InstaGLMMode(Mode):
                 help="A BIDS *_events.tsv, or an AFNI timing file as a single condition. "
                 "Without one the model is drift and nuisance only, which is still worth "
                 "looking at.",
+            ),
+            PathControl(
+                name="rois",
+                label="ROIs",
+                filter="ROI label map (*.nii *.nii.gz);;All (*)",
+                newline=True,
+                help="Fit ROI MEANS instead of voxels: a 3-D label map or binary mask on this "
+                "run's grid. Each ROI's voxels are averaged before the fit and every map is "
+                "painted back, so each voxel shows its ROI's value (this is a teaching view of "
+                "-atlas, not a substitute: the viewer only draws voxels). Click a voxel to "
+                "see its ROI's series and fit. Noise PCs are unavailable here.",
             ),
             ChoiceControl(
                 name="basis",
@@ -340,6 +353,7 @@ class InstaGLMMode(Mode):
         return frozenset(
             {
                 "events",
+                "rois",
                 "basis",
                 "hrf_index",
                 "peak",
@@ -419,6 +433,7 @@ class InstaGLMMode(Mode):
         # data and nothing on screen says which one you are looking at.
         if self._prepared is not None and (
             float(self.params.get("blur") or 0.0) != self._blur
+            or str(self.params.get("rois") or "").strip() != self._rois
             or self._cut[:2]
             != (int(self.params.get("drop_first") or 0), int(self.params.get("drop_last") or 0))
         ):
@@ -470,14 +485,23 @@ class InstaGLMMode(Mode):
             return False
         self._cut = (window.start, data.shape[-1] - window.stop, data.shape[-1])
         data = data[..., window]
-        self._prepared = engine.prepare(
-            data,
-            affine=np.asarray(layer.affine, dtype=float),
-            tr=tr,
-            blur_fwhm=float(self.params.get("blur") or 0.0),
-            device=device,
-            progress=progress,
-        )
+        rois = str(self.params.get("rois") or "").strip()
+        try:
+            self._prepared = engine.prepare(
+                data,
+                affine=np.asarray(layer.affine, dtype=float),
+                tr=tr,
+                blur_fwhm=float(self.params.get("blur") or 0.0),
+                rois=rois or None,
+                device=device,
+                progress=progress,
+            )
+        except (OSError, ValueError) as exc:
+            self._message = str(exc)
+            self._prepared = None
+            self._fit = None
+            return False
+        self._rois = rois
         self._blur = float(self.params.get("blur") or 0.0)
         self._source_key = layer.key
         self._source_name = layer.name
@@ -807,7 +831,8 @@ class InstaGLMMode(Mode):
         if self._prepared is None:
             return ""
         gb = self._prepared.bytes / 1e9
-        return f"{self._prepared.n_voxels} voxels, {gb:.2f} GB on {self._prepared.y.device.type}"
+        unit = "ROIs" if self._prepared.roi_names is not None else "voxels"
+        return f"{self._prepared.n_voxels} {unit}, {gb:.2f} GB on {self._prepared.y.device.type}"
 
     def status(self) -> str:
         if self._preparing:

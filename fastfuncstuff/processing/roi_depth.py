@@ -31,6 +31,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from fastfuncstuff.processing.roi_collapse import RoiSet, _gifti_label_table, _stem
+from fastfuncstuff.surface.slab import RibbonCells
 
 
 @dataclass(frozen=True)
@@ -329,6 +330,159 @@ def default_step(data_affine: np.ndarray) -> float:
     return float(abs(np.linalg.det(np.asarray(data_affine, np.float64)[:3, :3])) ** (1 / 3))
 
 
+@dataclass
+class DepthPlan:
+    """ROI x depth reads before any data grid: where to read and how to average.
+
+    ``operator`` is ``(len(rois) * n_depths, len(cells))`` -- each cell's volume,
+    split over the depth bins it spans -- rows ROI-major, depth 1 (deepest) first.
+    """
+
+    rois: list[_Roi]
+    cells: RibbonCells
+    operator: sp.csr_matrix
+    hemi_of: list[str]
+    n_depths: int
+    step: float
+    notes: list[str]
+
+    def columns_per_row(self) -> np.ndarray:
+        """Distinct cortical columns each operator row reads."""
+        key = self.cells.surface.astype(np.int64) * (1 << 40) + self.cells.vertex
+        coo = self.operator.tocoo()
+        on = coo.data > 0
+        pairs = np.unique(np.stack([coo.row[on], key[coo.col[on]]], 1), axis=0)
+        return np.bincount(pairs[:, 0], minlength=self.operator.shape[0])
+
+
+def _check_options(opts: DepthOptions) -> None:
+    if opts.n_depths < 1:
+        raise ValueError("-depths must be at least 1")
+    if opts.smooth < 0:
+        raise ValueError("-depth_smooth must be 0 or more")
+    if opts.method not in ("equidistant", "equivolume"):
+        raise ValueError(f"depth method must be equidistant or equivolume, not {opts.method!r}")
+    if opts.interp not in READ_KERNELS:
+        raise ValueError(f"read interpolation must be one of {READ_KERNELS}, not {opts.interp!r}")
+
+
+def read_depth_rois(files: list[str], surfaces, notes: list[str]) -> list[_Roi]:
+    """The ROIs of ``files`` that cover any vertex of ``surfaces``."""
+    rois = [
+        r for r in _read_rois(files, surfaces, notes) if any(m.any() for m in r.members.values())
+    ]
+    if not rois:
+        raise ValueError("no ROI covers any vertex of the surfaces given")
+    return rois
+
+
+def _faces_of(rois: list[_Roi], surfaces) -> dict[int, np.ndarray]:
+    """Faces to tile per surface so every cell the ROIs' columns own is among them."""
+    from fastfuncstuff.surface.slab import patch_faces
+
+    members: dict[int, np.ndarray] = {}
+    for r in rois:
+        for i, m in r.members.items():
+            members[i] = members.get(i, np.zeros(m.size, bool)) | m
+    out = {}
+    for i, m in sorted(members.items()):
+        if m.any():
+            s = surfaces[i]
+            column = np.linalg.norm(np.asarray(s.pial) - np.asarray(s.white), axis=1)[m].max()
+            out[i] = patch_faces(s, np.flatnonzero(m), float(column) + 3.0)
+    return out
+
+
+def tile_costs(
+    rois: list[_Roi], surfaces, step: float, n_depths: int, through: float
+) -> np.ndarray:
+    """Cells it takes to tile each ROI on its own, from the cut rule (nothing is built)."""
+    from fastfuncstuff.surface.slab import estimate_cells
+
+    cost = np.zeros(len(rois), np.int64)
+    for k, r in enumerate(rois):
+        for i, f in _faces_of([r], surfaces).items():
+            cost[k] += estimate_cells(surfaces[i], f, step, n_depths, through=through)
+    return cost
+
+
+def pass_groups(costs: np.ndarray, max_reads: int | None) -> list[list[int]]:
+    """Split ROIs into passes of at most ``max_reads`` cells (first fit, largest first).
+
+    A pass tiles, reads and discards its own ribbon, so memory follows the cap and not
+    the number of ROIs. An ROI whose own tiling exceeds the cap gets a pass of its own
+    (the caller decides whether that is acceptable).
+    """
+    order = list(np.argsort(-costs, kind="stable"))
+    if not max_reads or int(costs.sum()) <= max_reads:
+        return [list(range(len(costs)))]
+    groups: list[list[int]] = []
+    load: list[int] = []
+    for k in order:
+        for g, used in enumerate(load):
+            if used + int(costs[k]) <= max_reads:
+                groups[g].append(int(k))
+                load[g] += int(costs[k])
+                break
+        else:
+            groups.append([int(k)])
+            load.append(int(costs[k]))
+    return [sorted(g) for g in groups]
+
+
+def plan_depth_rois(
+    rois: list[_Roi],
+    surfaces,
+    step: float,
+    opts: DepthOptions = DepthOptions(),
+    *,
+    through: float = 0.5,
+    device=None,
+) -> DepthPlan:
+    """Tile the ribbon under ``rois`` and cut it into ROI x depth operator rows."""
+    from fastfuncstuff.surface.slab import ribbon_cells
+
+    _check_options(opts)
+    n_depths = opts.n_depths
+    faces_of = _faces_of(rois, surfaces)
+    log: list[str] = []
+    cells = ribbon_cells(
+        surfaces, faces_of, step, n_depths, opts.method,
+        smooth_rounds=opts.smooth, through=through, device=device, log=log.append,
+    )  # fmt: skip
+    members: dict[int, np.ndarray] = {}
+    for r in rois:
+        for i, m in r.members.items():
+            members[i] = members.get(i, np.zeros(m.size, bool)) | m
+    owned = np.zeros(len(cells), bool)
+    for i, m in members.items():
+        here = cells.surface == i
+        owned[here] = m[cells.vertex[here]]
+    inverted = cells.inverted_mm3
+    cells = cells.subset(owned)
+    cells.inverted_mm3 = inverted
+    if not len(cells):
+        raise ValueError("no ribbon under the ROIs: are the surfaces' cortex labels right?")
+    cell, k_bin, share = cells.bin_shares(n_depths)
+
+    rows_i, cols_i, vals, hemi_of = [], [], [], []
+    for r_idx, roi in enumerate(rois):
+        inside = np.zeros(len(cells), bool)
+        for i, member in roi.members.items():
+            here = cells.surface == i
+            inside[here] = member[cells.vertex[here]]
+        pick = np.flatnonzero(inside[cell])
+        hemi_of.append("+".join(sorted({surfaces[int(i)].name for i in np.unique(cells.surface[inside])})) or "-")  # fmt: skip
+        rows_i.append(r_idx * n_depths + k_bin[pick])
+        cols_i.append(cell[pick])
+        vals.append(cells.volume[cell[pick]] * share[pick])
+    operator = sp.csr_matrix(
+        (np.concatenate(vals), (np.concatenate(rows_i), np.concatenate(cols_i))),
+        shape=(len(rois) * n_depths, len(cells)),
+    )
+    return DepthPlan(rois, cells, operator, hemi_of, n_depths, step, [ln.strip() for ln in log])
+
+
 def build_depth_roi_set(
     paths: str | list[str],
     surfaces,
@@ -346,68 +500,19 @@ def build_depth_roi_set(
     grid) limits which voxels are ever read. Rows run ROI-major, depth 1 (deepest,
     by white matter) to ``n_depths`` (by pial).
     """
-    from fastfuncstuff.surface.slab import patch_faces, ribbon_cells
-
     files = [paths] if isinstance(paths, str) else list(paths)
-    if opts.n_depths < 1:
-        raise ValueError("-depths must be at least 1")
-    if opts.smooth < 0:
-        raise ValueError("-depth_smooth must be 0 or more")
-    if opts.method not in ("equidistant", "equivolume"):
-        raise ValueError(f"depth method must be equidistant or equivolume, not {opts.method!r}")
-    if opts.interp not in READ_KERNELS:
-        raise ValueError(f"read interpolation must be one of {READ_KERNELS}, not {opts.interp!r}")
+    _check_options(opts)
     shape3 = tuple(int(n) for n in data_shape[:3])
     aff = np.asarray(data_affine, np.float64)
     mask3 = None if mask is None else np.asarray(mask).astype(bool).reshape(shape3)
     notes: list[str] = []
-    rois = _read_rois(files, surfaces, notes)
-    rois = [r for r in rois if any(m.any() for m in r.members.values())]
-    if not rois:
-        raise ValueError("no ROI covers any vertex of the surfaces given")
-
+    rois = read_depth_rois(files, surfaces, notes)
     step = opts.dxyz or default_step(aff)
     n_depths = opts.n_depths
-    members: dict[int, np.ndarray] = {}
-    for r in rois:
-        for i, m in r.members.items():
-            members[i] = members.get(i, np.zeros(m.size, bool)) | m
-    faces_of = {}
-    for i, m in sorted(members.items()):
-        if m.any():
-            s = surfaces[i]
-            column = np.linalg.norm(np.asarray(s.pial) - np.asarray(s.white), axis=1)[m].max()
-            faces_of[i] = patch_faces(s, np.flatnonzero(m), float(column) + 3.0)
-    log: list[str] = []
-    cells = ribbon_cells(
-        surfaces, faces_of, step, n_depths, opts.method,
-        smooth_rounds=opts.smooth, device=device, log=log.append,
-    )  # fmt: skip
-    owned = np.zeros(len(cells), bool)
-    for i, m in members.items():
-        here = cells.surface == i
-        owned[here] = m[cells.vertex[here]]
-    cells = cells.subset(owned)
-    if not len(cells):
-        raise ValueError("no ribbon under the ROIs: are the surfaces' cortex labels right?")
-    cell, k_bin, share = cells.bin_shares(n_depths)
-
-    rows_i, cols_i, vals, hemi_of = [], [], [], []
-    for r_idx, roi in enumerate(rois):
-        inside = np.zeros(len(cells), bool)
-        for i, member in roi.members.items():
-            here = cells.surface == i
-            inside[here] = member[cells.vertex[here]]
-        pick = np.flatnonzero(inside[cell])
-        hemi_of.append("+".join(sorted({surfaces[int(i)].name for i in np.unique(cells.surface[inside])})) or "-")  # fmt: skip
-        rows_i.append(r_idx * n_depths + k_bin[pick])
-        cols_i.append(cell[pick])
-        vals.append(cells.volume[cell[pick]] * share[pick])
-    n_rows = len(rois) * n_depths
-    operator = sp.csr_matrix(
-        (np.concatenate(vals), (np.concatenate(rows_i), np.concatenate(cols_i))),
-        shape=(n_rows, len(cells)),
-    )
+    plan = plan_depth_rois(rois, surfaces, step, opts, device=device)
+    cells, operator, hemi_of = plan.cells, plan.operator, plan.hemi_of
+    n_rows = operator.shape[0]
+    log = plan.notes
     n_vox = int(np.prod(shape3))
     w, dropped = _compose(operator, cells.centre, aff, shape3, opts.interp, mask3, n_vox)
     inv = np.linalg.inv(aff)
@@ -442,8 +547,10 @@ def build_depth_roi_set(
     total_mm3 = float(cells.volume.sum())
     lost_fov = float(cells.volume[off_grid].sum())
     lost_mask = float(cells.volume[dropped & ~off_grid].sum())
-    names_used = ", ".join(surfaces[i].name for i in faces_of)
-    notes += [line.strip() for line in log]
+    names_used = ", ".join(
+        surfaces[i].name for i in sorted({i for r in rois for i, m in r.members.items() if m.any()})
+    )
+    notes += log
     notes += [
         f"depth sampling: {len(rois)} ROI(s) x {n_depths} {opts.method} depth(s) along the "
         f"{names_used} ribbon; depth 1 = deepest (white matter side), depth_frac = bin "
@@ -553,9 +660,14 @@ def _surface_data(header) -> bool:
 
 __all__ = [
     "DepthOptions",
+    "DepthPlan",
     "build_depth_roi_set",
     "READ_KERNELS",
     "default_step",
+    "pass_groups",
+    "plan_depth_rois",
+    "read_depth_rois",
+    "tile_costs",
     "options_from_args",
     "roi_set_from_args",
 ]

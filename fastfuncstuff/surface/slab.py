@@ -35,7 +35,9 @@ import numpy as np
 __all__ = [
     "RibbonCells",
     "Tiling",
+    "cuts",
     "equivolume_metric",
+    "estimate_cells",
     "patch_faces",
     "ribbon_cells",
     "tile_surface",
@@ -184,12 +186,53 @@ class Tiling:
     inverted_mm3: float
 
 
+def cuts(white, pial, step: float, n_depths: int, through: float, max_level: int, max_sheets: int):
+    """``(L, S)`` per face: cuts along the surface and sheets through the depth.
+
+    ``through`` is the thickest a sheet may be as a fraction of ``step`` (0.5 by
+    default; it is the one dial that can be relaxed to fit a read budget -- along the
+    surface a read stands for at most one voxel face, or voxels go unread), and there
+    are always at least two sheets per bin.
+    """
+    cw, cp = white, pial
+    level = np.clip(np.ceil(np.sqrt(np.maximum(_area(cw), _area(cp))) / step), 1, max_level).astype(
+        np.int64
+    )
+    tau = np.linalg.norm(cp - cw, axis=2).max(axis=1)
+    sheets = np.clip(
+        np.maximum(np.ceil(tau / (through * step)), 2 * n_depths), 2, max_sheets
+    ).astype(np.int64)
+    return level, sheets
+
+
+def estimate_cells(
+    surf,
+    face_idx: np.ndarray,
+    step: float,
+    n_depths: int = 1,
+    *,
+    through: float = 0.5,
+    max_level: int = 32,
+    max_sheets: int = 512,
+) -> int:
+    """How many cells :func:`tile_surface` would make over ``face_idx``, without making them."""
+    fv = np.asarray(surf.faces, np.int64)[np.asarray(face_idx, np.int64)]
+    if fv.size == 0:
+        return 0
+    level, sheets = cuts(
+        np.asarray(surf.white, np.float64)[fv], np.asarray(surf.pial, np.float64)[fv],
+        step, n_depths, through, max_level, max_sheets,
+    )  # fmt: skip
+    return int((level * level * sheets).sum())
+
+
 def tile_surface(
     surf,
     face_idx: np.ndarray,
     step: float,
     n_depths: int = 1,
     *,
+    through: float = 0.5,
     max_level: int = 32,
     max_sheets: int = 512,
     device=None,
@@ -302,6 +345,7 @@ def ribbon_cells(
     method: str = "equidistant",
     *,
     smooth_rounds: int = 1,
+    through: float = 0.5,
     max_level: int = 32,
     max_sheets: int = 512,
     device=None,
@@ -320,7 +364,7 @@ def ribbon_cells(
     for h, face_idx in faces_of.items():
         t = tile_surface(
             surfaces[h], face_idx, float(step), n_depths,
-            max_level=max_level, max_sheets=max_sheets, device=device, log=log,
+            through=through, max_level=max_level, max_sheets=max_sheets, device=device, log=log,
         )  # fmt: skip
         if t is None:
             continue

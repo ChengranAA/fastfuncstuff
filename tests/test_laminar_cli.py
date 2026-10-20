@@ -132,3 +132,29 @@ def test_a_measured_psf_matrix_is_matched_by_roi_and_k(reference, tmp_path, caps
     other = write_depth_psf(str(tmp_path / "k7_depth_psf.tsv"), [("V1", "lh", np.eye(7))], [1])
     assert laminar.main([*base, "-psf_matrix", other]) == 1
     assert "K = [9]" in capsys.readouterr().err
+
+
+def test_padding_is_explicit_and_only_the_reference_prior_feels_it(reference, tmp_path):
+    """The padding rows are masked out of the fit, but the reference centres the noise
+    prior on the variance of the whole padded series -- so the default F moves with the
+    padding's draw and amplitude, and -hyperprior rows removes the dependence entirely."""
+    o, a, b, kern = reference
+
+    def run(tag, *extra):
+        prefix = str(tmp_path / tag)
+        base = ["-cond1", str(a), "-cond2", str(b), "-duration", "1.6", "-models", "null",
+                "-max_iter", "3", "-workers", "1", "-verb", "0", "-prefix", prefix]  # fmt: skip
+        assert laminar.main([*base, *extra]) == 0
+        _, rows = _table(f"{prefix}_laminar_models.tsv")
+        return float(rows[0][4]), json.load(open(f"{prefix}_laminar.json"))
+
+    f1, doc = run("s1", "-pad_seed", "1")
+    f2, _ = run("s2", "-pad_seed", "2")
+    f3, _ = run("s3", "-pad_sd", "0.3")
+    assert f1 != f2 and f1 != f3  # the reference prior sees the padding
+    assert doc["padding"] == {"rows": 20, "sd": 0.1, "seed": 1, "hyperprior": "reference"}
+    r1, doc = run("r1", "-pad_seed", "1", "-hyperprior", "rows")
+    r2, _ = run("r2", "-pad_seed", "2", "-hyperprior", "rows")
+    r3, _ = run("r3", "-pad_rows", "30", "-pad_sd", "0.3", "-hyperprior", "rows")
+    assert r1 == pytest.approx(r2, rel=1e-9) == pytest.approx(r3, rel=1e-9)
+    assert doc["padding"]["hyperprior"] == "rows"

@@ -206,6 +206,7 @@ def _vl_coroutine(
     rows: torch.Tensor | None = None,
     max_iter: int = 128,
     verbose: bool = False,
+    hyper_from_rows: bool = False,
 ):
     """The Variational Laplace scheme, with the forward model lifted out.
 
@@ -246,8 +247,13 @@ def _vl_coroutine(
     # --- noise model: one log-precision per depth --------------------------
     nh = K
     if priors.hE is None:
-        # SPM's default: centre the precision on the data's own variance.
-        hE = torch.full((nh,), 4.0 - float(torch.log(y.var())), dtype=dtype, device=device)
+        # SPM's default: centre the precision on the data's own variance. The reference
+        # takes it over the WHOLE padded vector, masked rows included, so its free energy
+        # moves with the padding's amplitude and draw (~1 nat; the model comparison ~0.2).
+        # ``hyper_from_rows`` takes it over the fitted rows only: the padding then affects
+        # nothing at all. Off by default -- parity with the published analysis.
+        var = yv.var() if hyper_from_rows else y.var()
+        hE = torch.full((nh,), 4.0 - float(torch.log(var)), dtype=dtype, device=device)
     else:
         hE = priors.hE.to(dtype=dtype, device=device).expand(nh).clone()
     ihC = (
@@ -457,6 +463,7 @@ def variational_laplace(
     kernel: torch.Tensor | None = None,
     max_iter: int = 128,
     verbose: bool = False,
+    hyper_from_rows: bool = False,
     **integrate_kwargs,
 ) -> VLResult:
     """Invert the laminar model against one depth-resolved data matrix.
@@ -473,7 +480,10 @@ def variational_laplace(
     :class:`VLResult`, whose ``F`` is the quantity model comparison ranks.
     """
     n_scans = int(y.shape[0])
-    co = _vl_coroutine(spec, priors, y, rows=rows, max_iter=max_iter, verbose=verbose)
+    co = _vl_coroutine(
+        spec, priors, y, rows=rows, max_iter=max_iter, verbose=verbose,
+        hyper_from_rows=hyper_from_rows,
+    )  # fmt: skip
     try:
         full = next(co)
         while True:
@@ -496,6 +506,7 @@ def variational_laplace_lockstep(
     kernel: torch.Tensor | None = None,
     max_iter: int = 128,
     progress: bool = False,
+    hyper_from_rows: bool = False,
     **integrate_kwargs,
 ) -> list[VLResult]:
     """Invert many models, or many datasets, sharing the forward model.
@@ -536,7 +547,7 @@ def variational_laplace_lockstep(
             raise ValueError(f"dataset {i} has {int(y.shape[0])} scans, expected {n_scans}")
 
     coroutines = [
-        _vl_coroutine(spec, pr, y, rows=rows, max_iter=max_iter)
+        _vl_coroutine(spec, pr, y, rows=rows, max_iter=max_iter, hyper_from_rows=hyper_from_rows)
         for pr, y in zip(priors_list, y_list, strict=True)
     ]
     results: list[VLResult | None] = [None] * len(coroutines)

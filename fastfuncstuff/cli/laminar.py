@@ -66,8 +66,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="ROIs to fit, by id or name (default: every ROI in every table).")  # fmt: skip
     g.add_argument("-hemi", default=None, choices=("lh", "rh"),
                    help="Hemisphere, when an ROI name is in both.")  # fmt: skip
-    g.add_argument("-gap", type=int, default=20, help="Masked white-noise rows between conditions.")
-    g.add_argument("-seed", type=int, default=20260918, help="Seed of the padding noise.")
+    pad = p.add_argument_group(
+        "Padding between the two conditions",
+        "The two responses are fitted as one series, separated by rows of noise the fit "
+        "ignores: the padding exists so the model returns to baseline between the "
+        "responses instead of bridging them.  Each row is one sample of the curves (the "
+        "TENT knot spacing), so the default 20 rows is 20 knots of quiet.",
+    )
+    pad.add_argument("-pad_rows", "-gap", dest="pad_rows", type=int, default=20, metavar="N",
+                     help="Rows of padding between the conditions (default 20, the reference's).")  # fmt: skip
+    pad.add_argument("-pad_sd", type=float, default=0.1, metavar="PCT",
+                     help="Standard deviation of the padding noise, in percent signal change "
+                     "(default 0.1, the reference's).")  # fmt: skip
+    pad.add_argument("-pad_seed", "-seed", dest="pad_seed", type=int, default=20260918, metavar="N",
+                     help="Seed of the padding noise.")  # fmt: skip
+    pad.add_argument("-hyperprior", choices=("reference", "rows"), default="reference",
+                     help="Where the noise prior's centre comes from.  'reference': the "
+                     "variance of the whole padded series, as the published analysis does -- "
+                     "so -pad_sd and -pad_seed move the absolute free energy (~1 nat; the model "
+                     "comparison ~0.2).  'rows': the fitted rows only -- the padding then "
+                     "changes nothing, but F is no longer comparable with published values.")  # fmt: skip
 
     psf = p.add_argument_group("Depth point-spread function")
     one = psf.add_mutually_exclusive_group()
@@ -193,8 +211,9 @@ def main(argv: list[str] | None = None) -> int:
                     pick_roi(two[k], rid, hemi),
                     duration=args.duration,
                     n_neuronal=args.N,
-                    gap=args.gap,
-                    seed=args.seed,
+                    gap=args.pad_rows,
+                    seed=args.pad_seed,
+                    noise_sd=args.pad_sd,
                     delay_seconds=delay,
                     TE=args.TE,
                     B0=args.B0,
@@ -203,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                 for k in ks
             }
             kw = {"free_energy": args.free_energy, "max_iter": args.max_iter,
+                  "hyper_from_rows": args.hyperprior == "rows",
                   "roi": rid, "name": name, "hemi": hemi}  # fmt: skip
             jobs.append((data_for_k, _kernels(args, ks, name, hemi), targets, names, kw))
     except (OSError, ValueError) as exc:
@@ -230,7 +250,9 @@ def main(argv: list[str] | None = None) -> int:
         provenance={"cond1": args.cond1, "cond2": args.cond2, "duration": args.duration,
                     "K": ks, "psf": psf, "psf_matrix": args.psf_matrix,
                     "psf_kernel": args.psf_kernel, "psf_variance": args.psf_variance,
-                    "psf_raw": args.psf_raw, "models": names, "free_energy": args.free_energy,
+                    "psf_raw": args.psf_raw, "models": names,
+                    "padding": {"rows": args.pad_rows, "sd": args.pad_sd, "seed": args.pad_seed,
+                                "hyperprior": args.hyperprior}, "free_energy": args.free_energy,
                     "delay_seconds": "TR/2" if delay is None else delay, "TE": args.TE,
                     "B0": args.B0, "p0": "reference driver (V0t 3, nr 3, al_v 0.35, w_v 0.5)"},
     )  # fmt: skip

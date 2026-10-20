@@ -85,6 +85,7 @@ def fit_roi(
     names: list[str] | None = None,
     free_energy: str = "reference",
     max_iter: int = 128,
+    hyper_from_rows: bool = False,
     roi: str = "",
     name: str = "",
     hemi: str = "",
@@ -122,6 +123,7 @@ def fit_roi(
         free_energy=free_energy,
         progress=False,
         max_iter=max_iter,
+        hyper_from_rows=hyper_from_rows,
         **ikw,
     )  # fmt: skip
     F = np.array([float(a.F) for a in averaged])

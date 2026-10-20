@@ -183,3 +183,39 @@ def test_label_coordinates_pick_and_check_the_hemisphere(tmp_path):
         build_depth_roi_set(
             str(tmp_path / "bad.lh.label"), surfaces, img.affine, img.shape, opts=opts
         )
+
+
+def test_the_sampling_matrix_predicts_what_the_depth_read_measures(sphere, tmp_path):
+    """A voxel integrates the depths inside it; the ROI read then interpolates and
+    averages. The sampling matrix claims to be that whole path for a depth profile
+    that is the same along the cortex -- so build such data the slow, independent way
+    (supersample every voxel) and the real read must land on M @ profile."""
+    from fastfuncstuff.processing.roi_depth import depth_sampling_matrices
+
+    surf, affine, shape, _, v = sphere
+    k = 3
+    profile = np.array([1.0, 3.0, 2.0])  # deep -> superficial
+    s = 6
+    sub = (np.arange(s) + 0.5) / s - 0.5
+    off = np.stack(np.meshgrid(sub, sub, sub, indexing="ij"), -1).reshape(-1, 3) * 2.0
+    ijk = np.stack(np.meshgrid(*[np.arange(shape[0])] * 3, indexing="ij"), -1).reshape(-1, 3)
+    centre = ijk @ affine[:3, :3].T + affine[:3, 3]
+    r = np.linalg.norm(centre[:, None, :] + off[None], axis=2)  # (voxels, s^3)
+    b = np.ceil((r - RW) / (RP - RW) * k).astype(int)
+    val = np.where((r > RW) & (r <= RP), profile[np.clip(b, 1, k) - 1], 0.0).mean(axis=1)
+    data = np.stack([val, 2 * val], 1).astype(np.float32)
+
+    cap = np.flatnonzero(v[:, 2] > 0.3)
+    label = _all_label(tmp_path, len(v), cap)
+    opts = DepthOptions(n_depths=k, dxyz=1.0)
+    roi_set = build_depth_roi_set(label, [surf], affine, shape, opts=opts, device=CPU)
+    measured = _means(roi_set, data)[:, 0]
+
+    (name, hemi, m_raw), = depth_sampling_matrices(
+        label, [surf], affine, shape, opts, normalise=False, device=CPU
+    )  # fmt: skip
+    np.testing.assert_allclose(m_raw @ profile, measured, rtol=0.03)
+    # Depth mixing is real at 2 mm voxels for 2 mm bins, and strongest off the diagonal.
+    assert (np.diag(m_raw) > m_raw.sum(axis=1) * 0.4).all() and m_raw[0, 1] > 0.05
+    ((_, _, m),) = depth_sampling_matrices(label, [surf], affine, shape, opts, device=CPU)
+    np.testing.assert_allclose(m.sum(axis=1), 1.0, rtol=1e-9)

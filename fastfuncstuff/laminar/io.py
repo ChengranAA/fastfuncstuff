@@ -173,4 +173,21 @@ def two_condition_data(
     )
 
 
-__all__ = ["DepthCurves", "LaminarData", "pick_roi", "read_iresp_table", "two_condition_data"]
+def model_kernel(matrix_deep_first: np.ndarray, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    """A ``(K, K)`` depth sampling matrix from
+    :func:`processing.roi_depth.depth_sampling_matrices` (depth 1 deepest, as the
+    toolbox writes it) in the model's superficial-first order, ready for ``kernel=``."""
+    m = np.asarray(matrix_deep_first, np.float64)
+    if m.ndim != 2 or m.shape[0] != m.shape[1] or not np.isfinite(m).all():
+        raise ValueError("a depth sampling matrix must be a finite (K, K) array")
+    return torch.as_tensor(m[::-1, ::-1].copy(), dtype=dtype)
+
+
+__all__ = [
+    "DepthCurves",
+    "LaminarData",
+    "model_kernel",
+    "pick_roi",
+    "read_iresp_table",
+    "two_condition_data",
+]

@@ -345,6 +345,9 @@ class DepthPlan:
     n_depths: int
     step: float
     notes: list[str]
+    #: The whole tiling before cells were kept for their owners (``keep_all``): the
+    #: ribbon around the ROIs as well, which shares their voxels.
+    all_cells: RibbonCells | None = None
 
     def columns_per_row(self) -> np.ndarray:
         """Distinct cortical columns each operator row reads."""
@@ -376,8 +379,9 @@ def read_depth_rois(files: list[str], surfaces, notes: list[str]) -> list[_Roi]:
     return rois
 
 
-def _faces_of(rois: list[_Roi], surfaces) -> dict[int, np.ndarray]:
-    """Faces to tile per surface so every cell the ROIs' columns own is among them."""
+def _faces_of(rois: list[_Roi], surfaces, halo_mm: float = 3.0) -> dict[int, np.ndarray]:
+    """Faces to tile per surface so every cell the ROIs' columns own is among them
+    (``halo_mm`` beyond a column's length)."""
     from fastfuncstuff.surface.slab import patch_faces
 
     members: dict[int, np.ndarray] = {}
@@ -389,7 +393,7 @@ def _faces_of(rois: list[_Roi], surfaces) -> dict[int, np.ndarray]:
         if m.any():
             s = surfaces[i]
             column = np.linalg.norm(np.asarray(s.pial) - np.asarray(s.white), axis=1)[m].max()
-            out[i] = patch_faces(s, np.flatnonzero(m), float(column) + 3.0)
+            out[i] = patch_faces(s, np.flatnonzero(m), float(column) + halo_mm)
     return out
 
 
@@ -437,6 +441,8 @@ def plan_depth_rois(
     opts: DepthOptions = DepthOptions(),
     *,
     through: float = 0.5,
+    halo_mm: float = 3.0,
+    keep_all: bool = False,
     device=None,
 ) -> DepthPlan:
     """Tile the ribbon under ``rois`` and cut it into ROI x depth operator rows."""
@@ -444,7 +450,7 @@ def plan_depth_rois(
 
     _check_options(opts)
     n_depths = opts.n_depths
-    faces_of = _faces_of(rois, surfaces)
+    faces_of = _faces_of(rois, surfaces, halo_mm)
     log: list[str] = []
     cells = ribbon_cells(
         surfaces, faces_of, step, n_depths, opts.method,
@@ -459,6 +465,7 @@ def plan_depth_rois(
         here = cells.surface == i
         owned[here] = m[cells.vertex[here]]
     inverted = cells.inverted_mm3
+    everything = cells if keep_all else None
     cells = cells.subset(owned)
     cells.inverted_mm3 = inverted
     if not len(cells):
@@ -480,7 +487,9 @@ def plan_depth_rois(
         (np.concatenate(vals), (np.concatenate(rows_i), np.concatenate(cols_i))),
         shape=(len(rois) * n_depths, len(cells)),
     )
-    return DepthPlan(rois, cells, operator, hemi_of, n_depths, step, [ln.strip() for ln in log])
+    return DepthPlan(
+        rois, cells, operator, hemi_of, n_depths, step, [ln.strip() for ln in log], everything
+    )
 
 
 def build_depth_roi_set(
@@ -594,6 +603,84 @@ def build_depth_roi_set(
     )  # fmt: skip
 
 
+def depth_sampling_matrices(
+    paths: str | list[str],
+    surfaces,
+    data_affine: np.ndarray,
+    data_shape: tuple[int, ...],
+    opts: DepthOptions = DepthOptions(),
+    *,
+    normalise: bool = True,
+    device=None,
+) -> list[tuple[str, str, np.ndarray]]:
+    """How each measured depth bin mixes the true depths: ``(name, hemi, M)`` per ROI.
+
+    ``M[k, j]`` (``K x K``, **depth 1 deepest first**, as the tables are) is the share
+    of measured bin ``k`` that comes from true depth ``j`` when the data are on
+    ``(data_affine, data_shape)`` and read as :func:`build_depth_roi_set` reads them.
+    A voxel holds the volume of each true depth inside it (the box the voxel
+    integrates over); the ROI's reads interpolate those voxels with ``opts.interp``
+    and average with the cells' volumes. So ``M @ profile`` is what the pipeline
+    measures for a depth profile that is the same along the cortex -- the laminar
+    model's depth point-spread function, computed for this sampling rather than
+    fitted as a Gaussian.
+
+    Rows sum to the share of the read voxels that is cortex; ``normalise`` scales
+    them to 1, the reference's convention (no dilution by white matter or CSF). The
+    unnormalised form assumes every tissue has the same baseline signal per volume,
+    which CSF does not -- so it is the cautious one only for its shape.
+    """
+    files = [paths] if isinstance(paths, str) else list(paths)
+    _check_options(opts)
+    shape3 = tuple(int(n) for n in data_shape[:3])
+    aff = np.asarray(data_affine, np.float64)
+    notes: list[str] = []
+    rois = read_depth_rois(files, surfaces, notes)
+    step = opts.dxyz or default_step(aff)
+    k_n = opts.n_depths
+    vox = default_step(aff)
+    reach = 2 if opts.interp == "linear" else (_half(opts.interp) + 1)
+    # The halo must hold every cell inside any voxel the reads touch: the kernel's reach
+    # beyond the ROI's own voxels, plus a voxel, plus the usual pial slide margin.
+    plan = plan_depth_rois(
+        rois, surfaces, step, opts, halo_mm=3.0 + (reach + 1) * vox, keep_all=True, device=device
+    )
+    n_vox = int(np.prod(shape3))
+    w, _ = _compose(plan.operator, plan.cells.centre, aff, shape3, opts.interp, None, n_vox)
+    touched = np.flatnonzero(np.asarray((w != 0).sum(axis=0)).ravel() > 0)
+
+    every = plan.all_cells
+    assert every is not None
+    inv = np.linalg.inv(aff)
+    ijk = np.rint(every.centre @ inv[:3, :3].T + inv[:3, 3]).astype(np.int64)
+    inside = np.all((ijk >= 0) & (ijk < np.asarray(shape3)), axis=1)
+    flat = np.full(len(every), -1, np.int64)
+    flat[inside] = np.ravel_multi_index(tuple(ijk[inside].T), shape3)
+    slot = np.searchsorted(touched, flat)
+    hit = (
+        (flat >= 0) & (slot < touched.size) & (touched[np.minimum(slot, touched.size - 1)] == flat)
+    )
+    cell, k_bin, share = every.bin_shares(k_n)
+    keep = hit[cell]
+    v = np.zeros((touched.size, k_n))
+    np.add.at(v, (slot[cell[keep]], k_bin[keep]), every.volume[cell[keep]] * share[keep])
+    v /= abs(np.linalg.det(aff[:3, :3]))
+
+    wt = w[:, touched]
+    total = np.asarray(w.sum(axis=1)).ravel()
+    mixed = np.asarray(wt @ v)  # (rows, K)
+    out = []
+    for r_idx, roi in enumerate(rois):
+        rows = slice(r_idx * k_n, (r_idx + 1) * k_n)
+        m = np.divide(mixed[rows], total[rows, None], out=np.full((k_n, k_n), np.nan),
+                      where=total[rows, None] > 0)  # fmt: skip
+        if normalise:
+            s = m.sum(axis=1, keepdims=True)
+            m = np.divide(m, s, out=np.full_like(m, np.nan), where=s > 0)
+        out.append((roi.name, plan.hemi_of[r_idx], m))
+    return out
+
+
 def options_from_args(args) -> DepthOptions:
     return DepthOptions(
         n_depths=int(args.depths),
@@ -670,6 +757,7 @@ __all__ = [
     "build_depth_roi_set",
     "READ_KERNELS",
     "default_step",
+    "depth_sampling_matrices",
     "pass_groups",
     "plan_depth_rois",
     "read_depth_rois",

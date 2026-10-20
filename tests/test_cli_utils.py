@@ -363,6 +363,27 @@ def test_ortvec_glob_missing_label_is_named_not_unrecognized(capsys):
     parser.add_argument("-round_durations", type=int)
     with pytest.raises(SystemExit):
         parser.parse_args(["-ortvec_glob", "m_*.1D", "-round_durations", "1"])
-    assert "left out the LABEL" in capsys.readouterr().err
+    assert "left one out" in capsys.readouterr().err
     ok = parser.parse_args(["-ortvec_glob", "m_*.1D", "motion", "-round_durations", "1"])
     assert ok.ortvec_glob == [["m_*.1D", "motion"]]
+
+
+@pytest.mark.parametrize(
+    "flag,good",
+    [
+        ("-ortvec", ["m.1D", "motion"]),
+        ("-ortvec_run", ["m.1D", "motion", "1"]),
+        ("-ortvec_concat", ["m*.1D", "motion"]),
+    ],
+)
+def test_other_ortvec_flags_reject_a_swallowed_flag(flag, good, capsys):
+    from fastfuncstuff.cli_help import FfsArgumentParser
+    from fastfuncstuff.cli_utils import add_ortvec_arguments
+
+    parser = FfsArgumentParser()
+    add_ortvec_arguments(parser)
+    parser.add_argument("-round_durations", type=int)
+    with pytest.raises(SystemExit):
+        parser.parse_args([flag, *good[:-1], "-round_durations", "1"])
+    assert "left one out" in capsys.readouterr().err
+    assert parser.parse_args([flag, *good, "-round_durations", "1"]).round_durations == 1

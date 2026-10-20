@@ -1748,17 +1748,24 @@ def make_nuisance_block_from_glob(
     )
 
 
-def _ortvec_glob_value(value: str) -> str:
-    # argparse hands a following flag to a nargs=2 option when the LABEL is missing
-    # (`-ortvec_glob PATTERN -round_durations 1` -> LABEL='-round_durations'), then
-    # reports the flag's value as "unrecognized arguments: 1".
-    if value.startswith("-"):
-        raise argparse.ArgumentTypeError(
-            f"{value!r} starts with '-', so it is a flag, not a PATTERN or LABEL. "
-            "-ortvec_glob takes both: -ortvec_glob 'motion_run-*.1D' motion. "
-            "You probably left out the LABEL (or the PATTERN)."
-        )
-    return value
+def _ortvec_value(flag: str, example: str):
+    """Reject a value that is really the next flag, i.e. a missing positional.
+
+    argparse hands the following flag to a multi-value option when an argument is
+    left out (`-ortvec_glob PATTERN -round_durations 1` -> LABEL='-round_durations'),
+    then reports the flag's value as "unrecognized arguments: 1".
+    """
+
+    def check(value: str) -> str:
+        if value.startswith("-"):
+            raise argparse.ArgumentTypeError(
+                f"{value!r} starts with '-', so it is a flag, not a value for {flag}. "
+                f"{flag} takes all of its arguments: {flag} {example}. "
+                "You probably left one out."
+            )
+        return value
+
+    return check
 
 
 def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: str = "") -> None:
@@ -1812,6 +1819,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
             dest=f"{p}ortvec",
             action="append",
             nargs=2,
+            type=_ortvec_value(f"-{p}ortvec", "motion.1D motion"),
             metavar=("FILE", "LABEL"),
             help=(
                 "Full-length nuisance regressors (pre-concatenated across all runs). "
@@ -1824,6 +1832,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
         dest=f"{p}ortvec_run",
         action="append",
         nargs=3,
+        type=_ortvec_value(f"-{p}ortvec_run", "motion_r1.1D motion 1"),
         metavar=("FILE", "LABEL", "RUN"),
         help=(
             "Per-run nuisance regressors; RUN is 1-based run index. Other runs are zero-padded. "
@@ -1837,7 +1846,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
         dest=f"{p}ortvec_glob",
         action="append",
         nargs=2,
-        type=_ortvec_glob_value,
+        type=_ortvec_value(f"-{p}ortvec_glob", "'motion_run-*.1D' motion"),
         metavar=("PATTERN", "LABEL"),
         help=(
             "Glob matching per-run nuisance files; run index inferred from filename "
@@ -1851,6 +1860,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: s
         dest=f"{p}ortvec_concat",
         action="append",
         nargs=2,
+        type=_ortvec_value(f"-{p}ortvec_concat", "'mot_demean.r0*.1D' motion"),
         metavar=("PATTERN", "LABEL"),
         help=(
             "Glob matching N already-full-length per-run files (e.g. AFNI "

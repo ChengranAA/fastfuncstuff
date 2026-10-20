@@ -4,18 +4,27 @@ Pytest configuration for fastfuncstuff tests.
 
 import os
 
-# Cap CPU threads for the whole test session. Test problems are tiny, so torch's
-# default intra-op pool (one thread per core) mostly spins up threads to do
-# near-nothing: it momentarily pegs every core without speeding the suite up, and
-# it oversubscribes badly when a test spawns its own worker pool. A small fixed cap
-# keeps the suite well-behaved (and reduction order deterministic across machines)
-# without slowing the little real work there is. The env vars also cover numpy/BLAS
-# and are inherited by spawned worker processes. FFS_TEST_NUM_THREADS is the one
-# explicit escape hatch; ambient BLAS defaults must not silently claim the machine.
+# ONE CPU thread per test process, and the parallelism comes from xdist workers
+# instead (see addopts). Measured 2026-10-20: these tests barely thread-scale --
+# test_topup.py is 40 s on 4 threads and 50 s on 1 -- while `-n 4` with the old
+# 4-thread cap put 16 threads on 6 cores and made the whole suite SLOWER than
+# serial (47 min vs 39 min). Four processes at one thread each beat one process
+# at four threads by far more than that 20%.
+#
+# One thread is also the only setting that makes the suite's floats reproducible:
+# parallel reductions sum in whatever order the pool finishes, which moves results
+# at ~1e-7 and is enough to flip a convergence branch. test_topup.py's
+# test_level_stops_when_the_field_stops_moving failed exactly that way under the
+# old cap (reported 'flat cost' one level early) and passed when run alone.
+#
+# The env vars also cover numpy/BLAS and are inherited by spawned worker processes.
+# FFS_TEST_NUM_THREADS is the one explicit escape hatch -- raising it trades that
+# reproducibility back, so a test that only passes above 1 thread is a bug in the
+# test, not a reason to raise the cap.
 try:
-    _TEST_THREADS = max(1, int(os.environ.get("FFS_TEST_NUM_THREADS", "4")))
+    _TEST_THREADS = max(1, int(os.environ.get("FFS_TEST_NUM_THREADS", "1")))
 except ValueError:
-    _TEST_THREADS = 4
+    _TEST_THREADS = 1
 _TEST_THREADS = min(_TEST_THREADS, os.cpu_count() or 1)
 for _var in (
     "OMP_NUM_THREADS",

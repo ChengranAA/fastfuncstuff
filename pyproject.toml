@@ -52,10 +52,14 @@ classifiers = [
 [project.optional-dependencies]
 test = [
     "pytest>=7.0",
+    # Required, not optional: addopts carries -n 4, so a bare `pytest` without
+    # xdist fails on an unknown argument rather than quietly running serially.
+    "pytest-xdist>=3.0",
     "scikit-learn>=1.2",
 ]
 dev = [
     "pytest>=7.0",
+    "pytest-xdist>=3.0",
     "scikit-learn>=1.2",
     "ruff>=0.9",
     # The viewer's UI tests are part of the suite, and they skip silently
@@ -190,7 +194,14 @@ exclude = ["tests*", "examples*"]
 # `pytest -m gpu`. NOTE: -m is single-valued, so a command-line -m REPLACES this rather
 # than adding to it -- `pytest -m "not slow"` re-enables the GPU tests. Use
 # `-m "not slow and not gpu"`.
-addopts = "-m 'not gpu'"
+# -n 4: the suite is CPU-bound in many small, badly-threading tests, so the
+# parallelism belongs in processes (conftest pins each worker to ONE thread).
+# 4, not `auto`/`logical`: a 6-core box usually has a real fit or a recon on it,
+# and leaving two cores is the difference between a background test run and a
+# stalled machine. Serial again with `-n 0` when a traceback needs to be read in
+# order, or when profiling a single test -- NOT `-p no:xdist`, which unloads the
+# plugin and then dies on this very `-n`.
+addopts = "-m 'not gpu' -n 4"
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"

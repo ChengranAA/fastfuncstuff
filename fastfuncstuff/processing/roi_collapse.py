@@ -211,6 +211,9 @@ class RoiSet:
     #: What ``collapse`` divides each row's weighted sum by, when that is not ``sizes``:
     #: an ROI series' elements are already means, but the table still reports their size.
     divisor: np.ndarray | None = None
+    #: Depth-sampled sets: ``(name, hemi, K x K)`` per ROI, how each measured depth mixes
+    #: the true depths (:func:`processing.roi_depth.depth_sampling_matrices`).
+    depth_psf: list | None = None
 
     @property
     def n_rois(self) -> int:
@@ -265,6 +268,15 @@ class RoiSet:
 
     def _row_keys(self, i: int) -> list:
         return [self.ids[i], self.names[i], *(self.index[k][i] for k in self.index)]
+
+    def write_depth_psf(self, stem: str) -> str | None:
+        """``{stem}_depth_psf.tsv`` when the set was sampled by depth, else None."""
+        if not self.depth_psf:
+            return None
+        from fastfuncstuff.processing.roi_depth import write_depth_psf
+
+        ids = list(dict.fromkeys(self.ids))  # ROI ids in order, one per ROI (not per row)
+        return write_depth_psf(f"{stem}_depth_psf.tsv", self.depth_psf, ids)
 
     def write_table(self, path: str | Path, columns: dict[str, np.ndarray | Tensor]) -> str:
         """One row per ROI: id, name, size, then each named column."""

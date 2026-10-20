@@ -2849,6 +2849,9 @@ def main(argv: list[str] | None = None):
         roi_columns = {k: v for k, v in roi_columns.items() if v is not None}
         tsv = roi_set.write_table(f"{args.prefix}_roi.tsv", roi_columns)
         print(f"Wrote {tsv} ({roi_set.n_rois} ROIs x {len(roi_columns)} measures)")
+        psf = roi_set.write_depth_psf(args.prefix)
+        if psf:
+            print(f"Wrote {psf} (each depth bin's mix of true depths)")
 
     # Done
     if args.verb >= 1:

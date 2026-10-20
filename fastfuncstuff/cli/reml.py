@@ -1940,6 +1940,9 @@ def _write_roi_outputs(
         columns[label] = _roi_rows(values, voxel_mask, roi_set.n_rois)
     table = roi_set.write_table(f"{stem}_roi.tsv", columns)
     print(f"  • Wrote {table} ({roi_set.n_rois} ROIs)")
+    psf = roi_set.write_depth_psf(stem)
+    if psf:
+        print(f"  • Wrote {psf} (each depth bin's mix of true depths)")
     if args.single_trials:
         from fastfuncstuff.glm.roi_outputs import write_roi_single_trials
 

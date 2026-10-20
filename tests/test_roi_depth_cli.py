@@ -98,6 +98,13 @@ def test_reml_fits_each_depth_and_orders_them(brain):
     # amp is ~1, 3, 5 in the three equal-volume shells (they sit a bit outward).
     assert peak["1"] < peak["2"] < peak["3"] and peak["3"] > 3 * peak["1"]
     assert not list(tmp.glob("r*.nii*"))
+    # The depth PSF of this sampling, for the laminar model: K x K per ROI, diagonal-heavy.
+    psf_hdr, psf = _table(tmp / "r_depth_psf.tsv")
+    assert psf_hdr == ["roi", "name", "hemi", "depth", "true_depth", "weight"] and len(psf) == 9
+    m = np.zeros((3, 3))
+    for r in psf:
+        m[int(r[3]) - 1, int(r[4]) - 1] = float(r[5])
+    assert (np.argmax(m, axis=1) == np.arange(3)).all()
 
 
 def test_deconvolve_one_depth_is_the_ribbon(brain, monkeypatch):
@@ -113,6 +120,8 @@ def test_deconvolve_one_depth_is_the_ribbon(brain, monkeypatch):
     monkeypatch.setattr(sys, "argv", argv)
     assert deconvolve.main() == 0
     _check_depth_table(tmp / "d_roi.tsv", 1)
+    _, psf = _table(tmp / "d_depth_psf.tsv")
+    assert len(psf) == 1 and 0.5 < float(psf[0][5]) <= 1.05  # one depth: the cortex share
 
 
 def test_depth_flags_need_rois_and_volume_data(brain, monkeypatch):

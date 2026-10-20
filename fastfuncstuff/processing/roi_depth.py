@@ -783,8 +783,14 @@ def roi_set_from_args(
         args.fs_subj, args.white, args.pial, args.white_mesh, args.pial_mesh,
         args.cortex_label, log=log_lines.append,
     )  # fmt: skip
+    opts = options_from_args(args)
     roi_set = build_depth_roi_set(
-        args.atlas, surfaces, affine, volume_shape, mask, options_from_args(args), device=device
+        args.atlas, surfaces, affine, volume_shape, mask, opts, device=device
+    )
+    # The laminar model's depth PSF for exactly this sampling (unnormalised; the
+    # analysis mask is left out -- it is geometry, not data).
+    roi_set.depth_psf = depth_sampling_matrices(
+        args.atlas, surfaces, affine, volume_shape, opts, normalise=False, device=device
     )
     roi_set.notes[:0] = [line.strip() for line in log_lines]
     return roi_set

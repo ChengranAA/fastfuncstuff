@@ -94,7 +94,7 @@ def add_depth_args(group) -> None:
         help="With -equivolume: rounds of 1-ring mesh smoothing of each cortical column's "
         "volume profile.  0 keeps every vertex column on its own (exactly equal-volume bins "
         "per column, but noisier depths); more pools across neighbours, which cuts noise but "
-        "blurs across abrupt folding (outer bin ~5% light at 2 on real cortex)",
+        "blurs across abrupt folding (outer bin ~5%% light at 2 rounds on real cortex)",
     )
     group.add_argument(
         "-depth_interp",

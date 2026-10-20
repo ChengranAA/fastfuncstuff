@@ -126,3 +126,14 @@ def test_depth_flags_need_rois_and_volume_data(brain, monkeypatch):
     assert deconvolve.main() == 1
     monkeypatch.setattr(sys, "argv", [*base, "-atlas", str(tmp / "patch.lh.label"), "-depths", "3"])
     assert deconvolve.main() == 1
+
+
+def test_depth_flag_help_renders():
+    """A bare % in a help string breaks -help and `make completions` (argparse formats it)."""
+    from fastfuncstuff.cli_help import FfsArgumentParser
+    from fastfuncstuff.surface.ribbon_args import add_depth_args
+
+    parser = FfsArgumentParser(prog="x")
+    add_depth_args(parser.add_argument_group("depth"))
+    text = parser.format_help()
+    assert "-depth_smooth" in text and "-depth_interp" in text

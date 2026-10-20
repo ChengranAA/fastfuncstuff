@@ -383,6 +383,22 @@ def analyze_from_onsets(
     return results
 
 
+def _masked_hrf_indices(
+    hrf_indices: torch.Tensor | np.ndarray, mask_tensor: torch.Tensor | None, n_voxels: int
+) -> torch.Tensor:
+    """Per-voxel HRF index aligned to the masked data's voxel axis."""
+    idx = (
+        torch.as_tensor(hrf_indices) if not isinstance(hrf_indices, torch.Tensor) else hrf_indices
+    ).long()
+    if mask_tensor is not None and idx.numel() != n_voxels:
+        idx = idx.reshape(-1)[mask_tensor]
+    if idx.numel() != n_voxels:
+        raise ValueError(
+            f"hrf_indices length {idx.numel()} does not match masked data voxels {n_voxels}"
+        )
+    return idx
+
+
 def analyze_from_design_matrix(
     fmri_data: str | Path | list[str | Path] | np.ndarray | torch.Tensor,
     design_matrix_file: str | Path | None = None,
@@ -1087,6 +1103,41 @@ def analyze_from_design_matrix(
             dsort_run_bounds=dsort_run_bounds,
         )
 
+    elif method == "ols" and designs_by_hrf is not None and hrf_indices is not None:
+        # fit_glm() fits ONE shared design to every voxel, so a per-voxel HRF run
+        # with no -R* output used to fit the whole brain with whichever design came
+        # first (the slowest library curve, via index -1) and report it as the
+        # per-voxel fit. Group by HRF and run the GLS with (a, b) pinned to (0, 0),
+        # which is white noise and therefore exact OLS.
+        from fastfuncstuff.glm.arma import fit_glm_arma11_grouped
+
+        zero_ab = torch.zeros(
+            data.shape[0], 2, dtype=(torch.float64 if use_double else torch.float32)
+        )
+        results = fit_glm_arma11_grouped(
+            data,
+            designs_by_hrf,
+            _masked_hrf_indices(hrf_indices, mask_tensor, data.shape[0]),
+            tr=tr,
+            group_label="HRF",
+            precomputed_arma_params=zero_ab,
+            device=device,
+            batch_size=voxel_chunk_size,
+            use_double=use_double,
+            glt_labels=design_info.get("glt_labels", None),
+            glt_matrices=design_info.get("glt_matrices", None),
+            task_indices=stim_indices if stim_indices else None,
+            want_r2_partial=want_r2_partial,
+            r2_partial_mode=r2_partial_mode,
+            want_r2_semipartial=want_r2_semipartial,
+            r2_semipartial_mode=r2_semipartial_mode,
+            debug_memory=debug_memory,
+            want_residuals=want_residuals,
+            want_ljung_box=want_ljung_box,
+            run_starts=arma_run_starts,
+            tau=arma_tau,
+        )
+
     elif method == "ols":
         results = fit_glm(
             data,
@@ -1357,18 +1408,7 @@ def analyze_from_design_matrix(
 
         hrf_idx_tensor = None
         if has_hrf:
-            hrf_idx_tensor = (
-                torch.as_tensor(hrf_indices)
-                if not isinstance(hrf_indices, torch.Tensor)
-                else hrf_indices
-            ).long()
-            if mask_tensor is not None and hrf_idx_tensor.numel() != data.shape[0]:
-                hrf_idx_tensor = hrf_idx_tensor.reshape(-1)[mask_tensor]
-            if hrf_idx_tensor.numel() != data.shape[0]:
-                raise ValueError(
-                    f"hrf_indices length {hrf_idx_tensor.numel()} does not match "
-                    f"masked data voxels {data.shape[0]}"
-                )
+            hrf_idx_tensor = _masked_hrf_indices(hrf_indices, mask_tensor, data.shape[0])
 
         if has_hrf or has_sli:
             from fastfuncstuff.glm.arma import fit_glm_arma11_grouped

@@ -44,6 +44,8 @@ STAGE_TOOL: dict[str, str] = {
     "mni_nonlin": "optiwarp",
     "segment": "segment",
     "segment_fstpm": "segment",
+    "anat_tpm": "segment",
+    "anat_t2": "allineate",
     "nwarp": "nwarp",
     "glm": "reml",
 }

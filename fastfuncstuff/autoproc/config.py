@@ -67,6 +67,17 @@ DEFAULT_OPTS: dict[str, str] = {
     # uses the plain one. Which applies is set by -suma/-tpm, not by the user.
     "segment": "-niter 2000 -samp 1.5",
     "segment_fstpm": "-ngaus 1 1 1 1 1 2 3 4 -cleanup 0 -samp 1.5",
+    # The anat's own segmentation against an SPM-style group TPM, whose posteriors
+    # become the subject TPM when there is no FreeSurfer run to build one from.
+    # SPM's published defaults are exactly the settings this case was validated
+    # with (a T1 head against tpm/TPM.nii), so only the unused output is dropped:
+    # nothing reads the inverse of an anat-space warp we never compose.
+    "anat_tpm": "-no_invwarp",
+    # T2w → T1w before a two-channel segmentation. Rigid: one head, one session,
+    # so anything past pose is contrast, not motion. lpc because the two are
+    # different contrasts, and -smallrange because a cross-modal cost over a wide
+    # search finds scalp-on-brain minima (see the allineate cross-modal note).
+    "anat_t2": "-rigid -cost lpc -source_automask -autoweight -cmass -smallrange -final wsinc5",
     # -do_mni: the anat → MNI template affine. 12 DoF (a brain is not the
     # template's size), lpa because both sides are T1, and a wide -tbest because
     # this is a one-shot alignment whose failure costs the whole output space.

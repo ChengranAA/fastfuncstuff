@@ -1501,6 +1501,8 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
             for ev in [_events_script_path(plan, pr, bids_root)]
             if ev
         }
+        # The TPM build reads these before stage09 can produce a nonlinear anat.
+        | {p for p in (plan.options.spm_tpm, plan.options.anat_t2) if p and plan.options.anat_tpm}
     )
     checks = " \\\n".join(f"  {shlex.quote(p)}" for p in inputs)
     # Only the *command* is checked, not the flags that fix a backend's identity
@@ -2927,10 +2929,15 @@ def _stage_anat(plan: Plan) -> str:
         out.append(_anat_nl_register(plan, seg_mats))
         out.append(_anat_nl_anchor_call(plan))
     elif opt.anat_nonlin:
-        # Optionally build a subject TPM from FreeSurfer (SUMA) first, so no SPM
-        # TPM is needed ahead of time.
+        # Optionally build the subject TPM first: from FreeSurfer (SUMA), so no SPM
+        # TPM is needed ahead of time, else from the anat's own segmentation.
         if opt.fs_tpm:
             out.append(_fs_tpm_block(opt))
+        elif opt.anat_tpm:
+            out.append(_anat_tpm_block(opt))
+            # The head is the image those priors were fitted to, so it is the
+            # anat-in-EPI QC source that costs nothing extra to ask for.
+            tpm_src_path = tpm_src_path or _anat_prestrip(opt)
         # One last ffs_segment on the CURRENT data (PE-mode nonlinear anat), init
         # from the anat matrix/matrices. Needs a subject TPM.
         tpm = (
@@ -3332,6 +3339,90 @@ if [ ! -f "tpm_work/sub_specific_fsTPM.nii.gz" ]; then
   3dAutomask -overwrite -prefix tpm8_skull.nii.gz skull.nii.gz
   3dTcat -overwrite -prefix sub_specific_fsTPM.nii.gz tpm[1-8]_*.nii.gz
 )
+fi"""
+
+
+def _anat_tpm_file() -> str:
+    """The subject TPM built from the anat itself (the no-FreeSurfer path)."""
+    return "tpm_work/sub_specific_anatTPM.nii.gz"
+
+
+def _anat_t2_al() -> str:
+    """The T2w resampled onto the anat head's grid — a segmentation channel has to
+    sit on the same lattice as the first one.
+
+    Kept beside the head and brain rather than in tpm_work: it is a second
+    contrast of this subject in the final anat space, which is a QC underlay and
+    a tissue reference long after the TPM it was made for has been consumed."""
+    return "stage09.anat_t2.nii.gz"
+
+
+def _anat_tpm_block(opt) -> str:
+    """Build a subject TPM by segmenting the anat against an SPM-style group TPM.
+
+    The same trick as the FreeSurfer path, one step earlier: what ffs_segment
+    needs in EPI mode is tissue priors *in anat space*, and a segmentation of the
+    anat produces exactly that — its posteriors are the subject's own tissue, on
+    the subject's own grid, which is all the EPI fit reads them as. Fewer and
+    softer classes than aseg's hard labels, so -suma still wins when there is a
+    FreeSurfer run; this is the path for a T1w straight off the scanner.
+
+    The head goes in with its skull on: SPM's TPM carries bone/soft-tissue/air
+    classes, and segmenting a stripped brain against them leaves those classes
+    with nothing to claim — the EPI fit then has no prior for everything outside
+    the brain, which in a distortion fit is where the signal it must not chase
+    lives. A T2w channel is added when one was found, since bone-from-CSF and
+    dura-from-grey are the separations a T1 alone cannot make."""
+    head = _anat_prestrip(opt)
+    tpm = shlex.quote(opt.spm_tpm) if opt.spm_tpm else '"${FFS_TPM:?set FFS_TPM}"'
+    out = _anat_tpm_file()
+    steps = []
+    inputs = [head]
+    if opt.anat_t2:
+        inputs.append(_anat_t2_al())
+        steps.append(
+            _ffs(
+                "ffs_allineate",
+                [
+                    f'-base "{head}"',
+                    f"-source {shlex.quote(opt.anat_t2)}",
+                    f'-prefix "{_anat_t2_al()}"',
+                    *_split_flags(config.DEFAULT_OPTS["anat_t2"]),
+                    '-device "$DEVICE"',
+                ],
+            )
+        )
+    steps.append(
+        _ffs(
+            "ffs_segment",
+            [
+                "-input " + " ".join(f'"{p}"' for p in inputs),
+                f"-tpm {tpm}",
+                '-prefix "tpm_work/anatseg"',
+                *_split_flags(config.DEFAULT_OPTS["anat_tpm"]),
+                '-device "$DEVICE"',
+            ],
+        )
+    )
+    # The class count is the group TPM's 4th dimension, which only the file knows,
+    # so the stack is globbed at run time. -V so c10 sorts after c9, not after c1.
+    steps.append(
+        _ffs(
+            "ffs_util_3dmath",
+            [
+                "-input $(ls tpm_work/anatseg_c*.nii* | grep -E '_c[0-9]+\\.nii' | sort -V)",
+                "-tcat",
+                f'-prefix "{out}"',
+                '-device "$DEVICE"',
+            ],
+        )
+    )
+    body = "\n".join(steps)
+    chan = " (T1 + T2)" if opt.anat_t2 else ""
+    return f"""# --- build subject TPM from the anat{chan} ---
+if [ ! -f "{out}" ]; then
+  mkdir -p tpm_work
+{body}
 fi"""
 
 

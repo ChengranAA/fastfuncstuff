@@ -278,6 +278,11 @@ class Options:
     tpm: str | None = None  # subject tissue-probability template for ffs_segment
     tpm_source: str | None = None  # QC anat-in-EPI source for ffs_segment
     fs_tpm: bool = False  # build the TPM in-script from FreeSurfer (SUMA) outputs
+    # Build the TPM in-script by segmenting the anat (head, skull and all) against
+    # spm_tpm — the no-FreeSurfer path to subject priors.
+    anat_tpm: bool = False
+    spm_tpm: str | None = None  # SPM-style group TPM (tpm/TPM.nii) the builds read
+    anat_t2: str | None = None  # T2w second channel for the anat_tpm segmentation
     suma_dir: str | None = None  # FreeSurfer SUMA dir (aseg.auto + SurfVol for the TPM)
     # -surface_target: also sample every run onto this cortical mesh (ffs_nwarp -surf),
     # same chain minus the MNI links, master = the anat. fs_subject holds surf/.

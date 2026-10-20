@@ -84,6 +84,39 @@ def test_fs_tpm_segment_uses_its_own_opts_key(monkeypatch):
     assert "-niter 42" not in script
 
 
+def test_anat_tpm_build_segments_the_head_with_the_t2_aligned_onto_it():
+    """The no-FreeSurfer path to subject priors: segment the anat against a group
+    TPM, stack its posteriors, and feed THAT to the EPI fit. The T2 is a second
+    channel, so it has to be resampled onto the head's grid first — ffs_segment
+    aligns its input to the template, never one channel to another."""
+    plan = build_plan(
+        _subject(),
+        Options(
+            go_to_anat=True,
+            anat_nonlin=True,
+            anat_skull=True,
+            anat_tpm=True,
+            tpm="tpm_work/sub_specific_anatTPM.nii.gz",
+            spm_tpm="/t/TPM.nii",
+            anat_t2="/bids/sub-X/ses-01/anat/sub-X_T2w.nii.gz",
+        ),
+    )
+    script = write_script(plan, "wd", bids_root="/bids")
+    build = script.split("build subject TPM from the anat")[1].split("\nfi")[0]
+    # T2 onto the head's grid (base = the head), then both channels into segment.
+    assert '-base "stage09.anat_head.nii.gz"' in build
+    assert "-source /bids/sub-X/ses-01/anat/sub-X_T2w.nii.gz" in build
+    assert '-prefix "stage09.anat_t2.nii.gz"' in build  # kept in the results dir
+    assert '-input "stage09.anat_head.nii.gz" "stage09.anat_t2.nii.gz"' in build
+    assert "-tpm /t/TPM.nii" in build and "-tcat" in build
+    # ...and the EPI fit reads the stack, with the head as its anat-in-EPI QC source.
+    epi = script.split("-pe_axis y")[1]
+    assert "-tpm tpm_work/sub_specific_anatTPM.nii.gz" in epi
+    assert "-tpm_source stage09.anat_head.nii.gz" in epi
+    # The head and the T2 are the inputs stage09 cannot start without.
+    assert "/t/TPM.nii" in script.split("stage: preflight")[1].split("stage")[0]
+
+
 @pytest.mark.parametrize("value", ["-save_numcomps", "-nordic -save_numcomps", "-x"])
 def test_single_flag_override_is_not_eaten_as_an_option(value):
     """argparse only tolerates a '-'-leading value when it contains a space, so a

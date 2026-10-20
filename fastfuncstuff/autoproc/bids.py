@@ -979,6 +979,45 @@ def _pick_anat(t1s: list[Path]) -> Path | None:
 _ACQ = re.compile(r"(?<=_)acq-[a-zA-Z0-9]+(?=_)")
 
 
+def t2w_partner(t1: Path) -> Path | None:
+    """The T2w beside a T1w that images the same head in the same state, or None.
+
+    A second contrast is worth finding because the tissue classes a T1 alone
+    cannot separate — bone from CSF, dura from grey — are exactly the ones a T2
+    does, and ffs_segment takes several co-registered channels. Which T2w, when a
+    session holds more than one, is the same question `rec`/`acq` answers for the
+    T1w: an ``acq-corr`` T1w is the distortion-corrected reconstruction, and its
+    mate is the ``acq-corr`` T2w, not the uncorrected one lying next to it."""
+    anat_dir = t1.parent
+    if not anat_dir.is_dir():
+        return None
+    ent1 = parse_entities(t1.name)
+    cands = [
+        p
+        for p in sorted(anat_dir.glob("*.nii*"))
+        if (parse_suffix(p.name) or "").lower() == "t2w"
+        and not any(tok in p.name.lower() for tok in ("_denoised", "_border", "_roi"))
+    ]
+    if not cands:
+        return None
+
+    def rank(p: Path) -> tuple[int, int, int, str]:
+        ent = parse_entities(p.name)
+        rec = (ent.get("rec") or "").lower()
+
+        def same(key: str) -> bool:
+            return (ent.get(key) or "").lower() == (ent1.get(key) or "").lower()
+
+        return (
+            0 if same("acq") else 1,
+            0 if same("run") else 1,
+            0 if rec in _REC_PREFERRED else (2 if rec in _REC_AVOIDED else 1),
+            p.name,
+        )
+
+    return min(cands, key=rank)
+
+
 def mp2rage_partners(uni: Path) -> tuple[Path | None, Path | None]:
     """(inv2, inv1) filed beside an ``acq-uni`` T1w, or None for each one missing.
 

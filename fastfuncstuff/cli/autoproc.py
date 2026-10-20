@@ -162,7 +162,26 @@ def build_parser() -> argparse.ArgumentParser:
         "-presurf-tpm",
         metavar="FILE",
         help="6-class tissue template for the presurf segmentations (SPM's tpm/TPM.nii); "
-        "default -tpm, else $FFS_TPM",
+        "default -spm_tpm, else -tpm, else $FFS_TPM",
+    )
+    g.add_argument(
+        "-spm_tpm",
+        "-spm-tpm",
+        metavar="FILE",
+        help="SPM-style GROUP tissue template (SPM's tpm/TPM.nii), used to derive the "
+        "subject priors -anat_nonlin needs when there is no -suma: the anat is "
+        "segmented against it and its posteriors become the subject TPM. Default "
+        "$FFS_TPM. (-tpm is the opposite end — a subject TPM already in anat space.)",
+    )
+    g.add_argument(
+        "-anat_t2",
+        "-anat-t2",
+        metavar="FILE",
+        help="T2w to segment alongside the T1w when building the subject TPM "
+        "(-spm_tpm): it is rigidly aligned onto the T1 grid first, then both go in "
+        "as channels, which is what separates bone from CSF and dura from grey. "
+        "Default: the matching T2w in the BIDS anat/ dir, if there is one. Pass "
+        "'none' to segment the T1w alone.",
     )
     g.add_argument("-no_anat", "-no-anat", action="store_true", help="stay in EPI space (no anat)")
     g.add_argument(
@@ -1374,16 +1393,21 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "-grand_reference / -ref_file the anat link is borrowed (a chain of matrices "
             "the backend's single -matrix cannot take). Use -grand_reference_nonlin."
         )
-    if opt.anat_nonlin and opt.anat_nonlin_method == "segment" and not opt.tpm and not opt.fs_tpm:
-        skull = (
-            " -anat_skull yes strips the anat but derives no tissue priors, so the "
-            "nonlinear step needs -tpm even so."
-            if opt.anat_skull
-            else ""
+    if opt.anat_nonlin and opt.anat_nonlin_method == "segment" and not opt.tpm:
+        why = (
+            # The anat route is the one that needs no extra acquisition, so when it
+            # is unavailable, say which half is missing rather than listing all three.
+            " An unstripped anat plus an SPM group TPM would build one, but "
+            + (
+                "no group TPM was found: pass -spm_tpm FILE (SPM's tpm/TPM.nii) or set $FFS_TPM."
+                if opt.anat_skull
+                else "this anat is already skull-stripped (-anat_skull no), and the group "
+                "TPM's bone/soft-tissue/air classes need the head they describe."
+            )
         )
         errors.append(
             "-anat_nonlin (ffs_segment) needs a subject TPM: pass -tpm FILE, or -suma DIR "
-            "to build one from FreeSurfer (aseg.auto + SurfVol)." + skull
+            "to build one from FreeSurfer (aseg.auto + SurfVol)." + why
         )
     if opt.anat_extra and (opt.grand_reference or opt.ref_file):
         borrowed = "-grand_reference" if opt.grand_reference else "-ref_file"
@@ -1586,6 +1610,8 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     for label, val in (
         ("-anat", anat_path if args.anat else None),
         ("-tpm", args.tpm),
+        ("-spm_tpm (or $FFS_TPM)", opt.spm_tpm if opt.anat_tpm else None),
+        ("-anat_t2", opt.anat_t2),
         ("-presurf_tpm (or $FFS_TPM)", opt.presurf_tpm),
         ("-tpm_source", opt.tpm_source),
         ("-ref_file", opt.ref_file),
@@ -2205,6 +2231,65 @@ def _resolve_anat_skull(args, presurf: bool) -> bool:
     return args.anat_skull == "auto" and not args.suma
 
 
+def _resolve_tpm(
+    args, *, anat_nonlin: bool, anat_path: str | None, anat_skull: bool
+) -> tuple[str | None, bool, bool, str | None, str | None]:
+    """(subject tpm, build-from-FreeSurfer, build-from-anat, group tpm, T2 channel).
+
+    Three ways to get the tissue priors ffs_segment's PE warp is driven by, in
+    the order they are preferred:
+
+    1. ``-tpm`` — a subject TPM in anat space, already built. Nothing to do.
+    2. ``-suma`` — FreeSurfer ran, so aseg.auto's labels are the priors: eight
+       hard-edge classes of this subject's own anatomy, the best of the three.
+    3. the anat itself, segmented against an SPM-style group TPM. Softer and
+       coarser than aseg's labels, but it needs nothing but the T1w that is
+       already here — which is the common case, and used to be a hard error.
+
+    (3) needs the head with its skull on, because the group TPM's non-brain
+    classes are half of what the EPI fit uses to know where brain is not.
+    """
+    tpm, fs_tpm, anat_tpm = args.tpm, False, False
+    spm_tpm = args.spm_tpm or os.environ.get("FFS_TPM")
+    anat_t2 = None
+    if not (anat_nonlin and args.anat_nonlin_method == "segment") or tpm:
+        return tpm, fs_tpm, anat_tpm, spm_tpm, anat_t2
+    if args.suma:
+        fs_tpm = True
+        return "tpm_work/sub_specific_fsTPM.nii.gz", fs_tpm, anat_tpm, spm_tpm, anat_t2
+    # A borrowed anat link (-ref_file / -grand_reference) never builds this run's
+    # head, so there is nothing here to segment.
+    borrowed = bool(args.ref_file or args.grand_reference)
+    if not (anat_path and anat_skull and spm_tpm) or borrowed:
+        return tpm, fs_tpm, anat_tpm, spm_tpm, anat_t2  # preflight reports why
+    anat_tpm = True
+    anat_t2 = _resolve_anat_t2(args, anat_path)
+    chan = f" (+ {Path(anat_t2).name})" if anat_t2 else ""
+    print(
+        f"== subject TPM: segmenting the anat{chan} against {spm_tpm} ==\n"
+        "  (no -suma: the anat's own posteriors are the tissue priors -anat_nonlin "
+        "needs. -suma's FreeSurfer labels are sharper when a recon exists.)",
+        file=sys.stderr,
+    )
+    return "tpm_work/sub_specific_anatTPM.nii.gz", fs_tpm, anat_tpm, spm_tpm, anat_t2
+
+
+def _resolve_anat_t2(args, anat_path: str) -> str | None:
+    """The T2w channel for the anat segmentation: as given, else the one filed
+    beside the T1w. ``-anat_t2 none`` says T1 alone.
+
+    Looked for next to an explicit ``-anat FILE`` too, unlike presurf's MP2RAGE
+    partners: a second channel only sharpens the priors the segmentation is being
+    run for, and the pathological case — a T2w of some other state of the head —
+    is what the printed line and ``-anat_t2 none`` are for."""
+    from fastfuncstuff.autoproc.bids import t2w_partner
+
+    if args.anat_t2:
+        return None if args.anat_t2.lower() == "none" else str(Path(args.anat_t2).resolve())
+    t2 = t2w_partner(Path(anat_path))
+    return str(t2) if t2 else None
+
+
 def _resolve_presurf(
     args, anat_paths: list[str], from_bids: bool
 ) -> tuple[list[tuple[str, str, str | None]], str | None, str]:
@@ -2226,7 +2311,7 @@ def _resolve_presurf(
             None,
             (f"  presurfer skipped: no acq-inv2 beside {', '.join(missing)}; UNI used as found."),
         )
-    tpm = args.presurf_tpm or args.tpm or os.environ.get("FFS_TPM")
+    tpm = args.presurf_tpm or args.spm_tpm or args.tpm or os.environ.get("FFS_TPM")
     if not tpm:
         return (
             [],
@@ -2475,13 +2560,13 @@ def main(argv: list[str] | None = None) -> int:
         args.round_durations, "-round_durations"
     )
 
-    # TPM resolution: an explicit -tpm wins; else, with -suma, build one in-script
-    # from FreeSurfer outputs (no ahead-of-time SPM TPM needed).
-    tpm = args.tpm
-    fs_tpm = False
-    if anat_nonlin and args.anat_nonlin_method == "segment" and not tpm and args.suma:
-        fs_tpm = True
-        tpm = "tpm_work/sub_specific_fsTPM.nii.gz"  # produced by the FS-TPM stage
+    anat_skull = _resolve_anat_skull(args, bool(presurf and go_to_anat))
+    tpm, fs_tpm, anat_tpm, spm_tpm, anat_t2 = _resolve_tpm(
+        args,
+        anat_nonlin=anat_nonlin,
+        anat_path=anat_path if go_to_anat else None,
+        anat_skull=anat_skull,
+    )
 
     opt = Options(
         recipe=args.recipe,
@@ -2556,7 +2641,7 @@ def main(argv: list[str] | None = None) -> int:
         # the anat step alone.
         anat_source=args.anat_source or args.ref_image or "auto",
         # presurf's head still has a skull; synthstrip is what makes the brain.
-        anat_skull=_resolve_anat_skull(args, bool(presurf and go_to_anat)),
+        anat_skull=anat_skull,
         presurf=presurf if go_to_anat else [],
         presurf_denoise=args.presurf_denoise,
         presurf_tpm=presurf_tpm,
@@ -2573,6 +2658,9 @@ def main(argv: list[str] | None = None) -> int:
         tpm=tpm,
         tpm_source=tpm_source,
         fs_tpm=fs_tpm,
+        anat_tpm=anat_tpm,
+        spm_tpm=spm_tpm,
+        anat_t2=anat_t2,
         suma_dir=args.suma,
         surface_target=_baked_meshes(args.surface_target, fs_subject),
         fs_subject=fs_subject,

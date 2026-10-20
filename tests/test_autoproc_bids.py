@@ -580,7 +580,9 @@ def test_mp2rage_partners_pair_each_uni_with_its_own_run(tmp_path: Path):
 def _presurf_args(**kw):
     from argparse import Namespace
 
-    base = dict(presurf="auto", presurf_tpm="/t/TPM.nii", tpm=None, presurf_denoise="off")
+    base = dict(
+        presurf="auto", presurf_tpm="/t/TPM.nii", spm_tpm=None, tpm=None, presurf_denoise="off"
+    )
     return Namespace(**{**base, **kw})
 
 
@@ -617,6 +619,68 @@ def test_anat_scan_is_case_blind(tmp_path: Path):
     inv2, inv1 = mp2rage_partners(anat)
     assert inv2 is not None and inv2.name == "sub-ME1_ses-WB_acq-inv2_T1w.nii.gz"
     assert inv1 is not None and inv1.name == "sub-ME1_ses-WB_acq-INV1_t1w.nii.gz"
+
+
+def test_t2w_partner_matches_the_t1s_own_reconstruction(tmp_path: Path):
+    """A session with both reconstructions of both contrasts: the acq-corr T1w's
+    mate is the acq-corr T2w, not the uncorrected one filed first alphabetically."""
+    from fastfuncstuff.autoproc.bids import t2w_partner
+
+    anat = tmp_path / "sub-A" / "ses-01" / "anat"
+    for acq in ("corr", "dist"):
+        for suf in ("T1w", "T2w"):
+            _touch(anat / f"sub-A_ses-01_acq-{acq}_{suf}.nii.gz", {})
+    t2 = t2w_partner(anat / "sub-A_ses-01_acq-corr_T1w.nii.gz")
+    assert t2 is not None and t2.name == "sub-A_ses-01_acq-corr_T2w.nii.gz"
+    assert t2w_partner(anat / "sub-A_ses-01_acq-dist_T1w.nii.gz") == (
+        anat / "sub-A_ses-01_acq-dist_T2w.nii.gz"
+    )
+    # No T2w at all is the common case, and not an error.
+    solo = tmp_path / "sub-B" / "ses-01" / "anat"
+    _touch(solo / "sub-B_ses-01_T1w.nii.gz", {})
+    assert t2w_partner(solo / "sub-B_ses-01_T1w.nii.gz") is None
+
+
+def _tpm_args(**kw):
+    from argparse import Namespace
+
+    base = dict(
+        tpm=None,
+        spm_tpm="/t/TPM.nii",
+        suma=None,
+        anat_t2=None,
+        anat_nonlin_method="segment",
+        ref_file=None,
+        grand_reference=None,
+    )
+    return Namespace(**{**base, **kw})
+
+
+def test_tpm_resolution_builds_from_the_anat_when_there_is_no_freesurfer(tmp_path, monkeypatch):
+    """The error this replaces: -anat_nonlin with a plain T1w and no -suma could not
+    run at all. Order of preference is -tpm, then -suma's labels, then the anat."""
+    from fastfuncstuff.cli.autoproc import _resolve_tpm
+
+    monkeypatch.delenv("FFS_TPM", raising=False)
+    anat = tmp_path / "sub-A" / "ses-01" / "anat"
+    for suf in ("T1w", "T2w"):
+        _touch(anat / f"sub-A_ses-01_acq-corr_{suf}.nii.gz", {})
+    t1 = str(anat / "sub-A_ses-01_acq-corr_T1w.nii.gz")
+
+    def res(**kw):
+        return _resolve_tpm(_tpm_args(**kw), anat_nonlin=True, anat_path=t1, anat_skull=True)
+
+    tpm, fs_tpm, anat_tpm, spm_tpm, t2 = res()
+    assert tpm == "tpm_work/sub_specific_anatTPM.nii.gz" and anat_tpm and not fs_tpm
+    assert spm_tpm == "/t/TPM.nii" and t2 is not None and t2.endswith("acq-corr_T2w.nii.gz")
+    assert res(anat_t2="none")[4] is None  # T1 alone on request
+    # -suma wins (FreeSurfer labels are sharper), and an explicit -tpm wins outright.
+    assert res(suma="/fs/SUMA")[1:3] == (True, False)
+    assert res(tpm="/my/tpm.nii")[:3] == ("/my/tpm.nii", False, False)
+    # Nothing to segment: no group TPM, a stripped anat, or a borrowed anat link.
+    assert res(spm_tpm=None)[2] is False
+    assert _resolve_tpm(_tpm_args(), anat_nonlin=True, anat_path=t1, anat_skull=False)[2] is False
+    assert res(ref_file="/other/ref.nii.gz")[2] is False
 
 
 def test_anat_skull_defaults_to_stripping_all_but_the_suma_brain():

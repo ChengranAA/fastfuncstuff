@@ -75,6 +75,14 @@ class RoiFit:
     W: np.ndarray  # (K0, N) forward mixing, model order (superficial first)
     W_inv: np.ndarray  # (N, K0) deveining operator
     meta: dict = field(default_factory=dict)
+    # What the figures need (all for the first K and the best model, model depth order,
+    # superficial first):
+    y_obs: np.ndarray | None = None  # (n_scans, K0) the padded input, percent change
+    y_hat: np.ndarray | None = None  # (n_scans, K0) the fit
+    rows: np.ndarray | None = None  # (n_scans,) bool: rows that were fitted
+    impulse: np.ndarray | None = None  # (K0, N, n_t) neuronal -> BOLD transfer
+    drainage_shift: np.ndarray | None = None  # (K0,) depths deeper than the mapping predicts
+    kernels: dict | None = None  # {K: depth PSF (K,K) or (L,) or None}
 
 
 def fit_roi(
@@ -147,6 +155,9 @@ def fit_roi(
     dev = deveined_timecourses(spec0, res0.Ep, first.u, int(first.y.shape[0]), kernel=k0, **ikw)
     ir = laminar_impulse_response(spec0, res0.Ep, n_scans=20, amplitude=1.0, kernel=k0, **ikw)
     W, W_inv = static_deveining_matrix(ir, mode="auc")
+    from fastfuncstuff.laminar.devein import deveining_fidelity
+
+    fid = deveining_fidelity(ir, spec0, res0.Ep, mode="auc")
     return RoiFit(
         roi=roi, name=name, hemi=hemi, k_values=ks, models=list(names), targets=list(targets),
         F=F, per_k_F=np.array([[float(f) for f in a.per_k_F] for a in averaged]),
@@ -154,6 +165,9 @@ def fit_roi(
         r2=r2, neuronal=dev.neuronal.numpy(), W=W.numpy(), W_inv=W_inv.numpy(),
         meta={"TR": first.meta.get("TR"), "block": first.meta.get("block"),
               "gap": first.meta.get("gap"), "converged": [bool(r[0].converged) for r in per_k]},
+        y_obs=first.y.numpy().copy(), y_hat=res0.y_pred.numpy().copy(), rows=rows.copy(),
+        impulse=ir.numpy().copy(), drainage_shift=fid["drainage_shift"].numpy().copy(),
+        kernels={k: (None if (kk := kernels.get(k)) is None else kk.numpy().copy()) for k in ks},
     )  # fmt: skip
 
 

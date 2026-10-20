@@ -137,6 +137,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     o = p.add_argument_group("Output")
     o.add_argument("-prefix", required=True, help="Output prefix.")
+    o.add_argument("-plots", action="store_true",
+                   help="Also write one figure per ROI, {prefix}_laminar_<roi>_<hemi>.png: the "
+                   "model input and what was masked, free energy per model and K, model and "
+                   "depth probabilities, the modulation B with credible intervals, data against "
+                   "fit, measured against deveined time courses and depth profiles, the deveining "
+                   "operator, the vein-attributable shift, transit delay and the depth PSF.")  # fmt: skip
     o.add_argument("-workers", type=int, default=0,
                    help="Processes, one ROI each (0: half the cores).")  # fmt: skip
     o.add_argument("-verb", type=int, default=1, help="0 quiet, 1 progress.")
@@ -301,6 +307,13 @@ def main(argv: list[str] | None = None) -> int:
                     "delay_seconds": "TR/2" if delay is None else delay, "TE": args.TE,
                     "B0": args.B0, "p0": "reference driver (V0t 3, nr 3, al_v 0.35, w_v 0.5)"},
     )  # fmt: skip
+    if args.plots:
+        from fastfuncstuff.laminar.plots import plot_roi
+
+        conds = tuple(args.conds) if args.conds else ("cond 1", "cond 2")
+        for f in fits:
+            tag = f"{f.name}_{f.hemi}".replace("/", "-").replace(" ", "_")
+            written.append(plot_roi(f, f"{args.prefix}_laminar_{tag}.png", conds))
     if args.verb >= 1:
         for f in fits:
             print(f"  {f.name} ({f.hemi}): best '{f.models[f.best]}' "

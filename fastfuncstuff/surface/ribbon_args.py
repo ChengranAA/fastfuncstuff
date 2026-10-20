@@ -45,7 +45,7 @@ def add_ribbon_args(group, *, hemi: bool = True) -> None:
     )
 
 
-def add_depth_args(group) -> None:
+def add_depth_args(group, *, interp: bool = True) -> None:
     """Ribbon flags plus ``-depths -equidistant/-equivolume -depth_dxyz -depth_smooth -depth_interp``.
 
     Giving surfaces is what switches depth sampling on: the ROI means are then read
@@ -96,6 +96,8 @@ def add_depth_args(group) -> None:
         "per column, but noisier depths); more pools across neighbours, which cuts noise but "
         "blurs across abrupt folding (outer bin ~5%% light at 2 rounds on real cortex)",
     )
+    if not interp:  # the tool reads through its own transform chain, with its own -interp
+        return
     group.add_argument(
         "-depth_interp",
         default="cubic",

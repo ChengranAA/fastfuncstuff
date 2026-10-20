@@ -36,6 +36,7 @@ from fastfuncstuff.processing.nwarpforge import (
     nwarpforge,
     parse_nwarp_string,
 )
+from fastfuncstuff.surface.ribbon_args import add_depth_args, depth_requested
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 # -save_mean/-save_max/-save_min with no value: derive the path from -prefix.
@@ -378,6 +379,40 @@ Examples:
         "one read per vertex (aliases when vertices are sparser than voxels).",
     )
 
+    roi_group = parser.add_argument_group(
+        "ROI output (ROI means read through the chain instead of a volume)"
+    )
+    roi_group.add_argument(
+        "-atlas",
+        "-rois",
+        dest="atlas",
+        nargs="+",
+        default=None,
+        metavar="ROI_FILE",
+        help="Instead of a volume, read the source at the ROIs' voxels (or, with surfaces, "
+        "along the cortical ribbon) through the same chain, in the same single "
+        "interpolation, and average per ROI: PREFIX.roi.nii.gz is (n_rois, 1, n_depths, "
+        "time) -- depth is z -- readable by any viewer or by ffs_reml, with PREFIX.roi.tsv "
+        "saying what each (x, z) is and PREFIX.roi.json how it was made.  Volume ROIs "
+        "(3-D label map, binary mask, or 4-D weights) must be on the -master grid.  With "
+        "-fs_subj or -white_mesh/-pial_mesh the rows are one per ROI per cortical depth "
+        "(-depths, -equivolume), from surface ROIs (FreeSurfer .label/.annot, GIfTI) or "
+        "volume ROIs mapped to their columns, and PREFIX.roi.vertices.npz keeps each ROI's "
+        "columns.  -master must be the anatomy the ROIs and surfaces live in, and the "
+        "chain must end there.",
+    )
+    add_depth_args(roi_group, interp=False)
+    roi_group.add_argument(
+        "-roi_max_reads",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Most reads one pass may hold (0: from the device's available memory).  A "
+        "bigger ROI set runs as several passes over the one loaded source -- same numbers, "
+        "more time, never more memory.  A single ROI over the cap is read with thicker "
+        "sheets through the depth, then refused with advice.",
+    )
+
     interp_group = parser.add_argument_group("Interpolation")
     interp_group.add_argument(
         "-interp",
@@ -513,6 +548,10 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     parse_prefix). The phase output, mean, and first/last files are listed on
     intent; a mean/first-last that a 3-D output skips just means the run isn't
     skipped next time (safe)."""
+    if getattr(args, "atlas", None):
+        from fastfuncstuff.processing.roi_reads import output_paths
+
+        return output_paths(args.prefix, depth_requested(args))
     surf = [str(p) for p in _surface_outputs(args)] if getattr(args, "surf", None) else []
     if surf and not args.surf_prefix:
         return surf
@@ -695,6 +734,22 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             "ffs_nwarp: -jac with -surf needs the AXIS:FIELDMAP form: the auto mode "
             "differentiates along grid axes, and surface points have none"
         )
+    if args.atlas:
+        if args.surf:
+            raise SystemExit(
+                "ffs_nwarp: -atlas/-rois and -surf are separate outputs: run one at a time"
+            )
+        if jac_axis is not None and jac_match is None:
+            raise SystemExit(
+                "ffs_nwarp: -jac with -atlas/-rois needs the AXIS:FIELDMAP form: the auto mode "
+                "differentiates along grid axes, and reads at points have none"
+            )
+        _dispatch_roi(
+            args, device, nwarp_specs, time_range, ainterp, slice_times, tr, jac_axis, jac_match
+        )
+        if verb >= 1:
+            print_cli_footer("ffs_nwarp", elapsed_seconds=time.time() - t0)
+        return
     source_image = None
     if args.surf and args.surf_prefix:
         # Volume and surface from one read: a big series is decompressed once.
@@ -753,6 +808,85 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
 
     if verb >= 1:
         print_cli_footer("ffs_nwarp", elapsed_seconds=time.time() - t0)
+
+
+def _dispatch_roi(
+    args, device, nwarp_specs, time_range, ainterp, slice_times, tr, jac_axis, jac_match
+) -> None:
+    """-atlas/-rois: the same chain, read at the ROIs' voxels or along the ribbon."""
+    from fastfuncstuff.io.afni import get_tr_from_file, load_nifti
+    from fastfuncstuff.processing import roi_depth, roi_reads
+    from fastfuncstuff.processing.roi_collapse import build_roi_set
+
+    wrong = [
+        flag
+        for flag, val in (
+            ("-phase", args.phase),
+            ("-dxyz", args.dxyz),
+            ("-save_mean", args.save_mean),
+            ("-save_max", args.save_max),
+            ("-save_min", args.save_min),
+            ("-save_first_last", args.save_first_last),
+        )
+        if val
+    ]
+    if wrong:
+        raise SystemExit(
+            f"ffs_nwarp: {', '.join(wrong)} are volume options and mean nothing with -atlas/-rois"
+        )
+    if args.master is None:
+        raise SystemExit(
+            "ffs_nwarp: -atlas/-rois needs -master, the anatomy the ROIs (and surfaces) live in"
+        )
+    master = load_nifti(args.master)
+    aff, shape = master.affine, tuple(master.shape[:3])
+    try:
+        if depth_requested(args):
+            from fastfuncstuff.surface.volume_depth import resolve_ribbon_surfaces
+
+            log: list[str] = []
+            surfaces = resolve_ribbon_surfaces(
+                args.fs_subj, args.white, args.pial, args.white_mesh, args.pial_mesh,
+                args.cortex_label, log=log.append,
+            )  # fmt: skip
+            plan = roi_reads.plan_depth_reads(
+                args.atlas, surfaces, roi_depth.default_step(aff), roi_depth.options_from_args(args),
+                args.roi_max_reads or None, device=device,
+            )  # fmt: skip
+            plan.notes[:0] = [line.strip() for line in log]
+        else:
+            if args.depths != 1 or args.depth_method == "equivolume":
+                raise ValueError(
+                    "-depths / -equivolume sample along surfaces: give -fs_subj or -white_mesh"
+                )
+            roi_set = build_roi_set(args.atlas, shape)
+            plan = roi_reads.plan_volume_reads(roi_set, aff)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ffs_nwarp: {exc}") from exc
+    if args.verb >= 1:
+        print_cli_section("ROI reads")
+        for line in plan.notes:
+            print(f"  {line}")
+    result = roi_reads.read_through_chain(
+        plan, args.source, nwarp_specs, args.master,
+        interp=args.interp, device=device, time_range=time_range, debug=args.debug,
+        no_neg=args.no_neg, ainterp=ainterp, slice_times=slice_times, tr=tr,
+        tzero=args.tzero, tinterp=args.tinterp, follow_tissue=args.follow_tissue,
+        jac_axis=jac_axis, jac_match=jac_match, verb=args.verb,
+        progress=lambda message: spinner(message, enabled=args.verb >= 1),
+        chain_base=args.chain_base,
+    )  # fmt: skip
+    out_tr = tr or args.TR or get_tr_from_file(args.source)
+    written = roi_reads.write_roi_outputs(
+        args.prefix, plan, result, tr=out_tr if out_tr and out_tr > 0 else None,
+        extra={"source": str(args.source), "master": str(args.master), "interp": args.interp},
+    )  # fmt: skip
+    low = float(result.cover.min()) if result.cover.size else 1.0
+    if args.verb >= 1:
+        if low < 0.999:
+            print(f"  note: some rows read only {100 * low:.0f}% of their weight inside the EPI")
+        for path in written:
+            print(f"  wrote {path}")
 
 
 def _dispatch_surface(

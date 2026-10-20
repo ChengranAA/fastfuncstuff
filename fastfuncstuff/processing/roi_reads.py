@@ -35,10 +35,13 @@ from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
 
-#: Device bytes one read costs per frame: its coordinates, the composed coordinates,
-#: the warp evaluated there, the reduction operator's share. Measured, see tests.
-BYTES_PER_READ = 640
-#: Host bytes per cell while a pass is tiled (nodes, centres, feet, owners, ...).
+#: Device bytes one read costs per frame (coordinates, the composed coordinates, the warp
+#: evaluated there, the operator's share): measured 133 through a fieldmap + motion chain
+#: with wsinc5 at 32M reads (4.3 GB peak, 1.6 s for 6 frames) on an RTX 5070 Ti, 106 with
+#: cubic; 180 leaves a third of headroom.
+BYTES_PER_READ = 180
+#: Host bytes per cell while a pass is tiled (nodes, centres, feet, owners, ...): measured
+#: 399 on a whole left hemisphere, 34 ROIs x 7 equivolume depths, 4.7M reads (2.6 GB RSS).
 HOST_BYTES_PER_CELL = 400
 
 
@@ -177,7 +180,7 @@ def plan_depth_reads(
         if relaxed.max() > cap:
             big = rois[int(np.argmax(relaxed))].name
             raise ValueError(
-                f"ROI {big!r} alone needs ~{int(relaxed.max()):,} reads (cap {cap:,}) at "
+                f"ROI {big!r} alone tiles to ~{int(relaxed.max()):,} reads (cap {cap:,}) at "
                 f"{step:.3g} mm spacing and {k_n} depth(s): raise -roi_max_reads, or lower "
                 "-depths, or raise -depth_dxyz"
             )

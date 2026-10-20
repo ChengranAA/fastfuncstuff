@@ -1748,6 +1748,49 @@ def make_nuisance_block_from_glob(
     )
 
 
+def glt_from_contrast_files(
+    paths: list[str],
+    stim_labels: list[str],
+    stim_bots: list[int],
+    stim_tops: list[int],
+    n_columns: int,
+    extra_labels: list[str] | None = None,
+) -> tuple[list[str], list[np.ndarray]]:
+    """Resolve ``[[contrasts]]`` TOML fragments into full-width GLT rows.
+
+    ``stim_labels[i]`` owns design columns ``stim_bots[i]..stim_tops[i]``, so a
+    contrast names conditions and the weight spreads over their basis columns
+    exactly as ``-gltsym`` does. Each matrix is ``(1, n_columns)``: the fit only
+    computes t-tests, so a list-valued ``sym`` (an F-test) is refused here
+    rather than failing deep inside the GLS loop.
+    """
+    from fastfuncstuff.design.builder import glt_rows_to_matrix
+    from fastfuncstuff.design.spec import check_contrasts, parse_contrasts_text, resolve_contrast
+
+    contrasts = []
+    for path in paths:
+        contrasts.extend(parse_contrasts_text(Path(path).read_text(), str(path)))
+    problems = check_contrasts(contrasts, stim_labels, extra_labels)
+    if problems:
+        raise ValueError("-contrasts: " + "; ".join(problems))
+    stim_ranges = {
+        label: (int(bot), int(top))
+        for label, bot, top in zip(stim_labels, stim_bots, stim_tops, strict=False)
+    }
+    column_labels = [""] * n_columns
+    labels, matrices = [], []
+    for c in contrasts:
+        rows = resolve_contrast(c, stim_labels, extra_labels)
+        if len(rows) > 1:
+            raise ValueError(
+                f"-contrasts: '{c.label}' has several rows (an F-test); ffs_reml computes "
+                "t-test contrasts only. Split it into one contrast per row."
+            )
+        labels.append(c.label)
+        matrices.append(glt_rows_to_matrix(rows, column_labels, stim_ranges))
+    return labels, matrices
+
+
 def _ortvec_value(flag: str, example: str):
     """Reject a value that is really the next flag, i.e. a missing positional.
 

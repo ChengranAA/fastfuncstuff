@@ -1088,6 +1088,19 @@ Examples:
         "Durations are derived from the TSV data.",
     )
     onset_group.add_argument(
+        "-contrasts",
+        nargs="+",
+        metavar="TOML",
+        default=None,
+        help=(
+            "Contrasts to compute in the fit, from TOML files holding only [[contrasts]] "
+            "tables (the same fragment a design TOML takes; e.g. label = 'all_con', "
+            "sym = 'SYM: +0.5*a +0.5*b'). Needs -events/-onsets. Written to the "
+            "bucket beside the conditions, with the fit's own per-voxel HRFs and noise "
+            "model behind the t-stats. t-tests only."
+        ),
+    )
+    onset_group.add_argument(
         "-round_onsets",
         nargs="?",
         const=0.7,
@@ -2145,6 +2158,20 @@ def main():
         )
         sys.exit(1)
 
+    if args.contrasts:
+        if not (args.events or args.onsets):
+            print(
+                "ERROR: -contrasts needs -events or -onsets/-durations. A -matrix or -spec "
+                "design carries its own contrasts (put [[contrasts]] in the spec)."
+            )
+            sys.exit(1)
+        if args.single_trials:
+            print(
+                "ERROR: -contrasts cannot be combined with -single_trials: the design is "
+                "rewritten to one column per trial, so the condition names no longer exist."
+            )
+            sys.exit(1)
+
     # Single-trial design needs onset times; -matrix lacks per-event structure.
     if args.single_trials and not (args.events or args.onsets):
         print(
@@ -3052,6 +3079,22 @@ def main():
             "run_starts": run_starts,
             "n_runs": n_runs,
         }
+
+        if args.contrasts:
+            from fastfuncstuff.cli_utils import glt_from_contrast_files
+
+            try:
+                design_info["glt_labels"], design_info["glt_matrices"] = glt_from_contrast_files(
+                    args.contrasts,
+                    stim_labels_all,
+                    stim_bots,
+                    stim_tops,
+                    full_design_np.shape[1],
+                    extra_labels=stim_vec_labels,
+                )
+            except ValueError as exc:
+                sys.exit(f"ERROR: {exc}")
+            print(f"  Contrasts: {', '.join(design_info['glt_labels'])}")
 
         print()
         print("=" * 70)

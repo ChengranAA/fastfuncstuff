@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.laminar.params import ModelSpec
+from fastfuncstuff.laminar.params import P0, ModelSpec
 
 
 @dataclass
@@ -110,6 +110,7 @@ def two_condition_data(
     TE: float = 0.028,
     B0: float = 7.0,
     min_coverage: float = 0.99,
+    p0=None,
     dtype: torch.dtype = torch.float64,
 ) -> LaminarData:
     """Faes et al.'s design from two conditions' curves of one ROI.
@@ -152,7 +153,10 @@ def two_condition_data(
     rows[1:block] = True
     rows[block + gap + 1 :] = True
 
-    spec = ModelSpec(N=n_neuronal, K=k, n_inputs=2, n_mod=1, TE=TE, B0=B0, TR=tr, dtype=dtype)
+    spec = ModelSpec(
+        N=n_neuronal, K=k, n_inputs=2, n_mod=1, TE=TE, B0=B0, TR=tr, dtype=dtype,
+        p0=p0 if p0 is not None else P0(),  # e.g. pipeline.reference_p0(): the driver's baselines
+    )  # fmt: skip
     from fastfuncstuff.laminar.integrate import build_input
 
     onset_a = tr  # the event on the first response sample
@@ -173,13 +177,38 @@ def two_condition_data(
     )
 
 
-def model_kernel(matrix_deep_first: np.ndarray, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+def read_depth_psf(path: str | Path) -> dict[tuple[str, str], np.ndarray]:
+    """A ``*_depth_psf.tsv`` (written by reml/deconvolve/nwarp) as ``{(name, hemi): M}``,
+    each ``(K, K)`` with depth 1 deepest first and the weights as written."""
+    out: dict[tuple[str, str], dict] = {}
+    for r in csv.DictReader(open(path), delimiter="\t"):
+        out.setdefault((r["name"], r["hemi"]), {})[(int(r["depth"]), int(r["true_depth"]))] = float(
+            r["weight"]
+        )
+    mats = {}
+    for key, entries in out.items():
+        k = max(d for d, _ in entries)
+        m = np.zeros((k, k))
+        for (d, j), wgt in entries.items():
+            m[d - 1, j - 1] = wgt
+        mats[key] = m
+    return mats
+
+
+def model_kernel(
+    matrix_deep_first: np.ndarray, *, normalise: bool = True, dtype: torch.dtype = torch.float64
+) -> torch.Tensor:
     """A ``(K, K)`` depth sampling matrix from
     :func:`processing.roi_depth.depth_sampling_matrices` (depth 1 deepest, as the
     toolbox writes it) in the model's superficial-first order, ready for ``kernel=``."""
     m = np.asarray(matrix_deep_first, np.float64)
     if m.ndim != 2 or m.shape[0] != m.shape[1] or not np.isfinite(m).all():
         raise ValueError("a depth sampling matrix must be a finite (K, K) array")
+    if normalise:  # the reference's convention: no dilution by white matter or CSF
+        s = m.sum(axis=1, keepdims=True)
+        if (s <= 0).any():
+            raise ValueError("a depth sampling matrix row sums to zero")
+        m = m / s
     return torch.as_tensor(m[::-1, ::-1].copy(), dtype=dtype)
 
 
@@ -188,6 +217,7 @@ __all__ = [
     "LaminarData",
     "model_kernel",
     "pick_roi",
+    "read_depth_psf",
     "read_iresp_table",
     "two_condition_data",
 ]

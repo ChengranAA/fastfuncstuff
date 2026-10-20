@@ -1,0 +1,266 @@
+"""CLI: the laminar BOLD model on ROI x depth response curves -- model-based deveining.
+
+Command: ffs_laminar
+
+Usage:
+    ffs_laminar -cond1 k7_iresp_std.tsv k9_iresp_std.tsv -cond2 k7_iresp_dev.tsv k9_iresp_dev.tsv \
+        -duration 1.6 -psf_matrix k7_depth_psf.tsv k9_depth_psf.tsv -prefix lam/sub01
+    ffs_laminar -cond1 a_iresp_c1.tsv -cond2 a_iresp_c3.tsv -duration 1.6 -roi V1 -hemi lh \
+        -psf_kernel shipped_kernel.1D -models null superficial -prefix quick
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+import numpy as np
+
+from fastfuncstuff.cli_help import FfsArgumentParser
+
+_DESCRIPTION = """\
+Invert the Havlicek & Uludag laminar BOLD model on depth-resolved response curves,
+the analysis of Faes et al. (2026) (the notebook laminar_dcm_predictive_tones, as a
+tool): two conditions of one ROI are concatenated with masked white-noise padding,
+every layer hypothesis -- which neuronal depths the second condition modulates -- is
+inverted at each vascular resolution K, each model's posteriors are averaged across K,
+and the averaged models are compared by free energy.
+
+Inputs are the tidy curve tables ffs_deconvolve (or ffs_reml) writes in ROI x depth
+mode, {prefix}_iresp_<condition>.tsv, in PERCENT signal change (deconvolve's default;
+not -dont_scale).  Give one table per K for each condition: run the depth sampling at
+several -depths (the reference uses 7, 9, 10 and 11).  The model's scan interval is the
+curves' knot spacing; -duration is the event they respond to.
+
+The depth point-spread function, one of:
+  -psf_matrix FILE [FILE ...]  the measured mixing of this sampling, one
+                               *_depth_psf.tsv per K (reml/deconvolve/nwarp write
+                               them).  Rows normalised to 1 unless -psf_raw.
+  -psf_kernel FILE             a 1-D kernel (numbers in a text file) applied at every
+                               K, as the reference driver does -- parity.
+  -psf_variance V              the reference's Gaussian form, built for each K.
+  none of them                 no PSF.
+
+Writes {prefix}_laminar_models.tsv (F, model and per-K evidence), _depths.tsv
+(P(depth modulated) marginalised over the model space -- prefer it to the winner --
+and the best model's B with 90% credible intervals), _devein.tsv (the static
+deveining operator, neuronal depth x measured depth, depth 1 deepest), _neuronal.tsv
+(deveined neuronal time courses) and _laminar.json.
+
+Runs on the CPU in float64, as the model's small ODE wants; ROIs run in parallel
+across -workers processes.
+"""
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = FfsArgumentParser(prog="ffs_laminar", description=_DESCRIPTION)
+    g = p.add_argument_group("Data")
+    g.add_argument("-cond1", nargs="+", required=True, metavar="TSV",
+                   help="The first (baseline) condition's curve table, one per K.")  # fmt: skip
+    g.add_argument("-cond2", nargs="+", required=True, metavar="TSV",
+                   help="The second condition's, the one the modulatory input marks; one per K.")  # fmt: skip
+    g.add_argument("-duration", type=float, required=True, metavar="SEC",
+                   help="Duration of the event the curves respond to (s).")  # fmt: skip
+    g.add_argument("-roi", nargs="+", default=None, metavar="ROI",
+                   help="ROIs to fit, by id or name (default: every ROI in every table).")  # fmt: skip
+    g.add_argument("-hemi", default=None, choices=("lh", "rh"),
+                   help="Hemisphere, when an ROI name is in both.")  # fmt: skip
+    g.add_argument("-gap", type=int, default=20, help="Masked white-noise rows between conditions.")
+    g.add_argument("-seed", type=int, default=20260918, help="Seed of the padding noise.")
+
+    psf = p.add_argument_group("Depth point-spread function")
+    one = psf.add_mutually_exclusive_group()
+    one.add_argument("-psf_matrix", nargs="+", default=None, metavar="TSV",
+                     help="*_depth_psf.tsv tables, one per K (matched by their number of depths).")  # fmt: skip
+    one.add_argument("-psf_kernel", default=None, metavar="FILE",
+                     help="A 1-D kernel applied at every K (the reference's parity form).")  # fmt: skip
+    one.add_argument("-psf_variance", type=float, default=None, metavar="V",
+                     help="Variance of the reference's Gaussian PSF on the 0..1 depth axis.")  # fmt: skip
+    psf.add_argument("-psf_raw", action="store_true",
+                     help="Use -psf_matrix rows as written (cortex share < 1 at the edge depths) "
+                     "instead of normalised to 1.")  # fmt: skip
+
+    m = p.add_argument_group("Model")
+    m.add_argument("-models", nargs="+", default=None, metavar="NAME",
+                   help="Subset of the model space by name (null, superficial, middle, deep, "
+                   "superficial+middle, ...). Default: all 2^N.")  # fmt: skip
+    m.add_argument("-N", type=int, default=3, help="Neuronal depths.")
+    m.add_argument("-free_energy", choices=("reference", "sum", "mean"), default="reference",
+                   help="Which F an averaged model carries: 'reference' is the first K's, as "
+                   "spm_dcm_bpa leaves it; 'sum'/'mean' accumulate over K.")  # fmt: skip
+    m.add_argument("-delay", type=float, default=0.0, metavar="SEC",
+                   help="Where in each sample the prediction is read. TENT knots sit at exact "
+                   "times after the event, so 0.")  # fmt: skip
+    m.add_argument("-reference_delay", action="store_true",
+                   help="The reference's slice-timing delay instead, TR/2.")  # fmt: skip
+    m.add_argument("-TE", type=float, default=0.028, help="Echo time (s).")
+    m.add_argument("-B0", type=float, default=7.0, help="Field strength (T).")
+    m.add_argument("-max_iter", type=int, default=128, help="Variational Laplace iterations.")
+
+    o = p.add_argument_group("Output")
+    o.add_argument("-prefix", required=True, help="Output prefix.")
+    o.add_argument("-workers", type=int, default=0,
+                   help="Processes, one ROI each (0: half the cores).")  # fmt: skip
+    o.add_argument("-verb", type=int, default=1, help="0 quiet, 1 progress.")
+    return p.parse_args(argv)
+
+
+def _by_k(paths, what):
+    """``{K: table}`` from per-K curve tables (K = their number of depths)."""
+    from fastfuncstuff.laminar.io import read_iresp_table
+
+    out = {}
+    for path in paths:
+        table = read_iresp_table(path)
+        k = next(iter(table.values())).values.shape[1]
+        if k in out:
+            raise ValueError(f"{what}: two tables have K = {k} ({path})")
+        out[k] = table
+    return out
+
+
+def _kernels(args, ks, name, hemi):
+    import torch
+
+    from fastfuncstuff.laminar.io import model_kernel, read_depth_psf
+    from fastfuncstuff.laminar.layers import gaussian_depth_kernel
+
+    if args.psf_kernel:
+        kern = np.loadtxt(args.psf_kernel).reshape(-1)
+        return {k: torch.as_tensor(kern, dtype=torch.float64) for k in ks}
+    if args.psf_variance is not None:
+        return {k: torch.as_tensor(gaussian_depth_kernel(args.psf_variance, k)) for k in ks}
+    if args.psf_matrix:
+        mats = {}
+        for path in args.psf_matrix:
+            for (n, h), mat in read_depth_psf(path).items():
+                if n == name and h == hemi:
+                    mats[mat.shape[0]] = mat
+        missing = [k for k in ks if k not in mats]
+        if missing:
+            raise ValueError(f"ROI {name} ({hemi}): no -psf_matrix table with K = {missing}")
+        return {k: model_kernel(mats[k], normalise=not args.psf_raw) for k in ks}
+    return None
+
+
+def _fit_one(job):
+    import torch
+
+    torch.set_num_threads(1)
+    from fastfuncstuff.laminar.pipeline import fit_roi
+
+    data_for_k, kernels, targets, names, kw = job
+    return fit_roi(data_for_k, kernels, targets=targets, names=names, **kw)
+
+
+def main(argv: list[str] | None = None) -> int:
+    from fastfuncstuff.laminar.experiment import layer_model_names, layer_model_targets
+    from fastfuncstuff.laminar.io import pick_roi, two_condition_data
+    from fastfuncstuff.laminar.pipeline import reference_p0, write_results
+
+    args = parse_args(argv)
+    t0 = time.time()
+    try:
+        one, two = _by_k(args.cond1, "-cond1"), _by_k(args.cond2, "-cond2")
+        if sorted(one) != sorted(two):
+            raise ValueError(f"-cond1 has K = {sorted(one)} but -cond2 has K = {sorted(two)}")
+        ks = sorted(one)
+        all_names, all_targets = layer_model_names(args.N), layer_model_targets(args.N)
+        if args.models:
+            bad = [m for m in args.models if m not in all_names]
+            if bad:
+                raise ValueError(f"unknown model(s) {bad}; the space is {all_names}")
+            names = list(args.models)
+            targets = [all_targets[all_names.index(m)] for m in names]
+        else:
+            names, targets = all_names, all_targets
+        keys = [k for k in one[ks[0]] if all(k in one[q] and k in two[q] for q in ks)]
+        if args.roi:
+            wanted = set(args.roi)
+            keys = [k for k in keys if (k[0] in wanted or k[1] in wanted)]
+        if args.hemi:
+            keys = [k for k in keys if k[2] == args.hemi]
+        if not keys:
+            raise ValueError("no ROI is in every table (and matches -roi / -hemi)")
+
+        delay = None if args.reference_delay else args.delay
+        jobs = []
+        for rid, name, hemi in keys:
+            data_for_k = {
+                k: two_condition_data(
+                    pick_roi(one[k], rid, hemi),
+                    pick_roi(two[k], rid, hemi),
+                    duration=args.duration,
+                    n_neuronal=args.N,
+                    gap=args.gap,
+                    seed=args.seed,
+                    delay_seconds=delay,
+                    TE=args.TE,
+                    B0=args.B0,
+                    p0=reference_p0(),
+                )  # fmt: skip
+                for k in ks
+            }
+            kw = {"free_energy": args.free_energy, "max_iter": args.max_iter,
+                  "roi": rid, "name": name, "hemi": hemi}  # fmt: skip
+            jobs.append((data_for_k, _kernels(args, ks, name, hemi), targets, names, kw))
+    except (OSError, ValueError) as exc:
+        print(f"ffs_laminar: {exc}", file=sys.stderr)
+        return 1
+
+    psf = (
+        "matrix" if args.psf_matrix else "kernel" if args.psf_kernel
+        else "gaussian" if args.psf_variance is not None else "none"
+    )  # fmt: skip
+    if args.verb >= 1:
+        print(f"ffs_laminar: {len(jobs)} ROI(s) x {len(names)} model(s) x K = {ks} "
+              f"({len(jobs) * len(names) * len(ks)} inversions), PSF: {psf}")  # fmt: skip
+    workers = args.workers or max(1, __import__("os").cpu_count() // 2)
+    workers = min(workers, len(jobs))
+    if workers == 1:
+        fits = [_fit_one(j) for j in _progress(jobs, args.verb)]
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            fits = list(_progress(pool.map(_fit_one, jobs), args.verb, total=len(jobs)))
+    written = write_results(
+        args.prefix, fits,
+        provenance={"cond1": args.cond1, "cond2": args.cond2, "duration": args.duration,
+                    "K": ks, "psf": psf, "psf_matrix": args.psf_matrix,
+                    "psf_kernel": args.psf_kernel, "psf_variance": args.psf_variance,
+                    "psf_raw": args.psf_raw, "models": names, "free_energy": args.free_energy,
+                    "delay_seconds": "TR/2" if delay is None else delay, "TE": args.TE,
+                    "B0": args.B0, "p0": "reference driver (V0t 3, nr 3, al_v 0.35, w_v 0.5)"},
+    )  # fmt: skip
+    if args.verb >= 1:
+        for f in fits:
+            print(f"  {f.name} ({f.hemi}): best '{f.models[f.best]}' "
+                  f"p={f.p_model[f.best]:.3f}; P(modulated) "
+                  + ", ".join(f"{d} {p:.2f}" for d, p in zip(_names(args.N), f.p_depth, strict=True)))  # fmt: skip
+        for path in written:
+            print(f"  wrote {path}")
+        print(f"ffs_laminar: done in {time.time() - t0:.0f} s")
+    return 0
+
+
+def _names(n):
+    from fastfuncstuff.laminar.pipeline import depth_names
+
+    return depth_names(n)
+
+
+def _progress(it, verb, total=None):
+    if verb < 1:
+        return it
+    try:
+        from tqdm.auto import tqdm
+
+        return tqdm(it, total=total, desc="ROIs", leave=True, disable=(total or 2) < 2)
+    except ImportError:  # pragma: no cover
+        return it
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -234,6 +234,74 @@ def panel_psf(ax, fit: RoiFit) -> None:
     )
 
 
+def _label(f: RoiFit) -> str:
+    """ROI label for a summary axis; '!' marks a fit with warnings (stalled, inconsistent)."""
+    return f"{f.name} ({f.hemi})" + (" !" if f.warnings else "")
+
+
+def plot_summary(
+    fits: list[RoiFit], path: str | Path, conditions: tuple[str, str] = ("cond 1", "cond 2")
+) -> str:
+    """Where the effect is, across ROIs: one row per ROI, one column per neuronal depth.
+
+    Left, the probability each depth is modulated (marginalised over the whole model
+    space -- prefer it to the winning model); middle, the best model's B, starred where its
+    90% interval excludes zero; right, the winner and how sure the model comparison is.
+    ROIs whose fit stalled or contradicts nesting are marked '!' -- look at their pages.
+    """
+    plt = _plt()
+    n = len(fits)
+    names = depth_names(len(fits[0].B_mean))
+    labels = [_label(f) for f in fits]
+    p = np.array([f.p_depth for f in fits])
+    b = np.array([f.B_mean for f in fits])
+    sd = np.array([f.B_sd for f in fits])
+    fig, axes = plt.subplots(
+        1, 3, figsize=(15, max(3.5, 0.45 * n + 2.5)), gridspec_kw={"width_ratios": [1, 1, 1.15]}
+    )  # fmt: skip
+
+    ax = axes[0]
+    im = ax.imshow(p, vmin=0, vmax=1, cmap="magma", aspect="auto")
+    ax.set_xticks(range(len(names)), names, rotation=20, ha="right")
+    ax.set_yticks(range(n), labels)
+    for i in range(n):
+        for j in range(len(names)):
+            ax.text(j, i, f"{p[i, j]:.2f}", ha="center", va="center", fontsize=7,
+                    color="white" if p[i, j] < 0.6 else "black")  # fmt: skip
+    ax.grid(False)
+    ax.set_title(f"P(depth modulated: {conditions[1]} vs {conditions[0]})")
+    fig.colorbar(im, ax=ax, fraction=0.046)
+
+    ax = axes[1]
+    lim = max(float(np.nanmax(np.abs(b))), 1e-6)
+    im = ax.imshow(b, vmin=-lim, vmax=lim, cmap="RdBu_r", aspect="auto")
+    ax.set_xticks(range(len(names)), names, rotation=20, ha="right")
+    ax.set_yticks(range(n), [""] * n)
+    for i in range(n):
+        for j in range(len(names)):
+            if sd[i, j] > 0 and abs(b[i, j]) > 1.6448536 * sd[i, j]:
+                ax.text(j, i, "*", ha="center", va="center", fontsize=14)
+    ax.grid(False)
+    ax.set_title("B of the best model (* = 90% interval excludes 0)")
+    fig.colorbar(im, ax=ax, fraction=0.046)
+
+    ax = axes[2]
+    pm = np.array([f.p_model[f.best] for f in fits])
+    ax.barh(range(n), pm, color=[BEST if f.warnings else OTHER for f in fits])
+    ax.set_yticks(range(n), [""] * n)
+    ax.invert_yaxis()
+    for i, f in enumerate(fits):
+        ax.text(min(pm[i], 0.98) + 0.01, i, f.models[f.best], va="center", fontsize=8)
+    ax.set(xlim=(0, 1.5), xlabel="posterior probability of the winner",
+           title="Winning model per ROI")  # fmt: skip
+    fig.suptitle(f"Laminar model, {n} ROI(s): where the effect is", y=0.995)
+    fig.tight_layout()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+    return str(path)
+
+
 def plot_roi(
     fit: RoiFit, path: str | Path, conditions: tuple[str, str] = ("cond 1", "cond 2")
 ) -> str:
@@ -255,7 +323,8 @@ def plot_roi(
     panel_psf(a[11], fit)
     fig.suptitle(
         f"{fit.name} ({fit.hemi}):  best model '{fit.models[fit.best]}' "
-        f"(p = {fit.p_model[fit.best]:.3f}),  K = {fit.k_values}",
+        f"(p = {fit.p_model[fit.best]:.3f}),  K = {fit.k_values}"
+        + ("   [WARNING: stalled or inconsistent fit -- see the table]" if fit.warnings else ""),
         y=0.995, fontsize=12,
     )  # fmt: skip
     fig.tight_layout()
@@ -279,4 +348,5 @@ __all__ = [
     "panel_psf",
     "panel_transit",
     "plot_roi",
+    "plot_summary",
 ]

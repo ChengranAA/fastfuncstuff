@@ -151,7 +151,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    "model input and what was masked, free energy per model and K, model and "
                    "depth probabilities, the modulation B with credible intervals, data against "
                    "fit, measured against deveined time courses and depth profiles, the deveining "
-                   "operator, the vein-attributable shift, transit delay and the depth PSF.")  # fmt: skip
+                   "operator, the vein-attributable shift, transit delay and the depth PSF.  With several "
+                   "ROIs also {prefix}_laminar_summary.png: per ROI and neuronal depth, where the "
+                   "effect is.")  # fmt: skip
     o.add_argument("-workers", type=int, default=0,
                    help="Processes, one ROI each (0: half the cores).")  # fmt: skip
     o.add_argument("-verb", type=int, default=1, help="0 quiet, 1 progress.")
@@ -317,12 +319,14 @@ def main(argv: list[str] | None = None) -> int:
                     "B0": args.B0, "p0": "reference driver (V0t 3, nr 3, al_v 0.35, w_v 0.5)"},
     )  # fmt: skip
     if args.plots:
-        from fastfuncstuff.laminar.plots import plot_roi
+        from fastfuncstuff.laminar.plots import plot_roi, plot_summary
 
         conds = tuple(args.conds) if args.conds else ("cond 1", "cond 2")
         for f in fits:
             tag = f"{f.name}_{f.hemi}".replace("/", "-").replace(" ", "_")
             written.append(plot_roi(f, f"{args.prefix}_laminar_{tag}.png", conds))
+        if len(fits) > 1:
+            written.append(plot_summary(fits, f"{args.prefix}_laminar_summary.png", conds))
     for f in fits:
         for w in f.warnings:
             print(f"ffs_laminar: WARNING {f.name} ({f.hemi}): {w}", file=sys.stderr)

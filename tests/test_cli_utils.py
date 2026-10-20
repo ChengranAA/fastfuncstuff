@@ -349,3 +349,20 @@ def test_save_4d_nifti_rejects_mismatched_labels(tmp_path):
     data = np.zeros((10, 4), dtype=np.float32)
     with pytest.raises(ValueError, match="brick_labels"):
         save_4d_nifti(data, str(tmp_path / "x.nii.gz"), (10, 1, 1), np.eye(4), brick_labels=["a"])
+
+
+def test_ortvec_glob_missing_label_is_named_not_unrecognized(capsys):
+    """`-ortvec_glob PATTERN -flag N` lets argparse swallow the flag as LABEL."""
+    import pytest
+
+    from fastfuncstuff.cli_help import FfsArgumentParser
+    from fastfuncstuff.cli_utils import add_ortvec_arguments
+
+    parser = FfsArgumentParser()
+    add_ortvec_arguments(parser)
+    parser.add_argument("-round_durations", type=int)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["-ortvec_glob", "m_*.1D", "-round_durations", "1"])
+    assert "left out the LABEL" in capsys.readouterr().err
+    ok = parser.parse_args(["-ortvec_glob", "m_*.1D", "motion", "-round_durations", "1"])
+    assert ok.ortvec_glob == [["m_*.1D", "motion"]]

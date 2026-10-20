@@ -412,6 +412,11 @@ class Prepared:
     lookup: np.ndarray
     affine: np.ndarray
     tr: float
+    #: ROI mode: each row of ``y`` is the mean of one ROI's voxels, ``lookup`` sends every
+    #: voxel of an ROI to its row, and ``mask`` is the ROI voxels. Maps are painted back
+    #: through ``lookup``, so every voxel of an ROI wears its ROI's value.
+    roi_names: tuple[str, ...] | None = None
+    roi_sizes: np.ndarray | None = None
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -502,10 +507,17 @@ def prepare(
     tr: float,
     mask: np.ndarray | None = None,
     blur_fwhm: float = 0.0,
+    rois: str | Path | None = None,
     device: torch.device | None = None,
     progress: ProgressFn | None = None,
 ) -> Prepared:
     """Mask a 4-D run and lay it out as ``(V, T)`` on the compute device.
+
+    With ``rois`` (a 3-D label map or binary mask on the run's grid) each row is
+    instead one ROI's mean series, averaged *before* the fit -- the toolbox's
+    ``-atlas`` -- and the maps are painted back so every voxel of an ROI shows its
+    ROI's value. That is the one reason this is a label map and not a weighted or
+    overlapping set: a voxel in two ROIs has no single value to wear.
 
     Masked, not whole: outside the brain there is no baseline, so a percent
     signal change is a division by noise and the colour scale ends up set by
@@ -532,8 +544,17 @@ def prepare(
     if not mask.any():
         raise ValueError("the mask is empty; nothing to fit")
 
-    lookup = np.full(mask.shape, -1, dtype=np.int32)
-    lookup[mask] = np.arange(int(mask.sum()), dtype=np.int32)
+    roi_set = None
+    if rois is not None:
+        from fastfuncstuff.processing.roi_collapse import build_roi_set
+
+        roi_set = build_roi_set(str(rois), mask.shape, mask=mask)  # ROI cover & brain mask
+        if not roi_set.disjoint:
+            raise ValueError(
+                "ROIs are painted back onto voxels, so they must be one label map or binary "
+                "mask: overlapping or weighted ROIs leave a voxel with no single value"
+            )
+    gather = mask if roi_set is None else roi_set.rows
 
     if blur_fwhm > 0:
         from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox
@@ -542,24 +563,38 @@ def prepare(
             float(np.linalg.norm(np.asarray(affine, float)[:3, i])) or 1.0 for i in range(3)
         )
         y = _blurred_rows(data, mask, fwhm_mm_to_sigma_vox(blur_fwhm, zooms), device, progress)
+        if roi_set is not None:  # the blur ran inside the brain; keep the ROI voxels of it
+            pick = np.flatnonzero(roi_set.rows[mask])
+            y = y[torch.as_tensor(pick, device=y.device)]
     else:
         if progress is not None:
             progress(0.35, "gathering")
         flat = np.asarray(data, dtype=np.float32).reshape(-1, data.shape[3])
-        y = torch.as_tensor(flat[mask.reshape(-1)])
+        y = torch.as_tensor(flat[gather.reshape(-1)])
         if device.type != "cpu":
             if progress is not None:
                 progress(0.7, "to device")
             y = y.to(device)
+
+    lookup = np.full(mask.shape, -1, dtype=np.int32)
+    if roi_set is None:
+        lookup[mask] = np.arange(int(mask.sum()), dtype=np.int32)
+        names = sizes = None
+    else:
+        y = roi_set.collapse(y, device=y.device)
+        lookup[roi_set.rows] = np.asarray(roi_set.spec, dtype=np.int32)
+        names, sizes = tuple(roi_set.names), np.asarray(roi_set.sizes)
     if progress is not None:
         progress(1.0, "ready")
     return Prepared(
         y=y,
         mean=y.mean(dim=1),
-        mask=mask,
+        mask=gather,
         lookup=lookup,
         affine=np.asarray(affine, dtype=float),
         tr=float(tr),
+        roi_names=names,
+        roi_sizes=sizes,
     )
 
 
@@ -635,7 +670,10 @@ class Fit:
         """One map as a ``(nx, ny, nz)`` volume, zero outside the mask."""
         flat = self.values(kind, column, psc).detach().cpu().numpy().astype(np.float32)
         out = np.zeros(self.prepared.shape, dtype=np.float32)
-        out[self.prepared.mask] = np.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
+        mask = self.prepared.mask
+        # Through the lookup, not the mask's own order: in ROI mode a row is an ROI and
+        # every voxel of it takes the row's value.
+        out[mask] = np.nan_to_num(flat[self.prepared.lookup[mask]], nan=0.0, posinf=0.0, neginf=0.0)
         return out
 
     # -- one voxel -----------------------------------------------------
@@ -850,6 +888,10 @@ def noise_pcs(
     """
     from fastfuncstuff.denoise.combinatorial import extract_pcs_single_run_with_variance
 
+    if prepared.roi_names is not None and n_components > 0:
+        raise ValueError(
+            "noise PCs are drawn from a pool of brain voxels; ROI means have none to choose from"
+        )
     if n_components <= 0 or not bool(pool.any()):
         return np.zeros((prepared.n_time, 0), dtype=np.float64), np.zeros(0)
     device = device or prepared.y.device

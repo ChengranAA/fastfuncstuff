@@ -528,3 +528,103 @@ def test_a_drifting_regressor_does_not_change_what_the_drift_columns_absorb():
     got = fit.betas.numpy().astype(np.float64)
     scale = np.abs(reference).max()
     assert np.abs(got - reference).max() / scale < 1e-5
+
+
+# -- ROI mode ---------------------------------------------------------------
+
+
+def _label_map(tmp_path, labels=None):
+    import nibabel as nib
+
+    lab = np.zeros(SHAPE, np.int16)
+    lab[:3] = 1
+    lab[3:] = 2
+    lab = lab if labels is None else labels
+    path = tmp_path / "rois.nii.gz"
+    nib.save(nib.Nifti1Image(lab, np.diag([3.0, 3.0, 3.0, 1.0])), path)
+    return path, lab
+
+
+def _roi_prepare(run, path, **kw):
+    return ig.prepare(
+        run,
+        affine=np.diag([3.0, 3.0, 3.0, 1.0]),
+        tr=TR,
+        mask=np.ones(SHAPE, dtype=bool),
+        rois=path,
+        device=CPU,
+        **kw,
+    )
+
+
+def test_roi_mode_is_the_voxel_fit_of_a_run_made_of_roi_means(events, run, tmp_path):
+    """Averaging first, then painting back, must be indistinguishable from fitting a run
+    in which every voxel of an ROI already carries the ROI's mean series."""
+    path, lab = _label_map(tmp_path)
+    means = np.zeros_like(run)
+    for k in (1, 2):
+        means[lab == k] = run[lab == k].mean(axis=0)
+    parsed, task = _task(events)
+    model = ig.build_model(n_time=N_TIME, tr=TR, task=task[0], task_labels=task[1], polort=2)
+
+    roi_fit = ig.fit_model(_roi_prepare(run, path), model, device=CPU)
+    voxel_fit = ig.fit_model(
+        ig.prepare(means, affine=np.diag([3.0, 3.0, 3.0, 1.0]), tr=TR,
+                   mask=np.ones(SHAPE, bool), device=CPU),
+        model, device=CPU,
+    )  # fmt: skip
+    for kind in ig.MAPS:
+        np.testing.assert_allclose(
+            roi_fit.volume(kind), voxel_fit.volume(kind), rtol=1e-4, atol=1e-5, err_msg=kind
+        )
+    assert roi_fit.prepared.n_voxels == 2 and roi_fit.prepared.roi_names is not None
+
+
+def test_roi_maps_are_constant_within_an_roi_and_zero_outside_the_rois(events, run, tmp_path):
+    lab = np.zeros(SHAPE, np.int16)
+    lab[:2] = 1
+    lab[4:] = 2  # x in {2, 3} belongs to no ROI
+    path, _ = _label_map(tmp_path, lab)
+    parsed, task = _task(events)
+    model = ig.build_model(n_time=N_TIME, tr=TR, task=task[0], task_labels=task[1], polort=1)
+    fit = ig.fit_model(_roi_prepare(run, path), model, device=CPU)
+    vol = fit.volume("beta", column=0)
+    for k in (1, 2):
+        assert np.ptp(vol[lab == k]) == 0.0
+    assert (vol[lab == 0] == 0).all()
+    assert vol[lab == 1][0] != vol[lab == 2][0]
+
+
+def test_roi_decomposition_at_a_voxel_is_its_rois(events, run, tmp_path):
+    path, lab = _label_map(tmp_path)
+    parsed, task = _task(events)
+    model = ig.build_model(n_time=N_TIME, tr=TR, task=task[0], task_labels=task[1], polort=2)
+    fit = ig.fit_model(_roi_prepare(run, path), model, device=CPU)
+    a, b = fit.decompose((0, 0, 0)), fit.decompose((2, 4, 3))  # both in ROI 1
+    np.testing.assert_allclose(a["data"], run[lab == 1].mean(axis=0), rtol=1e-5)
+    np.testing.assert_allclose(a["data"], b["data"])
+    assert not np.allclose(a["data"], fit.decompose((5, 0, 0))["data"])
+
+
+def test_overlapping_rois_and_noise_pcs_are_refused_in_roi_mode(events, run, tmp_path):
+    import nibabel as nib
+
+    stack = np.zeros((*SHAPE, 2), np.float32)
+    stack[:4, ..., 0] = 1
+    stack[2:, ..., 1] = 1  # x in {2, 3} is in both
+    p = tmp_path / "overlap.nii.gz"
+    nib.save(nib.Nifti1Image(stack, np.diag([3.0, 3.0, 3.0, 1.0])), p)
+    with pytest.raises(ValueError, match="one label map"):
+        _roi_prepare(run, p)
+
+    path, _ = _label_map(tmp_path)
+    prepared = _roi_prepare(run, path)
+    with pytest.raises(ValueError, match="noise PCs"):
+        ig.noise_pcs(prepared, torch.ones(2, dtype=torch.bool), np.zeros((N_TIME, 0)), 2)
+
+
+def test_roi_mode_blur_blurs_inside_the_brain_before_averaging(run, tmp_path):
+    path, lab = _label_map(tmp_path)
+    plain = _roi_prepare(run, path)
+    blurred = _roi_prepare(run, path, blur_fwhm=3.0)
+    assert blurred.n_voxels == 2 and not torch.allclose(plain.y, blurred.y)

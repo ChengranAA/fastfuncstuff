@@ -69,6 +69,10 @@ class ReadPlan:
     meta: dict = field(default_factory=dict)
     #: ``{roi id: {surface name: vertex ids}}`` for ribbon plans, to paint results back.
     vertices: dict = field(default_factory=dict)
+    #: Ribbon plans: what built them, so the depth sampling matrices can be tiled the
+    #: same way, pass by pass (``rois``, ``groups``, ``surfaces``, ``opts``, ``step``,
+    #: ``through``). Not written anywhere.
+    build: dict = field(default_factory=dict, repr=False)
 
     @property
     def n_rois(self) -> int:
@@ -252,7 +256,11 @@ def plan_depth_reads(
             "max_reads": cap,
         },
         vertices=vertices,
-    )
+        build={
+            "rois": rois, "groups": groups, "surfaces": surfaces, "opts": opts,
+            "step": step, "through": through,
+        },
+    )  # fmt: skip
 
 
 class RoiFold:
@@ -332,10 +340,110 @@ def read_through_chain(
     return ReadResult(out, np.clip(cover, 0.0, 1.0))
 
 
+def native_depth_matrices(
+    plan: ReadPlan,
+    source_image,
+    source_path: str,
+    nwarp_specs,
+    master_path: str,
+    *,
+    interp: str = "wsinc5",
+    ainterp: str = "cubic",
+    normalise: bool = False,
+    device=None,
+    chain_base: str | None = None,
+) -> list[tuple[str, str, np.ndarray]]:
+    """The depth sampling matrices of reads through the chain, one per ROI (depth 1 first).
+
+    What :func:`processing.roi_depth.depth_sampling_matrices` computes for data on a
+    grid, for the grid that matters here: the **native EPI**. Every cell's native
+    coordinates come from reading index volumes through the chain with linear
+    interpolation, which is exact (the :mod:`surface_qc` trick; motion at frame 0). Each
+    cell's true-depth volume goes into the native voxel it lands in, divided by that
+    voxel's real volume in the anatomy (``1 / |det J|`` of the chain at a cell inside
+    it, so a voxel the distortion stretched holds more cortex, not more signal); the
+    ROI's reads then interpolate those voxels with ``interp`` -- nwarp's own -- and
+    average with the cells' volumes.
+    """
+    from fastfuncstuff.processing import roi_depth as rd
+    from fastfuncstuff.processing.surface_qc import _forge, _header_3d
+
+    b = plan.build
+    if not b:
+        raise ValueError("depth sampling matrices need a ribbon plan")
+    src, header = source_image
+    nz, ny, nx = (int(n) for n in src.shape[-3:])
+    shape3 = (nx, ny, nz)
+    h3 = _header_3d(header, (nz, ny, nx))
+    zz, yy, xx = torch_meshgrid(nz, ny, nx)
+    ones = xx * 0 + 1  # a constant volume: reads wholly inside the grid return exactly 1
+    kw = dict(interp="linear", ainterp=ainterp, device=device, verb=0, chain_base=chain_base)
+    zooms = np.asarray(header["header"].get_zooms()[:3], np.float64)
+    native_mm = float(np.prod(zooms) ** (1 / 3))
+
+    def native(points):
+        c = [_forge((vol, h3), points, nwarp_specs, master_path, source_path, **kw)
+             for vol in (xx, yy, zz, ones)]  # fmt: skip
+        ijk = np.stack([t.cpu().numpy().astype(np.float64) for t in c[:3]], 1)
+        ijk[np.abs(c[3].cpu().numpy() - 1.0) > 1e-3] = np.nan  # off the native grid
+        return ijk
+
+    out: list = [None] * len(b["rois"])
+    h = 0.25  # mm, for the chain's Jacobian by central differences
+    for group in b["groups"]:
+        sub = [b["rois"][i] for i in group]
+        dp = rd.plan_depth_rois(
+            sub, b["surfaces"], b["step"], b["opts"], through=b["through"],
+            halo_mm=rd.psf_halo_mm(interp, native_mm), keep_all=True, device=device,
+        )  # fmt: skip
+        assert dp.all_cells is not None and dp.owned_index is not None
+        every_ijk = native(dp.all_cells.centre)
+        own = np.nan_to_num(every_ijk[dp.owned_index], nan=-1e6)
+        n_vox = nx * ny * nz
+        w, _ = rd._compose(dp.operator, own, None, shape3, interp, None, n_vox)
+
+        def voxel_mm3(touched, every_ijk=every_ijk, dp=dp):
+            # One cell inside each touched voxel stands for it: the chain is smooth
+            # on the scale of a voxel.
+            ijk = np.rint(every_ijk)
+            ok = np.isfinite(ijk).all(1)
+            flat = np.full(len(ijk), -1, np.int64)
+            ii = ijk[ok].astype(np.int64)
+            good = np.all((ii >= 0) & (ii < np.asarray(shape3)), 1)
+            flat[np.flatnonzero(ok)[good]] = np.ravel_multi_index(tuple(ii[good].T), shape3)
+            first = {}
+            for c, f in zip(np.flatnonzero(flat >= 0), flat[flat >= 0], strict=True):
+                first.setdefault(int(f), int(c))
+            vol = np.full(touched.size, np.prod(zooms))
+            reps = [(i, first[int(t)]) for i, t in enumerate(touched) if int(t) in first]
+            if reps:
+                at = dp.all_cells.centre[[c for _, c in reps]]
+                steps = [s * h * np.eye(3)[a] for a in range(3) for s in (1.0, -1.0)]
+                got = native(np.concatenate([at + d for d in steps]))
+                blocks = np.split(got, 6)
+                jac = np.stack([(blocks[2 * a] - blocks[2 * a + 1]) / (2 * h) for a in range(3)], 2)
+                det = np.abs(np.linalg.det(jac))
+                vol[[i for i, _ in reps]] = np.where(det > 0, 1.0 / det, np.prod(zooms))
+            return vol
+
+        mats = rd._mix_matrices(dp, w, every_ijk, shape3, voxel_mm3, normalise)
+        for g, m in zip(group, mats, strict=True):
+            out[g] = m
+    return out
+
+
+def torch_meshgrid(nz: int, ny: int, nx: int):
+    import torch
+
+    return torch.meshgrid(
+        *(torch.arange(n, dtype=torch.float32) for n in (nz, ny, nx)), indexing="ij"
+    )
+
+
 def output_paths(prefix: str, ribbon: bool) -> list[str]:
     stem = f"{prefix}.roi"
     return [f"{stem}.nii.gz", f"{stem}.tsv", f"{stem}.json"] + (
-        [f"{stem}.vertices.npz"] if ribbon else []
+        [f"{stem}.vertices.npz", f"{stem}.depth_psf.tsv"] if ribbon else []
     )
 
 
@@ -526,6 +634,7 @@ __all__ = [
     "RoiFold",
     "adopt_roi_series_input",
     "default_max_reads",
+    "native_depth_matrices",
     "output_paths",
     "plan_depth_reads",
     "plan_volume_reads",

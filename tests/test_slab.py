@@ -121,3 +121,26 @@ def test_equivolume_cells_beat_equidistant_on_bok_truth_with_pial_slide():
     err_equidist = np.abs(tiling.rho - truth).mean()
     err_equivol = np.abs(equivolume_metric(tiling, surf, 1) - truth).mean()
     assert err_equivol < 0.25 * err_equidist, (err_equivol, err_equidist)
+
+
+def test_thicker_sheets_reach_the_tiling_and_the_estimate_is_exact():
+    """The read budget relaxes only the sheet thickness; that must change the cells
+    actually made, not just the estimate of them."""
+    from fastfuncstuff.surface.slab import estimate_cells
+
+    surf, v, f = _sphere()
+    faces = np.arange(len(f))
+    for through in (0.5, 1.0):
+        n = len(ribbon_cells([surf], {0: faces}, step=1.0, n_depths=2, through=through))
+        assert n == estimate_cells(surf, faces, 1.0, 2, through=through)
+    thin = len(ribbon_cells([surf], {0: faces}, step=1.0, n_depths=2, through=0.5))
+    thick = len(ribbon_cells([surf], {0: faces}, step=1.0, n_depths=2, through=1.0))
+    assert thick < thin
+
+
+def test_float32_vertices_do_not_change_the_tiling():
+    surf, v, f = _sphere()
+    s32 = RibbonSurfaces("lh", surf.white.astype(np.float32), surf.pial.astype(np.float32), f)
+    a = ribbon_cells([surf], {0: np.arange(len(f))}, step=1.0, n_depths=3)
+    b = ribbon_cells([s32], {0: np.arange(len(f))}, step=1.0, n_depths=3)
+    assert len(a) == len(b)

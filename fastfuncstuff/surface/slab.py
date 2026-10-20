@@ -195,12 +195,15 @@ def cuts(white, pial, step: float, n_depths: int, through: float, max_level: int
     are always at least two sheets per bin.
     """
     cw, cp = white, pial
-    level = np.clip(np.ceil(np.sqrt(np.maximum(_area(cw), _area(cp))) / step), 1, max_level).astype(
-        np.int64
-    )
+    # A hair under each integer: cortex exactly 6 mm thick at 0.5 mm sheets is 12 sheets,
+    # and float32 vertices must not make it 13 for some faces and 12 for others.
+    tol = 1e-4
+    level = np.clip(
+        np.ceil(np.sqrt(np.maximum(_area(cw), _area(cp))) / step - tol), 1, max_level
+    ).astype(np.int64)
     tau = np.linalg.norm(cp - cw, axis=2).max(axis=1)
     sheets = np.clip(
-        np.maximum(np.ceil(tau / (through * step)), 2 * n_depths), 2, max_sheets
+        np.maximum(np.ceil(tau / (through * step) - tol), 2 * n_depths), 2, max_sheets
     ).astype(np.int64)
     return level, sheets
 
@@ -251,13 +254,7 @@ def tile_surface(
     if fv.size == 0:
         return None
     cw, cp = white[fv], pial[fv]
-    level = np.clip(np.ceil(np.sqrt(np.maximum(_area(cw), _area(cp))) / step), 1, max_level).astype(
-        np.int64
-    )
-    tau = np.linalg.norm(cp - cw, axis=2).max(axis=1)
-    sheets = np.clip(np.maximum(np.ceil(tau / (0.5 * step)), 2 * n_depths), 2, max_sheets).astype(
-        np.int64
-    )
+    level, sheets = cuts(cw, cp, step, n_depths, through, max_level, max_sheets)
     nodes, centres, vols, lo_idx = [], [], [], []
     n_nodes = 0
     for key in np.unique(level * (max_sheets + 1) + sheets):

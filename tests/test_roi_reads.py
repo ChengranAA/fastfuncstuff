@@ -17,7 +17,7 @@ import torch
 
 from fastfuncstuff.processing.nwarpforge import nwarpforge
 from fastfuncstuff.processing.roi_collapse import build_roi_set
-from fastfuncstuff.processing.roi_depth import DepthOptions, pass_groups
+from fastfuncstuff.processing.roi_depth import DepthOptions, pass_groups, tile_costs
 from fastfuncstuff.processing.roi_reads import (
     default_max_reads,
     plan_depth_reads,
@@ -125,7 +125,9 @@ def test_two_rois_in_passes_equal_one_pass(sphere_world, tmp_path):
     opts = DepthOptions(n_depths=2, dxyz=1.0)
     kw = dict(interp="cubic", device=DEV, verb=0, auto_pad=False)
     big = plan_depth_reads(files, [surf], 2.0, opts, max_reads=10_000_000, device=DEV)
-    small = plan_depth_reads(files, [surf], 2.0, opts, max_reads=int(big.n_reads * 0.7), device=DEV)
+    # A cap over either ROI's own (halo-inclusive) tiling but under both together.
+    cap = int(tile_costs(big.build["rois"], [surf], 1.0, 2, 0.5).max()) + 1
+    small = plan_depth_reads(files, [surf], 2.0, opts, max_reads=cap, device=DEV)
     assert len(big.passes) == 1 and len(small.passes) == 2
     ra = read_through_chain(big, path, [ident], path, **kw)
     rb = read_through_chain(small, path, [ident], path, **kw)

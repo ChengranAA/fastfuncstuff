@@ -238,9 +238,12 @@ def _read_rois(paths: list[str], surfaces, notes: list[str]) -> list[_Roi]:
 READ_KERNELS = ("linear", "cubic", "quintic", "heptic", "wsinc5")
 
 
-def _read_taps(points: np.ndarray, affine: np.ndarray, shape, kernel: str, mask: np.ndarray | None):
+def _read_taps(
+    points: np.ndarray, affine: np.ndarray | None, shape, kernel: str, mask: np.ndarray | None
+):
     """``(flat voxel indices, weights)``, each ``(N, taps)``, of reading a grid at
-    ``points`` with a separable ``kernel``.
+    ``points`` with a separable ``kernel`` (``affine`` None: ``points`` are already
+    fractional voxel indices, e.g. where a transform chain lands them).
 
     Taps off the grid or outside ``mask`` are dropped and the rest renormalised, so a
     read never uses a voxel the analysis excludes; a read whose kept taps carry under
@@ -251,8 +254,11 @@ def _read_taps(points: np.ndarray, affine: np.ndarray, shape, kernel: str, mask:
     """
     import torch
 
-    inv = np.linalg.inv(np.asarray(affine, np.float64))
-    ijk = points @ inv[:3, :3].T + inv[:3, 3]
+    if affine is None:
+        ijk = np.asarray(points, np.float64)
+    else:
+        inv = np.linalg.inv(np.asarray(affine, np.float64))
+        ijk = points @ inv[:3, :3].T + inv[:3, 3]
     base = np.floor(ijk).astype(np.int64)
     frac = ijk - base
     if kernel == "linear":
@@ -348,6 +354,8 @@ class DepthPlan:
     #: The whole tiling before cells were kept for their owners (``keep_all``): the
     #: ribbon around the ROIs as well, which shares their voxels.
     all_cells: RibbonCells | None = None
+    #: Where each of ``cells`` sits in ``all_cells``.
+    owned_index: np.ndarray | None = None
 
     def columns_per_row(self) -> np.ndarray:
         """Distinct cortical columns each operator row reads."""
@@ -488,8 +496,9 @@ def plan_depth_rois(
         shape=(len(rois) * n_depths, len(cells)),
     )
     return DepthPlan(
-        rois, cells, operator, hemi_of, n_depths, step, [ln.strip() for ln in log], everything
-    )
+        rois, cells, operator, hemi_of, n_depths, step, [ln.strip() for ln in log], everything,
+        np.flatnonzero(owned) if keep_all else None,
+    )  # fmt: skip
 
 
 def build_depth_roi_set(
@@ -603,6 +612,61 @@ def build_depth_roi_set(
     )  # fmt: skip
 
 
+def _mix_matrices(
+    plan: DepthPlan,
+    w: sp.csr_matrix,
+    every_ijk: np.ndarray,
+    shape3: tuple[int, int, int],
+    voxel_mm3,
+    normalise: bool,
+) -> list[tuple[str, str, np.ndarray]]:
+    """The core of the depth sampling matrices, for any grid the reads land on.
+
+    ``w`` is the ROI rows' reads composed onto the grid's voxels, ``every_ijk`` where
+    each cell of ``plan.all_cells`` lies on that grid (voxel indices), ``voxel_mm3``
+    the volume of a grid voxel in the anatomy -- a number, or a callable of the flat
+    indices of the voxels the reads touch (a distorted EPI voxel is not its nominal size).
+    """
+    k_n = plan.n_depths
+    touched = np.flatnonzero(np.asarray((w != 0).sum(axis=0)).ravel() > 0)
+    every = plan.all_cells
+    assert every is not None
+    ijk = np.rint(every_ijk).astype(np.int64)
+    inside = np.all((ijk >= 0) & (ijk < np.asarray(shape3)), axis=1) & np.isfinite(every_ijk).all(1)
+    flat = np.full(len(every), -1, np.int64)
+    flat[inside] = np.ravel_multi_index(tuple(ijk[inside].T), shape3)
+    slot = np.searchsorted(touched, flat)
+    hit = (
+        (flat >= 0) & (slot < touched.size) & (touched[np.minimum(slot, touched.size - 1)] == flat)
+    )
+    cell, k_bin, share = every.bin_shares(k_n)
+    keep = hit[cell]
+    v = np.zeros((touched.size, k_n))
+    np.add.at(v, (slot[cell[keep]], k_bin[keep]), every.volume[cell[keep]] * share[keep])
+    vol = voxel_mm3(touched) if callable(voxel_mm3) else np.full(touched.size, float(voxel_mm3))
+    v /= np.where(vol > 0, vol, np.inf)[:, None]
+
+    total = np.asarray(w.sum(axis=1)).ravel()
+    mixed = np.asarray(w[:, touched] @ v)  # (rows, K)
+    out = []
+    for r_idx, roi in enumerate(plan.rois):
+        rows = slice(r_idx * k_n, (r_idx + 1) * k_n)
+        m = np.divide(mixed[rows], total[rows, None], out=np.full((k_n, k_n), np.nan),
+                      where=total[rows, None] > 0)  # fmt: skip
+        if normalise:
+            sm = m.sum(axis=1, keepdims=True)
+            m = np.divide(m, sm, out=np.full_like(m, np.nan), where=sm > 0)
+        out.append((roi.name, plan.hemi_of[r_idx], m))
+    return out
+
+
+def psf_halo_mm(interp: str, voxel_mm: float) -> float:
+    """Halo that holds every cell inside any voxel the reads touch: the kernel's reach
+    beyond the ROI's own voxels, plus a voxel, plus the usual pial-slide margin."""
+    reach = 2 if interp == "linear" else (_half(interp) + 1)
+    return 3.0 + (reach + 1) * voxel_mm
+
+
 def depth_sampling_matrices(
     paths: str | list[str],
     surfaces,
@@ -637,48 +701,29 @@ def depth_sampling_matrices(
     notes: list[str] = []
     rois = read_depth_rois(files, surfaces, notes)
     step = opts.dxyz or default_step(aff)
-    k_n = opts.n_depths
-    vox = default_step(aff)
-    reach = 2 if opts.interp == "linear" else (_half(opts.interp) + 1)
-    # The halo must hold every cell inside any voxel the reads touch: the kernel's reach
-    # beyond the ROI's own voxels, plus a voxel, plus the usual pial slide margin.
     plan = plan_depth_rois(
-        rois, surfaces, step, opts, halo_mm=3.0 + (reach + 1) * vox, keep_all=True, device=device
-    )
+        rois, surfaces, step, opts, halo_mm=psf_halo_mm(opts.interp, default_step(aff)),
+        keep_all=True, device=device,
+    )  # fmt: skip
     n_vox = int(np.prod(shape3))
     w, _ = _compose(plan.operator, plan.cells.centre, aff, shape3, opts.interp, None, n_vox)
-    touched = np.flatnonzero(np.asarray((w != 0).sum(axis=0)).ravel() > 0)
-
-    every = plan.all_cells
-    assert every is not None
+    assert plan.all_cells is not None
     inv = np.linalg.inv(aff)
-    ijk = np.rint(every.centre @ inv[:3, :3].T + inv[:3, 3]).astype(np.int64)
-    inside = np.all((ijk >= 0) & (ijk < np.asarray(shape3)), axis=1)
-    flat = np.full(len(every), -1, np.int64)
-    flat[inside] = np.ravel_multi_index(tuple(ijk[inside].T), shape3)
-    slot = np.searchsorted(touched, flat)
-    hit = (
-        (flat >= 0) & (slot < touched.size) & (touched[np.minimum(slot, touched.size - 1)] == flat)
-    )
-    cell, k_bin, share = every.bin_shares(k_n)
-    keep = hit[cell]
-    v = np.zeros((touched.size, k_n))
-    np.add.at(v, (slot[cell[keep]], k_bin[keep]), every.volume[cell[keep]] * share[keep])
-    v /= abs(np.linalg.det(aff[:3, :3]))
+    every_ijk = plan.all_cells.centre @ inv[:3, :3].T + inv[:3, 3]
+    return _mix_matrices(plan, w, every_ijk, shape3, abs(np.linalg.det(aff[:3, :3])), normalise)
 
-    wt = w[:, touched]
-    total = np.asarray(w.sum(axis=1)).ravel()
-    mixed = np.asarray(wt @ v)  # (rows, K)
-    out = []
-    for r_idx, roi in enumerate(rois):
-        rows = slice(r_idx * k_n, (r_idx + 1) * k_n)
-        m = np.divide(mixed[rows], total[rows, None], out=np.full((k_n, k_n), np.nan),
-                      where=total[rows, None] > 0)  # fmt: skip
-        if normalise:
-            s = m.sum(axis=1, keepdims=True)
-            m = np.divide(m, s, out=np.full_like(m, np.nan), where=s > 0)
-        out.append((roi.name, plan.hemi_of[r_idx], m))
-    return out
+
+def write_depth_psf(path: str, matrices, ids: list | None = None) -> str:
+    """The matrices as a tidy table: one line per ROI x measured depth x true depth,
+    depth 1 deepest, unnormalised ``weight`` -- readers normalise if they want to."""
+    with open(path, "w") as fh:
+        fh.write("roi\tname\themi\tdepth\ttrue_depth\tweight\n")
+        for i, (name, hemi, m) in enumerate(matrices):
+            rid = ids[i] if ids is not None else i + 1
+            for k in range(m.shape[0]):
+                for j in range(m.shape[1]):
+                    fh.write(f"{rid}\t{name}\t{hemi}\t{k + 1}\t{j + 1}\t{m[k, j]:.6g}\n")
+    return path
 
 
 def options_from_args(args) -> DepthOptions:
@@ -758,6 +803,8 @@ __all__ = [
     "READ_KERNELS",
     "default_step",
     "depth_sampling_matrices",
+    "psf_halo_mm",
+    "write_depth_psf",
     "pass_groups",
     "plan_depth_rois",
     "read_depth_rois",

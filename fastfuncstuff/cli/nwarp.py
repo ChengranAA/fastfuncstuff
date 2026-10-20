@@ -867,8 +867,11 @@ def _dispatch_roi(
         print_cli_section("ROI reads")
         for line in plan.notes:
             print(f"  {line}")
+    from fastfuncstuff.processing.io import load_image
+
+    source_image = load_image(args.source, device=None)  # once, for the reads and the PSF
     result = roi_reads.read_through_chain(
-        plan, args.source, nwarp_specs, args.master,
+        plan, args.source, nwarp_specs, args.master, source_image=source_image,
         interp=args.interp, device=device, time_range=time_range, debug=args.debug,
         no_neg=args.no_neg, ainterp=ainterp, slice_times=slice_times, tr=tr,
         tzero=args.tzero, tinterp=args.tinterp, follow_tissue=args.follow_tissue,
@@ -881,6 +884,14 @@ def _dispatch_roi(
         args.prefix, plan, result, tr=out_tr if out_tr and out_tr > 0 else None,
         extra={"source": str(args.source), "master": str(args.master), "interp": args.interp},
     )  # fmt: skip
+    if plan.kind == "ribbon":
+        if args.verb >= 1:
+            print("  depth sampling matrices (the PSF of these reads, on the native EPI grid)")
+        mats = roi_reads.native_depth_matrices(
+            plan, source_image, args.source, nwarp_specs, args.master, interp=args.interp,
+            ainterp=ainterp, device=device, chain_base=args.chain_base,
+        )  # fmt: skip
+        roi_depth.write_depth_psf(written[4], mats, ids=plan.ids)
     low = float(result.cover.min()) if result.cover.size else 1.0
     if args.verb >= 1:
         if low < 0.999:

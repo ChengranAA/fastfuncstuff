@@ -91,7 +91,17 @@ def test_a_small_read_cap_runs_passes_and_changes_nothing(world):
     args2 = _depth_args(world, small)
     args2[args2.index("-atlas") + 1] = world / "up.lh.label"
     args2.insert(args2.index("-atlas") + 2, world / "dn.lh.label")
-    _run(*args2, "-roi_max_reads", str(int(big["n_reads"] * 0.8)))
+    # A cap over either ROI's own (halo-inclusive) tiling but under both together.
+    from fastfuncstuff.processing.roi_depth import read_depth_rois, tile_costs
+    from fastfuncstuff.surface.volume_depth import RibbonSurfaces
+
+    v4, f4 = icosphere(4)
+    surf = RibbonSurfaces("lh", (v4 * RW).astype(np.float32), (v4 * RP).astype(np.float32), f4)
+    rois = read_depth_rois(
+        [str(world / "up.lh.label"), str(world / "dn.lh.label")], [surf], []
+    )  # fmt: skip
+    cap = int(tile_costs(rois, [surf], 2.0, 3, 0.5).max()) + 1
+    _run(*args2, "-roi_max_reads", str(cap))
     doc = json.load(open(f"{small}.roi.json"))
     assert doc["n_passes"] == 2
     a = np.asarray(nib.load(f"{two}.roi.nii.gz").dataobj)
@@ -131,3 +141,35 @@ def test_refusals(world):
         _run(*base, "-atlas", world / "cap.lh.label", "-depths", "3")
     with pytest.raises(SystemExit, match="volume options"):
         _run(*_depth_args(world, world / "bad"), "-dxyz", "1")
+
+
+def _psf_table(path, k):
+    rows = [ln.split("\t") for ln in open(path).read().splitlines()]
+    assert rows[0] == ["roi", "name", "hemi", "depth", "true_depth", "weight"]
+    m = np.zeros((k, k))
+    for r in rows[1:]:
+        m[int(r[3]) - 1, int(r[4]) - 1] = float(r[5])
+    return m
+
+
+def test_the_depth_psf_through_an_identity_chain_is_the_grid_one(world):
+    """With no transform the native EPI grid is the master grid, so the matrix nwarp
+    computes from exact chain coordinates must equal the one computed for data on that
+    grid -- the same voxels, the same reads, the same kernel."""
+    from fastfuncstuff.processing.roi_depth import DepthOptions, depth_sampling_matrices
+    from fastfuncstuff.surface.volume_depth import RibbonSurfaces
+
+    prefix = str(world / "psf")
+    _run(*_depth_args(world, prefix, "-depth_dxyz", "1.0"))
+    got = _psf_table(f"{prefix}.roi.depth_psf.tsv", 3)
+    v, f = icosphere(4)
+    surf = RibbonSurfaces("lh", v * RW, v * RP, f.astype(np.int64))
+    img = nib.load(world / "r.nii")
+    ((_, _, want),) = depth_sampling_matrices(
+        str(world / "cap.lh.label"), [surf], img.affine, img.shape[:3],
+        DepthOptions(n_depths=3, dxyz=1.0, interp="cubic"), normalise=False,
+    )  # fmt: skip
+    # Float32 meshes (the GIfTI) against float64 here: a few cells on voxel boundaries
+    # fall the other way (1e-4 at worst).
+    np.testing.assert_allclose(got, want, rtol=0, atol=3e-4)
+    assert (np.diag(got) > 0.4).all()

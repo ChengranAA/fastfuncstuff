@@ -476,12 +476,26 @@ def g_obs(
 def apply_depth_psf(lbr: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     """Blur the depth profile by the voxel point-spread function.
 
-    The reference convolves the profile in both depth orientations, each padded
-    by one replicated edge sample, and takes the elementwise maximum. Taking
-    the max rather than one orientation keeps the blur from eating the profile's
-    peak; it is asymmetric on purpose, since the physical leakage is toward the
-    surface. Replicated literally -- this sits directly between model and data.
+    A 1-D ``kernel`` is the reference's Gaussian, applied as the reference does:
+    the profile convolved in both depth orientations, each padded by one
+    replicated edge sample, and the elementwise maximum taken. Taking the max
+    rather than one orientation keeps the blur from eating the profile's peak; it
+    is asymmetric on purpose, since the physical leakage is toward the surface.
+    Replicated literally -- this sits directly between model and data.
+
+    A 2-D ``(K, K)`` kernel is a measured sampling matrix instead: measured depth
+    ``k`` (rows) as a mix of model depths (columns), superficial first like
+    ``lbr``. It is applied as it stands -- no symmetry, no normalisation -- because
+    its rows can rightly sum to less than one where an edge bin's voxels also hold
+    white matter or CSF.
     """
+    if kernel.ndim == 2:
+        if kernel.shape != (lbr.shape[-1], lbr.shape[-1]):
+            raise ValueError(
+                f"a matrix depth kernel must be (K, K) = {(lbr.shape[-1],) * 2}, "
+                f"got {tuple(kernel.shape)}"
+            )
+        return lbr @ kernel.to(lbr.dtype).T
     L = kernel.shape[-1]
     # MATLAB's conv(a, k, 'same') keeps full-convolution samples starting at
     # floor(L/2). For odd L that is the symmetric centre and matches numpy; for

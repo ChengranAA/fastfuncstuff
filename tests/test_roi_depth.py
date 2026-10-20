@@ -62,21 +62,21 @@ def _means(roi_set, data):
 def test_bins_land_on_the_analytic_shells(sphere, tmp_path, method):
     surf, affine, shape, data, v = sphere
     label = _all_label(tmp_path, len(v))
-    opts = DepthOptions(n_depths=3, method=method, dxyz=0.5)
+    opts = DepthOptions(n_depths=3, method=method, dxyz=1.0)
     roi_set = build_depth_roi_set(label, [surf], affine, shape, opts=opts, device=CPU)
     assert roi_set.index["depth"] == ["1", "2", "3"] and roi_set.names == ["lh.all"] * 3
     got = _means(roi_set, data)
     e = _edges(3, method)
     want = np.array([_shell_mean(a, b) for a, b in zip(e[:-1], e[1:], strict=True)])
-    # Trilinear reading of a curved field is biased by h^2/12 x its Laplacian (2/r for
-    # the radius): that much is the data grid's, not the depth sampling's.
-    want += 2.0**2 / (6 * want)
-    np.testing.assert_allclose(got[:, 0], want, atol=0.015)
-    np.testing.assert_allclose(got[:, 1], 2 * want, atol=0.03)
+    # Cubic reads of the 2 mm grid carry no curvature bias (trilinear's is h^2/(6r), up
+    # to 0.046 mm here). What is left is the cell tiling of a faceted sphere: at 1 mm
+    # spacing up to 0.022 mm in the outer bin, halving with the spacing (0.008 at 0.5).
+    np.testing.assert_allclose(got[:, 0], want, atol=0.025)
+    np.testing.assert_allclose(got[:, 1], 2 * want, atol=0.05)
     # Volume per bin: equal shells for equivolume; equidistant grows outward.
     vol = roi_set.sizes
     want_vol = 4 / 3 * np.pi * np.diff(e**3)
-    np.testing.assert_allclose(vol, want_vol, rtol=0.03)
+    np.testing.assert_allclose(vol, want_vol, rtol=0.005)
 
 
 def test_the_two_methods_differ_where_they_should(sphere, tmp_path):
@@ -84,7 +84,7 @@ def test_the_two_methods_differ_where_they_should(sphere, tmp_path):
     label = _all_label(tmp_path, len(v))
     out = {}
     for method in ("equidistant", "equivolume"):
-        opts = DepthOptions(n_depths=3, method=method, dxyz=0.5)
+        opts = DepthOptions(n_depths=3, method=method, dxyz=1.0)
         out[method] = _means(build_depth_roi_set(label, [surf], affine, shape, opts=opts), data)
     # On a sphere the outer shells hold more volume, so equal-volume bins move out.
     assert (out["equivolume"][:, 0] - out["equidistant"][:, 0])[1] > 0.3
@@ -94,14 +94,14 @@ def test_one_depth_is_the_whole_ribbon_of_a_cap(sphere, tmp_path):
     surf, affine, shape, data, v = sphere
     cap = np.flatnonzero(v[:, 2] > 0.5)
     label = _all_label(tmp_path, len(v), cap)
-    roi_set = build_depth_roi_set(label, [surf], affine, shape, opts=DepthOptions(dxyz=0.5))
+    roi_set = build_depth_roi_set(label, [surf], affine, shape, opts=DepthOptions(dxyz=1.0))
     assert roi_set.n_rois == 1
     # z of every grid voxel the cap reads: none of them sits below the cap's base.
     ijk = np.argwhere(roi_set.rows)
     z = (ijk @ affine[:3, :3].T + affine[:3, 3])[:, 2]
     assert z.min() > 0.5 * RW - 4.0
     want = _shell_mean(RW, RP)
-    np.testing.assert_allclose(_means(roi_set, data)[0, 0], want + 4 / (6 * want), atol=0.03)
+    np.testing.assert_allclose(_means(roi_set, data)[0, 0], want, atol=0.02)
 
 
 def test_volume_roi_maps_to_columns_and_mask_limits_reads(sphere, tmp_path):
@@ -117,11 +117,12 @@ def test_volume_roi_maps_to_columns_and_mask_limits_reads(sphere, tmp_path):
     nib.save(nib.Nifti1Image((x > 0).astype(np.int16), aff3), tmp_path / "half.nii.gz")
     mask = np.ones(shape, bool)
     mask[:, :, : shape[2] // 2] = False  # z < 0 excluded
-    opts = DepthOptions(n_depths=2, dxyz=0.5)
+    opts = DepthOptions(n_depths=2, dxyz=1.0)
     roi_set = build_depth_roi_set(str(tmp_path / "half.nii.gz"), [surf], affine, shape, mask, opts)
     assert roi_set.n_rois == 2
     xyz = np.argwhere(roi_set.rows) @ affine[:3, :3].T + affine[:3, 3]
-    assert (xyz[:, 0] > -2.5).all() and (xyz[:, 2] > -2.5).all()
+    # Cubic reads reach one voxel past trilinear's: taps -1..+2 of a 2 mm grid.
+    assert (xyz[:, 0] > -4.5).all() and (xyz[:, 2] > -2.5).all()
     assert mask.reshape(-1)[roi_set.rows.reshape(-1)].all()
     assert any("-mask" in n for n in roi_set.notes)
     # Same columns at every depth: column counts agree to the grid's rounding.
@@ -132,7 +133,7 @@ def test_volume_roi_maps_to_columns_and_mask_limits_reads(sphere, tmp_path):
 def test_long_rows_and_table(sphere, tmp_path):
     surf, affine, shape, _, v = sphere
     label = _all_label(tmp_path, len(v))
-    roi_set = build_depth_roi_set(label, [surf], affine, shape, opts=DepthOptions(2, dxyz=0.5))
+    roi_set = build_depth_roi_set(label, [surf], affine, shape, opts=DepthOptions(2, dxyz=1.0))
     table = roi_set.write_table(tmp_path / "t.tsv", {"beta": np.array([1.0, 2.0])})
     rows = [ln.split("\t") for ln in open(table).read().splitlines()]
     assert rows[0] == [
@@ -171,7 +172,7 @@ def test_label_coordinates_pick_and_check_the_hemisphere(tmp_path):
     import nibabel as nib
 
     img = nib.load(master)
-    opts = DepthOptions(dxyz=0.5)
+    opts = DepthOptions(dxyz=1.0)
     good = build_depth_roi_set(
         [str(tmp_path / "roi.lh.label"), str(tmp_path / "roi.rh.label")],
         surfaces, img.affine, img.shape, opts=opts, device=CPU,

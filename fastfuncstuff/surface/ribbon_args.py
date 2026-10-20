@@ -46,7 +46,7 @@ def add_ribbon_args(group, *, hemi: bool = True) -> None:
 
 
 def add_depth_args(group) -> None:
-    """Ribbon flags plus ``-depths -equidistant/-equivolume -depth_dxyz`` for -atlas/-rois.
+    """Ribbon flags plus ``-depths -equidistant/-equivolume -depth_dxyz -depth_interp``.
 
     Giving surfaces is what switches depth sampling on: the ROI means are then read
     along the cortical ribbon, one per ROI per depth, instead of over ROI voxels.
@@ -82,9 +82,17 @@ def add_depth_args(group) -> None:
         type=float,
         default=None,
         metavar="MM",
-        help="Ribbon sampling grid, mm: the data grid upsampled to this, each ribbon "
-        "point read from the data by trilinear interpolation.  Default: a third of "
-        "the data's finest voxel, at most 0.5 mm",
+        help="Read spacing along the surface, mm.  The ribbon is cut into cells this "
+        "wide, and at most half this thick through the depth with at least 2 per depth "
+        "bin.  Each cell counts by its exact volume.  Default: the data's voxel size",
+    )
+    group.add_argument(
+        "-depth_interp",
+        default="cubic",
+        choices=("linear", "cubic", "quintic", "heptic", "wsinc5"),
+        help="How each ribbon read interpolates the data grid.  The data were already "
+        "resampled once; linear blurs across depth, wsinc5 is sharpest but reads +-5 "
+        "voxels",
     )
 
 

@@ -406,10 +406,20 @@ def parse_args():
         "-do-scale",
         dest="do_scale",
         action="store_true",
+        default=True,
         help=(
-            "Scale each voxel per run to mean=100, so the estimated HRF is in "
-            "percent-signal-change units (values clipped at 200)."
+            "Scale each voxel (or ROI series) per run to mean=100, so the estimated HRF "
+            "is in percent signal change (values clipped at 200).  The DEFAULT: curves "
+            "in data units cannot be compared across voxels, runs or subjects, and the "
+            "laminar model wants percent.  Kept as a flag so old scripts still parse."
         ),
+    )
+    proc_opts.add_argument(
+        "-dont_scale",
+        dest="do_scale",
+        action="store_false",
+        help="Fit the data in their own units (no per-run mean=100 scaling) -- what "
+        "AFNI's 3dDeconvolve does, for a like-for-like comparison.",
     )
 
     add_load_threads_arg(proc_opts)

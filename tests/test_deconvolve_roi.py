@@ -163,3 +163,28 @@ def test_surface_runs_with_a_freesurfer_label(monkeypatch, tmp_path):
     assert [r[1] for r in table] == ["lh.V1", "lh.far"]
     r2 = [float(r[header.index("r2")]) for r in table]
     assert r2[0] > 5 * r2[1]
+
+
+def test_curves_are_percent_signal_change_by_default_and_data_units_with_dont_scale(
+    monkeypatch, tmp_path
+):
+    """Scaling is the default (the laminar model and any cross-voxel comparison want
+    percent); -dont_scale keeps the data's own units, as 3dDeconvolve does."""
+    runs, timing, arrays = _dataset(tmp_path)
+    # Baseline 1000, not ~100: at 100 percent and data units nearly coincide and the
+    # test could not tell scaling from no scaling.
+    for path, arr in zip(runs, arrays, strict=True):
+        img = nib.Nifti1Image((arr * 10).astype(np.float32), np.eye(4))
+        img.header.set_zooms((2, 2, 2, TR))
+        img.header.set_xyzt_units("mm", "sec")
+        nib.save(img, path)
+    atlas = _atlas(tmp_path)
+    assert _run(monkeypatch, runs, timing, str(tmp_path / "pct"), "-atlas", atlas) == 0
+    assert (
+        _run(monkeypatch, runs, timing, str(tmp_path / "raw"), "-atlas", atlas, "-dont_scale") == 0
+    )
+    pct = np.array([float(r[1]) for r in _table(tmp_path / "pct_iresp_stim.tsv")[1]])
+    raw = np.array([float(r[1]) for r in _table(tmp_path / "raw_iresp_stim.tsv")[1]])
+    baseline = 10 * np.mean([a[:2].mean() for a in arrays])  # ROI 1's mean level, ~1000
+    np.testing.assert_allclose(pct, raw * 100.0 / baseline, rtol=0.02, atol=0.02)
+    assert np.abs(raw).max() > 5 * np.abs(pct).max()

@@ -178,7 +178,9 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-model TENT "
         f"-window 0 15 "
         f"-polort 4 "
-        f"-mask {mask}"
+        f"-mask {mask} "
+        # 3dDeconvolve fits data units; ffs_deconvolve scales to percent by default.
+        f"-dont_scale"
         f"{ctx.ffs_device_flag()}",
         label="ffs_deconvolve TENT",
         cwd=ffs,

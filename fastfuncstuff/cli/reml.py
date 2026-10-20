@@ -2368,6 +2368,12 @@ def main():
         # white noise there would drag the measured smoothness down.
         print(f"❌ ERROR: {blurs[0]} on volume data needs -mask (the brain).", file=sys.stderr)
         sys.exit(1)
+    from fastfuncstuff.processing.roi_reads import adopt_roi_series_input
+
+    series_error = adopt_roi_series_input(args, input_files)
+    if series_error:
+        print(f"❌ ERROR: {series_error}", file=sys.stderr)
+        sys.exit(1)
     if args.atlas:
         _refuse_roi_incompatible(args)
     elif args.roi_maps:

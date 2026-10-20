@@ -1157,6 +1157,12 @@ def main(argv: list[str] | None = None):
     roi_set = None
     mask_file_for_load = args.mask
     mask_array_for_load = None
+    from fastfuncstuff.processing.roi_reads import adopt_roi_series_input
+
+    series_error = adopt_roi_series_input(args, input_files)
+    if series_error:
+        print(f"ERROR: {series_error}", file=sys.stderr)
+        return 1
     if depth_requested(args) and not args.atlas:
         print(
             "ERROR: -fs_subj / -white_mesh sample ROIs by depth: give -atlas/-rois", file=sys.stderr

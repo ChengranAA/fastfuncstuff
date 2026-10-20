@@ -619,8 +619,14 @@ def roi_set_from_args(
     surfaces are given (``-fs_subj`` / ``-white_mesh``) -- per ROI per depth along the
     ribbon. Raises ``ValueError`` with a message for the user."""
     from fastfuncstuff.processing.roi_collapse import build_roi_set
+    from fastfuncstuff.processing.roi_reads import SERIES, read_series_table, roi_set_from_series
     from fastfuncstuff.surface.ribbon_args import depth_requested
 
+    if list(args.atlas or []) == [SERIES]:
+        table = read_series_table(input_path or "")
+        if table is None:
+            raise ValueError("the input is not an ffs_nwarp ROI series")
+        return roi_set_from_series(table, volume_shape, input_path or "")
     on_surface = header is not None and _surface_data(header)
     if not depth_requested(args):
         if getattr(args, "depths", 1) != 1 or getattr(args, "depth_method", None) == "equivolume":

@@ -208,6 +208,9 @@ class RoiSet:
     #: Row files (curves, trials) one line per entry x ROI -- tidy -- rather than one
     #: column per ROI. Depth sampling turns it on: ROI x depth is too wide to read.
     long_rows: bool = False
+    #: What ``collapse`` divides each row's weighted sum by, when that is not ``sizes``:
+    #: an ROI series' elements are already means, but the table still reports their size.
+    divisor: np.ndarray | None = None
 
     @property
     def n_rois(self) -> int:
@@ -233,7 +236,8 @@ class RoiSet:
             raise ValueError(
                 f"data has {data.shape[0]} voxel rows but the ROI set indexes {self.n_rows}"
             )
-        return collapse_to_rois(data, self.spec, self.sizes, device=device)
+        div = self.sizes if self.divisor is None else self.divisor
+        return collapse_to_rois(data, self.spec, div, device=device)
 
     def paint(self, values: Tensor | np.ndarray, fill: float = 0.0) -> np.ndarray:
         """``(n_rois, ...)`` -> ``(n_rows, ...)``, every voxel carrying its ROI's value."""

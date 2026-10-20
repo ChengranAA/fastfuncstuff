@@ -402,16 +402,136 @@ def write_roi_outputs(
     return paths
 
 
+# -- reading the files back --------------------------------------------------------------
+
+#: What ``args.atlas`` holds once a fit tool has adopted an ROI-series input.
+SERIES = "@roi_series"
+_SERIES_SUFFIXES = (".nii.gz", ".nii.zst", ".nii")
+
+
+def series_table_path(path: str) -> Path:
+    """``PREFIX.roi.tsv`` for ``PREFIX.roi.nii.gz``."""
+    name = str(path)
+    for suf in _SERIES_SUFFIXES:
+        if name.endswith(suf):
+            return Path(name[: -len(suf)] + ".tsv")
+    return Path(name + ".tsv")
+
+
+def read_series_table(path: str) -> dict | None:
+    """The table beside an ``ffs_nwarp`` ROI series, or None when ``path`` is not one.
+
+    A series is recognised by its NIfTI intent name (``ffs_roi``) and the sidecar
+    table; a file with the intent but no table is an error worth naming, not a plain
+    volume.
+    """
+    plain = str(path).split("[")[0]
+    if not plain.endswith(_SERIES_SUFFIXES):
+        return None
+    try:
+        from fastfuncstuff.io.headers import read_nifti_header
+
+        intent = read_nifti_header(plain)["intent_name"]
+    except Exception:  # not a readable NIfTI: some other input
+        return None
+    if bytes(intent).rstrip(b"\0") != b"ffs_roi":
+        return None
+    table = series_table_path(plain)
+    if not table.exists():
+        raise ValueError(
+            f"{plain} is an ffs_nwarp ROI series but its table {table.name} is missing"
+        )
+    lines = [ln.split("\t") for ln in table.read_text().splitlines() if ln]
+    head, rows = lines[0], lines[1:]
+    col = {k: [r[i] for r in rows] for i, k in enumerate(head)}
+    size = next(k for k in ("volume_mm3", "n_voxels") if k in col)
+    first = head.index("name") + 1
+    index = {k: col[k] for k in head[first : head.index(size)]}
+    return {
+        "x": np.asarray(col["x"], int),
+        "z": np.asarray(col["z"], int),
+        "ids": [int(v) for v in col["roi"]],
+        "names": col["name"],
+        "index": {**index, "coverage": col["coverage"]},
+        "sizes": np.asarray(col[size], np.float64),
+        "size_name": size,
+    }
+
+
+def roi_set_from_series(table: dict, volume_shape: tuple[int, ...], source: str):
+    """Every ``(roi, depth)`` element of an ROI series as one row of an identity :class:`RoiSet`.
+
+    Rows are in the file's boolean-index order (roi-major, depth-minor), so the fit
+    tools' machinery -- tables, curves, single trials, ``-roi_maps`` painting back
+    into the same ``(n_rois, 1, n_depths)`` layout -- works unchanged.
+    """
+    from fastfuncstuff.processing.roi_collapse import RoiSet
+
+    shape = tuple(int(n) for n in volume_shape[:3])
+    n = int(np.prod(shape))
+    if len(table["ids"]) != n:
+        raise ValueError(
+            f"the table has {len(table['ids'])} rows but the series holds {n} elements"
+        )
+    depth = "depth" in table["index"]
+    return RoiSet(
+        spec=np.arange(n),
+        ids=list(table["ids"]),
+        names=list(table["names"]),
+        sizes=table["sizes"],
+        rows=np.ones(shape, bool),
+        sources=[Path(source).name],
+        notes=[
+            "input is an ffs_nwarp ROI series: each element is already an ROI (or ROI x depth) mean"
+        ],
+        index=table["index"],
+        size_name=table["size_name"],
+        long_rows=depth,
+        divisor=np.ones(n),
+    )
+
+
+def adopt_roi_series_input(args, input_files) -> str | None:
+    """Make a fit tool treat an ``ffs_nwarp`` ROI series input as ROI means.
+
+    Sets ``args.atlas`` to :data:`SERIES` and returns None; returns an error message
+    when the input is a series but the options contradict it (spatial blur, a mask, a
+    second ROI set), or when reading its table fails.
+    """
+    try:
+        table = read_series_table(str(input_files[0]))
+    except ValueError as exc:
+        return str(exc)
+    if table is None:
+        return None
+    if getattr(args, "atlas", None):
+        return "the input is already an ROI series (ffs_nwarp -atlas): drop -atlas/-rois"
+    bad = [
+        f"-{a}"
+        for a in ("do_blur", "blur_to_fwhm", "blur_to_tsnr", "mask")
+        if getattr(args, a, None) not in (None, False)
+    ]
+    if bad:
+        return f"{', '.join(bad)} are spatial and mean nothing on an ROI series (one voxel per ROI)"
+    args.atlas = [SERIES]
+    return None
+
+
 __all__ = [
     "BYTES_PER_READ",
+    "SERIES",
     "ReadPass",
     "ReadPlan",
     "ReadResult",
     "RoiFold",
+    "adopt_roi_series_input",
     "default_max_reads",
     "output_paths",
     "plan_depth_reads",
     "plan_volume_reads",
+    "read_series_table",
     "read_through_chain",
+    "roi_set_from_series",
+    "series_table_path",
     "write_roi_outputs",
 ]

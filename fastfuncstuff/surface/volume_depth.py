@@ -234,12 +234,51 @@ def volume_quantile_depth(
     ~``column_voxels`` voxels: the measured optimum at both 0.25 and 0.4 mm,
     where the rounds needed differed fourfold.
     """
+    cdf = column_depth_cdf(rho, face, bary, faces, n_vertices, column_voxels, bins)
+    return column_quantile(cdf, rho, face, bary, faces)
+
+
+def column_depth_cdf(
+    rho: torch.Tensor,
+    face: torch.Tensor,
+    bary: torch.Tensor,
+    faces: np.ndarray,
+    n_vertices: int,
+    column_voxels: float = 64.0,
+    bins: int = 64,
+    weight: torch.Tensor | None = None,
+    rho_hi: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Each column's volume CDF over equidistant depth, ``(V, bins + 1)``.
+
+    The first half of :func:`volume_quantile_depth`, for samples of the ribbon that
+    are not equal-volume voxels: ``weight`` is each sample's volume, and with
+    ``rho_hi`` a sample is a piece of ribbon spread evenly over depths ``[rho,
+    rho_hi]``. Samples that sit at a few discrete depths (cells of a tiling) need
+    that: as points they make every column's CDF a staircase. The smoothing still
+    counts samples, not volume -- it is there for counting noise.
+    """
     device = rho.device
     f = torch.as_tensor(faces, device=device)[face]  # (N, 3) vertex ids
-    b = torch.clamp((rho * bins).long(), max=bins - 1)
+    w = bary.double() if weight is None else bary.double() * weight.double()[:, None]
     hist = torch.zeros(n_vertices * bins, dtype=torch.float64, device=device)
-    for k in range(3):
-        hist.index_add_(0, f[:, k] * bins + b, bary[:, k].double())
+    if rho_hi is None:
+        pieces = [(f, torch.clamp((rho * bins).long(), max=bins - 1), w)]
+    else:
+        lo = torch.minimum(rho, rho_hi).double() * bins
+        hi = torch.maximum(rho, rho_hi).double() * bins
+        span = (hi - lo).clamp_min(1e-12)
+        first = lo.floor().clamp(max=bins - 1)
+        pieces = []
+        for off in range(int((hi.ceil() - first).max().item()) + 1 if rho.numel() else 0):
+            b = first + off
+            share = (torch.minimum(hi, b + 1) - torch.maximum(lo, b)).clamp_min(0) / span
+            share = torch.where(hi - lo < 1e-9, float(off == 0), share)
+            ok = (share > 0) & (b < bins)
+            pieces.append((f[ok], b[ok].long(), w[ok] * share[ok, None]))
+    for fv, b, wb in pieces:
+        for k in range(3):
+            hist.index_add_(0, fv[:, k] * bins + b, wb[:, k])
     hist = hist.view(n_vertices, bins)
     per_vertex = rho.numel() / max(int((hist.sum(1) > 0).sum()), 1)
     n_iter = int(np.clip(np.ceil(column_voxels / per_vertex), 1, 500))
@@ -247,7 +286,19 @@ def volume_quantile_depth(
     smooth = _smooth_on_mesh(hist.cpu().numpy(), faces, n_iter)
     total = smooth.sum(1, keepdims=True)
     cdf = np.concatenate([np.zeros((n_vertices, 1)), np.cumsum(smooth, 1)], 1)
-    cdf = torch.as_tensor(cdf / np.where(total > 0, total, 1.0), dtype=torch.float32, device=device)
+    return torch.as_tensor(
+        cdf / np.where(total > 0, total, 1.0), dtype=torch.float32, device=device
+    )
+
+
+def column_quantile(
+    cdf: torch.Tensor, rho: torch.Tensor, face: torch.Tensor, bary: torch.Tensor, faces: np.ndarray
+) -> torch.Tensor:
+    """Equivolume depth of points at equidistant depth ``rho`` with white feet
+    ``face``/``bary``: their column CDF (:func:`column_depth_cdf`) read there."""
+    bins = cdf.shape[1] - 1
+    f = torch.as_tensor(faces, device=rho.device)[face]
+    b = torch.clamp((rho * bins).long(), max=bins - 1)
     frac = rho * bins - b
     q = torch.zeros_like(rho)
     for k in range(3):

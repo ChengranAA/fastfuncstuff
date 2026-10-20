@@ -43,21 +43,28 @@ class DepthCurves:
     coverage: np.ndarray | None = None
 
 
-def read_iresp_table(path: str | Path) -> dict[tuple[str, str, str], DepthCurves]:
-    """Every ROI's curves in a tidy ``_iresp_<condition>.tsv`` (keyed ``(roi, name, hemi)``)."""
+def read_iresp_by_k(path: str | Path) -> dict[int, dict[tuple[str, str, str], DepthCurves]]:
+    """A tidy ``_iresp_<condition>.tsv`` as ``{K: {(roi, name, hemi): DepthCurves}}``.
+
+    A table from a multi-count run (``-depths 7 9 11``) has a ``K`` column and holds
+    several counts; one without has a single count, K being its number of depths.
+    """
     rows = list(csv.DictReader(open(path), delimiter="\t"))
     if not rows or "depth" not in rows[0]:
         raise ValueError(f"{path}: not an ROI x depth curve table (no 'depth' column)")
     value_col = list(rows[0])[-1]
-    groups: dict[tuple[str, str, str], list[dict]] = {}
+    groups: dict[tuple[int, str, str, str], list[dict]] = {}
     for r in rows:
-        groups.setdefault((r["roi"], r["name"], r.get("hemi", "-")), []).append(r)
-    out = {}
-    for key, rs in groups.items():
+        k_col = int(r["K"]) if "K" in r else 0
+        groups.setdefault((k_col, r["roi"], r["name"], r.get("hemi", "-")), []).append(r)
+    out: dict[int, dict] = {}
+    for (k_col, rid, name, hemi), rs in groups.items():
         times = np.array(sorted({float(r["time"]) for r in rs}))
         depths = sorted({int(r["depth"]) for r in rs})
         if depths != list(range(1, len(depths) + 1)):
-            raise ValueError(f"{path}: ROI {key[1]} has depths {depths}, not 1..K")
+            raise ValueError(f"{path}: ROI {name} has depths {depths}, not 1..K")
+        if k_col and k_col != len(depths):
+            raise ValueError(f"{path}: ROI {name} says K = {k_col} but has {len(depths)} depths")
         t_ix = {t: i for i, t in enumerate(times)}
         vals = np.full((len(times), len(depths)), np.nan)
         cov = np.ones(len(depths))
@@ -66,9 +73,20 @@ def read_iresp_table(path: str | Path) -> dict[tuple[str, str, str], DepthCurves
             if "coverage" in r:
                 cov[int(r["depth"]) - 1] = float(r["coverage"])
         if np.isnan(vals).any():
-            raise ValueError(f"{path}: ROI {key[1]} is missing time x depth entries")
-        out[key] = DepthCurves(times, vals, key[0], key[1], key[2], cov)
+            raise ValueError(f"{path}: ROI {name} is missing time x depth entries")
+        out.setdefault(len(depths), {})[(rid, name, hemi)] = DepthCurves(
+            times, vals, rid, name, hemi, cov
+        )
     return out
+
+
+def read_iresp_table(path: str | Path) -> dict[tuple[str, str, str], DepthCurves]:
+    """Every ROI's curves in a tidy ``_iresp_<condition>.tsv`` (keyed ``(roi, name, hemi)``);
+    the table must hold one depth count (see :func:`read_iresp_by_k`)."""
+    by_k = read_iresp_by_k(path)
+    if len(by_k) > 1:
+        raise ValueError(f"{path}: holds depth counts {sorted(by_k)}; use read_iresp_by_k")
+    return next(iter(by_k.values()))
 
 
 def pick_roi(
@@ -178,21 +196,14 @@ def two_condition_data(
 
 
 def read_depth_psf(path: str | Path) -> dict[tuple[str, str], np.ndarray]:
-    """A ``*_depth_psf.tsv`` (written by reml/deconvolve/nwarp) as ``{(name, hemi): M}``,
-    each ``(K, K)`` with depth 1 deepest first and the weights as written."""
-    out: dict[tuple[str, str], dict] = {}
-    for r in csv.DictReader(open(path), delimiter="\t"):
-        out.setdefault((r["name"], r["hemi"]), {})[(int(r["depth"]), int(r["true_depth"]))] = float(
-            r["weight"]
-        )
-    mats = {}
-    for key, entries in out.items():
-        k = max(d for d, _ in entries)
-        m = np.zeros((k, k))
-        for (d, j), wgt in entries.items():
-            m[d - 1, j - 1] = wgt
-        mats[key] = m
-    return mats
+    """A single-count ``*_depth_psf.tsv`` as ``{(name, hemi): M}``, each ``(K, K)`` with
+    depth 1 deepest first and the weights as written."""
+    from fastfuncstuff.processing.roi_depth import read_depth_psf_by_k
+
+    by_k = read_depth_psf_by_k(str(path))
+    if len(by_k) > 1:
+        raise ValueError(f"{path}: holds depth counts {sorted(by_k)}; use read_depth_psf_by_k")
+    return next(iter(by_k.values()))
 
 
 def model_kernel(
@@ -218,6 +229,7 @@ __all__ = [
     "model_kernel",
     "pick_roi",
     "read_depth_psf",
+    "read_iresp_by_k",
     "read_iresp_table",
     "two_condition_data",
 ]

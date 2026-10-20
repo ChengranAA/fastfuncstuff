@@ -103,3 +103,28 @@ def test_deconvolve_reads_the_series_too(brain):  # noqa: F811
     assert res.returncode == 0, res.stdout[-2000:] + res.stderr[-2000:]
     header, rows = _table(tmp / "dec_roi.tsv")
     assert header[3] == "depth" and [r[3] for r in rows] == ["1", "2", "3"]
+
+
+def test_a_series_brings_its_depth_psf_through_the_fit(brain):  # noqa: F811
+    """nwarp writes the PSF beside the series; deconvolve on that series writes it beside
+    its own tables, so the laminar step needs nothing assembled by hand."""
+    from fastfuncstuff.cli import deconvolve
+
+    tmp = brain
+    ser = tmp / "ser.roi.nii.gz"
+    if not ser.exists():
+        ser = _series(tmp)
+    assert (tmp / "ser.roi.depth_psf.tsv").exists()
+    import sys as _sys
+
+    old = _sys.argv
+    _sys.argv = ["ffs_deconvolve", "-input", str(ser), "-onsets", str(tmp / "stim.1D"),
+                 "-model", "TENT", "-window", "0", "14", "-prefix", str(tmp / "carry"),
+                 "-device", "cpu"]  # fmt: skip
+    try:
+        assert deconvolve.main() == 0
+    finally:
+        _sys.argv = old
+    rows = [ln.split("\t") for ln in open(tmp / "carry_depth_psf.tsv").read().splitlines()]
+    assert rows[0] == ["roi", "name", "hemi", "depth", "true_depth", "weight"]
+    assert len(rows) == 1 + 3 * 3 and {r[1] for r in rows[1:]} == {"patch.lh"}

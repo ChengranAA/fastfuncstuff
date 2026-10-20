@@ -833,6 +833,27 @@ def write_depth_psf(path: str, matrices, ids: list | None = None, ks: list | Non
     return path
 
 
+def read_depth_psf_by_k(path: str) -> dict[int, dict[tuple[str, str], np.ndarray]]:
+    """A ``*_depth_psf.tsv`` as ``{K: {(name, hemi): M}}``, each ``(K, K)``, depth 1
+    deepest, weights as written. A file without a ``K`` column has one count."""
+    import csv
+
+    raw: dict[tuple[int, str, str], dict] = {}
+    for r in csv.DictReader(open(path), delimiter="\t"):
+        k_col = int(r["K"]) if "K" in r else 0
+        raw.setdefault((k_col, r["name"], r["hemi"]), {})[
+            (int(r["depth"]), int(r["true_depth"]))
+        ] = float(r["weight"])
+    out: dict[int, dict] = {}
+    for (k_col, name, hemi), entries in raw.items():
+        k = max(d for d, _ in entries)
+        m = np.zeros((k, k))
+        for (d, j), wgt in entries.items():
+            m[d - 1, j - 1] = wgt
+        out.setdefault(k_col or k, {})[(name, hemi)] = m
+    return out
+
+
 def depth_list(args) -> list[int]:
     """The depth counts ``-depths`` asked for (a bare int from older callers works too)."""
     d = getattr(args, "depths", 1)
@@ -934,6 +955,7 @@ __all__ = [
     "depth_sampling_matrices",
     "depth_sampling_multi",
     "psf_halo_mm",
+    "read_depth_psf_by_k",
     "write_depth_psf",
     "pass_groups",
     "plan_depth_multi",

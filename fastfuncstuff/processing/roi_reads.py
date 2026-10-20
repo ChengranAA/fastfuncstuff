@@ -639,7 +639,9 @@ def read_series_table(path: str) -> dict | None:
     size = next(k for k in ("volume_mm3", "n_voxels") if k in col)
     first = head.index("name") + 1
     index = {k: col[k] for k in head[first : head.index(size)]}
+    psf = Path(str(table).replace(".tsv", ".depth_psf.tsv"))
     return {
+        "psf": str(psf) if psf.exists() else None,
         "x": np.asarray(col["x"], int),
         "z": np.asarray(col["z"], int),
         "ids": [int(v) for v in col["roi"]],
@@ -648,6 +650,23 @@ def read_series_table(path: str) -> dict | None:
         "sizes": np.asarray(col[size], np.float64),
         "size_name": size,
     }
+
+
+def _series_psf(table: dict):
+    """The series' own ``depth_psf.tsv`` (ffs_nwarp writes it beside the file) as the
+    fit tools carry it: ``(matrices, ROI ids, depth counts)``, or Nones."""
+    if not table.get("psf"):
+        return None, None, None
+    from fastfuncstuff.processing.roi_depth import read_depth_psf_by_k
+
+    ids = dict(zip(table["names"], table["ids"], strict=True))
+    mats, rids, ks = [], [], []
+    for k, per in read_depth_psf_by_k(table["psf"]).items():
+        for (name, hemi), m in per.items():
+            mats.append((name, hemi, m))
+            rids.append(ids.get(name, len(rids) + 1))
+            ks.append(k)
+    return mats, rids, ks
 
 
 def roi_set_from_series(table: dict, volume_shape: tuple[int, ...], source: str):
@@ -666,6 +685,7 @@ def roi_set_from_series(table: dict, volume_shape: tuple[int, ...], source: str)
             f"the table has {len(table['ids'])} rows but the series holds {n} elements"
         )
     depth = "depth" in table["index"]
+    psf = _series_psf(table)
     return RoiSet(
         spec=np.arange(n),
         ids=list(table["ids"]),
@@ -680,6 +700,9 @@ def roi_set_from_series(table: dict, volume_shape: tuple[int, ...], source: str)
         size_name=table["size_name"],
         long_rows=depth,
         divisor=np.ones(n),
+        depth_psf=psf[0],
+        depth_psf_ids=psf[1],
+        depth_psf_ks=psf[2],
     )
 
 

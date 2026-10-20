@@ -3,6 +3,11 @@
 Command: ffs_laminar
 
 Usage:
+    # one run at several vascular resolutions, then the model on its outputs
+    ffs_deconvolve -input bold.nii.gz -onsets std.1D dev.1D -model TENT -window 0 14 \
+        -atlas V1.lh.label -fs_subj $SUBJ -depths 7 9 11 -equivolume -prefix fit/sub01
+    ffs_laminar -fit_prefix fit/sub01 -conds std dev -duration 1.6 -prefix lam/sub01
+    # or from per-K files
     ffs_laminar -cond1 k7_iresp_std.tsv k9_iresp_std.tsv -cond2 k7_iresp_dev.tsv k9_iresp_dev.tsv \
         -duration 1.6 -psf_matrix k7_depth_psf.tsv k9_depth_psf.tsv -prefix lam/sub01
     ffs_laminar -cond1 a_iresp_c1.tsv -cond2 a_iresp_c3.tsv -duration 1.6 -roi V1 -hemi lh \
@@ -29,9 +34,16 @@ and the averaged models are compared by free energy.
 
 Inputs are the tidy curve tables ffs_deconvolve (or ffs_reml) writes in ROI x depth
 mode, {prefix}_iresp_<condition>.tsv, in PERCENT signal change (deconvolve's default;
-not -dont_scale).  Give one table per K for each condition: run the depth sampling at
-several -depths (the reference uses 7, 9, 10 and 11).  The model's scan interval is the
-curves' knot spacing; -duration is the event they respond to.
+not -dont_scale).  Sample several depth counts in one run (-depths 7 9 11: the reference
+uses 7, 9, 10 and 11) -- one table then holds them all, with a K column -- or give one
+table per K.  -fit_prefix PREFIX -conds A B finds the tables and the measured PSF from a
+run's prefix.  The model's scan interval is the curves' knot spacing; -duration is the
+event they respond to.
+
+The two conditions are fitted as ONE series: the first response, rows of padding noise,
+then the second.  The padding is masked out of the fit; its job is time -- the model is
+one continuous ODE, and the quiet rows let its states relax to baseline so the second
+response starts from rest, as the data do.  See -pad_rows / -pad_sd / -pad_seed.
 
 The depth point-spread function, one of:
   -psf_matrix FILE [FILE ...]  the measured mixing of this sampling, one
@@ -56,10 +68,17 @@ across -workers processes.
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = FfsArgumentParser(prog="ffs_laminar", description=_DESCRIPTION)
     g = p.add_argument_group("Data")
-    g.add_argument("-cond1", nargs="+", required=True, metavar="TSV",
-                   help="The first (baseline) condition's curve table, one per K.")  # fmt: skip
-    g.add_argument("-cond2", nargs="+", required=True, metavar="TSV",
-                   help="The second condition's, the one the modulatory input marks; one per K.")  # fmt: skip
+    g.add_argument("-cond1", nargs="+", default=None, metavar="TSV",
+                   help="The first (baseline) condition's curve table(s): one per K, or one "
+                   "table holding several K (-depths 7 9 11).")  # fmt: skip
+    g.add_argument("-cond2", nargs="+", default=None, metavar="TSV",
+                   help="The second condition's, the one the modulatory input marks.")  # fmt: skip
+    g.add_argument("-fit_prefix", default=None, metavar="PREFIX",
+                   help="Instead of -cond1/-cond2/-psf_matrix: the -prefix of an ffs_deconvolve "
+                   "or ffs_reml ROI x depth run; with -conds, finds PREFIX_iresp_<cond>.tsv and "
+                   "PREFIX_depth_psf.tsv (the measured PSF, used unless another PSF is chosen).")  # fmt: skip
+    g.add_argument("-conds", nargs=2, default=None, metavar=("COND1", "COND2"),
+                   help="With -fit_prefix: the two conditions' names, baseline first.")  # fmt: skip
     g.add_argument("-duration", type=float, required=True, metavar="SEC",
                    help="Duration of the event the curves respond to (s).")  # fmt: skip
     g.add_argument("-roi", nargs="+", default=None, metavar="ROI",
@@ -125,23 +144,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _by_k(paths, what):
-    """``{K: table}`` from per-K curve tables (K = their number of depths)."""
-    from fastfuncstuff.laminar.io import read_iresp_table
+    """``{K: table}`` from curve tables: one count per file, or several counts in one
+    file (a ``K`` column, from ``-depths 7 9 11``)."""
+    from fastfuncstuff.laminar.io import read_iresp_by_k
 
     out = {}
     for path in paths:
-        table = read_iresp_table(path)
-        k = next(iter(table.values())).values.shape[1]
-        if k in out:
-            raise ValueError(f"{what}: two tables have K = {k} ({path})")
-        out[k] = table
+        for k, table in read_iresp_by_k(path).items():
+            if k in out:
+                raise ValueError(f"{what}: two tables have K = {k} ({path})")
+            out[k] = table
     return out
 
 
 def _kernels(args, ks, name, hemi):
     import torch
 
-    from fastfuncstuff.laminar.io import model_kernel, read_depth_psf
+    from fastfuncstuff.laminar.io import model_kernel
     from fastfuncstuff.laminar.layers import gaussian_depth_kernel
 
     if args.psf_kernel:
@@ -150,16 +169,41 @@ def _kernels(args, ks, name, hemi):
     if args.psf_variance is not None:
         return {k: torch.as_tensor(gaussian_depth_kernel(args.psf_variance, k)) for k in ks}
     if args.psf_matrix:
+        from fastfuncstuff.processing.roi_depth import read_depth_psf_by_k
+
         mats = {}
         for path in args.psf_matrix:
-            for (n, h), mat in read_depth_psf(path).items():
-                if n == name and h == hemi:
-                    mats[mat.shape[0]] = mat
+            for k, per in read_depth_psf_by_k(path).items():
+                if (name, hemi) in per:
+                    mats[k] = per[(name, hemi)]
         missing = [k for k in ks if k not in mats]
         if missing:
             raise ValueError(f"ROI {name} ({hemi}): no -psf_matrix table with K = {missing}")
         return {k: model_kernel(mats[k], normalise=not args.psf_raw) for k in ks}
     return None
+
+
+def _resolve_fit_prefix(args) -> None:
+    """Fill -cond1 / -cond2 / -psf_matrix from a fit's output prefix."""
+    from pathlib import Path
+
+    if args.fit_prefix:
+        if not args.conds:
+            raise ValueError("-fit_prefix needs -conds COND1 COND2")
+        if args.cond1 or args.cond2:
+            raise ValueError("give -fit_prefix or -cond1/-cond2, not both")
+        found = [f"{args.fit_prefix}_iresp_{c}.tsv" for c in args.conds]
+        for path in found:
+            if not Path(path).exists():
+                raise ValueError(f"{path}: not found (-fit_prefix {args.fit_prefix}, -conds)")
+        args.cond1, args.cond2 = [found[0]], [found[1]]
+        psf = Path(f"{args.fit_prefix}_depth_psf.tsv")
+        if psf.exists() and not (
+            args.psf_matrix or args.psf_kernel or args.psf_variance is not None
+        ):
+            args.psf_matrix = [str(psf)]
+    if not args.cond1 or not args.cond2:
+        raise ValueError("give -cond1 and -cond2 (or -fit_prefix and -conds)")
 
 
 def _fit_one(job):
@@ -180,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     t0 = time.time()
     try:
+        _resolve_fit_prefix(args)
         one, two = _by_k(args.cond1, "-cond1"), _by_k(args.cond2, "-cond2")
         if sorted(one) != sorted(two):
             raise ValueError(f"-cond1 has K = {sorted(one)} but -cond2 has K = {sorted(two)}")

@@ -158,3 +158,31 @@ def test_padding_is_explicit_and_only_the_reference_prior_feels_it(reference, tm
     r3, _ = run("r3", "-pad_rows", "30", "-pad_sd", "0.3", "-hyperprior", "rows")
     assert r1 == pytest.approx(r2, rel=1e-9) == pytest.approx(r3, rel=1e-9)
     assert doc["padding"]["hyperprior"] == "rows"
+
+
+def test_fit_prefix_finds_tables_and_psf_and_reads_a_k_column(reference, tmp_path):
+    """The output of `ffs_deconvolve -depths 9 ...` (a K column, one PSF file) drives
+    ffs_laminar from just the prefix and the two condition names."""
+    from fastfuncstuff.processing.roi_depth import write_depth_psf
+
+    o, a, b, kern = reference
+    for cond, src in (("c1", a), ("c3", b)):  # re-write the per-condition tables with a K column
+        rows = [ln.split("\t") for ln in open(src).read().splitlines()]
+        with open(tmp_path / f"fit_iresp_{cond}.tsv", "w") as fh:
+            fh.write("\t".join(rows[0][:3] + ["K"] + rows[0][3:]) + "\n")
+            for r in rows[1:]:
+                fh.write("\t".join(r[:3] + ["9"] + r[3:]) + "\n")
+    m = np.eye(9) * 0.8 + np.eye(9, k=1) * 0.1 + np.eye(9, k=-1) * 0.1
+    write_depth_psf(str(tmp_path / "fit_depth_psf.tsv"), [("V1", "lh", m)], [1], ks=[9])
+    prefix = str(tmp_path / "viaprefix")
+    rc = laminar.main(
+        ["-fit_prefix", str(tmp_path / "fit"), "-conds", "c1", "c3", "-duration", "1.6",
+         "-models", "null", "-max_iter", "2", "-prefix", prefix, "-workers", "1", "-verb", "0"]
+    )  # fmt: skip
+    assert rc == 0
+    doc = json.load(open(f"{prefix}_laminar.json"))
+    assert doc["psf"] == "matrix" and doc["K"] == [9]
+    assert (
+        laminar.main(["-fit_prefix", str(tmp_path / "fit"), "-duration", "1", "-prefix", prefix])
+        == 1
+    )

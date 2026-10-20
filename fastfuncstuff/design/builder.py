@@ -1708,6 +1708,12 @@ def create_onset_matrix_microtime(
     return onset_matrix
 
 
+def round_onsets_places(all_onsets: list[list[np.ndarray]], places: int) -> list[list[np.ndarray]]:
+    """Round every onset to ``places`` decimal places (the meaning of the TOML's
+    ``round_onset = N`` and of ``-round_durations``); 0 = whole seconds."""
+    return [[np.round(np.asarray(run, dtype=float), places) for run in cond] for cond in all_onsets]
+
+
 def round_onsets(
     all_onsets: list[list[np.ndarray]],
     tr: float,

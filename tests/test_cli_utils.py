@@ -387,3 +387,30 @@ def test_other_ortvec_flags_reject_a_swallowed_flag(flag, good, capsys):
         parser.parse_args([flag, *good[:-1], "-round_durations", "1"])
     assert "left one out" in capsys.readouterr().err
     assert parser.parse_args([flag, *good, "-round_durations", "1"]).round_durations == 1
+
+
+def test_round_onsets_is_decimals_and_round_onsets_tr_is_the_snap(capsys):
+    """-round_onsets 1 used to floor every onset to its TR start (threshold 1.0)."""
+    import numpy as np
+
+    from fastfuncstuff.cli_help import FfsArgumentParser
+    from fastfuncstuff.cli_utils import add_round_onsets_arguments, apply_onset_rounding
+
+    parser = FfsArgumentParser()
+    add_round_onsets_arguments(parser)
+    onsets = [[np.array([10.0249, 14.5287])]]
+
+    args = parser.parse_args(["-round_onsets", "1"])
+    assert args.round_onsets == 1 and args.round_onsets_tr is None
+    got = apply_onset_rounding(args, onsets, tr=1.0, verbose=False)
+    np.testing.assert_allclose(got[0][0], [10.0, 14.5])
+
+    args = parser.parse_args(["-round-onsets-tr"])
+    assert args.round_onsets_tr == 0.7
+    np.testing.assert_allclose(
+        apply_onset_rounding(args, onsets, 1.0, verbose=False)[0][0], [10, 14]
+    )
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["-round_onsets", "0.5"])
+    assert "-round_onsets_tr" in capsys.readouterr().err

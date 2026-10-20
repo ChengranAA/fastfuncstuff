@@ -1791,6 +1791,74 @@ def glt_from_contrast_files(
     return labels, matrices
 
 
+def _round_places(value: str) -> int:
+    try:
+        places = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: -round_onsets takes whole decimal places, like -round_durations "
+            "(1 = tenths). To snap onsets to TR boundaries use -round_onsets_tr [THRESHOLD]."
+        ) from None
+    if places < 0:
+        raise argparse.ArgumentTypeError("-round_onsets PLACES must be 0 or more")
+    return places
+
+
+def add_round_onsets_arguments(parser_or_group, hyphen: bool = False) -> None:
+    """Register ``-round_onsets PLACES`` and ``-round_onsets_tr [THRESHOLD]``.
+
+    Two different operations get two different flags. ``-round_onsets`` was once
+    the TR snap here but meant decimal places in the design TOML, ``-round_durations``
+    and autoproc, so ``-round_onsets 1`` silently floored every onset to its TR start.
+    Pair with :func:`apply_onset_rounding`. ``hyphen`` picks the spelling shown in help.
+    """
+    sep = "-" if hyphen else "_"
+    parser_or_group.add_argument(
+        f"-round{sep}onsets",
+        dest="round_onsets",
+        type=_round_places,
+        default=None,
+        metavar="PLACES",
+        help="Round onsets to PLACES decimal places (1 = tenths), like -round_durations "
+        "and the TOML's round_onset. Not a TR snap: see -round_onsets_tr.",
+    )
+    parser_or_group.add_argument(
+        f"-round{sep}onsets{sep}tr",
+        dest="round_onsets_tr",
+        nargs="?",
+        const=0.7,
+        type=float,
+        default=None,
+        metavar="THRESHOLD",
+        help="Snap onsets to TR boundaries. An onset THRESHOLD or more of the way through a "
+        "TR rounds up, otherwise down (default 0.7, biased to floor; 0.5 = nearest TR). "
+        "Moves events by up to a TR, so it is for TR-locked designs and FIR.",
+    )
+
+
+def apply_onset_rounding(
+    args, all_onsets, tr: float, microtime_offset: float = 0.0, verbose: bool = True
+):
+    """Apply ``-round_onsets`` (decimals) then ``-round_onsets_tr`` (TR snap)."""
+    from fastfuncstuff.design.builder import round_onsets, round_onsets_places
+
+    if getattr(args, "round_onsets", None) is not None:
+        all_onsets = round_onsets_places(all_onsets, args.round_onsets)
+        if verbose:
+            print(f"\nOnsets rounded to {args.round_onsets} decimal place(s)")
+    threshold = getattr(args, "round_onsets_tr", None)
+    if threshold is not None:
+        all_onsets = round_onsets(
+            all_onsets, tr, threshold=threshold, microtime_offset=microtime_offset
+        )
+        if verbose:
+            where = (
+                f" (sample times, {microtime_offset:g} s into each TR)" if microtime_offset else ""
+            )
+            print(f"\nOnsets snapped to TR boundaries{where} (threshold={threshold:.2f})")
+    return all_onsets
+
+
 def _ortvec_value(flag: str, example: str):
     """Reject a value that is really the next flag, i.e. a missing positional.
 

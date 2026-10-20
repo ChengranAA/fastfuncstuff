@@ -176,7 +176,7 @@ def format_report(report: TimingReport) -> str:
     if report.rounding_shift_max > 0.25 * tr:
         kind = "shifts every event by" if aligned is not None else "moves events by up to"
         dangers.append(
-            f"Rounding onto the samples (FIR, -round-onsets) {kind} {report.rounding_shift_max:.2f} s "
+            f"Rounding onto the samples (FIR, -round-onsets-tr) {kind} {report.rounding_shift_max:.2f} s "
             f"(RMS {report.rounding_shift_rms:.2f} s): a "
             + ("timing bias." if aligned is not None else "blur of the response.")
         )
@@ -214,7 +214,7 @@ def format_report(report: TimingReport) -> str:
         )
     if report.rounding_shift_max > 1e-6:
         solutions.append(
-            f"-round-onsets 0.5 -model FIR: always stable, at the cost of the "
+            f"-round-onsets-tr 0.5 -model FIR: always stable, at the cost of the "
             f"{report.rounding_shift_max:.2f} s shift above."
         )
     else:

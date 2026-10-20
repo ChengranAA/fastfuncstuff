@@ -58,8 +58,10 @@ try:
         add_microtime_offset_arg,
         add_noise_ceiling_args,
         add_paired_surface_args,
+        add_round_onsets_arguments,
         add_trim_args,
         add_verbose_arg,
+        apply_onset_rounding,
         apply_trim_to_timing,
         auto_polort,
         bids_event_kwargs,
@@ -195,16 +197,7 @@ Notes:
         events_help="BIDS *_events.tsv files, one per run. Sorted by run number automatically. "
         "Mutually exclusive with -onsets.",
     )
-    bids_opts.add_argument(
-        "-round_onsets",
-        nargs="?",
-        const=0.7,
-        type=float,
-        default=None,
-        metavar="THRESHOLD",
-        help="Round onsets to nearest TR. Fraction-through-TR >= THRESHOLD → ceil, else floor. "
-        "Default threshold if flag given without value: 0.7.",
-    )
+    add_round_onsets_arguments(bids_opts, hyphen=False)
     bids_opts.add_argument(
         "-round_durations",
         type=int,
@@ -545,12 +538,9 @@ def main():
     # 3. Apply onset rounding (TR now known)
     # ========================================================================
     print()
-    if args.round_onsets is not None:
-        from fastfuncstuff.design.builder import round_onsets as _round_onsets
-
-        all_onsets = _round_onsets(
-            all_onsets, args.tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
-        )
+    all_onsets = apply_onset_rounding(
+        args, all_onsets, args.tr, args.microtime_offset, verbose=True
+    )
 
     # ========================================================================
     # 4. HRF model args and validation

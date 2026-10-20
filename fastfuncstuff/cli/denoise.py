@@ -55,9 +55,11 @@ try:
         add_noise_comps_arguments,
         add_ortvec_arguments,
         add_paired_surface_args,
+        add_round_onsets_arguments,
         add_single_trial_args,
         add_trim_args,
         add_verbose_arg,
+        apply_onset_rounding,
         apply_trim_to_timing,
         auto_polort,
         bids_event_kwargs,
@@ -301,16 +303,7 @@ Notes:
         events_help="BIDS *_events.tsv files, one per run. Sorted by run number automatically. "
         "Mutually exclusive with -onsets.",
     )
-    bids_opts.add_argument(
-        "-round_onsets",
-        nargs="?",
-        const=0.7,
-        type=float,
-        default=None,
-        metavar="THRESHOLD",
-        help="Round onsets to nearest TR. Fraction-through-TR >= THRESHOLD → ceil, else floor. "
-        "Default threshold if flag given without value: 0.7.",
-    )
+    add_round_onsets_arguments(bids_opts, hyphen=False)
     bids_opts.add_argument(
         "-round_durations",
         type=int,
@@ -2465,12 +2458,9 @@ def main():
     print("Building design matrix...")
 
     # Apply onset rounding (after TR is known from data load)
-    if args.round_onsets is not None:
-        from fastfuncstuff.design.builder import round_onsets as _round_onsets
-
-        all_onsets = _round_onsets(
-            all_onsets, args.tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
-        )
+    all_onsets = apply_onset_rounding(
+        args, all_onsets, args.tr, args.microtime_offset, verbose=True
+    )
 
     # Build onset matrix at microtime resolution (shared function ensures
     # grid-consistent bin placement matching convolve_hrf_microtime)

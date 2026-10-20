@@ -73,9 +73,11 @@ try:
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_ortvec_arguments,
+        add_round_onsets_arguments,
         add_trim_args,
         add_verbose_arg,
         append_nuisance_blocks,
+        apply_onset_rounding,
         apply_trim_to_timing,
         auto_polort,
         bids_event_kwargs,
@@ -318,21 +320,7 @@ def parse_args():
         "Requires -xval-tr-range > 0 and ≥2 runs.",
     )
 
-    model_opts.add_argument(
-        "-round-onsets",
-        nargs="?",
-        const=0.7,
-        type=float,
-        metavar="THRESHOLD",
-        help=(
-            "Snap all onset times to the nearest TR boundary. "
-            "THRESHOLD (default: 0.7) is the fractional position within a TR above which "
-            "an onset rounds up (ceil); below it rounds down (floor). "
-            "0.5 = standard nearest-TR rounding.  0.7 = biased toward floor "
-            "(only round up if 70%%+ through the TR).  "
-            "Reducing TENT/CSPLIN to FIR: use -round-onsets then -model FIR."
-        ),
-    )
+    add_round_onsets_arguments(model_opts, hyphen=True)
 
     model_opts.add_argument(
         "-round-durations",
@@ -1352,17 +1340,9 @@ def main(argv: list[str] | None = None):
         return np.ascontiguousarray(masked, dtype=np.float32).reshape(out_shape)
 
     # ── Optional onset / duration rounding ──────────────────────────────────
-    if args.round_onsets is not None:
-        from fastfuncstuff.design.builder import round_onsets
-
-        onsets_per_condition = round_onsets(
-            onsets_per_condition, tr, threshold=args.round_onsets, microtime_offset=microtime_offset
-        )
-        if args.verb >= 1:
-            where = (
-                f" (sample times, {microtime_offset:g} s into each TR)" if microtime_offset else ""
-            )
-            print(f"\nOnsets rounded to TR boundaries{where} (threshold={args.round_onsets:.2f})")
+    onsets_per_condition = apply_onset_rounding(
+        args, onsets_per_condition, tr, microtime_offset, verbose=args.verb >= 1
+    )
 
     # For BIDS, round_durations was already applied per-event inside parse_bids_events
     if args.round_durations is not None and condition_durations is not None and not args.events:

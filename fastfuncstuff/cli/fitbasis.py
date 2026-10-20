@@ -87,9 +87,11 @@ try:
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_ortvec_arguments,
+        add_round_onsets_arguments,
         add_trim_args,
         add_verbose_arg,
         append_nuisance_blocks,
+        apply_onset_rounding,
         apply_trim_to_timing,
         bids_event_kwargs,
         check_bids_event_args,
@@ -359,17 +361,7 @@ def create_parser() -> argparse.ArgumentParser:
         onset_grp,
         events_help="BIDS *_events.tsv files, one per run.  Paired with -input BY POSITION, never sorted.",
     )
-    onset_grp.add_argument(
-        "-round-onsets",
-        "-round_onsets",
-        dest="round_onsets",
-        nargs="?",
-        const=0.7,
-        type=float,
-        default=None,
-        metavar="THRESHOLD",
-        help="Snap onsets to nearest TR (default threshold 0.7).",
-    )
+    add_round_onsets_arguments(onset_grp, hyphen=True)
     onset_grp.add_argument(
         "-round-durations",
         "-round_durations",
@@ -2524,13 +2516,7 @@ def main() -> int:
     )
     all_onsets = timing.all_onsets
 
-    if args.round_onsets is not None:
-        from fastfuncstuff.design.builder import round_onsets as _round_onsets
-
-        all_onsets = _round_onsets(
-            all_onsets, tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
-        )
-        print(f"  Rounded onsets to nearest TR (threshold={args.round_onsets:.2f}).")
+    all_onsets = apply_onset_rounding(args, all_onsets, tr, args.microtime_offset, verbose=True)
 
     print(f"  Data: {n_voxels:,} voxels × {n_timepoints} TR ({n_runs} runs, TR={tr}s)")
 

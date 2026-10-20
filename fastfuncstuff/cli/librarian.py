@@ -63,9 +63,11 @@ try:
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_ortvec_arguments,
+        add_round_onsets_arguments,
         add_trim_args,
         add_verbose_arg,
         apply_automask,
+        apply_onset_rounding,
         apply_trim_to_timing,
         check_bids_event_args,
         collect_nuisance_blocks,
@@ -253,19 +255,7 @@ Notes:
         events_help="BIDS *_events.tsv files (one per run).",
     )
     add_microtime_offset_arg(onset_grp)
-    onset_grp.add_argument(
-        "-round-onsets",
-        nargs="?",
-        const=0.7,
-        type=float,
-        default=None,
-        metavar="THRESHOLD",
-        help=(
-            "Round onsets to nearest TR.  Fraction-through-TR >= "
-            "THRESHOLD → ceil, else floor.  If supplied without a "
-            "value, defaults to 0.7."
-        ),
-    )
+    add_round_onsets_arguments(onset_grp, hyphen=True)
     onset_grp.add_argument(
         "-round-durations",
         type=int,
@@ -2069,13 +2059,7 @@ def main() -> None:
     # both BIDS and AFNI paths.  Helpful when events are jittered around
     # nominal TR boundaries but the analyst wants the FIR path (rather
     # than auto-falling back to TENT).
-    if args.round_onsets is not None:
-        from fastfuncstuff.design.builder import round_onsets as _round_onsets
-
-        all_onsets = _round_onsets(
-            all_onsets, tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
-        )
-        print(f"  Rounded onsets to nearest TR (threshold={args.round_onsets:.2f} of TR).")
+    all_onsets = apply_onset_rounding(args, all_onsets, tr, args.microtime_offset, verbose=True)
 
     # --- Pool onsets per group ------------------------------------------------
     pooled_onsets, pooled_durations = pool_onsets_by_group(

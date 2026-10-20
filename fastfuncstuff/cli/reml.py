@@ -46,9 +46,11 @@ try:
         add_noise_ceiling_args,
         add_noise_comps_arguments,
         add_ortvec_arguments,
+        add_round_onsets_arguments,
         add_trim_args,
         add_verbose_arg,
         append_nuisance_blocks_to_design_info,
+        apply_onset_rounding,
         apply_trim_to_timing,
         auto_polort,
         build_nuisance_block_diag,
@@ -1100,19 +1102,7 @@ Examples:
             "model behind the t-stats. t-tests only."
         ),
     )
-    onset_group.add_argument(
-        "-round_onsets",
-        nargs="?",
-        const=0.7,
-        type=float,
-        metavar="THRESHOLD",
-        help=(
-            "Snap all onset times to the nearest TR boundary. "
-            "THRESHOLD (default: 0.7) is the fractional position within a TR above which "
-            "an onset rounds up; below it rounds down. "
-            "0.5 = standard nearest-TR rounding."
-        ),
-    )
+    add_round_onsets_arguments(onset_group, hyphen=False)
     onset_group.add_argument(
         "-round_durations",
         type=int,
@@ -2662,18 +2652,7 @@ def main():
 
         # Rounding comes after the trim shift, so the snap lands on the TR grid
         # the design is actually built on.
-        if args.round_onsets is not None:
-            from fastfuncstuff.design.builder import round_onsets
-
-            all_onsets = round_onsets(
-                all_onsets, tr, threshold=args.round_onsets, microtime_offset=args.microtime_offset
-            )
-            where = (
-                f" (sample times, {args.microtime_offset:g} s into each TR)"
-                if args.microtime_offset
-                else ""
-            )
-            print(f"\nOnsets rounded to TR boundaries{where} (threshold={args.round_onsets:.2f})")
+        all_onsets = apply_onset_rounding(args, all_onsets, tr, args.microtime_offset, verbose=True)
 
         print(f"  Runs: {n_runs}")
         print(f"  Total timepoints: {n_timepoints}")

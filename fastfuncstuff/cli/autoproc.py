@@ -1030,7 +1030,7 @@ def build_parser() -> argparse.ArgumentParser:
         "block). N is decimal places (0 = nearest second, 1 = nearest tenth) or TR "
         "(nearest multiple of the TR). No TASK = every task; name tasks to limit it, "
         "and repeat the flag for different N: `-round_onsets 1 -round_onsets TR "
-        "loc08pos`. Not ffs_reml's -round_onsets THRESHOLD. Only reaches a TOML "
+        "loc08pos`. The other tools split this in two: -round_onsets PLACES, -round_onsets_tr. Only reaches a TOML "
         "that is (re)written — add -glm_spec_overwrite for an existing one.",
     )
     g.add_argument(

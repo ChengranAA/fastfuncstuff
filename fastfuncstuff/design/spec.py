@@ -162,7 +162,7 @@ def parse_round_mode(value, what: str = "rounding") -> RoundMode:
 
     Refuses anything else. A fractional value (0.5) used to be truncated to 0
     decimals by ``int()`` without a word, which reads as "half a TR" to anyone
-    coming from ffs_reml -round_onsets THRESHOLD.
+    coming from a TR-snap threshold such as ffs_reml -round_onsets_tr 0.5.
     """
     if value is None:
         return None

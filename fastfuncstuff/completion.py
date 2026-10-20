@@ -251,7 +251,7 @@ def _completion_kind(action: argparse.Action) -> str:
         return "device"
 
     # A numeric flag never wants a filename, whatever its metavar says
-    # (-round_onsets THRESHOLD is a float, not a path).
+    # (-round_onsets_tr THRESHOLD is a float, not a path).
     if action.type in (int, float):
         return "none"
 

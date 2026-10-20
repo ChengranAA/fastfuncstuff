@@ -1034,6 +1034,14 @@ def hrf_index_path(prefix: str, surface: bool) -> str:
     return f"{pfx.stem}_hrf_index{ext}"
 
 
+def _hrf_library_size(prefix: str) -> int | None:
+    """Curve count of ``<prefix>_hrf_library.pt`` (None if the file is not there)."""
+    lib = Path(f"{parse_prefix(prefix).stem}_hrf_library.pt")
+    if not lib.exists():
+        return None
+    return int(torch.load(lib, weights_only=False, map_location="cpu")["hrf_library"].shape[0])
+
+
 def load_hrf_index_for_input(prefix: str, header, mask: np.ndarray | None = None) -> torch.Tensor:
     """Per-location HRF indices from an ``ffs_hrfopt`` prefix, in the input's domain.
 
@@ -1071,7 +1079,7 @@ def load_hrf_index_for_input(prefix: str, header, mask: np.ndarray | None = None
         found = surface_meta(load_nifti(path).header) or {}
         if found.get("mesh_fingerprint") != expected.get("mesh_fingerprint"):
             raise ValueError(f"{path} is on a different mesh than the input data")
-    return load_hrf_indices(path, mask=mask)
+    return load_hrf_indices(path, mask=mask, n_hrfs=_hrf_library_size(prefix))
 
 
 def save_volume_nifti(

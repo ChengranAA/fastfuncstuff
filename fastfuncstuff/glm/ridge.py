@@ -1299,7 +1299,9 @@ def fit_ridge_single_trial(
     )
 
 
-def load_hrf_indices(hrf_index_file: str, mask: np.ndarray | None = None) -> torch.Tensor:
+def load_hrf_indices(
+    hrf_index_file: str, mask: np.ndarray | None = None, n_hrfs: int | None = None
+) -> torch.Tensor:
     """
     Load HRF indices from HRFoptfast output
 
@@ -1309,6 +1311,11 @@ def load_hrf_indices(hrf_index_file: str, mask: np.ndarray | None = None) -> tor
         Path to {prefix}_hrf_index.nii.gz from HRFoptfast
     mask : np.ndarray, optional
         Boolean mask to apply (if data was masked)
+    n_hrfs : int, optional
+        Library size. Voxels ffs_hrfopt never assigned (0 in the NIfTI, i.e. outside its
+        mask) have no curve of their own; with this they take the middle one, so they
+        sit between the fast and slow ends instead of at index -1 (which Python reads
+        as the LAST, slowest curve and which has no design of its own).
 
     Returns
     -------
@@ -1336,7 +1343,16 @@ def load_hrf_indices(hrf_index_file: str, mask: np.ndarray | None = None) -> tor
     else:
         hrf_data = hrf_data.flatten()
 
-    return torch.from_numpy(hrf_data).long()
+    indices = torch.from_numpy(hrf_data).long()
+    if n_hrfs:
+        unassigned = indices < 0
+        if bool(unassigned.any()):
+            indices[unassigned] = n_hrfs // 2
+            print(
+                f"  {int(unassigned.sum()):,} voxel(s) have no ffs_hrfopt assignment "
+                f"(outside its mask): using the library's middle curve (index {n_hrfs // 2})"
+            )
+    return indices
 
 
 def load_noise_pcs(

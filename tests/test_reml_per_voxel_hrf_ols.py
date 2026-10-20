@@ -9,6 +9,7 @@ import sys
 
 import nibabel as nib
 import numpy as np
+import pytest
 import torch
 from scipy.stats import gamma
 
@@ -80,3 +81,52 @@ def test_ols_only_uses_each_voxels_own_hrf(tmp_path):
     beta = np.asanyarray(img.dataobj)[..., _read_brick_labels(img).index("a#0_Coef")]
     fast, slow = beta[idx == 1].mean(), beta[idx == 2].mean()
     assert abs(fast - slow) < 0.1 * max(fast, slow), (fast, slow)
+
+
+def _study(tmp_path, n_lib=3):
+    tt = np.arange(320) * 0.1
+    lib = np.stack([_hrf(tt, k) for k in (3.5, 5.0, 6.5)[:n_lib]])
+    lib /= lib.max(1, keepdims=True)
+    torch.save(
+        {"hrf_library": torch.tensor(lib, dtype=torch.float32)}, tmp_path / "lib_hrf_library.pt"
+    )
+    idx = (np.indices(SHAPE).sum(0) % n_lib) + 1
+    idx[0, 0, 0] = 0  # outside ffs_hrfopt's mask: no curve assigned
+    nib.save(
+        nib.Nifti1Image(idx.astype(np.float32), np.diag([3, 3, 3, 1])),
+        tmp_path / "lib_hrf_index.nii.gz",
+    )
+    onsets = np.arange(10, NT - 25, 7.3)
+    rng = np.random.default_rng(2)
+    nib.save(
+        nib.Nifti1Image(
+            (100 + rng.normal(0, 0.5, (*SHAPE, NT))).astype(np.float32), np.diag([3, 3, 3, 1])
+        ),
+        tmp_path / "run.nii.gz",
+    )
+    (tmp_path / "ev.tsv").write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t0.3\ta\n" for o in onsets)
+    )
+
+
+@pytest.mark.parametrize("extra", [[], ["-single_trials", "st"], ["-Rbuck", "r"]])
+def test_voxels_without_an_hrf_assignment_take_the_middle_curve(tmp_path, extra):
+    _study(tmp_path)
+    res = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-m",
+            "fastfuncstuff.cli.reml",
+            "-input",
+            "run.nii.gz",
+            "-events",
+            "ev.tsv",
+        ]
+        + ["-TR", "1", "-device", "cpu", "-hrfopt_prefix", "lib", "-Obuck", "o", *extra],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
+    )
+    assert res.returncode == 0, res.stdout[-2500:] + res.stderr[-1500:]
+    assert "middle curve (index 1)" in res.stdout

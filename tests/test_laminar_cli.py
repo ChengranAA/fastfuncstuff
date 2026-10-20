@@ -186,3 +186,34 @@ def test_fit_prefix_finds_tables_and_psf_and_reads_a_k_column(reference, tmp_pat
         laminar.main(["-fit_prefix", str(tmp_path / "fit"), "-duration", "1", "-prefix", prefix])
         == 1
     )
+
+
+@pytest.mark.slow
+def test_a_stalled_fit_is_flagged_warned_about_and_rescued_on_request(reference):
+    """Bug of record: with the CLI's default padding draw the noise prior's centre lands
+    0.005 below the oracle's, the damping collapses after one rejected step, and
+    superficial+deep "converges" at F = -624 (MATLAB, on its own padding: -125.7; the model
+    it contains, 'deep': -140). The default must still return the reference's answer -- but
+    say it stalled and that the nested models are inconsistent; -rescue must recover it."""
+    import torch
+
+    from fastfuncstuff.laminar.io import pick_roi, read_iresp_table, two_condition_data
+    from fastfuncstuff.laminar.pipeline import fit_roi, reference_p0
+
+    o, a, b, kern = reference
+    data = two_condition_data(
+        pick_roi(read_iresp_table(a), "V1"), pick_roi(read_iresp_table(b), "V1"),
+        duration=1.6, delay_seconds=None, p0=reference_p0(),
+    )  # fmt: skip
+    k = torch.tensor(np.loadtxt(kern))
+    kw = dict(targets=[(0, 0, 1), (1, 0, 1)], names=["deep", "superficial+deep"])
+    plain = fit_roi({9: data}, {9: k}, **kw)
+    assert plain.stalled[1, 0] and not plain.stalled[0, 0]
+    assert plain.F[1] < -400  # the reference's own answer, unchanged
+    assert any("below the model it contains" in w for w in plain.warnings)
+    assert any("-rescue" in w for w in plain.warnings)
+
+    fixed = fit_roi({9: data}, {9: k}, rescue=2, **kw)
+    assert not fixed.stalled.any() and not fixed.warnings
+    assert fixed.F[1] > fixed.F[0] - 5  # a superset is no worse than what it contains
+    assert abs(fixed.F[1] - (-125.7)) < 6  # MATLAB's value, on a different padding draw

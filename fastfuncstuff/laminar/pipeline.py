@@ -83,6 +83,8 @@ class RoiFit:
     impulse: np.ndarray | None = None  # (K0, N, n_t) neuronal -> BOLD transfer
     drainage_shift: np.ndarray | None = None  # (K0,) depths deeper than the mapping predicts
     kernels: dict | None = None  # {K: depth PSF (K,K) or (L,) or None}
+    stalled: np.ndarray | None = None  # (n_models, n_K) "converged" on rejected steps
+    warnings: list = field(default_factory=list)
 
 
 def fit_roi(
@@ -94,6 +96,7 @@ def fit_roi(
     free_energy: str = "reference",
     max_iter: int = 128,
     hyper_from_rows: bool = False,
+    rescue: int = 0,
     roi: str = "",
     name: str = "",
     hemi: str = "",
@@ -132,6 +135,7 @@ def fit_roi(
         progress=False,
         max_iter=max_iter,
         hyper_from_rows=hyper_from_rows,
+        rescue=rescue,
         **ikw,
     )  # fmt: skip
     F = np.array([float(a.F) for a in averaged])
@@ -158,6 +162,8 @@ def fit_roi(
     from fastfuncstuff.laminar.devein import deveining_fidelity
 
     fid = deveining_fidelity(ir, spec0, res0.Ep, mode="auc")
+    stalled = np.array([[bool(r.stalled) for r in runs] for runs in per_k])
+    warnings = _warnings(names, list(targets), F, stalled, ks, rescue)
     return RoiFit(
         roi=roi, name=name, hemi=hemi, k_values=ks, models=list(names), targets=list(targets),
         F=F, per_k_F=np.array([[float(f) for f in a.per_k_F] for a in averaged]),
@@ -168,7 +174,29 @@ def fit_roi(
         y_obs=first.y.numpy().copy(), y_hat=res0.y_pred.numpy().copy(), rows=rows.copy(),
         impulse=ir.numpy().copy(), drainage_shift=fid["drainage_shift"].numpy().copy(),
         kernels={k: (None if (kk := kernels.get(k)) is None else kk.numpy().copy()) for k in ks},
+        stalled=stalled, warnings=warnings,
     )  # fmt: skip
+
+
+def _warnings(names, targets, F, stalled, ks, rescue, tol: float = 10.0) -> list[str]:
+    """What to distrust in a fit: runs that "converged" on rejected steps, and nested
+    models that scored far worse than the model they contain (they cannot, so the
+    optimiser stalled -- see ``VLResult.stalled``)."""
+    out = []
+    for m, row in enumerate(stalled):
+        if row.any():
+            where = ", ".join(f"K={ks[j]}" for j in np.flatnonzero(row))
+            out.append(f"model '{names[m]}' stalled at {where} (ended on rejected steps)")
+    for i, ti in enumerate(targets):
+        for j, tj in enumerate(targets):
+            if i != j and all(a >= b for a, b in zip(ti, tj, strict=True)) and F[i] < F[j] - tol:
+                out.append(
+                    f"'{names[i]}' (F {F[i]:.1f}) scores {F[j] - F[i]:.0f} nats below the model "
+                    f"it contains, '{names[j]}' (F {F[j]:.1f}): a stalled fit, not evidence"
+                )
+    if out and not rescue:
+        out.append("rerun with -rescue 2 to restart stalled fits with the damping reset")
+    return out
 
 
 def write_results(prefix: str, fits: list[RoiFit], provenance: dict | None = None) -> list[str]:

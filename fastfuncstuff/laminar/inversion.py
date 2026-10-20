@@ -179,6 +179,12 @@ class VLResult:
     n_iter: int
     converged: bool
     history: list[float] = field(default_factory=list)
+    #: "Converged" only because the damping collapsed: the run ended on rejected steps. The
+    #: reference's rule (predicted gain < 0.1 four times running) cannot tell this from a
+    #: real optimum, and a fit that stalls this way can sit hundreds of nats short of it.
+    stalled: bool = False
+    #: The best point of the run, to restart from (``variational_laplace(rescue=...)``).
+    start: tuple | None = None
 
     def posterior_variance(self, spec: ModelSpec) -> dict[str, torch.Tensor]:
         """Posterior variances scattered back into the parameter structure."""
@@ -207,6 +213,7 @@ def _vl_coroutine(
     max_iter: int = 128,
     verbose: bool = False,
     hyper_from_rows: bool = False,
+    start: tuple | None = None,
 ):
     """The Variational Laplace scheme, with the forward model lifted out.
 
@@ -301,6 +308,9 @@ def _vl_coroutine(
 
     p = torch.zeros(np_, dtype=dtype, device=device)
     h = hE.clone()
+    if start is not None:  # a restart: the damping resets, the position does not
+        p = start[0].to(dtype=dtype, device=device).clone()
+        h = start[1].to(dtype=dtype, device=device).clone()
     v_rate = -4.0
     best = {
         "F": torch.tensor(-math.inf, dtype=dtype, device=device),
@@ -317,6 +327,7 @@ def _vl_coroutine(
     y_pred = torch.zeros(n_scans, K, dtype=dtype, device=device)
     Cp = best["Cp"]
     k = 0
+    rejected_tail = 0
 
     for k in range(1, max_iter + 1):
         preds = yield probe_matrix(p)
@@ -405,12 +416,14 @@ def _vl_coroutine(
             dFdpp = -Pp - ipC
             v_rate = min(v_rate + 0.5, 4.0)
             tag = "EM:(+)"
+            rejected_tail = 0
         else:
             p = best["p"].clone()
             h = best["h"].clone()
             Cp = best["Cp"].clone()
             v_rate = min(v_rate - 2.0, -4.0)
             tag = "EM:(-)"
+            rejected_tail += 1
 
         dp = spm_dx(dFdpp, dFdp, v_rate)
         p = p + dp
@@ -436,6 +449,8 @@ def _vl_coroutine(
         n_iter=k,
         converged=converged,
         history=history,
+        stalled=converged and rejected_tail >= 3,
+        start=(best["p"].clone(), best["h"].clone()),
     )
 
 
@@ -464,6 +479,7 @@ def variational_laplace(
     max_iter: int = 128,
     verbose: bool = False,
     hyper_from_rows: bool = False,
+    rescue: int = 0,
     **integrate_kwargs,
 ) -> VLResult:
     """Invert the laminar model against one depth-resolved data matrix.
@@ -480,20 +496,31 @@ def variational_laplace(
     :class:`VLResult`, whose ``F`` is the quantity model comparison ranks.
     """
     n_scans = int(y.shape[0])
-    co = _vl_coroutine(
-        spec, priors, y, rows=rows, max_iter=max_iter, verbose=verbose,
-        hyper_from_rows=hyper_from_rows,
-    )  # fmt: skip
-    try:
-        full = next(co)
-        while True:
-            padded, n = _pad_to_bucket(full)
-            preds = integrate(
-                u, unvec(padded, spec), spec, n_scans, kernel=kernel, **integrate_kwargs
-            )
-            full = co.send(preds[:n])
-    except StopIteration as stop:
-        return stop.value
+    start = None
+    result = None
+    for attempt in range(int(rescue) + 1):
+        co = _vl_coroutine(
+            spec, priors, y, rows=rows, max_iter=max_iter, verbose=verbose,
+            hyper_from_rows=hyper_from_rows, start=start,
+        )  # fmt: skip
+        try:
+            full = next(co)
+            while True:
+                padded, n = _pad_to_bucket(full)
+                preds = integrate(
+                    u, unvec(padded, spec), spec, n_scans, kernel=kernel, **integrate_kwargs
+                )
+                full = co.send(preds[:n])
+        except StopIteration as stop:
+            result = stop.value
+        # The reference accepts a run that ended on rejected steps as converged. With
+        # ``rescue`` a stalled run is restarted from its best point with the damping reset,
+        # up to ``rescue`` times; without it the flag is all that changes.
+        if not result.stalled or attempt == int(rescue):
+            break
+        start = result.start
+    assert result is not None
+    return result
 
 
 def variational_laplace_lockstep(

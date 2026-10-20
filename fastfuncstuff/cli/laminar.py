@@ -134,6 +134,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     m.add_argument("-TE", type=float, default=0.028, help="Echo time (s).")
     m.add_argument("-B0", type=float, default=7.0, help="Field strength (T).")
     m.add_argument("-max_iter", type=int, default=128, help="Variational Laplace iterations.")
+    m.add_argument("-rescue", type=int, default=0, metavar="N",
+                   help="Restart a fit that stalled up to N times from its best point with the "
+                   "damping reset.  The reference's rule calls a run converged when its "
+                   "predicted gain is under 0.1 four times running; after a rejected step the "
+                   "damping can collapse so far that the gain vanishes while the fit is hundreds "
+                   "of nats short (seen: a model scoring 480 nats below one it contains).  "
+                   "Stalls are always flagged and warned about; the default does not change a "
+                   "number, so results stay comparable with the published analysis.  2 is "
+                   "plenty.")  # fmt: skip
 
     o = p.add_argument_group("Output")
     o.add_argument("-prefix", required=True, help="Output prefix.")
@@ -273,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                 for k in ks
             }
             kw = {"free_energy": args.free_energy, "max_iter": args.max_iter,
-                  "hyper_from_rows": args.hyperprior == "rows",
+                  "hyper_from_rows": args.hyperprior == "rows", "rescue": args.rescue,
                   "roi": rid, "name": name, "hemi": hemi}  # fmt: skip
             jobs.append((data_for_k, _kernels(args, ks, name, hemi), targets, names, kw))
     except (OSError, ValueError) as exc:
@@ -314,6 +323,9 @@ def main(argv: list[str] | None = None) -> int:
         for f in fits:
             tag = f"{f.name}_{f.hemi}".replace("/", "-").replace(" ", "_")
             written.append(plot_roi(f, f"{args.prefix}_laminar_{tag}.png", conds))
+    for f in fits:
+        for w in f.warnings:
+            print(f"ffs_laminar: WARNING {f.name} ({f.hemi}): {w}", file=sys.stderr)
     if args.verb >= 1:
         for f in fits:
             print(f"  {f.name} ({f.hemi}): best '{f.models[f.best]}' "

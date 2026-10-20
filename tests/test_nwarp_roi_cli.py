@@ -173,3 +173,34 @@ def test_the_depth_psf_through_an_identity_chain_is_the_grid_one(world):
     # fall the other way (1e-4 at worst).
     np.testing.assert_allclose(got, want, rtol=0, atol=3e-4)
     assert (np.diag(got) > 0.4).all()
+
+
+def test_several_depth_counts_read_the_data_once_and_write_a_set_per_count(world):
+    """-depths 3 5: one pass over the data, PREFIX.K3.roi.* and PREFIX.K5.roi.*; each
+    count's profile is the analytic shell means (so the shared tiling serves both) and the
+    two counts agree where their bins coincide in volume (the whole ribbon)."""
+    prefix = str(world / "kk")
+    args = _depth_args(world, prefix, "-depth_dxyz", "1.0")
+    args[args.index("-depths") + 1 : args.index("-depths") + 2] = ["3", "5"]
+    _run(*args)
+    for k in (3, 5):
+        img = nib.load(f"{prefix}.K{k}.roi.nii.gz")
+        assert img.shape == (1, 1, k, NT)
+        d = np.asarray(img.dataobj)[0, 0, :, 0]
+        e = RW + np.linspace(0, 1, k + 1) * (RP - RW)
+        shell = 0.75 * np.diff(e**4) / np.diff(e**3)
+        np.testing.assert_allclose(d, shell, atol=0.06)
+        psf = _psf_table(f"{prefix}.K{k}.roi.depth_psf.tsv", k)
+        assert (np.argmax(psf, axis=1) == np.arange(k)).all()
+        doc = json.load(open(f"{prefix}.K{k}.roi.json"))
+        assert doc["K"] == k and doc["depth_counts"] == [3, 5] and doc["n_passes"] == 1
+    # The same reads: both counts' volume-weighted mean over the whole ribbon agree.
+    a = np.asarray(nib.load(f"{prefix}.K3.roi.nii.gz").dataobj)[0, 0, :, 0]
+    b = np.asarray(nib.load(f"{prefix}.K5.roi.nii.gz").dataobj)[0, 0, :, 0]
+    vol3 = np.asarray(
+        [float(r.split("\t")[8]) for r in open(f"{prefix}.K3.roi.tsv").read().splitlines()[1:]]
+    )
+    vol5 = np.asarray(
+        [float(r.split("\t")[8]) for r in open(f"{prefix}.K5.roi.tsv").read().splitlines()[1:]]
+    )
+    assert (a * vol3).sum() / vol3.sum() == pytest.approx((b * vol5).sum() / vol5.sum(), abs=0.01)

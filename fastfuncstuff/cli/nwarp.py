@@ -549,9 +549,10 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     intent; a mean/first-last that a 3-D output skips just means the run isn't
     skipped next time (safe)."""
     if getattr(args, "atlas", None):
+        from fastfuncstuff.processing.roi_depth import depth_list
         from fastfuncstuff.processing.roi_reads import output_paths
 
-        return output_paths(args.prefix, depth_requested(args))
+        return output_paths(args.prefix, depth_requested(args), depth_list(args))
     surf = [str(p) for p in _surface_outputs(args)] if getattr(args, "surf", None) else []
     if surf and not args.surf_prefix:
         return surf
@@ -850,29 +851,30 @@ def _dispatch_roi(
                 args.fs_subj, args.white, args.pial, args.white_mesh, args.pial_mesh,
                 args.cortex_label, log=log.append,
             )  # fmt: skip
-            plan = roi_reads.plan_depth_reads(
+            plans = roi_reads.plan_depth_reads_multi(
                 args.atlas, surfaces, roi_depth.default_step(aff), roi_depth.options_from_args(args),
-                args.roi_max_reads or None, device=device,
+                depth_list(args), args.roi_max_reads or None, device=device,
             )  # fmt: skip
-            plan.notes[:0] = [line.strip() for line in log]
+            for pl in plans:
+                pl.notes[:0] = [line.strip() for line in log]
         else:
             if depth_list(args) != [1] or args.depth_method == "equivolume":
                 raise ValueError(
                     "-depths / -equivolume sample along surfaces: give -fs_subj or -white_mesh"
                 )
             roi_set = build_roi_set(args.atlas, shape)
-            plan = roi_reads.plan_volume_reads(roi_set, aff)
+            plans = [roi_reads.plan_volume_reads(roi_set, aff)]
     except (OSError, ValueError) as exc:
         raise SystemExit(f"ffs_nwarp: {exc}") from exc
     if args.verb >= 1:
         print_cli_section("ROI reads")
-        for line in plan.notes:
+        for line in plans[0].notes:
             print(f"  {line}")
     from fastfuncstuff.processing.io import load_image
 
     source_image = load_image(args.source, device=None)  # once, for the reads and the PSF
-    result = roi_reads.read_through_chain(
-        plan, args.source, nwarp_specs, args.master, source_image=source_image,
+    results = roi_reads.read_through_chain(
+        plans, args.source, nwarp_specs, args.master, source_image=source_image,
         interp=args.interp, device=device, time_range=time_range, debug=args.debug,
         no_neg=args.no_neg, ainterp=ainterp, slice_times=slice_times, tr=tr,
         tzero=args.tzero, tinterp=args.tinterp, follow_tissue=args.follow_tissue,
@@ -881,19 +883,27 @@ def _dispatch_roi(
         chain_base=args.chain_base,
     )  # fmt: skip
     out_tr = tr or args.TR or get_tr_from_file(args.source)
-    written = roi_reads.write_roi_outputs(
-        args.prefix, plan, result, tr=out_tr if out_tr and out_tr > 0 else None,
-        extra={"source": str(args.source), "master": str(args.master), "interp": args.interp},
-    )  # fmt: skip
-    if plan.kind == "ribbon":
+    multi = len(plans) > 1
+    mats_by_k = None
+    if plans[0].kind == "ribbon":
         if args.verb >= 1:
             print("  depth sampling matrices (the PSF of these reads, on the native EPI grid)")
-        mats = roi_reads.native_depth_matrices(
-            plan, source_image, args.source, nwarp_specs, args.master, interp=args.interp,
+        mats_by_k = roi_reads.native_depth_matrices_multi(
+            plans[0], source_image, args.source, nwarp_specs, args.master, interp=args.interp,
             ainterp=ainterp, device=device, chain_base=args.chain_base,
         )  # fmt: skip
-        roi_depth.write_depth_psf(written[4], mats, ids=plan.ids)
-    low = float(result.cover.min()) if result.cover.size else 1.0
+    written: list[str] = []
+    low = 1.0
+    for plan, result in zip(plans, results, strict=True):
+        stem = f"{args.prefix}.K{plan.n_depths}" if multi else args.prefix
+        paths = roi_reads.write_roi_outputs(
+            stem, plan, result, tr=out_tr if out_tr and out_tr > 0 else None,
+            extra={"source": str(args.source), "master": str(args.master), "interp": args.interp},
+        )  # fmt: skip
+        if mats_by_k is not None:
+            roi_depth.write_depth_psf(paths[4], mats_by_k[plan.n_depths], ids=plan.ids)
+        written += paths
+        low = min(low, float(result.cover.min()) if result.cover.size else 1.0)
     if args.verb >= 1:
         if low < 0.999:
             print(f"  note: some rows read only {100 * low:.0f}% of their weight inside the EPI")

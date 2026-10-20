@@ -151,6 +151,132 @@ def plan_volume_reads(roi_set, affine: np.ndarray) -> ReadPlan:
     )
 
 
+def plan_depth_reads_multi(
+    files: list[str],
+    surfaces,
+    voxel_size: float,
+    opts,
+    depths: list[int],
+    max_reads: int | None = None,
+    *,
+    device=None,
+) -> list[ReadPlan]:
+    """ROI x depth reads along the ribbon for several depth counts, from ONE tiling.
+
+    One :class:`ReadPlan` per count in ``depths`` (ascending), their passes sharing the
+    same read points, so :func:`read_through_chain` reads the data once for all of them.
+    Reads per pass are capped at ``max_reads`` cells, the cells being cut finely enough
+    for the largest count. ``voxel_size`` (mm) is the data's: reads sit one apart along
+    the surface unless ``opts.dxyz`` says otherwise.
+    """
+    from fastfuncstuff.processing import roi_depth as rd
+
+    ks = sorted({int(k) for k in depths})
+    k_max = ks[-1]
+    notes: list[str] = []
+    rois = rd.read_depth_rois(files, surfaces, notes)
+    rd._check_options(opts)
+    step = opts.dxyz or voxel_size
+    cap = int(max_reads) if max_reads else default_max_reads(device)
+
+    through = 0.5
+    costs = rd.tile_costs(rois, surfaces, step, k_max, through)
+    if costs.max() > cap:
+        # One ROI alone is over the cap: thicken the sheets (never the spacing along
+        # the surface, which would leave voxels unread), keeping 2 per depth bin.
+        through = 1.0
+        relaxed = rd.tile_costs(rois, surfaces, step, k_max, through)
+        if relaxed.max() > cap:
+            big = rois[int(np.argmax(relaxed))].name
+            raise ValueError(
+                f"ROI {big!r} alone tiles to ~{int(relaxed.max()):,} reads (cap {cap:,}) at "
+                f"{step:.3g} mm spacing and {k_max} depth(s): raise -roi_max_reads, or lower "
+                "-depths, or raise -depth_dxyz"
+            )
+        costs = relaxed
+        notes.append(
+            f"sheets through the depth thickened to {through:g} of the read spacing so the largest "
+            f"ROI fits the {cap:,}-read cap (2 per depth bin kept)"
+        )
+    groups = rd.pass_groups(costs, cap)
+
+    sizes = {k: np.zeros(len(rois) * k) for k in ks}
+    columns = {k: np.zeros(len(rois) * k, np.int64) for k in ks}
+    hemi = ["-"] * len(rois)
+    passes: dict[int, list[ReadPass]] = {k: [] for k in ks}
+    tile_notes: list[str] = []
+    n_cells = 0
+    for gi, group in enumerate(groups):
+        sub = [rois[i] for i in group]
+        plans = rd.plan_depth_multi(
+            sub, surfaces, step, opts, ks, through=through, device=device
+        )  # fmt: skip
+        points = plans[0].cells.centre.copy()  # shared by every count's pass
+        n_cells += len(plans[0].cells)
+        for plan in plans:
+            k_n = plan.n_depths
+            rows = np.concatenate([np.arange(g * k_n, (g + 1) * k_n) for g in group])
+            op = plan.operator
+            sizes[k_n][rows] = np.asarray(op.sum(axis=1)).ravel()
+            columns[k_n][rows] = plan.columns_per_row()
+            for j, g in enumerate(group):
+                hemi[g] = plan.hemi_of[j]
+            passes[k_n].append(ReadPass(points, _normalised(op), rows))
+        if gi == 0:
+            tile_notes = plans[0].notes
+        del plans
+
+    names_used = ", ".join(sorted({s.name for r in rois for i, m in r.members.items() if m.any() for s in [surfaces[i]]}))  # fmt: skip
+    vertices = {
+        r.rid: {surfaces[i].name: np.flatnonzero(m).tolist() for i, m in r.members.items() if m.any()}
+        for r in rois
+    }  # fmt: skip
+    out = []
+    for k_n in ks:
+        index = {"hemi": [], "depth": [], "depth_frac": [], "n_columns": []}
+        for r in range(len(rois) * k_n):
+            g, k = divmod(r, k_n)
+            index["hemi"].append(hemi[g])
+            index["depth"].append(str(k + 1))
+            index["depth_frac"].append(f"{(k + 0.5) / k_n:.4g}")
+            index["n_columns"].append(str(int(columns[k_n][r])))
+        plan_notes = (
+            notes
+            + tile_notes
+            + [
+                f"{len(rois)} ROI(s) x {k_n} {opts.method} depth(s) along the {names_used} ribbon; "
+                "depth 1 = deepest (white matter side)",
+                f"{n_cells:,} reads ({step:.3g} mm apart along the surface, finer through the depth) "
+                f"in {len(groups)} pass(es) of at most {cap:,}"
+                + (f", shared by depth counts {ks}" if len(ks) > 1 else ""),
+            ]
+        )
+        out.append(
+            ReadPlan(
+                passes=passes[k_n],
+                ids=[r.rid for r in rois],
+                names=[r.name for r in rois],
+                n_depths=k_n,
+                index=index,
+                sizes=sizes[k_n],
+                size_name="volume_mm3",
+                kind="ribbon",
+                notes=plan_notes,
+                meta={
+                    "method": opts.method, "step_mm": step, "smooth_rounds": opts.smooth,
+                    "surfaces": [s.name for s in surfaces], "through": through,
+                    "max_reads": cap, "K": k_n, "depth_counts": ks,
+                },
+                vertices=vertices,
+                build={
+                    "rois": rois, "groups": groups, "surfaces": surfaces, "opts": opts,
+                    "step": step, "through": through, "depths": ks,
+                },
+            )
+        )  # fmt: skip
+    return out
+
+
 def plan_depth_reads(
     files: list[str],
     surfaces,
@@ -160,107 +286,11 @@ def plan_depth_reads(
     *,
     device=None,
 ) -> ReadPlan:
-    """ROI x depth reads along the ribbon, in passes of at most ``max_reads`` cells.
-
-    ``voxel_size`` (mm) is the data's: reads sit one apart along the surface unless
-    ``opts.dxyz`` says otherwise.
-    """
-    from fastfuncstuff.processing import roi_depth as rd
-
-    notes: list[str] = []
-    rois = rd.read_depth_rois(files, surfaces, notes)
-    rd._check_options(opts)
-    step = opts.dxyz or voxel_size
-    k_n = opts.n_depths
-    cap = int(max_reads) if max_reads else default_max_reads(device)
-
-    through = 0.5
-    costs = rd.tile_costs(rois, surfaces, step, k_n, through)
-    if costs.max() > cap:
-        # One ROI alone is over the cap: thicken the sheets (never the spacing along
-        # the surface, which would leave voxels unread), keeping 2 per depth bin.
-        through = 1.0
-        relaxed = rd.tile_costs(rois, surfaces, step, k_n, through)
-        if relaxed.max() > cap:
-            big = rois[int(np.argmax(relaxed))].name
-            raise ValueError(
-                f"ROI {big!r} alone tiles to ~{int(relaxed.max()):,} reads (cap {cap:,}) at "
-                f"{step:.3g} mm spacing and {k_n} depth(s): raise -roi_max_reads, or lower "
-                "-depths, or raise -depth_dxyz"
-            )
-        costs = relaxed
-        notes.append(
-            f"sheets through the depth thickened to {through:g} of the read spacing so the largest "
-            f"ROI fits the {cap:,}-read cap (2 per depth bin kept)"
-        )
-    groups = rd.pass_groups(costs, cap)
-    n_rows = len(rois) * k_n
-
-    sizes = np.zeros(n_rows)
-    columns = np.zeros(n_rows, np.int64)
-    hemi = ["-"] * len(rois)
-    passes: list[ReadPass] = []
-    tile_notes: list[str] = []
-    n_cells = 0
-    for gi, group in enumerate(groups):
-        sub = [rois[i] for i in group]
-        plan = rd.plan_depth_rois(sub, surfaces, step, opts, through=through, device=device)
-        rows = np.concatenate([np.arange(g * k_n, (g + 1) * k_n) for g in group])
-        op = plan.operator
-        row_sizes = np.asarray(op.sum(axis=1)).ravel()
-        sizes[rows] = row_sizes
-        columns[rows] = plan.columns_per_row()
-        for j, g in enumerate(group):
-            hemi[g] = plan.hemi_of[j]
-        n_cells += len(plan.cells)
-        passes.append(ReadPass(plan.cells.centre.copy(), _normalised(op), rows))
-        if gi == 0:
-            tile_notes = plan.notes
-        del plan
-
-    index = {"hemi": [], "depth": [], "depth_frac": [], "n_columns": []}
-    for r in range(n_rows):
-        g, k = divmod(r, k_n)
-        index["hemi"].append(hemi[g])
-        index["depth"].append(str(k + 1))
-        index["depth_frac"].append(f"{(k + 0.5) / k_n:.4g}")
-        index["n_columns"].append(str(int(columns[r])))
-    names_used = ", ".join(sorted({s.name for r in rois for i, m in r.members.items() if m.any() for s in [surfaces[i]]}))  # fmt: skip
-    notes += tile_notes
-    notes += [
-        f"{len(rois)} ROI(s) x {k_n} {opts.method} depth(s) along the {names_used} ribbon; "
-        "depth 1 = deepest (white matter side)",
-        f"{n_cells:,} reads ({step:.3g} mm apart along the surface, finer through the depth) "
-        f"in {len(passes)} pass(es) of at most {cap:,}",
-    ]
-    vertices = {
-        r.rid: {surfaces[i].name: np.flatnonzero(m).tolist() for i, m in r.members.items() if m.any()}
-        for r in rois
-    }  # fmt: skip
-    return ReadPlan(
-        passes=passes,
-        ids=[r.rid for r in rois],
-        names=[r.name for r in rois],
-        n_depths=k_n,
-        index=index,
-        sizes=sizes,
-        size_name="volume_mm3",
-        kind="ribbon",
-        notes=notes,
-        meta={
-            "method": opts.method,
-            "step_mm": step,
-            "smooth_rounds": opts.smooth,
-            "surfaces": [s.name for s in surfaces],
-            "through": through,
-            "max_reads": cap,
-        },
-        vertices=vertices,
-        build={
-            "rois": rois, "groups": groups, "surfaces": surfaces, "opts": opts,
-            "step": step, "through": through,
-        },
-    )  # fmt: skip
+    """ROI x depth reads along the ribbon for ``opts.n_depths``; see
+    :func:`plan_depth_reads_multi` (this is its one-count form)."""
+    return plan_depth_reads_multi(
+        files, surfaces, voxel_size, opts, [opts.n_depths], max_reads, device=device
+    )[0]
 
 
 class RoiFold:
@@ -308,23 +338,36 @@ class ReadResult:
 
 
 def read_through_chain(
-    plan: ReadPlan, source_path: str, nwarp_specs, master_path: str, **nwarp_kwargs
-) -> ReadResult:
-    """Run every pass of ``plan`` through ``nwarpforge`` over one read of the source."""
+    plan: ReadPlan | list[ReadPlan], source_path: str, nwarp_specs, master_path: str, **nwarp_kwargs
+) -> ReadResult | list[ReadResult]:
+    """Run every pass of ``plan`` through ``nwarpforge`` over one read of the source.
+
+    Given several plans (depth counts from :func:`plan_depth_reads_multi`) their passes
+    must share their read points: each pass is read ONCE, the plans' operators stacked
+    into one fold, and the rows split back per plan -- one :class:`ReadResult` each.
+    """
     from fastfuncstuff.processing.io import load_image
     from fastfuncstuff.processing.nwarpforge import nwarpforge
 
+    plans = [plan] if isinstance(plan, ReadPlan) else list(plan)
+    n_pass = len(plans[0].passes)
+    for pl in plans:
+        if len(pl.passes) != n_pass or any(
+            a.points is not b.points for a, b in zip(pl.passes, plans[0].passes, strict=True)
+        ):
+            raise ValueError("plans read together must share their passes' points")
     source = nwarp_kwargs.pop("source_image", None) or load_image(source_path, device=None)
-    out = np.zeros((0, plan.n_rows), np.float32)
-    cover = np.zeros(plan.n_rows, np.float32)
-    for p in plan.passes:
-        fold = RoiFold(p.operator)
+    outs = [np.zeros((0, pl.n_rows), np.float32) for pl in plans]
+    covers = [np.zeros(pl.n_rows, np.float32) for pl in plans]
+    for i in range(n_pass):
+        ops = [pl.passes[i].operator for pl in plans]
+        fold = RoiFold(sp.vstack(ops).tocsr() if len(ops) > 1 else ops[0])
         res = nwarpforge(
             source_path=source_path,
             nwarp_specs=nwarp_specs,
             prefix="",
             master_path=master_path,
-            points=p.points,
+            points=plans[0].passes[i].points,
             point_reducer=fold,
             source_image=source,
             **nwarp_kwargs,
@@ -332,12 +375,18 @@ def read_through_chain(
         assert res is not None
         vals = res.cpu().numpy().astype(np.float32)
         vals = vals[None] if vals.ndim == 1 else vals
-        if out.shape[0] == 0:
-            out = np.zeros((vals.shape[0], plan.n_rows), np.float32)
-        out[:, p.rows] = vals
-        if fold.cover is not None:
-            cover[p.rows] = fold.cover.cpu().numpy()
-    return ReadResult(out, np.clip(cover, 0.0, 1.0))
+        cov = fold.cover.cpu().numpy() if fold.cover is not None else None
+        c0 = 0
+        for j, pl in enumerate(plans):
+            n = ops[j].shape[0]
+            if outs[j].shape[0] == 0:
+                outs[j] = np.zeros((vals.shape[0], pl.n_rows), np.float32)
+            outs[j][:, pl.passes[i].rows] = vals[:, c0 : c0 + n]
+            if cov is not None:
+                covers[j][pl.passes[i].rows] = cov[c0 : c0 + n]
+            c0 += n
+    results = [ReadResult(o, np.clip(c, 0.0, 1.0)) for o, c in zip(outs, covers, strict=True)]
+    return results[0] if isinstance(plan, ReadPlan) else results
 
 
 def native_depth_matrices(
@@ -365,12 +414,35 @@ def native_depth_matrices(
     ROI's reads then interpolate those voxels with ``interp`` -- nwarp's own -- and
     average with the cells' volumes.
     """
+    return native_depth_matrices_multi(
+        plan, source_image, source_path, nwarp_specs, master_path, interp=interp,
+        ainterp=ainterp, normalise=normalise, device=device, chain_base=chain_base,
+    )[plan.n_depths]  # fmt: skip
+
+
+def native_depth_matrices_multi(
+    plan: ReadPlan,
+    source_image,
+    source_path: str,
+    nwarp_specs,
+    master_path: str,
+    *,
+    interp: str = "wsinc5",
+    ainterp: str = "cubic",
+    normalise: bool = False,
+    device=None,
+    chain_base: str | None = None,
+) -> dict[int, list[tuple[str, str, np.ndarray]]]:
+    """:func:`native_depth_matrices` for every depth count the plan was built for
+    (``plan.build["depths"]``), from one tiling and one set of chain reads:
+    ``{K: [(name, hemi, M) per ROI]}``."""
     from fastfuncstuff.processing import roi_depth as rd
     from fastfuncstuff.processing.surface_qc import _forge, _header_3d
 
     b = plan.build
     if not b:
         raise ValueError("depth sampling matrices need a ribbon plan")
+    ks = list(b.get("depths") or [plan.n_depths])
     src, header = source_image
     nz, ny, nx = (int(n) for n in src.shape[-3:])
     shape3 = (nx, ny, nz)
@@ -388,19 +460,22 @@ def native_depth_matrices(
         ijk[np.abs(c[3].cpu().numpy() - 1.0) > 1e-3] = np.nan  # off the native grid
         return ijk
 
-    out: list = [None] * len(b["rois"])
+    out: dict[int, list] = {k: [None] * len(b["rois"]) for k in ks}
     h = 0.25  # mm, for the chain's Jacobian by central differences
     for group in b["groups"]:
         sub = [b["rois"][i] for i in group]
-        dp = rd.plan_depth_rois(
-            sub, b["surfaces"], b["step"], b["opts"], through=b["through"],
+        dps = rd.plan_depth_multi(
+            sub, b["surfaces"], b["step"], b["opts"], ks, through=b["through"],
             halo_mm=rd.psf_halo_mm(interp, native_mm), keep_all=True, device=device,
         )  # fmt: skip
+        dp = dps[0]
         assert dp.all_cells is not None and dp.owned_index is not None
         every_ijk = native(dp.all_cells.centre)
         own = np.nan_to_num(every_ijk[dp.owned_index], nan=-1e6)
         n_vox = nx * ny * nz
-        w, _ = rd._compose(dp.operator, own, None, shape3, interp, None, n_vox)
+        w_all, _ = rd._compose(
+            sp.vstack([d.operator for d in dps]).tocsr(), own, None, shape3, interp, None, n_vox
+        )
 
         def voxel_mm3(touched, every_ijk=every_ijk, dp=dp):
             # One cell inside each touched voxel stands for it: the chain is smooth
@@ -426,9 +501,15 @@ def native_depth_matrices(
                 vol[[i for i, _ in reps]] = np.where(det > 0, 1.0 / det, np.prod(zooms))
             return vol
 
-        mats = rd._mix_matrices(dp, w, every_ijk, shape3, voxel_mm3, normalise)
-        for g, m in zip(group, mats, strict=True):
-            out[g] = m
+        row0 = 0
+        for d in dps:
+            r1 = row0 + d.operator.shape[0]
+            mats = rd._mix_matrices(
+                d, w_all[row0:r1].tocsr(), every_ijk, shape3, voxel_mm3, normalise
+            )  # fmt: skip
+            for g, m in zip(group, mats, strict=True):
+                out[d.n_depths][g] = m
+            row0 = r1
     return out
 
 
@@ -440,7 +521,10 @@ def torch_meshgrid(nz: int, ny: int, nx: int):
     )
 
 
-def output_paths(prefix: str, ribbon: bool) -> list[str]:
+def output_paths(prefix: str, ribbon: bool, depths: list[int] | None = None) -> list[str]:
+    """Every file written; with several depth counts one set per count, ``PREFIX.K7.roi.*``."""
+    if depths and len(depths) > 1:
+        return [p for k in depths for p in output_paths(f"{prefix}.K{k}", ribbon)]
     stem = f"{prefix}.roi"
     return [f"{stem}.nii.gz", f"{stem}.tsv", f"{stem}.json"] + (
         [f"{stem}.vertices.npz", f"{stem}.depth_psf.tsv"] if ribbon else []
@@ -635,8 +719,10 @@ __all__ = [
     "adopt_roi_series_input",
     "default_max_reads",
     "native_depth_matrices",
+    "native_depth_matrices_multi",
     "output_paths",
     "plan_depth_reads",
+    "plan_depth_reads_multi",
     "plan_volume_reads",
     "read_series_table",
     "read_through_chain",

@@ -161,7 +161,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_device_arg(parser, extra="Passed through to every FFS tool the benchmark runs.")
     add_verbose_arg(parser, default=0)
 
-    if len(sys.argv) == 1:
+    # A bare `ffs_benchmark` prints help rather than running the default dataset.
+    # Keyed on the argv THIS call was given, not the process's: a programmatic
+    # parse_args(["-profile"]) is not a bare invocation, and under pytest-xdist
+    # the worker's own sys.argv is a single element -- which printed help and
+    # exited 0 in the middle of whichever test asked the parser a question.
+    if not (sys.argv[1:] if argv is None else argv):
         parser.print_help()
         sys.exit(0)
 

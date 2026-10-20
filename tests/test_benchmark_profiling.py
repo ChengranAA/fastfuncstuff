@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import types
 
 import pytest
@@ -213,6 +214,18 @@ def test_profile_cli_flags():
     assert args.profile_trace is False
     with pytest.raises(SystemExit):
         parse_args(["-profile-trace"])
+
+
+def test_parse_args_reads_its_own_argv_not_the_process(monkeypatch):
+    """Bug of record: the bare-invocation check read sys.argv, so a programmatic
+    parse_args() printed help and exited 0 whenever the HOST process happened to
+    have a one-element command line -- which every pytest-xdist worker does."""
+    monkeypatch.setattr(sys, "argv", ["ffs_benchmark"])
+    assert parse_args(["-profile"]).profile is True
+    # ...and a genuinely bare call still prints help and exits 0.
+    with pytest.raises(SystemExit) as exc:
+        parse_args([])
+    assert exc.value.code == 0
 
 
 def test_standalone_profile_parser_accepts_command_after_separator():

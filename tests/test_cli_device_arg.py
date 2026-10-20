@@ -79,7 +79,11 @@ def test_device_flag_accepts_spec_forms(name, monkeypatch):
         if hasattr(mod, "parse_args"):
             try:
                 try:
-                    mod.parse_args([])
+                    # A non-empty argv on purpose: for a tool whose bare
+                    # invocation prints help and exits (ffs_benchmark), an empty
+                    # list never reaches the parser this probe wants. The flag's
+                    # value is never parsed -- parse_args is monkeypatched above.
+                    mod.parse_args(["-device", "cpu"])
                 except TypeError:  # parse_args() reading sys.argv directly
                     mod.parse_args()
             except _Captured as c:

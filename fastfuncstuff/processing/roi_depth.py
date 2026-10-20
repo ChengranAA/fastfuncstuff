@@ -442,26 +442,35 @@ def pass_groups(costs: np.ndarray, max_reads: int | None) -> list[list[int]]:
     return [sorted(g) for g in groups]
 
 
-def plan_depth_rois(
+def plan_depth_multi(
     rois: list[_Roi],
     surfaces,
     step: float,
     opts: DepthOptions = DepthOptions(),
+    depths: list[int] | None = None,
     *,
     through: float = 0.5,
     halo_mm: float = 3.0,
     keep_all: bool = False,
     device=None,
-) -> DepthPlan:
-    """Tile the ribbon under ``rois`` and cut it into ROI x depth operator rows."""
+) -> list[DepthPlan]:
+    """One :class:`DepthPlan` per depth count in ``depths``, all from ONE tiling.
+
+    A cell's depth metric does not depend on how many bins it is cut into, so the ribbon
+    is tiled once, finely enough for the largest count (at least two sheets per bin),
+    and each count's operator is cut from the same cells -- the reads are shared, which
+    is what lets ``ffs_nwarp`` read the data once for every K.
+    """
     from fastfuncstuff.surface.slab import ribbon_cells
 
-    _check_options(opts)
-    n_depths = opts.n_depths
+    ks = sorted({int(k) for k in (depths or [opts.n_depths])})
+    for k in ks:
+        _check_options(DepthOptions(k, opts.method, opts.dxyz, opts.smooth, opts.interp))
+    k_max = ks[-1]
     faces_of = _faces_of(rois, surfaces, halo_mm)
     log: list[str] = []
     cells = ribbon_cells(
-        surfaces, faces_of, step, n_depths, opts.method,
+        surfaces, faces_of, step, k_max, opts.method,
         smooth_rounds=opts.smooth, through=through, device=device, log=log.append,
     )  # fmt: skip
     members: dict[int, np.ndarray] = {}
@@ -478,27 +487,103 @@ def plan_depth_rois(
     cells.inverted_mm3 = inverted
     if not len(cells):
         raise ValueError("no ribbon under the ROIs: are the surfaces' cortex labels right?")
-    cell, k_bin, share = cells.bin_shares(n_depths)
 
-    rows_i, cols_i, vals, hemi_of = [], [], [], []
-    for r_idx, roi in enumerate(rois):
+    inside_by_roi = []
+    hemi_of = []
+    for roi in rois:
         inside = np.zeros(len(cells), bool)
         for i, member in roi.members.items():
             here = cells.surface == i
             inside[here] = member[cells.vertex[here]]
-        pick = np.flatnonzero(inside[cell])
+        inside_by_roi.append(inside)
         hemi_of.append("+".join(sorted({surfaces[int(i)].name for i in np.unique(cells.surface[inside])})) or "-")  # fmt: skip
-        rows_i.append(r_idx * n_depths + k_bin[pick])
-        cols_i.append(cell[pick])
-        vals.append(cells.volume[cell[pick]] * share[pick])
-    operator = sp.csr_matrix(
-        (np.concatenate(vals), (np.concatenate(rows_i), np.concatenate(cols_i))),
-        shape=(len(rois) * n_depths, len(cells)),
-    )
-    return DepthPlan(
-        rois, cells, operator, hemi_of, n_depths, step, [ln.strip() for ln in log], everything,
-        np.flatnonzero(owned) if keep_all else None,
-    )  # fmt: skip
+    plans = []
+    for k_n in ks:
+        cell, k_bin, share = cells.bin_shares(k_n)
+        rows_i, cols_i, vals = [], [], []
+        for r_idx, inside in enumerate(inside_by_roi):
+            pick = np.flatnonzero(inside[cell])
+            rows_i.append(r_idx * k_n + k_bin[pick])
+            cols_i.append(cell[pick])
+            vals.append(cells.volume[cell[pick]] * share[pick])
+        operator = sp.csr_matrix(
+            (np.concatenate(vals), (np.concatenate(rows_i), np.concatenate(cols_i))),
+            shape=(len(rois) * k_n, len(cells)),
+        )
+        plans.append(
+            DepthPlan(
+                rois, cells, operator, hemi_of, k_n, step, [ln.strip() for ln in log], everything,
+                np.flatnonzero(owned) if keep_all else None,
+            )
+        )  # fmt: skip
+    return plans
+
+
+def plan_depth_rois(
+    rois: list[_Roi],
+    surfaces,
+    step: float,
+    opts: DepthOptions = DepthOptions(),
+    *,
+    through: float = 0.5,
+    halo_mm: float = 3.0,
+    keep_all: bool = False,
+    device=None,
+) -> DepthPlan:
+    """Tile the ribbon under ``rois`` and cut it into ROI x depth operator rows."""
+    return plan_depth_multi(
+        rois, surfaces, step, opts, [opts.n_depths], through=through, halo_mm=halo_mm,
+        keep_all=keep_all, device=device,
+    )[0]  # fmt: skip
+
+
+def build_depth_roi_sets(
+    paths: str | list[str],
+    surfaces,
+    data_affine: np.ndarray,
+    data_shape: tuple[int, ...],
+    mask: np.ndarray | None = None,
+    opts: DepthOptions = DepthOptions(),
+    depths: list[int] | None = None,
+    *,
+    device=None,
+) -> list[RoiSet]:
+    """One ROI x depth :class:`RoiSet` per depth count in ``depths``, from one tiling.
+
+    The ribbon is tiled once and read onto the data grid once: every count's operator
+    is composed in a single pass over the taps. Each set's rows are ROI-major, depth 1
+    (deepest, by white matter) to ``n_depths`` (by pial). ``surfaces`` are
+    :class:`surface.volume_depth.RibbonSurfaces` in scanner RAS -- the data must be in
+    register with the anatomy they were made from. ``mask`` (data grid) limits which
+    voxels are ever read.
+    """
+    files = [paths] if isinstance(paths, str) else list(paths)
+    _check_options(opts)
+    shape3 = tuple(int(n) for n in data_shape[:3])
+    aff = np.asarray(data_affine, np.float64)
+    mask3 = None if mask is None else np.asarray(mask).astype(bool).reshape(shape3)
+    notes: list[str] = []
+    rois = read_depth_rois(files, surfaces, notes)
+    step = opts.dxyz or default_step(aff)
+    plans = plan_depth_multi(rois, surfaces, step, opts, depths, device=device)
+    cells = plans[0].cells
+    n_vox = int(np.prod(shape3))
+    stacked = sp.vstack([p.operator for p in plans]).tocsr()
+    w_all, dropped = _compose(stacked, cells.centre, aff, shape3, opts.interp, mask3, n_vox)
+    inv = np.linalg.inv(aff)
+    near = np.rint(cells.centre @ inv[:3, :3].T + inv[:3, 3])
+    off_grid = ~np.all((near >= 0) & (near < np.asarray(shape3)), axis=1)
+    out, row0 = [], 0
+    for plan in plans:
+        r1 = row0 + plan.operator.shape[0]
+        out.append(
+            _roi_set_from_plan(
+                plan, w_all[row0:r1].tocsr(), dropped, off_grid, files, notes, opts, shape3,
+                mask3 is not None, n_vox,
+            )
+        )  # fmt: skip
+        row0 = r1
+    return out
 
 
 def build_depth_roi_set(
@@ -511,31 +596,21 @@ def build_depth_roi_set(
     *,
     device=None,
 ) -> RoiSet:
-    """ROI x depth rows for data on ``(data_affine, data_shape)``, read along the ribbon.
+    """ROI x depth rows for data on ``(data_affine, data_shape)``, read along the ribbon;
+    see :func:`build_depth_roi_sets` (this is its one-count form)."""
+    return build_depth_roi_sets(
+        paths, surfaces, data_affine, data_shape, mask, opts, [opts.n_depths], device=device
+    )[0]
 
-    ``surfaces`` are :class:`surface.volume_depth.RibbonSurfaces` in scanner RAS --
-    the data must be in register with the anatomy they were made from. ``mask`` (data
-    grid) limits which voxels are ever read. Rows run ROI-major, depth 1 (deepest,
-    by white matter) to ``n_depths`` (by pial).
-    """
-    files = [paths] if isinstance(paths, str) else list(paths)
-    _check_options(opts)
-    shape3 = tuple(int(n) for n in data_shape[:3])
-    aff = np.asarray(data_affine, np.float64)
-    mask3 = None if mask is None else np.asarray(mask).astype(bool).reshape(shape3)
-    notes: list[str] = []
-    rois = read_depth_rois(files, surfaces, notes)
-    step = opts.dxyz or default_step(aff)
-    n_depths = opts.n_depths
-    plan = plan_depth_rois(rois, surfaces, step, opts, device=device)
-    cells, operator, hemi_of = plan.cells, plan.operator, plan.hemi_of
+
+def _roi_set_from_plan(
+    plan: DepthPlan, w, dropped, off_grid, files, notes0, opts, shape3, masked, n_vox
+) -> RoiSet:
+    """One count's ROI set from its plan and its rows of the composed reads."""
+    rois, cells, operator, hemi_of = plan.rois, plan.cells, plan.operator, plan.hemi_of
+    n_depths, step, log = plan.n_depths, plan.step, plan.notes
+    notes = list(notes0)
     n_rows = operator.shape[0]
-    log = plan.notes
-    n_vox = int(np.prod(shape3))
-    w, dropped = _compose(operator, cells.centre, aff, shape3, opts.interp, mask3, n_vox)
-    inv = np.linalg.inv(aff)
-    near = np.rint(cells.centre @ inv[:3, :3].T + inv[:3, 3])
-    off_grid = ~np.all((near >= 0) & (near < np.asarray(shape3)), axis=1)
     read_op = operator.multiply(~dropped[None]).tocsr()
     w.eliminate_zeros()
     sizes = np.asarray(read_op.sum(axis=1)).ravel()
@@ -565,9 +640,7 @@ def build_depth_roi_set(
     total_mm3 = float(cells.volume.sum())
     lost_fov = float(cells.volume[off_grid].sum())
     lost_mask = float(cells.volume[dropped & ~off_grid].sum())
-    names_used = ", ".join(
-        surfaces[i].name for i in sorted({i for r in rois for i, m in r.members.items() if m.any()})
-    )
+    names_used = "+".join(sorted({h for h in "+".join(hemi_of).split("+") if h != "-"})) or "-"
     notes += log
     notes += [
         f"depth sampling: {len(rois)} ROI(s) x {n_depths} {opts.method} depth(s) along the "
@@ -588,7 +661,7 @@ def build_depth_roi_set(
         )
     elif lost_fov > 0:
         notes.append(f"{100 * lost_fov / total_mm3:.1f}% of the ROI ribbon is outside the data")
-    if mask3 is not None:
+    if masked:
         notes.append(
             "ribbon reads limited to the analysis mask (-mask, or the missing-data guard's)"
             + (
@@ -667,6 +740,49 @@ def psf_halo_mm(interp: str, voxel_mm: float) -> float:
     return 3.0 + (reach + 1) * voxel_mm
 
 
+def depth_sampling_multi(
+    paths: str | list[str],
+    surfaces,
+    data_affine: np.ndarray,
+    data_shape: tuple[int, ...],
+    opts: DepthOptions = DepthOptions(),
+    depths: list[int] | None = None,
+    *,
+    normalise: bool = True,
+    device=None,
+) -> dict[int, list[tuple[int, str, str, np.ndarray]]]:
+    """:func:`depth_sampling_matrices` for several depth counts from one tiling:
+    ``{K: [(roi id, name, hemi, M), ...]}``, ROIs in the order the set has them."""
+    files = [paths] if isinstance(paths, str) else list(paths)
+    _check_options(opts)
+    shape3 = tuple(int(n) for n in data_shape[:3])
+    aff = np.asarray(data_affine, np.float64)
+    rois = read_depth_rois(files, surfaces, [])
+    step = opts.dxyz or default_step(aff)
+    plans = plan_depth_multi(
+        rois, surfaces, step, opts, depths, halo_mm=psf_halo_mm(opts.interp, default_step(aff)),
+        keep_all=True, device=device,
+    )  # fmt: skip
+    n_vox = int(np.prod(shape3))
+    stacked = sp.vstack([p.operator for p in plans]).tocsr()
+    w_all, _ = _compose(stacked, plans[0].cells.centre, aff, shape3, opts.interp, None, n_vox)
+    assert plans[0].all_cells is not None
+    inv = np.linalg.inv(aff)
+    every_ijk = plans[0].all_cells.centre @ inv[:3, :3].T + inv[:3, 3]
+    out, row0 = {}, 0
+    for plan in plans:
+        r1 = row0 + plan.operator.shape[0]
+        mats = _mix_matrices(
+            plan, w_all[row0:r1].tocsr(), every_ijk, shape3,
+            abs(np.linalg.det(aff[:3, :3])), normalise,
+        )  # fmt: skip
+        out[plan.n_depths] = [
+            (roi.rid, name, hemi, m) for roi, (name, hemi, m) in zip(rois, mats, strict=True)
+        ]
+        row0 = r1
+    return out
+
+
 def depth_sampling_matrices(
     paths: str | list[str],
     surfaces,
@@ -694,41 +810,40 @@ def depth_sampling_matrices(
     unnormalised form assumes every tissue has the same baseline signal per volume,
     which CSF does not -- so it is the cautious one only for its shape.
     """
-    files = [paths] if isinstance(paths, str) else list(paths)
-    _check_options(opts)
-    shape3 = tuple(int(n) for n in data_shape[:3])
-    aff = np.asarray(data_affine, np.float64)
-    notes: list[str] = []
-    rois = read_depth_rois(files, surfaces, notes)
-    step = opts.dxyz or default_step(aff)
-    plan = plan_depth_rois(
-        rois, surfaces, step, opts, halo_mm=psf_halo_mm(opts.interp, default_step(aff)),
-        keep_all=True, device=device,
+    by_k = depth_sampling_multi(
+        paths, surfaces, data_affine, data_shape, opts, [opts.n_depths],
+        normalise=normalise, device=device,
     )  # fmt: skip
-    n_vox = int(np.prod(shape3))
-    w, _ = _compose(plan.operator, plan.cells.centre, aff, shape3, opts.interp, None, n_vox)
-    assert plan.all_cells is not None
-    inv = np.linalg.inv(aff)
-    every_ijk = plan.all_cells.centre @ inv[:3, :3].T + inv[:3, 3]
-    return _mix_matrices(plan, w, every_ijk, shape3, abs(np.linalg.det(aff[:3, :3])), normalise)
+    return [(name, hemi, m) for _, name, hemi, m in by_k[opts.n_depths]]
 
 
-def write_depth_psf(path: str, matrices, ids: list | None = None) -> str:
+def write_depth_psf(path: str, matrices, ids: list | None = None, ks: list | None = None) -> str:
     """The matrices as a tidy table: one line per ROI x measured depth x true depth,
-    depth 1 deepest, unnormalised ``weight`` -- readers normalise if they want to."""
+    depth 1 deepest, unnormalised ``weight`` -- readers normalise if they want to.
+    ``ks`` (one depth count per matrix) adds a ``K`` column after ``hemi``."""
     with open(path, "w") as fh:
-        fh.write("roi\tname\themi\tdepth\ttrue_depth\tweight\n")
+        fh.write("roi\tname\themi\t" + ("K\t" if ks is not None else "")
+                 + "depth\ttrue_depth\tweight\n")  # fmt: skip
         for i, (name, hemi, m) in enumerate(matrices):
             rid = ids[i] if ids is not None else i + 1
+            kcol = f"{ks[i]}\t" if ks is not None else ""
             for k in range(m.shape[0]):
                 for j in range(m.shape[1]):
-                    fh.write(f"{rid}\t{name}\t{hemi}\t{k + 1}\t{j + 1}\t{m[k, j]:.6g}\n")
+                    fh.write(f"{rid}\t{name}\t{hemi}\t{kcol}{k + 1}\t{j + 1}\t{m[k, j]:.6g}\n")
     return path
 
 
+def depth_list(args) -> list[int]:
+    """The depth counts ``-depths`` asked for (a bare int from older callers works too)."""
+    d = getattr(args, "depths", 1)
+    ks = [d] if isinstance(d, int) else [int(k) for k in d]
+    return list(dict.fromkeys(ks)) or [1]
+
+
 def options_from_args(args) -> DepthOptions:
+    """The options of the first depth count; the others come from :func:`depth_list`."""
     return DepthOptions(
-        n_depths=int(args.depths),
+        n_depths=depth_list(args)[0],
         method=str(args.depth_method),
         dxyz=args.depth_dxyz,
         interp=str(getattr(args, "depth_interp", "cubic")),
@@ -761,7 +876,7 @@ def roi_set_from_args(
         return roi_set_from_series(table, volume_shape, input_path or "")
     on_surface = header is not None and _surface_data(header)
     if not depth_requested(args):
-        if getattr(args, "depths", 1) != 1 or getattr(args, "depth_method", None) == "equivolume":
+        if depth_list(args) != [1] or getattr(args, "depth_method", None) == "equivolume":
             raise ValueError(
                 "-depths / -equivolume sample along surfaces: give -fs_subj or -white_mesh"
             )
@@ -784,14 +899,20 @@ def roi_set_from_args(
         args.cortex_label, log=log_lines.append,
     )  # fmt: skip
     opts = options_from_args(args)
-    roi_set = build_depth_roi_set(
-        args.atlas, surfaces, affine, volume_shape, mask, opts, device=device
+    ks = depth_list(args)
+    sets = build_depth_roi_sets(
+        args.atlas, surfaces, affine, volume_shape, mask, opts, ks, device=device
     )
     # The laminar model's depth PSF for exactly this sampling (unnormalised; the
     # analysis mask is left out -- it is geometry, not data).
-    roi_set.depth_psf = depth_sampling_matrices(
-        args.atlas, surfaces, affine, volume_shape, opts, normalise=False, device=device
+    psf = depth_sampling_multi(
+        args.atlas, surfaces, affine, volume_shape, opts, ks, normalise=False, device=device
     )
+    roi_set = sets[0] if len(ks) == 1 else RoiSet.stack(sets, "K", sorted(ks))
+    flat = [(k, rid, name, hemi, m) for k in sorted(ks) for rid, name, hemi, m in psf[k]]
+    roi_set.depth_psf = [(name, hemi, m) for _, _, name, hemi, m in flat]
+    roi_set.depth_psf_ids = [rid for _, rid, *_ in flat]
+    roi_set.depth_psf_ks = [k for k, *_ in flat]
     roi_set.notes[:0] = [line.strip() for line in log_lines]
     return roi_set
 
@@ -806,12 +927,16 @@ __all__ = [
     "DepthOptions",
     "DepthPlan",
     "build_depth_roi_set",
+    "build_depth_roi_sets",
     "READ_KERNELS",
     "default_step",
+    "depth_list",
     "depth_sampling_matrices",
+    "depth_sampling_multi",
     "psf_halo_mm",
     "write_depth_psf",
     "pass_groups",
+    "plan_depth_multi",
     "plan_depth_rois",
     "read_depth_rois",
     "tile_costs",

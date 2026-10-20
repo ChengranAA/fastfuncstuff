@@ -146,3 +146,57 @@ def test_depth_flag_help_renders():
     add_depth_args(parser.add_argument_group("depth"))
     text = parser.format_help()
     assert "-depth_smooth" in text and "-depth_interp" in text
+
+
+def test_several_depth_counts_are_one_fit_with_a_k_column(brain):
+    """-depths 3 5: one load, one fit, every (K, depth) a row; K is a table column and
+    each count's depth profile is ordered like its single-count run."""
+    tmp = brain
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.reml", "-input", str(tmp / "bold.nii.gz"),
+         "-events", str(tmp / "ev.tsv"), "-TR", str(TR), "-hrf_model", "TENT(0,14,8)",
+         "-tout", "-fout", "-device", "cpu", "-Rbuck", str(tmp / "m"),
+         "-atlas", str(tmp / "patch.lh.label"), *_surfs(tmp), "-depths", "3", "5", "-equivolume",
+         "-depth_dxyz", "0.6"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=tmp,
+    )  # fmt: skip
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-3000:]
+    header, rows = _table(tmp / "m_roi.tsv")
+    assert header[:8] == [
+        "roi",
+        "name",
+        "K",
+        "hemi",
+        "depth",
+        "depth_frac",
+        "n_columns",
+        "volume_mm3",
+    ]
+    assert [(r[2], r[4]) for r in rows] == [("3", str(d)) for d in (1, 2, 3)] + [
+        ("5", str(d)) for d in (1, 2, 3, 4, 5)
+    ]
+    for k in ("3", "5"):  # the response grows outward at each count
+        f = [float(r[header.index("Full_Fstat")]) for r in rows if r[2] == k]
+        assert f == sorted(f)
+    ch, curve = _table(tmp / "m_iresp_vis.tsv")
+    assert ch[:4] == ["time", "roi", "name", "K"] and {r[3] for r in curve} == {"3", "5"}
+    ph, psf = _table(tmp / "m_depth_psf.tsv")
+    assert ph == ["roi", "name", "hemi", "K", "depth", "true_depth", "weight"]
+    assert len(psf) == 3 * 3 + 5 * 5
+
+
+def test_deconvolve_takes_several_depth_counts_too(brain, monkeypatch):
+    from fastfuncstuff.cli import deconvolve
+
+    tmp = brain
+    monkeypatch.chdir(tmp)
+    argv = ["ffs_deconvolve", "-input", str(tmp / "bold.nii.gz"), "-onsets", str(tmp / "stim.1D"),
+            "-model", "TENT", "-window", "0", "14", "-prefix", str(tmp / "dm"), "-device", "cpu",
+            "-atlas", str(tmp / "patch.lh.label"), *_surfs(tmp), "-depths", "3", "5",
+            "-depth_dxyz", "0.6"]  # fmt: skip
+    monkeypatch.setattr(sys, "argv", argv)
+    assert deconvolve.main() == 0
+    header, rows = _table(tmp / "dm_roi.tsv")
+    assert header[2] == "K" and len(rows) == 8
+    _, psf = _table(tmp / "dm_depth_psf.tsv")
+    assert len(psf) == 3 * 3 + 5 * 5

@@ -817,6 +817,7 @@ def _dispatch_roi(
     from fastfuncstuff.io.afni import get_tr_from_file, load_nifti
     from fastfuncstuff.processing import roi_depth, roi_reads
     from fastfuncstuff.processing.roi_collapse import build_roi_set
+    from fastfuncstuff.processing.roi_depth import depth_list
 
     wrong = [
         flag
@@ -855,7 +856,7 @@ def _dispatch_roi(
             )  # fmt: skip
             plan.notes[:0] = [line.strip() for line in log]
         else:
-            if args.depths != 1 or args.depth_method == "equivolume":
+            if depth_list(args) != [1] or args.depth_method == "equivolume":
                 raise ValueError(
                     "-depths / -equivolume sample along surfaces: give -fs_subj or -white_mesh"
                 )

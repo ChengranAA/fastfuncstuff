@@ -214,6 +214,59 @@ class RoiSet:
     #: Depth-sampled sets: ``(name, hemi, K x K)`` per ROI, how each measured depth mixes
     #: the true depths (:func:`processing.roi_depth.depth_sampling_matrices`).
     depth_psf: list | None = None
+    #: ROI id and depth count of each ``depth_psf`` matrix (parallel to it).
+    depth_psf_ids: list | None = None
+    depth_psf_ks: list | None = None
+
+    @staticmethod
+    def stack(sets: list[RoiSet], label: str, labels: list) -> RoiSet:
+        """Several sparse sets of the same ROIs on one grid as one: every row of every set,
+        with ``label`` (e.g. ``K``) as the first extra table column.
+
+        The sets' voxel rows are united so a single load serves them all; each set's
+        spec is re-indexed onto the union. The fit tools treat every row as an ROI, so a
+        multi-depth-count run is one fit of ``sum_k n_rois * k`` series.
+        """
+        if not sets:
+            raise ValueError("nothing to stack")
+        shape = sets[0].rows.shape
+        union = np.zeros(shape, bool)
+        for st in sets:
+            if not sp.issparse(st.spec) or st.rows.shape != shape:
+                raise ValueError("only sparse ROI x depth sets on one grid can be stacked")
+            union |= st.rows
+        union_flat = np.flatnonzero(union.reshape(-1))
+        specs = []
+        for st in sets:
+            touched = np.flatnonzero(st.rows.reshape(-1))
+            coo = sp.coo_matrix(st.spec)
+            cols = np.searchsorted(union_flat, touched)[coo.col]
+            specs.append(
+                sp.csr_matrix(
+                    (coo.data, (coo.row, cols)), shape=(st.spec.shape[0], union_flat.size)
+                )
+            )
+        index: dict[str, list] = {label: []}
+        for key in sets[0].index:
+            index[key] = []
+        for st, lab in zip(sets, labels, strict=True):
+            index[label] += [str(lab)] * len(st.ids)
+            for key in sets[0].index:
+                index[key] += list(st.index[key])
+        first = sets[0]
+        return RoiSet(
+            spec=sp.vstack(specs).tocsr(),
+            ids=[i for st in sets for i in st.ids],
+            names=[n for st in sets for n in st.names],
+            sizes=np.concatenate([np.asarray(st.sizes) for st in sets]),
+            rows=union,
+            sources=first.sources,
+            notes=first.notes
+            + [f"{len(sets)} depth counts ({', '.join(str(x) for x in labels)}) sampled together"],
+            index=index,
+            size_name=first.size_name,
+            long_rows=True,
+        )
 
     @property
     def n_rois(self) -> int:
@@ -275,8 +328,8 @@ class RoiSet:
             return None
         from fastfuncstuff.processing.roi_depth import write_depth_psf
 
-        ids = list(dict.fromkeys(self.ids))  # ROI ids in order, one per ROI (not per row)
-        return write_depth_psf(f"{stem}_depth_psf.tsv", self.depth_psf, ids)
+        ks = self.depth_psf_ks if len(set(self.depth_psf_ks or [])) > 1 else None
+        return write_depth_psf(f"{stem}_depth_psf.tsv", self.depth_psf, self.depth_psf_ids, ks=ks)
 
     def write_table(self, path: str | Path, columns: dict[str, np.ndarray | Tensor]) -> str:
         """One row per ROI: id, name, size, then each named column."""

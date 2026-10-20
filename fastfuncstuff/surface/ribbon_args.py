@@ -55,10 +55,14 @@ def add_depth_args(group, *, interp: bool = True) -> None:
     group.add_argument(
         "-depths",
         type=int,
-        default=1,
+        nargs="+",
+        default=[1],
         metavar="N",
         help="With surfaces: N cortical depth bins per ROI, 1 = deepest (next to white "
-        "matter) .. N = by pial.  1 averages the whole ribbon inside each ROI",
+        "matter) .. N = by pial.  1 averages the whole ribbon inside each ROI.  Several "
+        "counts (-depths 7 9 11) sample every one from the same read of the data, for "
+        "models that average over the number of depths: ffs_nwarp writes one file per "
+        "count (PREFIX.K7.roi.*), ffs_reml / ffs_deconvolve one table with a K column",
     )
     how = group.add_mutually_exclusive_group()
     how.add_argument(

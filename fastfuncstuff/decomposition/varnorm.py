@@ -160,11 +160,31 @@ def noise_std_map(
 
     # Temporal demeaning: the covariance whose eigenvectors we want is of the time series
     # about their own means, and the mean is separately accounted for in the DoF below.
-    work_dtype = widest_float_dtype(x_t.device)
-    xc = x_t.to(work_dtype)
-    xc = xc - xc.mean(dim=0, keepdim=True)
+    # The float64 working copy carries the voxel axis, so it is built a voxel chunk at a
+    # time (sized for float64) rather than for the whole (T, V) series at once: that was
+    # ~2-3 float64 copies of the dataset, 4-6x its float32 size, live together.
+    from fastfuncstuff.memory import estimate_chunk_size
 
-    cov_t = (xc @ xc.T) / float(n_vox)  # (T, T)
+    work_dtype = widest_float_dtype(x_t.device)
+    chunk = estimate_chunk_size(
+        n_voxels=n_vox,
+        n_timepoints=n_time,
+        n_regressors=0,
+        device=x_t.device,
+        operation="ica_varnorm",
+        use_double=work_dtype == torch.float64,
+    )
+
+    def _centred(v0: int, v1: int) -> Tensor:
+        xc = x_t[:, v0:v1].to(work_dtype)
+        return xc - xc.mean(dim=0, keepdim=True)
+
+    cov_t = torch.zeros((n_time, n_time), dtype=work_dtype, device=x_t.device)
+    for v0 in range(0, n_vox, chunk):
+        xc = _centred(v0, min(v0 + chunk, n_vox))
+        cov_t += xc @ xc.T
+        del xc
+    cov_t /= float(n_vox)  # (T, T)
     evals, evecs = torch.linalg.eigh(cov_t)
     del cov_t
     order = torch.argsort(evals, descending=True)
@@ -173,14 +193,17 @@ def noise_std_map(
 
     # Residual after projecting each voxel's time series onto the signal subspace.
     # (I - B Bt) x, computed as x - B (Bt x) so nothing (T, T) is materialised.
-    resid = xc - basis @ (basis.T @ xc)
-    del xc, basis
-
     # Plain std would divide by (T - 1); the residual actually carries (T - r - 1)
     # degrees of freedom, so rescale to remove the downward bias.
     dof = max(1, n_time - r - 1)
-    noise_var = (resid * resid).sum(dim=0) / float(dof)
-    del resid
+    noise_var = torch.empty(n_vox, dtype=work_dtype, device=x_t.device)
+    for v0 in range(0, n_vox, chunk):
+        v1 = min(v0 + chunk, n_vox)
+        resid = _centred(v0, v1)
+        resid -= basis @ (basis.T @ resid)
+        noise_var[v0:v1] = resid.pow_(2).sum(dim=0) / float(dof)
+        del resid
+    del basis
     noise_std = torch.sqrt(torch.clamp(noise_var, min=0.0)).to(total_std.dtype)
 
     const_mask = (total_std < const_threshold) | (noise_std < const_threshold)

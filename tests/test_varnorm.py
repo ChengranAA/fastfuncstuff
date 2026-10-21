@@ -187,3 +187,17 @@ def test_rank_is_clamped_to_leave_residual_dof():
     est2, _, _ = noise_std_map(tiny)
     assert est2.shape == (5,)
     assert torch.isfinite(est2).all()
+
+
+def test_voxel_chunked_float64_matches_single_chunk(monkeypatch):
+    """The float64 working copy is built per voxel chunk; the chunked covariance sum
+    and residual must agree with doing all voxels at once."""
+    import fastfuncstuff.memory as memory
+
+    x = _data(101, 60, noise_sd=np.linspace(0.5, 2.0, 101), signal_amp=3.0)
+    monkeypatch.setattr(memory, "estimate_chunk_size", lambda *a, **k: k["n_voxels"])
+    whole, mask_whole, _ = noise_std_map(x, signal_rank=5)
+    monkeypatch.setattr(memory, "estimate_chunk_size", lambda *a, **k: 7)
+    chunked, mask_chunked, _ = noise_std_map(x, signal_rank=5)
+    torch.testing.assert_close(chunked, whole, rtol=1e-6, atol=1e-7)
+    assert torch.equal(mask_chunked, mask_whole)

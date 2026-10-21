@@ -706,6 +706,7 @@ def evaluate_combinations_cross_run(
             operation="cross_run_combos",
             n_trials=len(other_runs),
             n_designs=n_combos,
+            empty_cache=False,  # per group; the group-end flush below is the boundary
         )
         group_data = data_criteria if voxel_mask is None else data_criteria[voxel_mask, :]
 
@@ -1255,6 +1256,9 @@ def fit_combinatorial_denoising(
             n_regressors=n_conds,
             device=device,
             operation="glm",
+            # The fold-boundary flush above already ran; planning per fold must
+            # not add a second.
+            empty_cache=False,
         )
 
         if per_hrf_mode:

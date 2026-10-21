@@ -604,9 +604,17 @@ def test_level_stops_when_the_field_stops_moving():
         return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
 
     early, full = run(0.1), run(0.0)
+    # The displacement stop fires when enabled, and only then.
     assert [lv.stop for lv in early.levels] == ["converged", "converged"]
-    assert [lv.stop for lv in full.levels] == ["miter", "miter"]
     assert all(lv.last_update_vox < 0.1 for lv in early.levels)
+    assert all(lv.stop != "converged" for lv in full.levels)
+    # ...and ending early means fewer Gauss-Newton steps. Not asserted on the
+    # exact reason min_update=0.0 ends with: "miter" vs the cost-plateau stop
+    # turns on float noise at ~1e-7, so it moves with thread count.
+    assert all(
+        lv_full.iters >= lv_early.iters
+        for lv_early, lv_full in zip(early.levels, full.levels, strict=True)
+    )
 
 
 def test_help_schedule_lines_round_trip_to_the_preset():

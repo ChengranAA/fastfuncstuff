@@ -1034,14 +1034,6 @@ def hrf_index_path(prefix: str, surface: bool) -> str:
     return f"{pfx.stem}_hrf_index{ext}"
 
 
-def _hrf_library_size(prefix: str) -> int | None:
-    """Curve count of ``<prefix>_hrf_library.pt`` (None if the file is not there)."""
-    lib = hrf_library_path(prefix)
-    if not lib.exists():
-        return None
-    return int(torch.load(lib, weights_only=False, map_location="cpu")["hrf_library"].shape[0])
-
-
 def hrf_library_path(prefix: str) -> Path:
     """``ffs_hrfopt``'s saved library for *prefix*."""
     return Path(f"{parse_prefix(prefix).stem}_hrf_library.pt")
@@ -1078,12 +1070,14 @@ def load_hrfopt_library(
     against the indices.  Without either, it is a refusal, not a fallback.
 
     Voxels still carrying ``-1`` (no assignment) are set **in place** in
-    ``hrf_indices`` to the middle curve of the library returned.
+    ``hrf_indices`` to the library curve closest to the canonical HRF (see
+    :func:`assign_unassigned_hrf`).
     """
     from fastfuncstuff.design.hrf import get_hrf_library
 
     sidecar = hrf_library_path(prefix)
     n_needed = int(hrf_indices.max().item()) + 1 if hrf_indices.numel() else 0
+    saved_meta: dict = {}
 
     if library_path is None and sidecar.exists():
         with spinner(f"Loading {sidecar.name}"):
@@ -1094,7 +1088,8 @@ def load_hrfopt_library(
         # The curves are bare samples: their spacing lives only in the metadata.
         # Convolved at another -microtime_dt they stretch or shrink in time, and
         # every voxel gets a shape ffs_hrfopt never chose -- silently.
-        saved_dt = (saved.get("metadata") or {}).get("microtime_dt")
+        saved_meta = saved.get("metadata") or {}
+        saved_dt = saved_meta.get("microtime_dt")
         if saved_dt is not None and abs(float(saved_dt) - float(microtime_dt)) > 1e-9:
             sys.exit(
                 f"ERROR: {sidecar.name} was sampled at -microtime_dt {saved_dt}, but this "
@@ -1128,19 +1123,13 @@ def load_hrfopt_library(
             print(f"  Loaded custom HRF library from {library_path}")
             print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
-    # load_hrf_index_for_input fills unassigned voxels (outside ffs_hrfopt's
-    # mask, -1 on load) only when it can size the library from the sidecar.
-    # Without it they reach here as -1, which Python reads as the LAST, slowest
-    # curve; give them the middle of the library actually in hand instead.
-    unassigned = hrf_indices < 0
-    if bool(unassigned.any()):
-        hrf_indices[unassigned] = len(hrf_library) // 2
-        if verbose:
-            print(
-                f"  {int(unassigned.sum()):,} voxel(s) have no ffs_hrfopt assignment "
-                f"(outside its mask): using the library's middle curve "
-                f"(index {len(hrf_library) // 2})"
-            )
+    assign_unassigned_hrf(
+        hrf_indices,
+        hrf_library,
+        microtime_dt,
+        canonical_mode=str(saved_meta.get("canonical_mode") or "spmg1"),
+        verbose=verbose,
+    )
 
     if n_needed > len(hrf_library):
         sys.exit(
@@ -1153,6 +1142,40 @@ def load_hrfopt_library(
     return hrf_library, model_durations
 
 
+def assign_unassigned_hrf(
+    hrf_indices: torch.Tensor | np.ndarray,
+    hrf_library: torch.Tensor | np.ndarray,
+    microtime_dt: float,
+    *,
+    canonical_mode: str = "spmg1",
+    verbose: bool = True,
+) -> int | None:
+    """Give voxels with no HRF assignment (index < 0) a curve, **in place**.
+
+    ffs_hrfopt leaves voxels outside its mask unassigned (0 on disk, -1 once
+    0-based), and -1 indexes the LAST curve -- arbitrary, and in the stock
+    library the slowest.  They take the library curve closest to the canonical
+    HRF instead (:func:`closest_to_canonical_index`): the assumption a
+    voxel-agnostic analysis would have made.  Returns the index used, or None
+    when every voxel was assigned.
+    """
+    from fastfuncstuff.design.hrf_selection import closest_to_canonical_index
+
+    unassigned = hrf_indices < 0
+    n_unassigned = int(unassigned.sum())
+    if n_unassigned == 0:
+        return None
+    fallback = closest_to_canonical_index(hrf_library, microtime_dt, canonical_mode)
+    hrf_indices[unassigned] = fallback
+    if verbose:
+        print(
+            f"  {n_unassigned:,} voxel(s) have no ffs_hrfopt assignment (outside its "
+            f"mask): using the curve closest to canonical {canonical_mode.upper()} "
+            f"(index {fallback})"
+        )
+    return fallback
+
+
 def load_hrf_index_for_input(prefix: str, header, mask: np.ndarray | None = None) -> torch.Tensor:
     """Per-location HRF indices from an ``ffs_hrfopt`` prefix, in the input's domain.
 
@@ -1160,7 +1183,8 @@ def load_hrf_index_for_input(prefix: str, header, mask: np.ndarray | None = None
     ``<stem>_hrf_index.shape.gii`` (and refuses another mesh's map), a volume
     ``<stem>_hrf_index<ext>``, and paired input (a ``PairedHeader``) both,
     concatenated in data order. Running ffs_hrfopt once per domain with the same
-    prefix leaves exactly that pair on disk.
+    prefix leaves exactly that pair on disk.  Unassigned voxels come back as -1;
+    :func:`load_hrfopt_library` gives them a curve once the library is known.
     """
     from fastfuncstuff.glm.ridge import load_hrf_indices
     from fastfuncstuff.io.afni import load_nifti
@@ -1190,7 +1214,7 @@ def load_hrf_index_for_input(prefix: str, header, mask: np.ndarray | None = None
         found = surface_meta(load_nifti(path).header) or {}
         if found.get("mesh_fingerprint") != expected.get("mesh_fingerprint"):
             raise ValueError(f"{path} is on a different mesh than the input data")
-    return load_hrf_indices(path, mask=mask, n_hrfs=_hrf_library_size(prefix))
+    return load_hrf_indices(path, mask=mask)
 
 
 def save_volume_nifti(

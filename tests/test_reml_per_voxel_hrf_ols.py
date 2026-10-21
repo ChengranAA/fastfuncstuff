@@ -129,8 +129,12 @@ def _study(tmp_path, n_lib=3):
 
 
 @pytest.mark.parametrize("extra", [[], ["-single_trials", "st"], ["-Rbuck", "r"]])
-def test_voxels_without_an_hrf_assignment_take_the_middle_curve(tmp_path, extra):
+def test_voxels_without_an_hrf_assignment_take_the_canonical_like_curve(tmp_path, extra):
+    from fastfuncstuff.design.hrf_selection import closest_to_canonical_index
+
     _study(tmp_path)
+    lib = torch.load(tmp_path / "lib_hrf_library.pt")["hrf_library"]
+    expected = closest_to_canonical_index(lib, 0.1)
     res = subprocess.run(  # noqa: S603
         [
             sys.executable,
@@ -148,7 +152,7 @@ def test_voxels_without_an_hrf_assignment_take_the_middle_curve(tmp_path, extra)
         cwd=tmp_path,
     )
     assert res.returncode == 0, res.stdout[-2500:] + res.stderr[-1500:]
-    assert "middle curve (index 1)" in res.stdout
+    assert f"closest to canonical SPMG1 (index {expected})" in res.stdout
 
 
 def test_xval_r2_scores_each_voxel_with_its_own_hrf(tmp_path):

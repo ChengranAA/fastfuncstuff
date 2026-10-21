@@ -86,15 +86,30 @@ def test_library_sampled_at_another_microtime_dt_is_refused(tmp_path):
     assert len(lib) == 20
 
 
-def test_unassigned_voxels_take_the_middle_curve_without_the_sidecar(tmp_path):
-    """load_hrf_index_for_input can only fill -1 when the sidecar sizes the
-    library; under -hrf_library they used to stay -1 and be fit with
-    library[-1], the slowest curve."""
+def test_unassigned_voxels_take_the_curve_closest_to_canonical(tmp_path):
+    """Unassigned voxels once stayed -1 (library[-1], the slowest curve), then
+    took row n // 2, which means nothing in a library not sorted by latency. The
+    canonical curve sits at row 0 here, so neither rule finds it."""
+    from fastfuncstuff.design.hrf import get_spmg1_hrf
+
+    canonical = get_spmg1_hrf(microtime_dt=0.1, stim_duration=0.0, device=torch.device("cpu"))
+    t = torch.arange(canonical.numel()) * 0.1
+    slow = [t**k * torch.exp(-t / 1.5) for k in (8.0, 10.0, 12.0)]
+    lib = torch.stack([canonical / canonical.max(), *[c / c.max() for c in slow]])
+    torch.save({"hrf_library": lib.float()}, tmp_path / "hrf_hrf_library.pt")
+
     idx = torch.tensor([-1, 3, -1])
-    lib, _ = load_hrfopt_library(
+    load_hrfopt_library(str(tmp_path / "hrf"), idx, microtime_dt=0.1)
+    assert idx.tolist() == [0, 3, 0]
+
+
+def test_unassigned_voxels_get_a_curve_under_an_explicit_library(tmp_path):
+    """Without the sidecar, -1 used to survive to the design (library[-1])."""
+    idx = torch.tensor([-1, 3, -1])
+    load_hrfopt_library(
         str(tmp_path / "nothing"), idx, microtime_dt=0.1, library_path=_custom_tsv(tmp_path)
     )
-    assert idx.tolist() == [len(lib) // 2, 3, len(lib) // 2]
+    assert int(idx.min()) >= 0 and idx[0] == idx[2]
 
 
 def test_ridge_cli_fits_a_forty_curve_library(tmp_path, monkeypatch):

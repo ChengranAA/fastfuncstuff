@@ -2625,6 +2625,33 @@ def canonical_hrf_curve(
     )
 
 
+def closest_to_canonical_index(
+    hrf_library: torch.Tensor | np.ndarray,
+    microtime_dt: float,
+    canonical_mode: str = "spmg1",
+) -> int:
+    """Library row most like the ``canonical_mode`` HRF: the fallback curve.
+
+    Used for voxels with no assignment of their own (outside ffs_hrfopt's
+    mask).  The measure is the Pearson correlation between each curve and the
+    canonical, both sampled at the library's ``microtime_dt`` and zero-padded to
+    a common length -- scale-free, so it is the same as comparing peak-normalised
+    curves.  Row order carries no meaning (a multi-group ffs_librarian set is not
+    sorted by latency), which is why "the middle row" was not a fallback.
+    """
+    lib = torch.as_tensor(hrf_library, dtype=torch.float64).detach().cpu()
+    lib = lib.reshape(1, -1) if lib.ndim == 1 else lib
+    canon, _ = canonical_hrf_curve(canonical_mode, microtime_dt, torch.device("cpu"))
+    canon = canon.detach().cpu().to(torch.float64).reshape(-1)
+    n = max(lib.shape[1], canon.numel())
+    lib = torch.nn.functional.pad(lib, (0, n - lib.shape[1]))
+    canon = torch.nn.functional.pad(canon, (0, n - canon.numel()))
+    lib = lib - lib.mean(dim=1, keepdim=True)
+    canon = canon - canon.mean()
+    corr = (lib @ canon) / (lib.norm(dim=1) * canon.norm()).clamp_min(1e-30)
+    return int(torch.argmax(corr).item())
+
+
 def _library_is_duration_convolved(hrf_metadata) -> bool:
     """Did the saved library's curves already contain the stimulus boxcar?
 

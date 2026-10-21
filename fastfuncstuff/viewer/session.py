@@ -363,8 +363,8 @@ class ViewerSession:
         # is what lets one land already coloured and already named. A 4-D stack
         # of masks cannot be told from a stats bucket, so that one waits to be
         # asked.
-        if layer.n_volumes == 1 and looks_like_labels(preview):
-            layer = layer.with_(roi=True)
+        if looks_like_labels(preview):
+            layer = layer.with_(integer_labels=True, roi=layer.n_volumes == 1)
         if layer.n_volumes > 1:
             self.store.load_async(key, on_done=self._on_loaded)
         return layer
@@ -953,6 +953,17 @@ class ViewerSession:
     #: are the same grid, and flipping interpolation on that is noise.
     UPSAMPLE_RATIO = 1.2
 
+    @staticmethod
+    def is_label_layer(layer: Layer) -> bool:
+        """Whether a layer's values are identities, so only nearest may sample it.
+
+        An ROI, atlas, mask, painted or cluster layer, or data that loaded as
+        integer labels. Between label 0 and label 3, linear and cubic paint a
+        1.5 that is no region at all -- at the edge of a depth-layer file on a
+        finer grid, a rim of "low depth" that is really outside the cortex.
+        """
+        return layer.roi or layer.integer_labels
+
     def resample_mode(self, layer: Layer) -> str:
         """``"nearest"``, ``"linear"`` or ``"cubic"`` for one layer. Display only.
 
@@ -966,7 +977,12 @@ class ViewerSession:
         grid (:attr:`ViewerState.grid_mm`): a finer grid exists so that the
         anatomy is the layer interpolated, and nearest would only redraw its
         own voxels as blocks. Set its DRAW to nearest to see them anyway.
+
+        A label layer (:meth:`is_label_layer`) is nearest whatever is set,
+        underlay included: there is no in-between of two labels to draw.
         """
+        if self.is_label_layer(layer):
+            return "nearest"
         if layer.resample in ("nearest", "linear", "cubic"):
             return layer.resample
         grid = self.state.grid

@@ -1368,7 +1368,9 @@ class SetLayerRoi(Command):
     Guessed on load for a 3-D volume of small integers, and this is how the
     guess is corrected in either direction -- on for a 4-D stack of masks,
     whose frames cannot be told from a stats bucket's sub-bricks, and off for
-    the rare integer picture that only looks like an atlas.
+    the rare integer picture that only looks like an atlas. Off also clears
+    :attr:`Layer.integer_labels`, so the corrected picture is interpolated
+    like any other.
     """
 
     name = "SET_LAYER_ROI"
@@ -2884,9 +2886,12 @@ def install(
     @bus.handle(SetLayerRoi.name)
     def _set_layer_roi(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetLayerRoi)
-        if st.layers.get(cmd.key).roi == bool(cmd.on):
+        layer, on = st.layers.get(cmd.key), bool(cmd.on)
+        if layer.roi == on and (on or not layer.integer_labels):
             return Aspect.NOTHING
-        st.layers.update(cmd.key, roi=bool(cmd.on))
+        # Off is the correction "this is a picture, not labels", so it also
+        # drops the load-time guess that pins the layer to nearest sampling.
+        st.layers.update(cmd.key, roi=on, **({} if on else {"integer_labels": False}))
         if session is not None:
             # The description was built from the old answer to "is this
             # labels?", and a stale one would keep colouring the layer after

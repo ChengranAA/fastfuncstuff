@@ -90,6 +90,94 @@ def test_matching_grids_are_not_called_upsampling(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# labels are never interpolated
+# ---------------------------------------------------------------------------
+
+
+def _depth_labels(shape=(16, 18, 14)):
+    """A slab of four depth layers inside zeros: patches of small integers."""
+    vol = np.zeros(shape, dtype=np.float32)
+    for n in range(4):
+        vol[3:13, 3:15, 3 + 2 * n : 5 + 2 * n] = n + 1
+    return vol
+
+
+def _drawn_values(s, layer, pos):
+    from fastfuncstuff.viewer.compose import _GRID_SAMPLE
+    from fastfuncstuff.viewer.slicing import extract_plane
+    from fastfuncstuff.viewer.state import Plane
+
+    volume = s.display_volume(layer.key)
+    how = _GRID_SAMPLE[s.resample_mode(layer)]
+    plane = extract_plane(volume, s.state.grid, layer.affine, Plane.SAGITTAL, pos, mode=how)
+    return set(np.unique(np.asarray(plane)).tolist())
+
+
+def test_a_label_underlay_on_a_finer_grid_is_drawn_nearest(tmp_path):
+    """The reported case: a depth-layer file on a resized grid grew a rim of 0.5s."""
+    from fastfuncstuff.viewer.vocab import SetGridRes
+
+    _save(tmp_path / "layers.nii.gz", _depth_labels(), 1.0)
+    s = ViewerSession(device=CPU)
+    try:
+        s.do(Load(str(tmp_path / "layers.nii.gz")))
+        s.do(SetGridRes(0.4))
+        layer = s.state.layers.base
+        assert s.is_label_layer(layer)
+        assert s.resample_mode(layer) == "nearest"
+        for pos in range(0, s.state.grid.shape[0], 3):
+            assert _drawn_values(s, layer, pos) <= {0.0, 1.0, 2.0, 3.0, 4.0}
+    finally:
+        s.close()
+
+
+def test_a_label_layer_is_nearest_whatever_draw_says(tmp_path):
+    """Finer than the grid (auto would say linear) and set to cubic by hand."""
+    rng = np.random.default_rng(6)
+    _save(tmp_path / "anat.nii.gz", rng.random((16, 18, 14)) * 100, 3.0)
+    _save(tmp_path / "atlas.nii.gz", _depth_labels((48, 54, 42)), 1.0)
+    s = ViewerSession(device=CPU)
+    try:
+        s.do(Load(str(tmp_path / "anat.nii.gz")))
+        s.do(Load(str(tmp_path / "atlas.nii.gz")))
+        atlas = _layer(s, "atlas")
+        s.do(SetResample(atlas.key, "cubic"))
+        assert s.resample_mode(_layer(s, "atlas")) == "nearest"
+        # The anatomy beside it keeps its own rule.
+        assert s.resample_mode(_layer(s, "anat")) == "linear"
+    finally:
+        s.close()
+
+
+def test_a_4d_stack_of_masks_is_labels_but_not_an_roi(tmp_path):
+    """Undecidable from a stats bucket for colouring, but not for sampling."""
+    from fastfuncstuff.viewer.vocab import SetLayerRoi
+
+    rng = np.random.default_rng(7)
+    _save(tmp_path / "anat.nii.gz", rng.random((48, 54, 42)) * 100, 1.0)
+    masks = np.stack([_depth_labels() > n for n in range(3)], axis=-1).astype(np.float32)
+    _save(tmp_path / "masks.nii.gz", masks, 1.0)
+    s = ViewerSession(device=CPU)
+    try:
+        s.do(Load(str(tmp_path / "anat.nii.gz")))
+        s.do(Load(str(tmp_path / "masks.nii.gz")))
+        stack = _layer(s, "masks")
+        assert stack.integer_labels and not stack.roi
+        assert s.resample_mode(stack) == "nearest"
+        # ROI off is how a wrong guess is corrected: it is a picture after all.
+        s.do(SetLayerRoi(stack.key, False))
+        assert not _layer(s, "masks").integer_labels
+        assert s.resample_mode(_layer(s, "masks")) == "linear"
+    finally:
+        s.close()
+
+
+def test_a_picture_is_not_labels(session):
+    assert not _layer(session, "anat").integer_labels
+    assert not _layer(session, "bold").integer_labels
+
+
+# ---------------------------------------------------------------------------
 # it is a choice, and it is only visual
 # ---------------------------------------------------------------------------
 

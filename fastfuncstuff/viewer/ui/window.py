@@ -2516,6 +2516,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         layer = self.session.state.selected_layer()
         if layer is None:
             return
+        if self.session.is_label_layer(layer):
+            self.statusBar().showMessage(f"{layer.name} holds labels: always drawn nearest", 4000)
+            return
         order = RESAMPLE_MODES
         nxt = (
             order[(order.index(layer.resample) + 1) % len(order)]
@@ -2583,10 +2586,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # setting is knowing which way it went, and a layer that looks blocky
         # while the box says "auto" is a question rather than an answer.
         resolved = self.session.resample_mode(layer)
+        labels = self.session.is_label_layer(layer)
         self.resample_box.blockSignals(True)
-        self.resample_box.setItemText(0, f"auto ({resolved})")
-        index = self.resample_box.findData(layer.resample)
+        self.resample_box.setItemText(0, "labels (nearest)" if labels else f"auto ({resolved})")
+        index = 0 if labels else self.resample_box.findData(layer.resample)
         self.resample_box.setCurrentIndex(max(index, 0))
+        # Labels have no in-between to interpolate: offering linear would be
+        # offering a picture of regions that do not exist.
+        self.resample_box.setEnabled(not labels)
         self.resample_box.blockSignals(False)
         timed = layer.time_linked and layer.n_volumes > 1
         self.time_head.setVisible(timed)

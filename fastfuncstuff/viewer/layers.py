@@ -71,6 +71,13 @@ class Layer:
     #: layer is what a correlation matrix's rows are made of. Guessed on load
     #: for a 3-D integer volume; SET_LAYER_ROI corrects the guess.
     roi: bool = False
+    #: The values are integer labels by the load-time test (few distinct,
+    #: non-negative integers in patches), whether or not they are drawn as an
+    #: ROI. Kept apart from ``roi`` because that is a choice of how to colour
+    #: the layer, while this is a fact about the data: a depth-layer file or a
+    #: 4-D stack of masks shown on a colour scale is still labels, and
+    #: interpolating it invents values no voxel holds.
+    integer_labels: bool = False
     #: The file's own affine, while the layer is drawn somewhere else. ``None``
     #: for a layer that has not been moved, which is nearly all of them; set,
     #: ``affine`` is where it is drawn and the difference is the transform

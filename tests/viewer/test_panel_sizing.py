@@ -22,7 +22,7 @@ pytest.importorskip("PySide6")
 # Must be set before any QApplication is constructed.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6 import QtWidgets  # noqa: E402
+from PySide6 import QtCore, QtWidgets  # noqa: E402
 
 from fastfuncstuff.viewer.commands import Aspect  # noqa: E402
 from fastfuncstuff.viewer.modes import registry  # noqa: E402
@@ -94,6 +94,67 @@ def test_a_long_stack_scrolls_rather_than_growing(qapp, datadir):
     assert len(win.session.state.layers) > LAYER_ROWS
     assert win.layer_list.verticalScrollBar().isVisible()
     assert win.layer_list.height() < 200
+    win.close()
+
+
+def _long_stack(qapp, datadir):
+    win = _window(qapp, datadir)
+    win.session.do(SetUnderlay(str(datadir / "v0.nii.gz")))
+    for i in range(1, 10):
+        win.session.do(AddOverlay(str(datadir / f"v{i}.nii.gz")))
+    _settle(win, qapp)
+    return win
+
+
+def test_selecting_a_row_keeps_the_scroll_and_the_rows(qapp, datadir):
+    """A click used to clear and refill the list, which threw the scroll away."""
+    win = _long_stack(qapp, datadir)
+    bar = win.layer_list.verticalScrollBar()
+    bar.setValue(bar.maximum())
+    qapp.processEvents()
+    scrolled = bar.value()
+    assert scrolled > 0
+    items = [win.layer_list.item(r) for r in range(win.layer_list.count())]
+    # A click on a row in the middle of what is on screen: a rebuild scrolled
+    # back to the top and then only far enough to show it.
+    row = win.layer_list.count() - 5
+    win.layer_list.setCurrentRow(row)
+    _settle(win, qapp)
+    assert win.current_key() == items[row].data(QtCore.Qt.ItemDataRole.UserRole)
+    assert [win.layer_list.item(r) for r in range(win.layer_list.count())] == items
+    assert bar.value() == scrolled
+    win.close()
+
+
+def test_a_rebuild_keeps_the_scroll_too(qapp, datadir):
+    from fastfuncstuff.viewer.vocab import RemoveLayer
+
+    win = _long_stack(qapp, datadir)
+    bar = win.layer_list.verticalScrollBar()
+    win.layer_list.setCurrentRow(win.layer_list.count() - 1)
+    bar.setValue(bar.maximum())
+    _settle(win, qapp)
+    scrolled = bar.value()
+    assert scrolled > 0
+    selected = win.current_key()
+    # A row goes away (not the selected one): the list is rebuilt.
+    win.session.do(RemoveLayer(win.layer_list.item(0).data(QtCore.Qt.ItemDataRole.UserRole)))
+    _settle(win, qapp)
+    assert win.current_key() == selected
+    assert bar.value() == min(scrolled, bar.maximum()) > 0
+    win.close()
+
+
+def test_the_expand_button_shows_every_layer_and_back(qapp, datadir):
+    win = _long_stack(qapp, datadir)
+    capped = win.layer_list.height()
+    win.layers_expand.click()
+    _settle(win, qapp)
+    assert win.layer_list.height() > capped
+    assert not win.layer_list.verticalScrollBar().isVisible()
+    win.layers_expand.click()
+    _settle(win, qapp)
+    assert win.layer_list.height() == capped
     win.close()
 
 

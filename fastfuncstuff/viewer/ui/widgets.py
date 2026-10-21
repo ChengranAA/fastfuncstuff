@@ -29,6 +29,7 @@ class RowSizedList(QtWidgets.QListWidget):
     def __init__(self, max_rows: int, min_rows: int = 1) -> None:
         super().__init__()
         self._max_rows = max_rows
+        self._cap = max_rows
         self._min_rows = min_rows
         #: Pixels the list is never shorter than, asked at measure time -- for
         #: a list sharing a row with something taller, so it fills that
@@ -50,6 +51,15 @@ class RowSizedList(QtWidgets.QListWidget):
 
     def rows_changed(self) -> None:
         """Call after adding or removing items, so the layout re-measures."""
+        self.updateGeometry()
+
+    @property
+    def expanded(self) -> bool:
+        return self._max_rows != self._cap
+
+    def set_expanded(self, on: bool) -> None:
+        """Every row on show (no cap), or back to the cap."""
+        self._max_rows = 10**6 if on else self._cap
         self.updateGeometry()
 
 

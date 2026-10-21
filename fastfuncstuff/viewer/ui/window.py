@@ -1452,14 +1452,36 @@ class ViewerWindow(QtWidgets.QMainWindow):
             b.clicked.connect(slot)
             stack_buttons.addWidget(b)
         stack_buttons.addStretch(1)
+        # Bottom right of the stack: past the cap the list scrolls, and with a
+        # long stack that is a lot of scrolling to find one layer.
+        self.layers_expand = QtWidgets.QToolButton()
+        self.layers_expand.setCheckable(True)
+        self.layers_expand.setText("\u25be")
+        self.layers_expand.setAutoRaise(True)
+        self.layers_expand.setToolTip(
+            "Grow the list to show every layer (the window grows with it);\n"
+            "press again to cap it at its usual height."
+        )
+        self.layers_expand.setStyleSheet(
+            f"QToolButton {{ font-size: {theme.FONT_SMALL}px; padding: 0px 3px; }}"
+        )
+        self.layers_expand.toggled.connect(self._expand_layers)
+        stack_buttons.addWidget(self.layers_expand, 0, QtCore.Qt.AlignmentFlag.AlignRight)
         stack_column.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Preferred
         )
-        self.layer_list.floor = lambda: stack_column.sizeHint().height()
+        # Less the expand button, which hangs below the list's bottom edge
+        # rather than making a short stack's list taller than its rows.
+        self.layer_list.floor = lambda: (
+            stack_column.sizeHint().height()
+            - self.layers_expand.sizeHint().height()
+            - stack_buttons.spacing()
+        )
         layer_row = QtWidgets.QHBoxLayout()
         layer_row.setSpacing(4)
         layer_row.addWidget(self.layer_list, 1)
-        layer_row.addWidget(stack_column, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+        # Full height, so the stretch puts the expand button at the bottom right.
+        layer_row.addWidget(stack_column, 0)
         v.addLayout(layer_row)
 
         # The layer form and the colour bar side by side: the bar stands on end
@@ -2075,6 +2097,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._sync_layer_list()
         self.statusBar().showMessage(f"removed {name}", 4000)
 
+    def _expand_layers(self, on: bool) -> None:
+        self.layer_list.set_expanded(on)
+        self.layers_expand.setText("\u25b4" if on else "\u25be")
+
+        # Shrink on the way back too: the extra height was this button's.
+        def settle() -> None:
+            self.fit_to_content(shrink=not on)
+            self._schedule_values()  # rows that were scrolled out have none
+
+        QtCore.QTimer.singleShot(0, settle)
+
     def _row_selected(self, row: int) -> None:
         keys = list(reversed(self.session.state.layers.keys))
         if 0 <= row < len(keys):
@@ -2404,16 +2437,24 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.grid_box.blockSignals(False)
 
     def _sync_layer_list(self) -> None:
+        """Bring the stack's rows up to date, in place whenever the stack's order allows.
+
+        Rebuilt only when layers came, went or moved. Every selection is a
+        LAYERS refresh, and clearing the list for it threw the scroll position
+        away, so with a long stack the row just clicked could land off screen.
+        Even a rebuild keeps the scroll where it was.
+        """
         self._watch()
         self._sync_grid_box()
         selected = self.current_key()
-        self.layer_list.blockSignals(True)
-        self.layer_list.clear()
+        listed = self.layer_list
+        listed.blockSignals(True)
         self._sync_directories()  # a load can add a directory
         keys = list(reversed(self.session.state.layers.keys))
         # Which directory a file came from, by its number in the directory
         # box -- only once there is more than one to tell apart.
         numbered = len(self.session.directories) > 1
+        rows: list[tuple[str, str, str, QtCore.Qt.CheckState]] = []
         for layer in reversed(list(self.session.state.layers)):
             try:
                 pending = self.session.store.get(layer.key).pending
@@ -2422,24 +2463,49 @@ class ViewerWindow(QtWidgets.QMainWindow):
             tag = " ·computed" if layer.is_computed else (" ·loading" if pending else "")
             n = self.session.directory_number(layer.path) if layer.source == "file" else None
             where = f"{n}  " if numbered and n is not None else ""
-            item = QtWidgets.QListWidgetItem(f"{where}{layer.name}{tag}")
-            if layer.source == "file":
-                item.setToolTip(layer.path)
-            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(
+            check = (
                 QtCore.Qt.CheckState.Checked if layer.visible else QtCore.Qt.CheckState.Unchecked
             )
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, layer.key)
-            self.layer_list.addItem(item)
+            tip = layer.path if layer.source == "file" else ""
+            rows.append((layer.key, f"{where}{layer.name}{tag}", tip, check))
+        role = QtCore.Qt.ItemDataRole.UserRole
+        present = [listed.item(r).data(role) for r in range(listed.count())]
+        if present == keys:
+            # Setters only where something differs: each one is a dataChanged
+            # and a repaint of its row.
+            for r, (_key, text, tip, check) in enumerate(rows):
+                item = listed.item(r)
+                if item.text() != text:
+                    item.setText(text)
+                if item.toolTip() != tip:
+                    item.setToolTip(tip)
+                if item.checkState() != check:
+                    item.setCheckState(check)
+        else:
+            scroll = listed.verticalScrollBar().value()
+            listed.clear()
+            for key, text, tip, check in rows:
+                item = QtWidgets.QListWidgetItem(text)
+                if tip:
+                    item.setToolTip(tip)
+                item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(check)
+                item.setData(role, key)
+                listed.addItem(item)
+            # Laid out now, or the restored value is clamped to an empty range.
+            listed.doItemsLayout()
+            listed.verticalScrollBar().setValue(scroll)
         if keys:
             row = keys.index(selected) if selected in keys else 0
-            self.layer_list.setCurrentRow(row)
+            if listed.currentRow() != row:
+                listed.setCurrentRow(row)
         # Unblocked only after the row is set. A sync that writes back into
         # state is a refresh that dispatches, which puts a SELECT_LAYER into
         # the recording for every repaint and can recurse.
-        self.layer_list.blockSignals(False)
-        self.layer_list.rows_changed()
+        listed.blockSignals(False)
+        listed.rows_changed()
         self._sync_layer_controls()
+        self._schedule_values()
 
     def _dispatch_input(self, key: str) -> None:
         self._dispatch(SetInput(key))

@@ -1278,30 +1278,7 @@ def fit_glm_hrf_library_with_xval(
         print()
         print("Computing canonical HRF baseline for comparison...")
 
-    from .hrf import get_spmg1_hrf
-
-    canonical_mode_lower = canonical_mode.lower()
-    if canonical_mode_lower == "spmg1":
-        canonical_hrf = get_spmg1_hrf(
-            microtime_dt=microtime_dt,
-            stim_duration=0.0,
-            normalize_peak=True,
-            device=device,
-        )
-        canonical_label = "SPMG1"
-    elif canonical_mode_lower in ("glmsingle", "single"):
-        canonical_hrf = get_hrf_library(
-            mode="single",
-            stim_duration=0.0,
-            microtime_dt=microtime_dt,
-            device=device,
-        )
-        canonical_label = "GLMsingle"
-    else:
-        raise ValueError(
-            f"Unknown canonical_mode: {canonical_mode}. "
-            f"Choose 'spmg1' (AFNI) or 'glmsingle' (scipy/nilearn)."
-        )
+    canonical_hrf, canonical_label = canonical_hrf_curve(canonical_mode, microtime_dt, device)
 
     if verbose:
         print(f"  Using {canonical_label} canonical HRF for baseline comparison")
@@ -2619,6 +2596,33 @@ def save_design_diagnostic_figure(
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Design diagnostic figure saved: {output_path}")
+
+
+def canonical_hrf_curve(
+    canonical_mode: str, microtime_dt: float, device: torch.device | None
+) -> tuple[torch.Tensor, str]:
+    """The ``-canonical`` baseline HRF (impulse response) and its label.
+
+    A separate curve, never a library entry: row 0 of the stock library is
+    its fastest curve, not a canonical one.
+    """
+    from .hrf import get_spmg1_hrf
+
+    mode = canonical_mode.lower()
+    if mode == "spmg1":
+        hrf = get_spmg1_hrf(
+            microtime_dt=microtime_dt, stim_duration=0.0, normalize_peak=True, device=device
+        )
+        return hrf, "SPMG1"
+    if mode in ("glmsingle", "single"):
+        hrf = get_hrf_library(
+            mode="single", stim_duration=0.0, microtime_dt=microtime_dt, device=device
+        )
+        return hrf, "GLMsingle"
+    raise ValueError(
+        f"Unknown canonical_mode: {canonical_mode}. "
+        f"Choose 'spmg1' (AFNI) or 'glmsingle' (scipy/nilearn)."
+    )
 
 
 def _library_is_duration_convolved(hrf_metadata) -> bool:

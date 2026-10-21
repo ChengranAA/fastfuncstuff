@@ -122,6 +122,30 @@ def test_one_run_single_trials(monkeypatch, tmp_path, capsys):
     assert "Beta-series CV skipped" in capsys.readouterr().out
 
 
+def test_single_trial_canonical_is_the_requested_curve(monkeypatch, tmp_path):
+    """-cv_design single used library row 0 -- the stock library's fastest
+    curve -- as its "canonical" baseline and ignored -canonical; its sidecar
+    also lacked the microtime_dt / durations consumers read back."""
+    import torch
+
+    inputs, events, _ = _make_run(tmp_path)
+    maps = {}
+    for mode in ("spmg1", "glmsingle"):
+        prefix = _run(
+            monkeypatch,
+            tmp_path,
+            inputs,
+            events,
+            ["-single_trials", "-cv_design", "single", "-canonical", mode],
+        )
+        maps[mode] = np.asanyarray(nib.load(f"{prefix}_canonical_full_r2.nii.gz").dataobj)
+    assert not np.allclose(maps["spmg1"], maps["glmsingle"])
+    first = np.asanyarray(nib.load(f"{prefix}_insample_r2_all_hrfs.nii.gz").dataobj)[..., 0]
+    assert not np.allclose(maps["glmsingle"], first)
+    meta = torch.load(f"{prefix}_hrf_library.pt", weights_only=False)["metadata"]
+    assert meta["microtime_dt"] > 0 and meta["stim_durations"]
+
+
 def test_multi_run_full_without_repeats(monkeypatch, tmp_path):
     """In-sample selection does not need conditions shared across runs."""
     inputs, events, _ = _make_run(tmp_path, n_runs=2)

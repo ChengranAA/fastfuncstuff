@@ -88,6 +88,7 @@ try:
     from fastfuncstuff.design.hrf_selection import (
         _fit_voxelwise_hrf_canonical,
         _fit_voxelwise_hrf_single_trial,
+        canonical_hrf_curve,
         fit_glm_hrf_library_with_xval,
         save_hrf_selection_results,
     )
@@ -1177,14 +1178,8 @@ def main():
         # Cache projected designs on CPU for second-pass beta recomputation (~12 MB each)
         projected_designs_cache = []
 
-        # Canonical betas: stored during first pass (lazy-init)
-        canonical_betas = None  # Will become (n_voxels, n_trials) on CPU
-        n_trials = None
-
-        print(f"  Evaluating {n_hrfs} HRFs (in-sample R² on projected data)...")
-        for hrf_idx in tqdm(range(n_hrfs), desc="HRF evaluation"):
-            hrf = [hrf_library[hrf_idx]]  # Wrap single HRF in list
-
+        def _projected_st_design(curve: torch.Tensor):
+            """Single-trial design for one HRF curve, nuisance-projected per run."""
             # Build single-trial design with this HRF
             st_design, labels, cond_ids, run_ids, cond_design = create_single_trial_design(
                 onsets_by_condition=all_onsets,
@@ -1192,7 +1187,7 @@ def main():
                 run_starts=run_starts,
                 tr=args.tr,
                 n_timepoints=n_timepoints,
-                hrf_library=hrf,
+                hrf_library=[curve],
                 microtime_dt=args.microtime_dt,
                 condition_labels=condition_labels,
                 device=device,
@@ -1206,7 +1201,7 @@ def main():
             st_design, _ = append_stim_vecs_to_single_trial_design(
                 stim_vec_blocks,
                 st_design,
-                hrf_library=hrf_library[hrf_idx].reshape(1, -1),
+                hrf_library=curve.reshape(1, -1),
                 n_timepoints=n_timepoints,
                 tr=args.tr,
                 microtime_dt=args.microtime_dt,
@@ -1227,14 +1222,33 @@ def main():
                     projected_st_design[start_tp:end_tp] = (
                         run_design - Q @ (Q.T @ run_design)
                     ).cpu()
+            return projected_st_design, n_trial_cols_st, cond_ids, run_ids
+
+        # The -canonical baseline is its own curve, not library row 0 (the
+        # stock library's FASTEST curve), and is fitted exactly like a candidate.
+        canonical_hrf, _canonical_label = canonical_hrf_curve(
+            args.canonical, args.microtime_dt, device
+        )
+        canonical_design, n_trials, cond_ids, run_ids = _projected_st_design(canonical_hrf)
+        canonical_betas = torch.zeros(n_voxels, n_trials)
+        canonical_full_r2 = torch.zeros(n_voxels)
+        canonical_design_dev = canonical_design.to(device)
+        canonical_chol = design_cholesky(canonical_design_dev)
+        for c0 in range(0, n_voxels, chunk_size):
+            c1 = min(c0 + chunk_size, n_voxels)
+            chunk_data = projected_data[c0:c1].to(device)
+            chunk_betas = ols_betas(canonical_design_dev, chunk_data, cholesky_L=canonical_chol)
+            chunk_pred = (canonical_design_dev @ chunk_betas.T).T
+            canonical_full_r2[c0:c1] = compute_r2_metric(chunk_data, chunk_pred, metric="cod").cpu()
+            canonical_betas[c0:c1] = chunk_betas[:, :n_trials].cpu()
+        del canonical_design, canonical_design_dev, canonical_chol
+
+        print(f"  Evaluating {n_hrfs} HRFs (in-sample R² on projected data)...")
+        for hrf_idx in tqdm(range(n_hrfs), desc="HRF evaluation"):
+            projected_st_design, _, _, _ = _projected_st_design(hrf_library[hrf_idx])
 
             # Cache projected design for second-pass beta recomputation
             projected_designs_cache.append(projected_st_design)
-
-            # Lazy-init canonical_betas now that we know n_trials
-            if canonical_betas is None:
-                n_trials = n_trial_cols_st
-                canonical_betas = torch.zeros(n_voxels, n_trials)
 
             # Fit OLS in voxel chunks (projected data stays on CPU, stream to GPU)
             proj_design_dev = projected_st_design.to(device)
@@ -1252,10 +1266,6 @@ def main():
                 chunk_r2 = compute_r2_metric(chunk_data, chunk_pred, metric="cod")
 
                 fit_r2_all[c0:c1, hrf_idx] = chunk_r2.cpu()
-
-                # Store canonical (idx 0) betas for beta-series CV
-                if hrf_idx == 0:
-                    canonical_betas[c0:c1] = chunk_betas[:, :n_trials].cpu()
 
             if args.verb >= 1 and hrf_idx % 5 == 0:
                 col_r2 = fit_r2_all[:, hrf_idx]
@@ -1302,12 +1312,10 @@ def main():
         # Compute HRF usage counts for reporting
         hrf_usage_counts = torch.bincount(hrf_index_cpu, minlength=n_hrfs).tolist()
 
-        # Canonical baseline: first HRF in library (index 0)
-        xval_r2_canonical = fit_r2_all[:, 0].to(device)
+        xval_r2_canonical = canonical_full_r2.to(device)
 
         # ---- Clearly-named R² maps ----
         # In-sample R² (already computed above)
-        canonical_full_r2 = fit_r2_all[:, 0]  # canonical HRF, in-sample
         hrfopt_full_r2 = xval_r2_best  # best-HRF per voxel, in-sample
 
         # Beta-series CV R² (genuine cross-validated). It needs a held-out run
@@ -1400,6 +1408,11 @@ def main():
                 "mode": "single_trial_insample_r2",
                 "select_mode": "full",  # single-trial selection is always in-sample
                 "n_hrfs": n_hrfs,
+                # What consumers of the saved library read back: the curves'
+                # sample spacing, and (via all-zero durations) whether they
+                # already carry the stimulus boxcar.
+                "microtime_dt": args.microtime_dt,
+                "stim_durations": list(model_durations),
                 "hrf_usage_counts": hrf_usage_counts,
             },
         )
@@ -1407,10 +1420,6 @@ def main():
         if args.save_canonical_betas:
             print()
             print("Fitting canonical HRF for comparison...")
-
-            # Get canonical HRF (usually first in library)
-            # hrf_library is (n_hrfs, n_timepoints), get first HRF as 1D tensor
-            canonical_hrf = hrf_library[0] if hrf_library.dim() == 2 else hrf_library
 
             # Build canonical condition-level design
             canonical_results = _fit_voxelwise_hrf_canonical(

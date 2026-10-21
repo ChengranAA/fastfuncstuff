@@ -216,6 +216,10 @@ def main(argv: list[str] | None = None) -> int:
     subj = Path(args.fs_subj) if args.fs_subj is not None else None
     if args.nr_layers < 1:
         raise SystemExit("-nr_layers must be at least 1")
+    if args.roi_fill < 0 or (args.roi_surround is not None and args.roi_surround < 0):
+        raise SystemExit("-roi_fill and -roi_surround are distances along the surface, mm >= 0")
+    if args.column_rounds is not None and args.column_rounds < 0:
+        raise SystemExit("-column_rounds must be 0 or more")
     try:
         surfaces = resolve_ribbon_surfaces(
             args.fs_subj, args.white, args.pial, args.white_mesh, args.pial_mesh,

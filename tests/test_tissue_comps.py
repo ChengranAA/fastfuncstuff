@@ -72,7 +72,13 @@ def test_components_are_what_motion_does_not_explain(tmp_path):
 
 def test_append_blocks_to_loaded_design_is_block_diagonal():
     X = np.ones((10, 2))
-    info = {"matrix": X, "run_starts": [0, 6], "n_regressors": 2, "column_labels": ["a", "b"], "column_groups": [1, -1]}
+    info = {
+        "matrix": X,
+        "run_starts": [0, 6],
+        "n_regressors": 2,
+        "column_labels": ["a", "b"],
+        "column_groups": [1, -1],
+    }
     block = NuisanceBlock(label="ncomp_wm", per_run=[np.full((6, 1), 2.0), np.full((4, 1), 3.0)])
     added = append_nuisance_blocks_to_design_info(info, [block])
     assert added == 2

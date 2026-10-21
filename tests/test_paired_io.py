@@ -93,4 +93,3 @@ def test_paired_header_splits_saved_maps(tmp_path):
     assert np.array_equal(vol.reshape(8, 2), values[:8, 0, 0])
     assert np.array_equal(np.asanyarray(surf.dataobj).reshape(3, 2), values[8:, 0, 0])
     assert surface_meta(surf.header)["mesh_fingerprint"] == "V3_F1_test"
-

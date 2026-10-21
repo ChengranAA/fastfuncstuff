@@ -94,9 +94,9 @@ def test_roi_restricts_and_crops_to_the_patch(tmp_path, capsys):
     prefix = tmp_path / "r" / "p"
     assert main([*run, "-prefix", str(prefix), "-roi", str(label), str(roi_path)]) == 0
     out = capsys.readouterr().out
-    assert "cap_lh" in out and "boxy" in out and "WARNING" not in out
+    assert "cap_lh" in out and "boxy_rh" in out and "WARNING" not in out
 
-    for name in ("cap_lh", "boxy"):
+    for name in ("cap_lh", "boxy_rh"):
         rim = nib.load(f"{prefix}_{name}_rim.nii.gz")
         gm = np.asarray(rim.dataobj) == 3
         # Cropped to the patch, and much smaller than the whole-cortex run.
@@ -115,6 +115,42 @@ def test_roi_restricts_and_crops_to_the_patch(tmp_path, capsys):
         sl = tuple(slice(a, a + n) for a, n in zip(lo, rim.shape, strict=True))
         assert (full_rim[sl][gm] == 3).all()
         np.testing.assert_allclose(full_eq[sl][gm], metric[gm], atol=1e-6)
+
+    # A BILATERAL ROI (both +z caps, as a drawn V1 would be): one box per
+    # hemisphere, not one box of mostly air spanning both.
+    both = np.zeros(full_rim.shape[:3], np.int16)
+    both[:, :, full_rim.shape[2] // 2 :] = 1
+    bi = tmp_path / "v1.nii.gz"
+    nib.save(nib.Nifti1Image(both, full.affine), str(bi))
+    bpre = tmp_path / "b" / "p"
+    assert main([*run, "-prefix", str(bpre), "-roi", str(bi), "-quiet"]) == 0
+    boxes = [nib.load(f"{bpre}_v1_{h}_rim.nii.gz") for h in ("lh", "rh")]
+    for box in boxes:
+        assert (np.asarray(box.dataobj) == 3).any()
+        # Each box reaches nowhere near the other hemisphere's sphere, 22 mm away.
+        assert abs(box.affine[0, 0]) * box.shape[0] < 22.0
+    assert boxes[0].affine[0, 3] != boxes[1].affine[0, 3]
+
+    # One of them alone, as -hemi asks for, lands in the same place under the same
+    # name -- so two -hemi runs of a bilateral ROI do not collide or disagree.
+    hpre = tmp_path / "h" / "p"
+    assert main([*run, "-hemi", "rh", "-prefix", str(hpre), "-roi", str(bi), "-quiet"]) == 0
+    alone = nib.load(f"{hpre}_v1_rh_rim.nii.gz")
+    np.testing.assert_allclose(alone.affine, boxes[1].affine)
+    np.testing.assert_array_equal(np.asarray(alone.dataobj), np.asarray(boxes[1].dataobj))
+
+    # Spill across the midline is not a region: the bigger side, and a warning.
+    spill = np.zeros(full_rim.shape[:3], np.int16)
+    spill[: full_rim.shape[0] // 2, :, full_rim.shape[2] // 2 :] = 1  # all of lh's cap
+    spill[full_rim.shape[0] // 2 :, 12:14, full_rim.shape[2] // 2 :] = 1  # a sliver of rh's
+    sp = tmp_path / "lop.nii.gz"
+    nib.save(nib.Nifti1Image(spill, full.affine), str(sp))
+    capsys.readouterr()
+    assert main([*run, "-prefix", str(tmp_path / "s" / "p"), "-roi", str(sp), "-quiet"]) == 0
+    warn = capsys.readouterr().out
+    assert "WARNING" in warn and "dropping" in warn and "-hemi" in warn
+    assert (tmp_path / "s" / "p_lop_lh_rim.nii.gz").exists()
+    assert not (tmp_path / "s" / "p_lop_rh_rim.nii.gz").exists()
 
 
 def test_alternative_surface_names(tmp_path):

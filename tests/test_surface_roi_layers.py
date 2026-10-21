@@ -85,6 +85,67 @@ def test_restriction_keeps_exactly_what_the_full_run_computed():
     assert not np.isin(part.border_idx, full.gm_idx[~keep]).any()
 
 
+def _two_hemis():
+    """Two shells clear of each other (an intersecting pair turns GM into WM)."""
+    from fastfuncstuff.surface.volume_depth import RibbonSurfaces
+
+    s, v, affine, shape = shell(step=0.5)
+    off = np.array([19.0, 0.0, 0.0])
+    rh = RibbonSurfaces("rh", s.white + off, s.pial + off, s.faces)
+    return [s, rh], v, affine, (shape[0] + int(2 * off[0]), shape[1], shape[2])
+
+
+def test_a_bilateral_region_splits_or_keeps_its_bigger_half():
+    from fastfuncstuff.surface.volume_depth import split_regions
+
+    surfaces, v, _, _ = _two_hemis()
+    big, small = cap(v, 0.8), cap(v, 0.97)
+    assert 0 < small.sum() < 0.2 * big.sum()
+
+    # Both banks on purpose: one region each, hemisphere in the name.
+    notes: list[str] = []
+    out = split_regions([_Roi("v1", {0: big, 1: big})], surfaces, "auto", notes)
+    assert [r.name for r in out] == ["v1_lh", "v1_rh"]
+    assert [sorted(r.members) for r in out] == [[0], [1]]
+    assert "one region each" in notes[0] and "WARNING" not in notes[0]
+
+    # A spill over the midline: the bigger side only, and a warning naming both.
+    notes = []
+    out = split_regions([_Roi("v1", {0: big, 1: small})], surfaces, "auto", notes)
+    assert [r.name for r in out] == ["v1_lh"] and sorted(out[0].members) == [0]
+    assert notes[0].startswith("WARNING") and "-hemi" in notes[0] and "dropping" in notes[0]
+
+    # The explicit modes, and a name that already says its hemisphere.
+    assert [r.name for r in split_regions([_Roi("v1", {0: big, 1: small})], surfaces, "split")] == [
+        "v1_lh",
+        "v1_rh",
+    ]
+    major = split_regions([_Roi("v1", {0: small, 1: big})], surfaces, "major")
+    assert [r.name for r in major] == ["v1_rh"] and sorted(major[0].members) == [1]
+    both = split_regions([_Roi("v1", {0: big, 1: big})], surfaces, "both")
+    assert [r.name for r in both] == ["v1"] and sorted(both[0].members) == [0, 1]
+    one = split_regions([_Roi("cap.lh", {0: big})], surfaces, "auto")
+    assert [r.name for r in one] == ["cap.lh"]  # not cap.lh_lh
+    with pytest.raises(ValueError, match="-roi_hemi"):
+        split_regions([], surfaces, "nonsense")
+
+
+def test_a_bilateral_roi_writes_one_cropped_box_per_hemisphere(tmp_path):
+    surfaces, v, affine, shape = _two_hemis()
+    both = cap(v, 0.8)
+    res = export_roi_depth_volumes(
+        surfaces, affine, shape, str(tmp_path / "L"), ".nii.gz",
+        [_Roi("v1", {0: both, 1: both})], fill_mm=0.0, surround_mm=3.0, device=CPU,
+    )  # fmt: skip
+    assert [r.name for r in res] == ["v1_lh", "v1_rh"]
+    # Each box holds its own hemisphere's patch and not the other's, 19 mm away.
+    for r in res:
+        assert r.out.n_gm > 0
+        x = r.affine[0, 3] + r.affine[0, 0] * np.arange(r.out.shape[0])
+        assert x.max() - x.min() < 19.0
+    assert res[0].affine[0, 3] != res[1].affine[0, 3]
+
+
 def test_a_hemisphere_the_region_misses_is_dropped_unmeasured():
     """A hemisphere with no column of the region costs nothing but its fill.
 
@@ -93,20 +154,10 @@ def test_a_hemisphere_the_region_misses_is_dropped_unmeasured():
     """
     import time
 
-    from fastfuncstuff.surface.volume_depth import RibbonSurfaces
-
-    s, v, affine, shape = shell(step=0.5)
-    # A second hemisphere on the same grid, clear of the first (the shells must not
-    # intersect, or one's white surface turns the other's GM into WM), which the
-    # region will not touch. The grid is widened along x to hold both.
-    off = np.array([19.0, 0.0, 0.0])
-    other = RibbonSurfaces("rh", s.white + off, s.pial + off, s.faces)
-    shape = (shape[0] + int(2 * off[0]), shape[1], shape[2])
-    empty = np.zeros(len(s.white), bool)
+    surfaces, v, affine, shape = _two_hemis()
+    empty = np.zeros(len(surfaces[0].white), bool)
     t0 = time.time()
-    out = cortical_depth_volumes(
-        [s, other], affine, shape, device=CPU, columns=[cap(v, 0.8), empty]
-    )
+    out = cortical_depth_volumes(surfaces, affine, shape, device=CPU, columns=[cap(v, 0.8), empty])
     assert [h for h, _ in out.smooth_rounds] == [0], out.smooth_rounds
     assert out.n_gm > 0 and all(r < 500 for _, r in out.smooth_rounds)
     assert time.time() - t0 < 60
@@ -153,10 +204,10 @@ def test_a_partial_depth_volume_roi_becomes_whole_columns(tmp_path):
     # Both borders are there, so LN2_LAYERS could rebuild the depths from the rim.
     assert (rim == RIM_WM).sum() > 50 and (rim == RIM_CSF).sum() > 50
     # Written files: every LN2 output plus the region as a mask, on the same grid.
-    head = f"{tmp_path}/L_blob_"
+    head = f"{tmp_path}/L_blob_lh_"
     tags = {p.removeprefix(head).removesuffix(".nii.gz") for p in res[0].written}
     assert {"rim", "metric_equivol", "thickness", "roi"} <= tags
-    mask = np.asanyarray(load_nifti(f"{tmp_path}/L_blob_roi.nii.gz").dataobj)
+    mask = np.asanyarray(load_nifti(f"{tmp_path}/L_blob_lh_roi.nii.gz").dataobj)
     np.testing.assert_array_equal(mask > 0, out.metric_equidist.astype(bool) | (rim == RIM_GM))
 
 

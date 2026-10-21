@@ -41,8 +41,14 @@ def test_surface_model_fit_bucket_preserves_mesh_and_labels(tmp_path):
         tstats=torch.tensor([[4.0], [5.0], [6.0]]),
     )
     paths = save_model_fit_outputs(
-        fit, str(tmp_path / "fit"), (3, 1, 1), np.eye(4), "initial",
-        condition_labels=["trial"], nifti_header=_header(), nii_ext=".func.gii",
+        fit,
+        str(tmp_path / "fit"),
+        (3, 1, 1),
+        np.eye(4),
+        "initial",
+        condition_labels=["trial"],
+        nifti_header=_header(),
+        nii_ext=".func.gii",
     )
     data, meta = load_gifti_data(paths["initial_bucket"])
     assert data.shape == (3, 2)

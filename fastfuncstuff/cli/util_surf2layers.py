@@ -158,6 +158,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "and throw away",
     )
     r.add_argument(
+        "-roi_hemi",
+        default="auto",
+        choices=("auto", "split", "major", "both"),
+        help="A region covering BOTH hemispheres (a bilateral V1, say) would otherwise "
+        "be layered on one grid spanning both, which is mostly air between the banks.  "
+        "'auto' (default) writes one region per hemisphere when the smaller side holds "
+        "at least a third of the columns, and otherwise keeps the larger side and warns "
+        "-- a few columns over the midline is threshold spill or a millimetre of "
+        "misalignment, not a region.  'split' always writes both, 'major' always keeps "
+        "the larger, 'both' leaves the region on one grid.  Every region's name carries "
+        "its hemisphere (NAME_lh), so -hemi lh and -hemi rh runs do not collide",
+    )
+    r.add_argument(
         "-roi_claim",
         default="any",
         choices=("any", "mid"),
@@ -292,6 +305,7 @@ def _roi_main(args, surfaces, affine, shape, stem, ext, device, verbose, t0) -> 
             pad_mm=args.autobox_pad,
             fill_mm=args.roi_fill,
             surround_mm=args.roi_surround,
+            hemi_mode=args.roi_hemi,
             n_layers=args.nr_layers,
             column_voxels=args.column_voxels,
             column_rounds=args.column_rounds,

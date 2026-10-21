@@ -767,6 +767,109 @@ def _mean_edge_mm(positions: np.ndarray, faces: np.ndarray) -> float:
     return float(np.linalg.norm(positions[e[:, 0]] - positions[e[:, 1]], axis=1).mean())
 
 
+#: What to do with a region that covers both hemispheres (``split_regions``).
+ROI_HEMI_MODES = ("auto", "split", "major", "both")
+
+#: ``auto`` splits when the smaller side holds at least this share of the columns.
+#: A third: a bilateral V1 drawn on both banks is a region per hemisphere, while a
+#: handful of columns across the midline is spill from a threshold or a millimetre
+#: of misalignment, not a region.
+HEMI_SPLIT_SHARE = 1.0 / 3.0
+
+
+@dataclass
+class Region:
+    """One region to layer: a name, a label value, and its columns per hemisphere.
+
+    The same three fields ``processing.roi_depth`` returns, after the hemisphere
+    rule has been applied -- so ``export_roi_depth_volumes`` takes either.
+    """
+
+    name: str
+    rid: int
+    members: dict[int, np.ndarray]
+
+
+def split_regions(
+    rois,
+    surfaces: list[RibbonSurfaces],
+    mode: str = "auto",
+    notes: list[str] | None = None,
+) -> list[Region]:
+    """Regions to layer, one hemisphere each, from ROIs that may cover both.
+
+    A region spanning both hemispheres would be layered on one grid covering both,
+    which for a bilateral V1 is a box of mostly air between the banks. So:
+
+    * ``split`` -- one region per hemisphere, named ``<roi>_lh`` / ``<roi>_rh``;
+    * ``major`` -- the hemisphere holding more of the region's columns, the other
+      dropped;
+    * ``auto`` (the default) -- ``split`` when the smaller side holds at least
+      :data:`HEMI_SPLIT_SHARE` of the columns, else ``major``: a region on both
+      banks on purpose is two regions, a few columns over the midline is spill;
+    * ``both`` -- left alone, on one grid, hemisphere left out of the name.
+
+    Either way the hemisphere goes in the name, so ``-hemi lh`` and ``-hemi rh``
+    runs of a bilateral ROI write files that do not collide. What was dropped or
+    split is appended to ``notes``.
+    """
+    if mode not in ROI_HEMI_MODES:
+        raise ValueError(f"-roi_hemi must be one of {ROI_HEMI_MODES}, not {mode!r}")
+    notes = [] if notes is None else notes
+    out: list[Region] = []
+    for roi in rois:
+        counts = {
+            h: int(np.asarray(m, bool).sum())
+            for h, m in sorted(roi.members.items())
+            if np.asarray(m, bool).any()
+        }
+        if mode == "both" or len(counts) < 2:
+            name = roi.name
+            if len(counts) == 1:
+                name = _with_hemi(name, surfaces[next(iter(counts))].name)
+            out.append(Region(name, roi.rid, dict(roi.members)))
+            continue
+        order = sorted(counts, key=lambda h: -counts[h])
+        total = sum(counts.values())
+        share = counts[order[-1]] / total
+        split = mode == "split" or (mode == "auto" and share >= HEMI_SPLIT_SHARE)
+        where = ", ".join(f"{surfaces[h].name} {counts[h]:,}" for h in order)
+        if split:
+            notes.append(f"{roi.name}: columns on both hemispheres ({where}) -- one region each")
+            for h in order:
+                out.append(
+                    Region(
+                        _with_hemi(roi.name, surfaces[h].name),
+                        roi.rid,
+                        {h: np.asarray(roi.members[h], bool)},
+                    )
+                )
+        else:
+            keep = order[0]
+            notes.append(
+                f"WARNING: {roi.name} has columns on both hemispheres ({where}); keeping "
+                f"{surfaces[keep].name} and dropping {total - counts[keep]:,} column(s) on "
+                f"{surfaces[order[-1]].name}. Run it once per -hemi to get both, or "
+                "-roi_hemi split to write both from one run"
+            )
+            out.append(
+                Region(
+                    _with_hemi(roi.name, surfaces[keep].name),
+                    roi.rid,
+                    {keep: np.asarray(roi.members[keep], bool)},
+                )
+            )
+    return out
+
+
+def _with_hemi(name: str, hemi: str) -> str:
+    """``name`` carrying ``hemi``, unless its own name already says so."""
+    low = name.lower().replace(".", "_").replace("-", "_")
+    if low == hemi or low.startswith(f"{hemi}_") or low.endswith(f"_{hemi}"):
+        return name
+    return f"{name}_{hemi}"
+
+
 def grow_columns(
     surfaces: list[RibbonSurfaces],
     members: dict[int, np.ndarray],
@@ -820,10 +923,12 @@ def export_roi_depth_volumes(
     pad_mm: float = 1.0,
     fill_mm: float = 2.0,
     surround_mm: float | None = None,
+    hemi_mode: str = "auto",
     n_layers: int = 3,
     column_voxels: float = 64.0,
     column_rounds: int | None = None,
     thick_limit: float = 6.0,
+    notes: list[str] | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
 ) -> list[RoiDepthResult]:
@@ -837,6 +942,10 @@ def export_roi_depth_volumes(
     distances and the column CDFs all read geometry within a column's reach of the
     voxel. The one thing that is not local is how far the CDF pools along the surface,
     which the grown surround covers and :attr:`RoiDepthResult.pooled_mm` checks.
+
+    A region covering both hemispheres becomes one region per hemisphere, or the
+    hemisphere holding most of it -- see :func:`split_regions` for ``hemi_mode``.
+    The hemisphere is in every region's name either way.
 
     ``surround_mm`` None sizes that surround per region from the grid and the meshes
     (:func:`estimate_column_reach`, plus a quarter for the estimate's own error): the
@@ -852,7 +961,15 @@ def export_roi_depth_volumes(
 
     edge_mm = [_mean_edge_mm(0.5 * (s.white + s.pial), s.faces) for s in surfaces]
     results = []
-    rois = list(rois)
+    said: list[str] = []
+    rois = split_regions(rois, surfaces, hemi_mode, said)
+    for note in said:
+        # A dropped hemisphere is the user's business whether or not they asked for
+        # a running commentary; the rest is commentary.
+        if verbose or note.startswith("WARNING"):
+            print(note if note.startswith("WARNING") else f"  {note}")
+    if notes is not None:
+        notes += said
     for k, roi in enumerate(rois, 1):
         name = _file_token(roi.name)
         # Where a bar would go: an .annot is 34 regions, each its own fill and
@@ -1095,8 +1212,11 @@ __all__ = [
     "OUTPUT_TAGS",
     "DepthVolumes",
     "RibbonSurfaces",
+    "ROI_HEMI_MODES",
+    "Region",
     "RoiDepthResult",
     "column_smooth_rounds",
+    "estimate_column_reach",
     "cortical_depth_volumes",
     "crop_to_points",
     "export_depth_volumes",
@@ -1105,6 +1225,7 @@ __all__ = [
     "regrid",
     "resolve_ribbon_surfaces",
     "roi_report",
+    "split_regions",
     "thick_report",
     "volume_quantile_depth",
 ]

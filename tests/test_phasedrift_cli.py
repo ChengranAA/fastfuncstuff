@@ -23,7 +23,10 @@ def test_per_slice_wobble_removed_local_signal_kept(tmp_path):
 
     out = tmp_path / "clean.nii"
     trace = tmp_path / "trace.1D"
-    assert main(["-input", str(src), "-prefix", str(out), "-save_trace", str(trace), "-verb", "0"]) == 0
+    assert (
+        main(["-input", str(src), "-prefix", str(out), "-save_trace", str(trace), "-verb", "0"])
+        == 0
+    )
     got = np.asarray(nib.load(str(out)).dataobj, dtype=np.float64)
 
     dyn = got - got.mean(-1, keepdims=True)

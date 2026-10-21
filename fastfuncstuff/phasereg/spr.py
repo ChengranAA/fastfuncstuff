@@ -139,7 +139,7 @@ def select_phase_donor(
     phase: torch.Tensor,
     neighbors: torch.Tensor,
     device: torch.device | str = "cpu",
-    chunk_size: int = 50000,
+    chunk_size: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pick, per voxel, the neighbour whose phase best tracks its magnitude.
 
@@ -153,8 +153,8 @@ def select_phase_donor(
     neighbors : Tensor (n_voxels, K) int64
         From :func:`build_neighbor_index`.
     device : torch.device or str
-    chunk_size : int
-        Voxels per chunk.
+    chunk_size : int, optional
+        Voxels per chunk. Planned by the memory module when None.
 
     Returns
     -------
@@ -182,6 +182,20 @@ def select_phase_donor(
 
         if pha_n.numel() * pha_n.element_size() < get_available_memory(device):
             pha_n = pha_n.to(device)
+
+    if chunk_size is None:
+        from fastfuncstuff.memory import estimate_chunk_size
+
+        # Per voxel: the magnitude chunk, its normalised copy, one gathered donor
+        # column and the product -- the paired-correlation footprint for two series.
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_vox,
+            n_timepoints=int(magnitude.shape[0]),
+            n_regressors=int(neighbors.shape[1]),
+            device=device,
+            operation="paired_corr",
+            n_trials=2,
+        )
 
     donor = torch.zeros(n_vox, dtype=torch.int64)
     donor_corr = torch.zeros(n_vox)

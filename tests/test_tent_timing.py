@@ -241,3 +241,30 @@ def test_every_event_glm_tool_takes_microtime_offset(module, builder):
 
     parser = getattr(importlib.import_module(f"fastfuncstuff.cli.{module}"), builder)()
     assert "-microtime_offset" in parser._option_string_actions
+
+
+def test_fir_window_longer_than_the_run_caps_instead_of_crashing():
+    # 32 s at TR 0.5 is 64 lags; a 20-volume run used to raise a shape error.
+    onsets = torch.zeros(20, 1)
+    onsets[2] = 1.0
+    with pytest.warns(UserWarning, match="64 lags is longer than this 20-volume run"):
+        X = make_fir_design(onsets, 64, 20, device=CPU)
+    # Column layout unchanged (shared across runs); lags 20.. are empty.
+    assert X.shape == (20, 64)
+    assert torch.all(X[:, 20:] == 0)
+    # The lags that fit are the ordinary shifted onsets.
+    for lag in range(18):
+        assert X[2 + lag, lag] == 1.0 and X[:, lag].sum() == 1.0
+
+    # Through the shared builder: a short run beside a long one keeps both runs'
+    # task blocks the same width, so the shared-task fit still lines up.
+    with pytest.warns(UserWarning, match="longer than this"):
+        designs = build_per_run_task_designs(
+            [[np.array([2.0]), np.array([2.0, 40.0])]],
+            [20, 200],
+            0.5,
+            basis="FIR",
+            fir_window_s=32.0,
+            device=CPU,
+        )
+    assert [d.shape for d in designs.per_run] == [(20, 64), (200, 64)]

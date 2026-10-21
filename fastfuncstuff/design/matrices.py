@@ -6,6 +6,7 @@ Handles FIR, assumed HRF, and convolution operations
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 import torch
@@ -758,6 +759,15 @@ def make_fir_design(
     -------
     design : torch.Tensor
         (n_timepoints, n_conditions * n_lags) FIR design matrix
+
+    Notes
+    -----
+    Lags at or past the end of the run are capped: they keep their columns,
+    all zero, rather than failing. The column layout has to stay the same in
+    every run (the task block is shared across runs), and it is what
+    ``make_tent_design`` does with knots past the run end. A window longer
+    than a run (likely at short TRs: 32 s at TR 0.5 is 64 lags) warns, since
+    those lags can only be estimated from longer runs.
     """
     if device is None:
         device = get_device()
@@ -771,9 +781,18 @@ def make_fir_design(
     # Pre-allocate design matrix
     design = torch.zeros(n_timepoints, n_conditions * n_lags, device=device)
 
+    n_live = min(n_lags, n_timepoints)
+    if n_live < n_lags:
+        warnings.warn(
+            f"FIR window of {n_lags} lags is longer than this {n_timepoints}-volume run; "
+            f"lags {n_live}..{n_lags - 1} have no samples in it and are left as zero "
+            "columns (estimable only from longer runs).",
+            stacklevel=2,
+        )
+
     # For each condition and lag, shift onset vector
     for cond_idx in range(n_conditions):
-        for lag in range(n_lags):
+        for lag in range(n_live):
             col_idx = cond_idx * n_lags + lag
 
             if lag == 0:

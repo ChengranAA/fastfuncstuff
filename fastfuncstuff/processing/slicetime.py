@@ -39,6 +39,22 @@ def _interp_dtype(device: torch.device) -> torch.dtype:
     return widest_float_dtype(device)
 
 
+def _row_chunk(n_rows: int, nt: int, device: torch.device) -> int:
+    """Time series per chunk for the detrend -> shift -> retrend chain on ``device``.
+
+    Local per-row model (not a memory.py planner): about sixteen float64 copies of
+    a row are live at the peak -- the float32 input and its float64 promotion, the
+    detrended pair, the zero-padded FFT buffer, the complex spectrum and its
+    phase-rotated product, the inverse, and the retrend. Planned once per shift
+    group, so no cache flush.
+    """
+    from fastfuncstuff.memory import get_available_memory
+
+    bytes_per_row = 16 * 8 * max(1, nt)
+    avail = get_available_memory(device, empty_cache=False)
+    return max(1, min(n_rows, int(avail // bytes_per_row)))
+
+
 # ---------------------------------------------------------------------------
 # Slice timing loading
 # ---------------------------------------------------------------------------
@@ -334,8 +350,11 @@ def slicetime_correct(
     -------
     (nt, nz, ny, nx) float tensor — corrected 4D volume.
     """
-    if device is not None:
-        vol4d = vol4d.to(device)
+    # `device` is where the arithmetic runs; the series stays where the caller holds
+    # it and comes back there. A series too big for the card is held on the host and
+    # streamed through the GPU a chunk of time series at a time ([[Device management]]).
+    compute = device if device is not None else vol4d.device
+    source = vol4d.device
 
     nt, nz, ny, nx = vol4d.shape
 
@@ -348,7 +367,7 @@ def slicetime_correct(
     if verbose:
         print(
             f"  slicetime: {nz} slices, TR={tr:.4f}s, tzero={tzero:.4f}s, "
-            f"method={method}, device={vol4d.device}"
+            f"method={method}, device={compute}"
         )
 
     nt_shift = nt - ignore
@@ -377,40 +396,51 @@ def slicetime_correct(
 
         # Gather all voxels from all slices in this group → (n_slices * ny*nx, nt_shift)
         slabs = vol4d[ignore:, slices, :, :]  # (nt_shift, n_slices, ny, nx)
-        ts = slabs.permute(1, 2, 3, 0).reshape(-1, nt_shift).contiguous()
+        ts_all = slabs.permute(1, 2, 3, 0).reshape(-1, nt_shift).contiguous()
+        n_rows = ts_all.shape[0]
+        chunk = _row_chunk(n_rows, nt_shift, compute)
+        shifted_all = ts_all if chunk >= n_rows else torch.empty_like(ts_all)
 
-        # 1. Record original range
-        orig_min = ts.min(dim=1).values
-        orig_max = ts.max(dim=1).values
+        for r0 in range(0, n_rows, chunk):
+            ts = ts_all[r0 : r0 + chunk].to(compute)
 
-        # 2. Detrend (float64 for accumulation precision; float32 on MPS)
-        ts_hp = ts.to(_interp_dtype(ts.device))
-        ts_dt, intercepts, slopes = _linear_detrend(ts_hp)
-        ts_dt = ts_dt.to(ts.dtype)
+            # 1. Record original range
+            orig_min = ts.min(dim=1).values
+            orig_max = ts.max(dim=1).values
 
-        # 3. Record detrended range
-        dt_min = ts_dt.min(dim=1).values
-        dt_max = ts_dt.max(dim=1).values
+            # 2. Detrend (float64 for accumulation precision; float32 on MPS)
+            ts_hp = ts.to(_interp_dtype(ts.device))
+            ts_dt, intercepts, slopes = _linear_detrend(ts_hp)
+            ts_dt = ts_dt.to(ts.dtype)
 
-        # 4. Shift — one call for all voxels in this shift group
-        #    (shift functions promote to float64 internally)
-        ts_shifted = shift_timeseries(ts_dt, fshift, method=method)
+            # 3. Record detrended range
+            dt_min = ts_dt.min(dim=1).values
+            dt_max = ts_dt.max(dim=1).values
 
-        # 5. Clip to detrended range
-        ts_shifted = ts_shifted.clamp(min=dt_min[:, None], max=dt_max[:, None])
+            # 4. Shift — one call for all voxels in this chunk of the shift group
+            #    (shift functions promote to float64 internally)
+            ts_shifted = shift_timeseries(ts_dt, fshift, method=method)
 
-        # 6. Retrend (float64 for accumulation precision; float32 on MPS)
-        ts_shifted = _linear_retrend(
-            ts_shifted.to(_interp_dtype(ts.device)),
-            intercepts,
-            slopes,
-        ).to(ts.dtype)
+            # 5. Clip to detrended range
+            ts_shifted = ts_shifted.clamp(min=dt_min[:, None], max=dt_max[:, None])
 
-        # 7. Clip to original range
-        ts_shifted = ts_shifted.clamp(min=orig_min[:, None], max=orig_max[:, None])
+            # 6. Retrend (float64 for accumulation precision; float32 on MPS)
+            ts_shifted = _linear_retrend(
+                ts_shifted.to(_interp_dtype(ts.device)),
+                intercepts,
+                slopes,
+            ).to(ts.dtype)
+
+            # 7. Clip to original range
+            ts_shifted = ts_shifted.clamp(min=orig_min[:, None], max=orig_max[:, None])
+            if chunk >= n_rows:
+                shifted_all = ts_shifted.to(source)
+            else:
+                shifted_all[r0 : r0 + chunk] = ts_shifted.to(source)
+            del ts, ts_hp, ts_dt, ts_shifted, intercepts, slopes
 
         # Scatter back: (n_slices*ny*nx, nt_shift) → (nt_shift, n_slices, ny, nx)
-        ts_back = ts_shifted.reshape(n_slices, ny, nx, nt_shift).permute(3, 0, 1, 2)
+        ts_back = shifted_all.reshape(n_slices, ny, nx, nt_shift).permute(3, 0, 1, 2)
         out[ignore:, slices, :, :] = ts_back
 
         pbar.update(n_slices)
@@ -457,8 +487,9 @@ def temporal_resample(
     -------
     (nt_new, nz, ny, nx) float tensor at the new TR.
     """
-    if device is not None:
-        vol4d = vol4d.to(device)
+    # Computed slice by slice on `device`; the series and the result stay on the
+    # caller's device, so a host-held series streams through the GPU a slice at a time.
+    compute = device if device is not None else vol4d.device
 
     nt_old, nz, ny, nx = vol4d.shape
 
@@ -471,9 +502,9 @@ def temporal_resample(
         print(f"  duration: {total_duration:.2f}s, method: {method}")
 
     # Build old and new time grids (float32 on MPS, which has no float64)
-    grid_dtype = _interp_dtype(vol4d.device)
-    t_old = torch.arange(nt_old, device=vol4d.device, dtype=grid_dtype) * tr_old
-    t_new = torch.arange(nt_new, device=vol4d.device, dtype=grid_dtype) * tr_new
+    grid_dtype = _interp_dtype(compute)
+    t_old = torch.arange(nt_old, device=compute, dtype=grid_dtype) * tr_old
+    t_new = torch.arange(nt_new, device=compute, dtype=grid_dtype) * tr_new
 
     # Clamp new times to old range (avoid extrapolation)
     t_new = t_new.clamp(max=t_old[-1].item())
@@ -483,7 +514,7 @@ def temporal_resample(
 
     for kk in range(nz):
         # (ny*nx, nt_old) — each voxel's time series as a row
-        ts = vol4d[:, kk, :, :].reshape(nt_old, -1).T.to(grid_dtype)
+        ts = vol4d[:, kk, :, :].to(compute).reshape(nt_old, -1).T.to(grid_dtype)
 
         if method == "linear":
             # Find insertion indices for t_new in t_old
@@ -529,7 +560,7 @@ def temporal_resample(
             raise ValueError(f"Unknown resample method: {method}. Use 'linear' or 'cubic'.")
 
         # (n_vox, nt_new) -> (nt_new, ny, nx)
-        out[:, kk, :, :] = interp.to(vol4d.dtype).T.reshape(nt_new, ny, nx)
+        out[:, kk, :, :] = interp.to(vol4d.dtype).T.reshape(nt_new, ny, nx).to(out.device)
 
     if verbose:
         print(f"  resample: done ({nt_new} output volumes)")
@@ -569,29 +600,37 @@ def tween_midpoints(
     """
     if vol4d.ndim != 4:
         raise ValueError(f"tween expects a 4D series, got {vol4d.ndim}D")
-    if device is not None:
-        vol4d = vol4d.to(device)
+    # As in slicetime_correct: computed on `device` in chunks of time series, returned
+    # on the caller's device, so the float64 working copies never span the volume.
+    compute = device if device is not None else vol4d.device
     nt, nz, ny, nx = vol4d.shape
     if nt < 2:
         raise ValueError(f"tween needs ≥2 frames, got {nt}")
 
     # out[i] = ts_cont(i + 0.5): a -0.5-sample shift (shift_timeseries: out[i] = ts(i - s)).
     frac = -0.5
-    ts = vol4d.reshape(nt, -1).T  # (n_vox, nt)
+    ts_all = vol4d.reshape(nt, -1).T  # (n_vox, nt)
+    n_rows = ts_all.shape[0]
+    rows = torch.empty((n_rows, nt - 1), dtype=vol4d.dtype, device=vol4d.device)
+    dtype = _interp_dtype(compute)
+    t_shift = (torch.arange(nt, device=compute, dtype=dtype) - frac) - (nt - 1) / 2.0
+    chunk = _row_chunk(n_rows, nt, compute)
 
-    # Detrend → shift residual → RE-add the trend at the SHIFTED grid (t = i - frac). This
-    # keeps a linear trend exact at the midpoints — so 'linear' stays the plain neighbour
-    # average — while sparing the Fourier/sinc methods the ringing a non-periodic drift
-    # would otherwise cause. (The usual same-grid retrend would bias every frame by
-    # slope·0.5.)
-    dtype = _interp_dtype(ts.device)
-    detr, intercepts, slopes = _linear_detrend(ts.to(dtype))
-    shifted = shift_timeseries(detr.to(ts.dtype), frac, method=method).to(dtype)
-    t_shift = (torch.arange(nt, device=ts.device, dtype=dtype) - frac) - (nt - 1) / 2.0
-    retr = shifted + intercepts[:, None] + slopes[:, None] * t_shift[None, :]
+    for r0 in range(0, n_rows, chunk):
+        ts = ts_all[r0 : r0 + chunk].to(compute)
+        # Detrend → shift residual → RE-add the trend at the SHIFTED grid (t = i - frac).
+        # This keeps a linear trend exact at the midpoints — so 'linear' stays the plain
+        # neighbour average — while sparing the Fourier/sinc methods the ringing a
+        # non-periodic drift would otherwise cause. (The usual same-grid retrend would
+        # bias every frame by slope·0.5.)
+        detr, intercepts, slopes = _linear_detrend(ts.to(dtype))
+        shifted = shift_timeseries(detr.to(ts.dtype), frac, method=method).to(dtype)
+        retr = shifted + intercepts[:, None] + slopes[:, None] * t_shift[None, :]
+        # Drop the trailing frame, whose midpoint falls past the last acquired sample.
+        rows[r0 : r0 + chunk] = retr[:, : nt - 1].to(vol4d.dtype).to(rows.device)
+        del ts, detr, shifted, retr, intercepts, slopes
 
-    # Drop the trailing frame, whose midpoint falls past the last acquired sample.
-    out = retr[:, : nt - 1].to(vol4d.dtype).T.reshape(nt - 1, nz, ny, nx)
+    out = rows.T.reshape(nt - 1, nz, ny, nx)
 
     if verbose:
         print(f"  tween: {nt} -> {nt - 1} midpoint frames (method={method})")

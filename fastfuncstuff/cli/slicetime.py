@@ -222,12 +222,21 @@ def main(argv: list[str] | None = None) -> None:
 
     t0 = time.time()
     with spinner(f"Loading {Path(args.input).name}"):
-        vol, header = load_image(args.input, device=device)
+        vol, header = load_image(args.input)
 
     if vol.ndim != 4:
         raise ValueError(f"Expected 4D input, got {vol.ndim}D with shape {vol.shape}")
 
     nt, nz, ny, nx = vol.shape
+    # Input and output series are both resident (plus -resample's longer one), so
+    # gate on twice the series. A series that does not fit stays on the host and
+    # the corrections stream it through `device` in chunks.
+    from fastfuncstuff.memory import estimate_keep_on_cpu
+
+    if device.type != "cpu" and not estimate_keep_on_cpu(nz * ny * nx, 2 * nt, device):
+        vol = vol.to(device)
+    elif device.type != "cpu" and verb >= 1:
+        print("  series kept in host memory; streaming it through the GPU")
     if verb >= 1:
         print(f"Input: {args.input} ({nt} volumes, {nz} slices, {ny}x{nx})")
 

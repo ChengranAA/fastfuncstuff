@@ -233,21 +233,38 @@ def main(argv: list[str] | None = None) -> None:
     surface = all(surface)
     if surface and args.automask:
         raise SystemExit("-automask is a volume method; surface data are masked by default.")
-    echoes = []
+    #
+    # The full-grid stack is staged in host memory and only the masked (V, E, T) series
+    # goes to the device. Loading every echo there and then stacking them held the
+    # whole multi-echo grid on the card twice, for data the fit never looks at outside
+    # the mask. Each echo still passes through `device` on its way in, so the default
+    # mask's temporal mean is computed exactly where it always was.
+    default_mask = args.mask is None and not args.automask
+    data = None
+    positive = None
     header = None
-    for path in args.input:
+    for e, path in enumerate(args.input):
         if surface:
             vol, hdr = _load_surface(path, device)
         else:
             vol, hdr = load_image(path, device=device)
         if vol.ndim == 3:
             vol = vol.unsqueeze(0)
-        echoes.append(vol)
+        if data is None:
+            data = torch.empty((n_echos, *vol.shape), dtype=vol.dtype)  # (E, T, nz, ny, nx)
+        elif tuple(vol.shape) != tuple(data.shape[1:]):
+            raise SystemExit(
+                f"All echo files must share a shape; got {tuple(data.shape[1:])} and "
+                f"{tuple(vol.shape)}"
+            )
+        if default_mask:
+            # Voxels positive in every echo's temporal mean.
+            pos = vol.mean(dim=0) > 0
+            positive = pos if positive is None else positive & pos
+        data[e].copy_(vol)
+        del vol
         header = header or hdr
-    shapes = {tuple(v.shape) for v in echoes}
-    if len(shapes) != 1:
-        raise SystemExit(f"All echo files must share a shape; got {shapes}")
-    data = torch.stack(echoes, dim=0)  # (E, T, nz, ny, nx)
+    assert data is not None
     spatial = data.shape[2:]
     phases = None
     if args.phase is not None:
@@ -275,23 +292,35 @@ def main(argv: list[str] | None = None) -> None:
     elif args.automask:
         from fastfuncstuff.processing.mask import automask
 
-        mask = automask(data[0, 0], dilate_extra=1, device=device, verbose=verb >= 1) > 0
+        mask = automask(data[0, 0].to(device), dilate_extra=1, device=device, verbose=verb >= 1) > 0
     else:
-        # Default: voxels positive in every echo's temporal mean.
-        mask = (data.mean(dim=1) > 0).all(dim=0)
+        assert positive is not None
+        mask = positive
+    mask = mask.to(device)
 
     n_vox = int(mask.sum())
     if n_vox == 0:
         raise SystemExit("Mask is empty; nothing to fit.")
 
-    # (E, T, nz, ny, nx) -> masked (V, E, T).
-    data_cat = data[:, :, mask].permute(2, 0, 1).contiguous()  # (V, E, T)
+    from fastfuncstuff.memory import estimate_keep_on_cpu
+
+    n_t = data.shape[1]
+    if device.type == "cuda" and estimate_keep_on_cpu(n_vox, n_echos * n_t, device):
+        gb = n_vox * n_echos * n_t * 4 / 1024**3
+        raise SystemExit(
+            f"The masked {n_echos}-echo series ({gb:.1f} GB) does not fit in the free "
+            f"memory of {device}, and the decay fits need several working copies of it. "
+            "Free the card, tighten -mask, or run with -device cpu."
+        )
+
+    # (E, T, nz, ny, nx) -> masked (V, E, T), gathered on the host, then moved over.
+    data_cat = data[:, :, mask.cpu()].permute(2, 0, 1).contiguous().to(device)  # (V, E, T)
     field_hz = None
     if phases is not None:
         with spinner("Fitting the frequency shift from every echo's phase"):
             field_hz = _field_in_chunks(phases, mask, data_cat, tes, device)
         del phases
-    del echoes, data
+    del data
 
     if verb >= 1:
         print(f"ffs_t2smap: {n_echos} echoes, {data_cat.shape[2]} TRs, {n_vox} voxels")

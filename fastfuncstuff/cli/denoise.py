@@ -471,6 +471,32 @@ Notes:
         "  0 0      disable.",
     )
     pool_opts.add_argument(
+        "-noise_pool_exclude",
+        action="append",
+        metavar="MASK",
+        default=None,
+        help="Keep the voxels in MASK OUT of the noise pool, whatever their task R²."
+        " For structure you do not want a component to describe: a vein mask, a task"
+        " ROI the R² cut alone will not hold back, the edge of the slab.\n"
+        "Resampled onto the data grid if it is on another one and thresholded at 0.5,"
+        " so a probability map works. Repeat the flag to exclude several ROIs; they"
+        " union.\n"
+        "Restricts the pool only -- the voxels are still fitted, still scored and"
+        " still written out. Volume input only.",
+    )
+    pool_opts.add_argument(
+        "-noise_pool_mask",
+        action="append",
+        metavar="MASK",
+        default=None,
+        help="Restrict the noise pool to MASK, on top of the R² and intensity cuts."
+        " The complement of -noise_pool_exclude: say where components MAY come from"
+        " (white matter + CSF, say) rather than where they may not. Repeat the flag"
+        " to intersect several ROIs.\n"
+        "For components taken from a map directly, rather than from the R²-defined"
+        " pool, see -noise_comps, which is the aCompCor-style path.",
+    )
+    pool_opts.add_argument(
         "-min_noise_voxels",
         type=int,
         default=100,
@@ -2330,7 +2356,7 @@ def main():
         print("  -brainthresh 99 0.5 so background voxels stay out of the noise pool.")
         print("  Pass '-brainthresh 0 0' to disable the intensity cut entirely.")
 
-    brainthresh_mask = None
+    pool_restrict = None
     if args.brainthresh is not None:
         percentile, fraction = args.brainthresh
         print()
@@ -2344,8 +2370,8 @@ def main():
         threshold = percentile_value * fraction
 
         # Create mask: True for voxels ABOVE threshold (valid voxels)
-        brainthresh_mask = mean_intensity > threshold
-        n_above = brainthresh_mask.sum().item()
+        pool_restrict = mean_intensity > threshold
+        n_above = pool_restrict.sum().item()
 
         print(f"  {percentile:.0f}th percentile intensity: {percentile_value:.2f}")
         print(f"  Threshold ({fraction:.2f} × {percentile_value:.2f}): {threshold:.2f}")
@@ -2371,10 +2397,8 @@ def main():
                 f"  {n_invalid:,} voxels are zero/constant in at least one run "
                 "(kept: -keep_constant_voxels); excluded from the noise pool"
             )
-            brainthresh_mask = (
-                valid_per_run_mask
-                if brainthresh_mask is None
-                else brainthresh_mask & valid_per_run_mask
+            pool_restrict = (
+                valid_per_run_mask if pool_restrict is None else pool_restrict & valid_per_run_mask
             )
         else:
             print(f"  Removed {n_invalid:,} voxels with zero/constant values in any run")
@@ -2382,8 +2406,55 @@ def main():
             data, mask, mask_flat, n_voxels = restrict_voxels(
                 data, valid_per_run_mask, volume_shape, mask_flat
             )
-            if brainthresh_mask is not None:
-                brainthresh_mask = brainthresh_mask[valid_per_run_mask.to(brainthresh_mask.device)]
+            if pool_restrict is not None:
+                pool_restrict = pool_restrict[valid_per_run_mask.to(pool_restrict.device)]
+
+    # ROI restrictions ride the same channel as the intensity floor: that is the
+    # one path (`intensity_mask`) every noise-pool consumer already narrows by,
+    # the single-trial branch included.  Loaded here, after the constant-voxel
+    # restriction, because the row domain is only final once that has run.
+    if args.noise_pool_exclude or args.noise_pool_mask:
+        if paired is not None or surface_input:
+            sys.exit(
+                "ERROR: -noise_pool_exclude / -noise_pool_mask are volume-only; they read a "
+                "3D ROI\n       on the data's grid, and surface input has no such grid. Use "
+                "-surface_mask to\n       restrict the analysis, or -noise_comps for "
+                "components from a volume ROI."
+            )
+        from fastfuncstuff.cli_utils import roi_mask_on_data_rows
+
+        print()
+        print("Restricting the noise pool by ROI...")
+        for path in args.noise_pool_mask or []:
+            keep = roi_mask_on_data_rows(
+                path,
+                input_file=input_files[0],
+                mask_flat=mask_flat,
+                n_voxels=n_voxels,
+                flag="-noise_pool_mask",
+                device=device,
+            ).to(data.device)
+            pool_restrict = keep if pool_restrict is None else pool_restrict & keep
+        for path in args.noise_pool_exclude or []:
+            drop = roi_mask_on_data_rows(
+                path,
+                input_file=input_files[0],
+                mask_flat=mask_flat,
+                n_voxels=n_voxels,
+                flag="-noise_pool_exclude",
+                device=device,
+            ).to(data.device)
+            pool_restrict = ~drop if pool_restrict is None else pool_restrict & ~drop
+        assert pool_restrict is not None  # one of the two loops ran
+        n_left = int(pool_restrict.sum().item())
+        print(f"  Noise pool may draw from {n_left:,} of {n_voxels:,} voxels before the R² cut")
+        if n_left < args.min_noise_voxels:
+            sys.exit(
+                f"ERROR: only {n_left:,} voxels survive the noise-pool ROIs, below "
+                f"-min_noise_voxels ({args.min_noise_voxels}).\n"
+                "       Check that the ROI is in the same space as the data, not just the "
+                "same grid."
+            )
 
     if args.automask and mask is not None:
         save_nifti(
@@ -3011,8 +3082,8 @@ def main():
         noise_pool_mask = initial_r2 < args.r2_threshold
 
         # Apply intensity threshold if provided
-        if brainthresh_mask is not None:
-            noise_pool_mask = noise_pool_mask & brainthresh_mask.to(device)
+        if pool_restrict is not None:
+            noise_pool_mask = noise_pool_mask & pool_restrict.to(device)
 
         n_noise = noise_pool_mask.sum().item()
         n_total = noise_pool_mask.numel()
@@ -3892,7 +3963,7 @@ def main():
             zero_event_strategy=args.zero_event,
             clean_reference_diagnostic=args.diag_clean_reference,
             compute_task_overlap=args.plots in ("yes", "full", "all"),
-            intensity_mask=brainthresh_mask,
+            intensity_mask=pool_restrict,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
             compute_noise_ceiling=args.noise_ceiling in ("auto", "loro", "df", "repeat"),
@@ -3944,7 +4015,7 @@ def main():
             zero_event_strategy=args.zero_event,
             clean_reference_diagnostic=args.diag_clean_reference,
             compute_task_overlap=args.plots in ("yes", "full", "all"),
-            intensity_mask=brainthresh_mask,
+            intensity_mask=pool_restrict,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
             compute_noise_ceiling=args.noise_ceiling in ("auto", "loro", "df", "repeat"),

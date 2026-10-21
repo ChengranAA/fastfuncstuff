@@ -2160,6 +2160,53 @@ def collect_noise_comp_blocks(
     return blocks
 
 
+def roi_mask_on_data_rows(
+    path: str,
+    *,
+    input_file,
+    mask_flat: np.ndarray | None,
+    n_voxels: int,
+    flag: str,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> torch.Tensor:
+    """A 3D ROI as a boolean row mask over the voxels an analysis is actually fitting.
+
+    Resampled to the data's grid when it is on another one, so an ROI drawn on
+    the anatomical works without a separate regrid step -- the same route
+    ``-noise_comps`` maps take (``tissue_mask_on_grid``), and the same 0.5
+    threshold, so a probability map behaves identically in both.
+
+    ``mask_flat`` is the analysis's own voxel selection; the returned mask is in
+    that domain, which is the only one the per-voxel tensors live in.
+    """
+    from fastfuncstuff.denoise.tissue_comps import reference_grid, tissue_mask_on_grid
+
+    if not Path(path).exists():
+        sys.exit(f"ERROR: {flag} file not found: {path}")
+    ref_shape, ref_affine = reference_grid(input_file)
+    try:
+        mask_xyz, counts = tissue_mask_on_grid(path, ref_shape, ref_affine, device=device)
+    except ValueError as exc:
+        sys.exit(f"ERROR: {flag} {path}: {exc}")
+    flat = np.ascontiguousarray(mask_xyz).reshape(-1)
+    if mask_flat is not None:
+        flat = flat[np.asarray(mask_flat).reshape(-1).astype(bool)]
+    if flat.size != n_voxels:
+        sys.exit(
+            f"ERROR: {flag} {path} covers {flat.size:,} of the analysed voxels, "
+            f"but {n_voxels:,} are being fitted.\n"
+            "       The ROI is not on this data's grid and could not be resampled onto it."
+        )
+    if verbose:
+        how = "resampled to the data grid, " if counts["resampled"] else ""
+        print(
+            f"  {flag} {Path(path).name}: {how}{counts['above_threshold']:,} voxels > 0.5, "
+            f"{int(flat.sum()):,} of them inside the analysed voxels"
+        )
+    return torch.from_numpy(flat)
+
+
 def append_nuisance_blocks_to_design_info(design_info: dict, blocks: list[NuisanceBlock]) -> int:
     """Append per-run (block-diagonal) nuisance columns to a loaded xmat ``design_info``.
 

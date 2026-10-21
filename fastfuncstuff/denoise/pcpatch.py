@@ -61,6 +61,7 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.denoise.nordic import _build_patch_starts, _default_kernel_size_pca
 from fastfuncstuff.io.afni import load_nifti, save_nifti
+from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.utils import get_device, to_tensor
 
 # ---------------------------------------------------------------------------
@@ -387,14 +388,14 @@ def run_pcpatch(
     data_dev = dev
     if dev.type == "cuda":
         vol_bytes = data_np.size * 4
-        free_b, _ = torch.cuda.mem_get_info(dev)
+        budget = get_available_memory(dev)
         # data + residual + recon accumulator, with headroom for the batch working set.
-        if 3.2 * vol_bytes > 0.5 * free_b:
+        if 3.2 * vol_bytes > budget:
             data_dev = torch.device("cpu")
             if cfg.verbose:
                 print(
                     f"  Memory guard: {3.2 * vol_bytes / 1024**3:.2f} GiB resident vs "
-                    f"{0.5 * free_b / 1024**3:.2f} GiB budget — streaming inputs from CPU."
+                    f"{budget / 1024**3:.2f} GiB budget — streaming inputs from CPU."
                 )
 
     data = to_tensor(data_np, dtype=torch.float32, device=data_dev)

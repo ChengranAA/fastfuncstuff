@@ -114,7 +114,16 @@ def test_paired_single_trials_outputs(tmp_path, monkeypatch):
 
 def test_paired_hrf_opt_reads_both_domain_maps(tmp_path, monkeypatch):
     """One hrfopt prefix run per domain feeds a paired fit; masked maps line up."""
+    import torch
+
+    from fastfuncstuff.design.hrf import get_hrf_library
+
     vols, surfs = _inputs(tmp_path)
+    # The library the indices number into; consumers refuse to guess it.
+    torch.save(
+        {"hrf_library": get_hrf_library(mode="library", device=torch.device("cpu"))},
+        tmp_path / "hrf_hrf_library.pt",
+    )
     nib.save(
         nib.Nifti1Image(np.full((2, 2, 2), 3, np.float32), np.eye(4)),
         tmp_path / "hrf_hrf_index.nii.gz",

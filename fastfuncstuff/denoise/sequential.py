@@ -78,7 +78,7 @@ from fastfuncstuff.glm.xval import (
     generate_cv_splits,
     project_out_nuisance_per_run,
 )
-from fastfuncstuff.memory import dyn_chunk_estimator
+from fastfuncstuff.memory import dyn_chunk_estimator, get_memory_config
 from fastfuncstuff.utils import (
     accum_dtype,
     cpu_if_mps,
@@ -502,14 +502,14 @@ def estimate_noise_component_caps_per_run(
                 next_max = int(np.ceil(current_max * growth_factor))
                 next_max = max(current_max + 1, next_max)
                 current_max = min(search_ceiling, next_max)
-                if device.type == "cuda":
-                    del pca
-                    torch.cuda.empty_cache()
+                # No empty_cache per search step: the caching allocator reuses
+                # (or, on a miss, flushes) these blocks itself; a flush per
+                # iteration only serialises the device. The per-run one below
+                # is the stage boundary.
+                del pca
                 continue
 
-            if device.type == "cuda":
-                del pca
-                torch.cuda.empty_cache()
+            del pca
             break
 
         cap = final_target
@@ -1732,27 +1732,38 @@ def cross_validate_noise_pcs(
     )
     is_loro_temp = cv_strategy == 1 and all(len(test) == 1 for _, test in cv_splits_temp)
 
-    # Projection device: use GPU when available, fall back to CPU if OOM risk
-    # For split-half: check if GPU has enough free memory for projections
+    # Projection device: the GPU when the chunk planner can fit a full-floor chunk
+    # of the working set there, else the CPU. LORO keeps only streaming stats, so
+    # it always qualifies; the full prediction accumulators of other strategies
+    # grow with max_components and may not.
     use_gpu_for_projections = False
     if device.type == "cuda":
-        # Check available GPU memory
-        gpu_free_gb = torch.cuda.mem_get_info(device)[0] / (1024**3)
-
         if is_loro_temp:
-            # LORO: streaming stats are tiny, always use GPU
             use_gpu_for_projections = True
         else:
-            # Split-half: use GPU if we have >6GB free (conservative threshold)
-            # This leaves room for projection matrices + accumulators
-            use_gpu_for_projections = gpu_free_gb > 6.0
+            floor = min(get_memory_config().min_chunk_size, data.shape[0])
+            gpu_chunk = dyn_chunk_estimator(
+                n_voxels=data.shape[0],
+                n_timepoints=data.shape[1],
+                n_task_regressors=design_matrix.shape[1],
+                n_nuisance_regressors=max_components,
+                device=device,
+                operation="denoise",
+                cv_strategy=cv_strategy,
+                n_runs=len(run_starts),
+                max_components=max_components,
+                data_location="cpu",
+                streaming_stats=False,
+                min_chunk_size=1,
+                per_component_actuals=clean_reference,
+            )
+            use_gpu_for_projections = gpu_chunk >= floor
             if verbose:
-                if use_gpu_for_projections:
-                    print(f"  GPU has {gpu_free_gb:.1f} GB free → using GPU for projections")
-                else:
-                    print(
-                        f"  GPU has {gpu_free_gb:.1f} GB free → using CPU for projections (need >6GB)"
-                    )
+                where = "GPU" if use_gpu_for_projections else "CPU"
+                print(
+                    f"  GPU fits {gpu_chunk:,} voxels per chunk (floor {floor:,}) "
+                    f"→ using {where} for projections"
+                )
 
     proj_device = device if use_gpu_for_projections else torch.device("cpu")
 
@@ -1861,9 +1872,6 @@ def cross_validate_noise_pcs(
                 max_components=max_components,
                 data_location="cpu",  # Data stays on CPU, chunks stream to GPU
                 streaming_stats=True,  # LORO uses streaming stats
-                min_chunk_size=20000,
-                max_chunk_size=None,
-                safety_factor=0.5,
                 verbose=verbose,
             )
         else:
@@ -1881,9 +1889,6 @@ def cross_validate_noise_pcs(
                 max_components=max_components,
                 data_location="cpu",
                 streaming_stats=False,  # Non-LORO uses full accumulators
-                min_chunk_size=10000,
-                max_chunk_size=None,
-                safety_factor=0.5,
                 verbose=verbose,
                 per_component_actuals=clean_reference,
             )

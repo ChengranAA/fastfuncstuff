@@ -1,4 +1,4 @@
-.PHONY: shaders check lint fix install test clean help completions
+.PHONY: shaders check lint fix install test test-fast test-file clean help completions
 
 help:
 	@echo "Available commands:"
@@ -6,7 +6,9 @@ help:
 	@echo "  make lint    - Run ruff linter only"
 	@echo "  make fix     - Auto-fix linting issues and format"
 	@echo "  make install - Install package in editable mode"
-	@echo "  make test    - Run pytest test suite"
+	@echo "  make test-file F=tests/test_foo.py - One file, serial (the iteration loop)"
+	@echo "  make test-fast - Everything but the slow set (after an iteration)"
+	@echo "  make test    - The whole non-GPU suite (two or three times a week)"
 	@echo "  make clean   - Remove generated files"
 	@echo "  make completions - Regenerate shell completions for the ffs_* tools"
 
@@ -23,8 +25,23 @@ fix:
 install:
 	pip install -e ".[dev]"
 
+# Three tiers, by how often they are meant to run. See the testing section of
+# CLAUDE.md for the measured costs and for what `slow` means.
+# One file, serially: the loop during iterative work. Most of its ~5 s is the
+# torch import, so there is nothing to gain by narrowing further than a file.
+test-file:
+	@test -n "$(F)" || { echo "usage: make test-file F=tests/test_foo.py"; exit 2; }
+	pytest $(F) -n 0
+
+# Once a change is finished. -m REPLACES addopts' own -m, so `not gpu` has to be
+# repeated here or every GPU test comes back.
+test-fast:
+	pytest tests/ -m "not slow and not gpu"
+
+# The whole non-GPU set, slow tests included. Run it a couple of times a week:
+# the slow set rots when nothing exercises it (it has already happened once).
 test:
-	pytest tests/ -v
+	pytest tests/
 
 completions:
 	@# Uses THIS environment's python on purpose: the tool list comes from its

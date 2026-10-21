@@ -38,9 +38,21 @@ All of these are spelled out under `../fmri_wiki/principles/`. Don't re-derive t
 
 ## Testing
 
+**Three tiers, by how often they run.** The suite is 7811 non-GPU tests and ~10–12 min end to end, which is far too slow to sit in an edit loop — so most testing is deliberately *not* the whole suite:
+
 ```bash
-/home/logan/miniconda3/envs/py314_ffs/bin/python -m pytest tests/ -q
+make test-file F=tests/test_foo.py   # ~5 s   — during iterative work
+make test-fast                       # ~5.5 min — once a change is finished
+make test                            # 10–12 min — two or three times a week
 ```
+
+1. **Iterating: run the touched file, nothing more.** `pytest tests/test_foo.py -n 0`. A typical file is ~5 s, of which **~3.9 s is the torch import** — `test_glm_core` is 29 tests in 0.82 s inside a 4.7 s invocation. Narrowing to a single test therefore buys almost nothing; the file is the right unit.
+2. **Change finished: `make test-fast`** (`-m "not slow and not gpu"`), ~5.5 min.
+3. **The full set, a couple of times a week:** plain `make test`. Not optional — the `slow` set rots when nothing exercises it, and that has already happened once: three stale tests surfaced the day it started running again, one of them failing because the code under test had *improved* past a tripwire.
+
+Where the time actually goes, measured at `-n auto` (3594 core-seconds total): 67 tests (0.9%) hold 43% of it, while ~7000 tests under 0.2 s plus worker startup are 555 core-seconds — **a floor of ~1.6 min that no amount of marking can remove.** That is why the `slow` cut is at 10 s: it captures nearly all of the removable weight, and the next thresholds down pay 111 more marks for another 0.9 min.
+
+**Marking criterion for `slow`: over ~10 s measured in the tier it will actually run in.** Put the cost in a comment next to the mark (`@pytest.mark.slow  # 27s`), and **re-measure after marking**, because the numbers move: much of the cost in the heavy files is a one-time per-process warm-up (compiled kernels, the session disk cache), charged to whichever test runs first. Marking that test hands its bill to its neighbour rather than deleting it — `test_laminar_cli`'s psf test is 1.3 s with its siblings and 42 s without them. Deselecting still won real time there (154 s → 51 s), but never trust a single test's duration across tiers.
 
 Per-module tests are colocated under `tests/`. Add a test for any new primitive — synthetic data is fine; we're verifying correctness, not benchmarking. The bar is "the test would have caught a real bug we hit", not coverage for its own sake.
 
@@ -53,7 +65,9 @@ Gotcha: pytest's `-m` is single-valued, so a command-line `-m` *replaces* the de
 - A test that only passes on more than one thread is a bug in the test. Thread count changes parallel reduction order, which moves float results ~1e-7 — enough to flip a convergence branch. Assert on the result, not on an iteration count or a convergence *reason*, and don't raise `FFS_TEST_NUM_THREADS` to make something pass. The exception is a test whose *subject* is a thread split: `tests/test_interp_grid_sample_threading.py` monkeypatches `torch.get_num_threads` to report a multicore box, because the lane count it tests is that number — otherwise its `is None` assertions pass on the cap instead of on their own condition.
 - `addopts` deselects only `gpu`, so **the `slow` set runs**. It had been sitting out for months under the habitual `-m "not slow and not gpu"`, and two of its tests had gone stale unnoticed — one of them failing because the code under test had *improved* past a tripwire. Don't assume a `slow` failure is new.
 
-Timings from a parallel run are **not** per-test costs: under oversubscription `--durations` inflated 18 s tests to 437 s. Time a suspected slow test with `-n 0` on its own file before shrinking or marking it.
+Parallel `--durations` are trustworthy *now* — one thread per worker puts the inflation at ~2.5% (a 63 s test reported 64.6 s), which is what makes the tiering numbers above plannable. They were not before: under the old oversubscription the same list inflated 18 s tests to 437 s and a 49 s test to 1954 s. If you ever see a `--durations` number you cannot believe, check the thread cap before believing it.
+
+**Don't assert bit-equality on a compiled path.** `torch.equal` between two routes through a `torch.compile`'d kernel holds in a clean process and then fails on collection order, because once enough distinct kernels accumulate some calls fall back to eager and differ in the last bit. `test_slabbed_matches_single_shot` asserted exactly that and failed only in the fast tier, at 4.8e-7 — one ULP — with *which* case tripped moving between runs. Assert at ULP tolerance (`assert_close(rtol=1e-6, atol=1e-6)`) and say in a comment what was measured. Same rule as the existing no-CUDA-bit-equality one.
 
 ## Type checking and linting
 

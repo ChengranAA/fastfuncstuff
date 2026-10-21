@@ -2995,7 +2995,8 @@ def _task_stage_on(args) -> bool:
 
     For -task_qc, which asks for the diagnostic, and for the modes that act on the
     estimated field and need its active mask (-detask field / ica, -warp_recon,
-    -reject). -events alone does not: it may be there only for a pre-estimation
+    -reject, and -write_pc_maps, whose per-component enrichment IS that mask's
+    measurement). -events alone does not: it may be there only for a pre-estimation
     -detask filter/fit or -ref paired, which are done by the time the field exists.
     """
     if not args.events:
@@ -3006,6 +3007,7 @@ def _task_stage_on(args) -> bool:
         or args.detask_ica
         or args.warp_recon
         or args.reject is not None
+        or args.write_pc_maps is not None
     )
 
 

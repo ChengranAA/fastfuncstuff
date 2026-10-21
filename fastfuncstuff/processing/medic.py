@@ -32,7 +32,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from ..utils import linalg_lstsq
+from ..utils import get_device, linalg_lstsq
 
 # Map a phase-encoding direction string to a NIfTI spatial axis (0=i/x, 1=j/y,
 # 2=k/z).  The sign ("j-") only affects displacement polarity, handled later.
@@ -423,7 +423,7 @@ def medic_fieldmaps(
     pe_dir : str
         Phase-encoding direction, e.g. "j" / "j-" / "y".
     """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or get_device()
     tes_np = np.asarray(tes, dtype=np.float32)
     pe_axis = PE_AXIS_MAP[pe_dir]
 

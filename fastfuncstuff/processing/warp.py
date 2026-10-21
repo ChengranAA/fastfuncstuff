@@ -4361,7 +4361,7 @@ def qwarp_pe_scaled_polish(
         raise ValueError("base_echoes/source_echoes must be (E, nz, ny, nx).")
 
     if device is None:
-        device = base_echoes.device if base_echoes.is_cuda else torch.device("cpu")
+        device = base_echoes.device
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
 
@@ -4450,7 +4450,7 @@ def qwarp_pe_scaled_polish_series(
     if config is None:
         config = QwarpConfig()
     if device is None:
-        device = base_echoes.device if base_echoes.is_cuda else torch.device("cpu")
+        device = base_echoes.device
     alpha = torch.ones(E, device=device) if alpha is None else alpha.float().to(device)
 
     # Build the frame-invariant geometry + base/weight/mask gathers ONCE.

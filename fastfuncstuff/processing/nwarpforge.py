@@ -29,7 +29,7 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
-from ..utils import full_fp32_matmul
+from ..utils import full_fp32_matmul, get_device
 from .interp import (
     _separable_resample_3d,
     normalize_interp_mode,
@@ -2070,7 +2070,7 @@ def nwarpforge(
         The sampled points when ``points`` is given, else None (the volume is saved).
     """
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
 
     interp = normalize_interp_mode(interp)
     if points is not None:

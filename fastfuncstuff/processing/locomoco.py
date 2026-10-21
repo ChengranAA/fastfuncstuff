@@ -50,6 +50,8 @@ except Exception:  # pragma: no cover - Triton is optional and CUDA-only
     shift1d_lanczos_triton = shift2d_triton = None
 from tqdm import tqdm
 
+from ..utils import get_device
+
 if TYPE_CHECKING:
     from fastfuncstuff.stats.fwhmx import FWHMxResult
 
@@ -2084,7 +2086,7 @@ def estimate_residual_flow(
     corrected series is rebuilt from the masked flow (so it stays consistent).
     """
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
     _validate_estimation_inputs(
         data.shape,
         pe_axis,
@@ -2844,7 +2846,7 @@ def estimate_residual_flow_rotaware(
     elif pe_axis == slice_axis:
         raise ValueError(f"-pe_axis ({pe_axis}) must differ from -slice_axis ({slice_axis}).")
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
 
     nx, ny, nz, nt = raw_data.shape
     _validate_estimation_inputs(
@@ -5873,7 +5875,7 @@ def estimate_residual_flow_multiecho(
     plus the shared ``alpha`` / linearity diagnostics.
     """
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
     e = len(datas)
     if e < 2:
         raise ValueError(f"multi-echo needs ≥2 echoes, got {e}.")
@@ -6415,7 +6417,7 @@ def estimate_residual_flow_me_scaled(
     trial_step = axis_scalar(trial_step, "-xcorr_step")
     reg_sigma = axis_scalar(reg_sigma, "-reg_sigma")
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
     e = len(datas)
     if len(echo_times) != e:
         raise ValueError(f"-echo_times has {len(echo_times)} values but there are {e} inputs.")
@@ -6813,11 +6815,7 @@ def polish_me_result(
 
     # Reference = temporal median of the corrected series (refined template). The
     # moving data is the corrected series (polish) or the raw echoes (full backend).
-    dev = (
-        device
-        if device is not None
-        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    dev = device if device is not None else get_device()
     red = _refine_reduce_label(ref_mode)
     if verbose:
         print(
@@ -7075,7 +7073,7 @@ def estimate_residual_flow_me_interecho(
     trial_step = axis_scalar(trial_step, "-xcorr_step")
     reg_sigma = axis_scalar(reg_sigma, "-reg_sigma")
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
     e = len(datas)
     if e < 2:
         raise ValueError(f"inter-echo needs ≥2 echoes, got {e}.")
@@ -7509,7 +7507,7 @@ def refine_interecho_temporally(
     trial_step = axis_scalar(trial_step, "-xcorr_step")
     reg_sigma = axis_scalar(reg_sigma, "-reg_sigma")
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_device()
     e = len(datas)
     nx, ny, nz, nt = datas[0].shape
     proto = result.per_echo[0]

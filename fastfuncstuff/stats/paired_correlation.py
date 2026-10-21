@@ -94,7 +94,9 @@ def paired_voxel_correlation(
     ``atanh(r)``.
     """
     if device is None:
-        device = torch.device("cpu")
+        from fastfuncstuff.utils import get_device
+
+        device = get_device()
     n = len(series)
     pairs = list(pairs) if pairs is not None else pair_list(n, "all")
     if n < 2:

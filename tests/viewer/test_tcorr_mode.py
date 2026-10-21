@@ -72,7 +72,10 @@ def test_go_draws_the_pair_map_and_it_matches_the_primitive(session, files):
     assert vol[3, 4, 3] > 0.8, "the shared blob must correlate"
     assert abs(float(np.median(vol))) < 0.2, "independent noise must not"
     ref = paired_voxel_correlation(
-        [nib.load(p).get_fdata(dtype=np.float32) for p in paths[:2]], polort=2, verbose=False
+        [nib.load(p).get_fdata(dtype=np.float32) for p in paths[:2]],
+        polort=2,
+        device=torch.device("cpu"),
+        verbose=False,
     )[..., 0]
     np.testing.assert_allclose(vol, ref.numpy(), atol=1e-5)
 

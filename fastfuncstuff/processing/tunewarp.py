@@ -32,6 +32,7 @@ import numpy as np
 import torch
 
 from ..io.dsetinfo import read_info
+from ..utils import get_device
 from .affine import load_matrix_1D, save_matrix_1D
 from .allineate import _voxdims_from_header
 from .io import load_image, load_warp_field, save_image, save_warp_field
@@ -643,7 +644,7 @@ def affine_align(
     from .allineate import AffineAlignConfig
     from .allineate import allineate as run_allineate
 
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or get_device()
     cache = out_dir / "affine"
     cache.mkdir(parents=True, exist_ok=True)
 
@@ -994,7 +995,7 @@ def run_search(
     progress=None,
 ) -> None:
     """Search every backend over its own full grid, on every subject."""
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or get_device()
     names = backends or list(recipe.backends)
     for backend in names:
         if backend not in BACKENDS:
@@ -1254,7 +1255,7 @@ def run_adaptive(
     than a refusal because only the operator can judge whether a given commit
     moved the numbers.
     """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or get_device()
     names = backends or list(recipe.backends)
     for backend in names:
         if backend not in BACKENDS:
@@ -1448,7 +1449,7 @@ def evaluate_holdout(
     """
     if not pairs:
         return []
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or get_device()
 
     ranked = [r for r in store.results(split="train") if not r.is_baseline]
     # The frontier rows are the real choices on the accuracy/smoothness trade, so
@@ -1733,7 +1734,7 @@ def group_diagnostics(
     subjects *have* each label, which is what separates a parcel the tracers left
     out from one the warp misplaced.
     """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or get_device()
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics = resolve_diagnostic_metrics(metrics, recipe.contrast)
     volumes = CohortVolumes.open(pairs, device)
@@ -2187,7 +2188,7 @@ def diagnose_warped(
     quietly, it reports implausible folding, so that column doubles as the check
     that the field was understood at all.
     """
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = device or get_device()
     metrics = resolve_diagnostic_metrics(metrics, contrast)
     referee = Referee(base, device) if base else None
     if referee is not None and verb >= 1:

@@ -204,11 +204,9 @@ def _lm_curvefit_chunk(
     # MPS has no float64; the LM fit runs in float32 there (use -device cpu for
     # full float64 precision). The fit is full-batch over voxels, so a CPU
     # fallback would mean a large host transfer per chunk.
-    if y.device.type == "mps":
+    dtype = widest_float_dtype(y.device)
+    if dtype != torch.float64:
         warn_mps_float32_precision("multi-echo T2*/S0 LM fit")
-        dtype = torch.float32
-    else:
-        dtype = torch.float64
     te = tes.to(dtype)
     y = y.to(dtype)
     w = weights.to(dtype)

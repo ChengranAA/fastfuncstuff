@@ -325,7 +325,7 @@ def equivolume_metric(t: Tiling, surf, smooth_rounds: int = 1, device=None) -> n
     def dev(a):
         return torch.as_tensor(a, device=device)
 
-    cdf = column_depth_cdf(
+    cdf, _ = column_depth_cdf(
         dev(t.rho[ends]), dev(t.foot_face[ends]), dev(t.foot_bary[ends]), faces,
         len(surf.white), weight=dev(np.r_[t.volume, t.volume] * 0.5),
         rho_hi=dev(t.rho[other]), rounds=smooth_rounds,

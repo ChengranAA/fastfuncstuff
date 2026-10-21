@@ -44,7 +44,13 @@ anatomical) at voxel size -dxyz (default: the master's own), cropped to the cort
 unless -no_autobox. A functional image aligned to the anatomical, upsampled with
 -dxyz, gives layers on exactly the part of the brain it covers.
 
-Outputs (prefix P), named as LN2_LAYERS names them:
+With -roi, only the cortex a region covers is layered, cropped to that patch and
+written per region. A volume region (a thresholded statistic, say) is turned into
+whole cortical columns, so a patchy blob becomes a depth-spanning ROI; cortex
+around it is computed to get the equivolume depths right and then dropped.
+
+Outputs (prefix P, or P_<region> with -roi; -roi also writes P_<region>_roi,
+the region as a mask), named as LN2_LAYERS names them:
   P_rim              1 = CSF border, 2 = WM border, 3 = GM  (an LN2_* -rim input)
   P_metric_equidist  P_layers_equidist  P_midGM_equidist
   P_metric_equivol   P_layers_equivol   P_midGM_equivol
@@ -93,7 +99,72 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "layers; columns are widened along the surface until they hold this many (64)",
     )
     s.add_argument(
+        "-column_rounds",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Equivolume: rounds of 1-ring pooling, instead of the number -column_voxels "
+        "asks for at this resolution.  Pass a whole-hemisphere run's reported rounds to "
+        "reproduce its depths exactly inside a -roi",
+    )
+    s.add_argument(
         "-thick_warn", type=float, default=6.0, metavar="MM", help="Warn above this thickness (6)"
+    )
+
+    r = p.add_argument_group(
+        "regions",
+        "Layers for part of the cortex only, each region on its own cropped grid.  "
+        "Everything is still measured from the whole surfaces, so the depths are the "
+        "ones a whole-hemisphere run gives -- only the grid is small.",
+    )
+    r.add_argument(
+        "-roi",
+        "-rois",
+        dest="roi",
+        nargs="+",
+        default=None,
+        metavar="ROI",
+        help="Region(s) to layer, as surface or volume files, in any mix.  Surface: a "
+        "FreeSurfer .label (an ROI drawn in ffs_viewer), .annot (one region per name) or "
+        "a .label.gii.  Volume: a 3-D integer label map (one region per value), a 3-D "
+        "binary mask (one region, named after the file) or a 4-D stack (one per volume), "
+        "on any grid in register with the surfaces -- no resampling needed.  A volume "
+        "region claims the cortical columns it covers at any depth (-roi_claim), so a "
+        "thresholded statistic that only reaches the pial half still gives whole-depth "
+        "columns.  Outputs are PREFIX_<region>_<tag>, plus PREFIX_<region>_roi, the "
+        "region's own voxels as a mask",
+    )
+    r.add_argument(
+        "-roi_fill",
+        type=float,
+        default=2.0,
+        metavar="MM",
+        help="Close holes and notches narrower than twice this far along the surface (2 "
+        "mm), so the specks a threshold leaves inside a region become part of it.  0 "
+        "takes the region exactly as given",
+    )
+    r.add_argument(
+        "-roi_surround",
+        type=float,
+        default=None,
+        metavar="MM",
+        help="Cortex computed around each region along the surface, and then dropped.  "
+        "Equivolume pools each column's volume with its neighbours', so the columns at a "
+        "region's edge need cortex beyond it or they pool against nothing.  The default "
+        "is worked out per region from the voxel size and the meshes, which is what it "
+        "depends on -- a 0.8 mm grid pools several times further than a 0.2 mm one.  "
+        "Either way the run reports how far it pooled and says so if the surround was "
+        "too small.  Costs grid, not accuracy: more surround is a bigger box to measure "
+        "and throw away",
+    )
+    r.add_argument(
+        "-roi_claim",
+        default="any",
+        choices=("any", "mid"),
+        help="Which columns a VOLUME region claims: 'any' = the region covers the ribbon "
+        "anywhere along the column's depth (default -- what a thresholded map needs), "
+        "'mid' = at its midthickness point only (stricter, and what the ROI depth "
+        "sampling in ffs_reml/ffs_nwarp uses)",
     )
 
     o = p.add_argument_group("execution")
@@ -158,6 +229,8 @@ def main(argv: list[str] | None = None) -> int:
     if verbose:
         print(f"ffs_util_surf2layers: master {master}")
     affine, shape = master_grid(master)
+    if args.roi:
+        return _roi_main(args, surfaces, affine, shape, stem, ext, device, verbose, t0)
     try:
         out, affine, _ = export_depth_volumes(
             surfaces,
@@ -170,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
             pad_mm=args.autobox_pad,
             n_layers=args.nr_layers,
             column_voxels=args.column_voxels,
+            column_rounds=args.column_rounds,
             thick_limit=args.thick_warn,
             device=device,
             verbose=verbose,
@@ -180,11 +254,66 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  GM voxels {out.n_gm:,}  medial wall dropped {out.n_medial:,}"
             + (f"  hemisphere overlap {out.n_overlap:,}" if out.n_overlap else "")
+            + f"  equivolume pooling {'/'.join(str(r) for _, r in out.smooth_rounds)} rounds"
         )
     for line in thick_report(out, affine):
         print(line)
     if verbose:
         print(f"ffs_util_surf2layers done in {time.time() - t0:.0f}s -> {stem}_*{ext}")
+    return 0
+
+
+def _roi_main(args, surfaces, affine, shape, stem, ext, device, verbose, t0) -> int:
+    """``-roi``: one region at a time, each on its own crop."""
+    from fastfuncstuff.processing.roi_depth import CLAIM_ANY, CLAIM_MID, read_depth_rois
+    from fastfuncstuff.surface.volume_depth import (
+        export_roi_depth_volumes,
+        roi_report,
+        thick_report,
+    )
+
+    notes: list[str] = []
+    try:
+        rois = read_depth_rois(
+            args.roi, surfaces, notes, CLAIM_MID if args.roi_claim == "mid" else CLAIM_ANY
+        )
+        if verbose:
+            for note in notes:
+                print(f"  {note}")
+        results = export_roi_depth_volumes(
+            surfaces,
+            affine,
+            shape,
+            stem,
+            ext,
+            rois,
+            dxyz=args.dxyz,
+            autobox=not args.no_autobox,
+            pad_mm=args.autobox_pad,
+            fill_mm=args.roi_fill,
+            surround_mm=args.roi_surround,
+            n_layers=args.nr_layers,
+            column_voxels=args.column_voxels,
+            column_rounds=args.column_rounds,
+            thick_limit=args.thick_warn,
+            device=device,
+            verbose=verbose,
+        )
+    except (OSError, ValueError) as err:
+        raise SystemExit(f"ffs_util_surf2layers: {err}") from err
+    for res in results:
+        if verbose:
+            for line in roi_report(res):
+                print(line)
+        elif not res.enough_surround:
+            print(roi_report(res)[-1])
+        for line in thick_report(res.out, res.affine):
+            print(line)
+    if verbose:
+        print(
+            f"ffs_util_surf2layers done in {time.time() - t0:.0f}s -> "
+            f"{len(results)} region(s), {stem}_<region>_*{ext}"
+        )
     return 0
 
 

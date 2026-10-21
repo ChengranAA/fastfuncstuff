@@ -61,6 +61,62 @@ def test_writes_laynii_set_on_upsampled_master(tmp_path, capsys):
     assert 0.4 < (lh == 3).sum() / (rim == 3).sum() < 0.6
 
 
+def test_roi_restricts_and_crops_to_the_patch(tmp_path, capsys):
+    """``-roi``: one patch per region, cropped, with the same depths as the whole run."""
+    import nibabel.freesurfer as nfs
+
+    from fastfuncstuff.io.freesurfer import write_label
+
+    subj, master = _subject(tmp_path)
+    run = ["-fs_subj", str(subj), "-master", str(master), "-dxyz", "0.5", "-device", "cpu"]
+    whole = tmp_path / "whole"
+    assert main([*run, "-prefix", str(whole), "-quiet"]) == 0
+    full = nib.load(f"{whole}_rim.nii.gz")
+    full_rim, full_eq = (
+        np.asarray(full.dataobj),
+        np.asarray(nib.load(f"{whole}_metric_equidist.nii.gz").dataobj),
+    )
+
+    # A drawn surface ROI: the +z cap of the left hemisphere.
+    lh_white = nfs.read_geometry(str(subj / "surf" / "lh.white"))[0]
+    ids = np.flatnonzero(lh_white[:, 2] > 4.0)
+    assert ids.size > 20
+    label = tmp_path / "cap.lh.label"
+    # A label carries tkregister coordinates, which is what read_geometry returns;
+    # the reader checks them against the white surface to find the hemisphere.
+    write_label(label, ids, lh_white[ids], np.zeros(ids.size))
+    # A volume ROI: a box over the right hemisphere, as a 3-D mask on the master grid.
+    vol = np.zeros(full_rim.shape[:3], np.int16)
+    vol[full_rim.shape[0] // 2 :, :, full_rim.shape[2] // 2 :] = 1
+    roi_path = tmp_path / "boxy.nii.gz"
+    nib.save(nib.Nifti1Image(vol, full.affine), str(roi_path))
+
+    prefix = tmp_path / "r" / "p"
+    assert main([*run, "-prefix", str(prefix), "-roi", str(label), str(roi_path)]) == 0
+    out = capsys.readouterr().out
+    assert "cap_lh" in out and "boxy" in out and "WARNING" not in out
+
+    for name in ("cap_lh", "boxy"):
+        rim = nib.load(f"{prefix}_{name}_rim.nii.gz")
+        gm = np.asarray(rim.dataobj) == 3
+        # Cropped to the patch, and much smaller than the whole-cortex run.
+        assert gm.sum() and gm.sum() < 0.4 * (full_rim == 3).sum()
+        assert np.prod(rim.shape) < np.prod(full_rim.shape)
+        # The region's own mask is exactly the GM that was written.
+        mask = np.asarray(nib.load(f"{prefix}_{name}_roi.nii.gz").dataobj)
+        np.testing.assert_array_equal(mask > 0, gm)
+        # Whole columns: the patch spans the depth even where the ROI did not.
+        metric = np.asarray(nib.load(f"{prefix}_{name}_metric_equidist.nii.gz").dataobj)
+        assert metric[gm].min() < 0.15 and metric[gm].max() > 0.85
+        # Same voxels, same equidistant depth as the whole-cortex run: the crop and
+        # the restriction move nothing (exact -- these are point-to-mesh distances).
+        inv = np.linalg.inv(full.affine) @ rim.affine
+        lo = np.rint(inv[:3, 3]).astype(int)
+        sl = tuple(slice(a, a + n) for a, n in zip(lo, rim.shape, strict=True))
+        assert (full_rim[sl][gm] == 3).all()
+        np.testing.assert_allclose(full_eq[sl][gm], metric[gm], atol=1e-6)
+
+
 def test_alternative_surface_names(tmp_path):
     subj, master = _subject(tmp_path)
     for hemi in ("lh", "rh"):

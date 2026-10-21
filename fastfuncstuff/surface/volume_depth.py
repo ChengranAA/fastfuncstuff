@@ -27,7 +27,7 @@ import scipy.sparse as sp
 import torch
 
 from fastfuncstuff.memory import get_available_memory
-from fastfuncstuff.surface.mesh import MeshTopology
+from fastfuncstuff.surface.mesh import MeshTopology, vertex_areas
 from fastfuncstuff.surface.voxelize import MeshDistance, winding_number
 
 #: Rim labels, as LN2_LAYERS reads them.
@@ -100,6 +100,11 @@ class DepthVolumes:
     thick_limit: float = 6.0
     #: GM-by-fill voxels dropped as medial wall.
     n_medial: int = 0
+    #: GM voxels dropped because their column is outside the region asked for.
+    n_outside: int = 0
+    #: ``(hemisphere index, rounds)`` of 1-ring mesh pooling the equivolume CDF used:
+    #: how far along the surface each column's volume was measured.
+    smooth_rounds: tuple[tuple[int, int], ...] = ()
     #: GM voxels claimed by two hemispheres, or by one's GM and the other's WM.
     n_overlap: int = 0
     #: With ``owners=True``: each GM voxel's column -- the index into ``surfaces``
@@ -156,6 +161,10 @@ class DepthVolumes:
     def thickness(self) -> np.ndarray:
         return self._dense(self.thick)
 
+    def gm_mask(self, value: int = 1) -> np.ndarray:
+        """The GM voxels as an int16 volume holding ``value``: the region, cropped."""
+        return self._dense(np.int16(value), dtype=np.int16)
+
     def outputs(self) -> Iterator[tuple[str, np.ndarray]]:
         """``(LN2_LAYERS file tag, volume)``, built one at a time."""
         for tag in OUTPUT_TAGS:
@@ -210,7 +219,8 @@ def volume_quantile_depth(
     n_vertices: int,
     column_voxels: float = 64.0,
     bins: int = 64,
-) -> torch.Tensor:
+    rounds: int | None = None,
+) -> tuple[torch.Tensor, int]:
     """Equivolume depth as each voxel's volume quantile within its cortical column.
 
     Equivolume layers are the depths that split every column's volume into
@@ -233,9 +243,25 @@ def volume_quantile_depth(
     depth histograms smoothed along the mesh until a column holds
     ~``column_voxels`` voxels: the measured optimum at both 0.25 and 0.4 mm,
     where the rounds needed differed fourfold.
+
+    Returns the depths and the rounds of mesh smoothing they took -- how far along
+    the surface a column's volume was pooled, which is how much cortex beyond a
+    region of interest its equivolume depths depend on. ``rounds`` sets that count
+    instead of deriving it from the voxels per column seen here.
     """
-    cdf = column_depth_cdf(rho, face, bary, faces, n_vertices, column_voxels, bins)
-    return column_quantile(cdf, rho, face, bary, faces)
+    cdf, rounds = column_depth_cdf(
+        rho, face, bary, faces, n_vertices, column_voxels, bins, rounds=rounds
+    )
+    return column_quantile(cdf, rho, face, bary, faces), rounds
+
+
+def column_smooth_rounds(n_samples: int, n_columns: int, column_voxels: float) -> int:
+    """Rounds of 1-ring pooling for a column to hold ~``column_voxels`` samples."""
+    return _rounds_for(n_samples / max(int(n_columns), 1), column_voxels)
+
+
+def _rounds_for(per_vertex: float, column_voxels: float) -> int:
+    return int(np.clip(np.ceil(column_voxels / max(per_vertex, 1e-9)), 1, 500))
 
 
 def column_depth_cdf(
@@ -249,8 +275,9 @@ def column_depth_cdf(
     weight: torch.Tensor | None = None,
     rho_hi: torch.Tensor | None = None,
     rounds: int | None = None,
-) -> torch.Tensor:
-    """Each column's volume CDF over equidistant depth, ``(V, bins + 1)``.
+) -> tuple[torch.Tensor, int]:
+    """Each column's volume CDF over equidistant depth, ``(V, bins + 1)``, and
+    the rounds of mesh smoothing used.
 
     The first half of :func:`volume_quantile_depth`, for samples of the ribbon that
     are not equal-volume voxels: ``weight`` is each sample's volume, and with
@@ -282,17 +309,17 @@ def column_depth_cdf(
         for k in range(3):
             hist.index_add_(0, fv[:, k] * bins + b, wb[:, k])
     hist = hist.view(n_vertices, bins)
-    per_vertex = rho.numel() / max(int((hist.sum(1) > 0).sum()), 1)
     n_iter = (
-        int(np.clip(np.ceil(column_voxels / per_vertex), 1, 500)) if rounds is None else int(rounds)
+        column_smooth_rounds(rho.numel(), int((hist.sum(1) > 0).sum()), column_voxels)
+        if rounds is None
+        else int(rounds)
     )
     # (V, bins) is small; the sparse smoothing stays with scipy.
     smooth = _smooth_on_mesh(hist.cpu().numpy(), faces, n_iter)
     total = smooth.sum(1, keepdims=True)
     cdf = np.concatenate([np.zeros((n_vertices, 1)), np.cumsum(smooth, 1)], 1)
-    return torch.as_tensor(
-        cdf / np.where(total > 0, total, 1.0), dtype=torch.float32, device=device
-    )
+    out = torch.as_tensor(cdf / np.where(total > 0, total, 1.0), dtype=torch.float32, device=device)
+    return out, n_iter
 
 
 def column_quantile(
@@ -364,6 +391,8 @@ def cortical_depth_volumes(
     thick_limit: float = 6.0,
     k: int = 24,
     owners: bool = False,
+    columns: list[np.ndarray] | None = None,
+    column_rounds: int | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
 ) -> DepthVolumes:
@@ -378,8 +407,24 @@ def cortical_depth_volumes(
     thick_limit : GM voxels thicker than this (mm) are counted and located.
     k : candidate faces per voxel for the CPU distance search (see MeshDistance).
     owners : also record each GM voxel's owning vertex (one more distance search).
+    columns : one vertex mask per hemisphere -- keep only the voxels those cortical
+        columns own (implies ``owners``, by whose rule membership is decided). The
+        depths are measured first and the voxels dropped after, so what is kept is
+        exactly what an unrestricted run would have put there, as long as the grid
+        holds enough cortex around the region for the equivolume CDF's pooling (see
+        :func:`export_roi_depth_volumes`). Dropped voxels are not rim borders, as
+        the medial wall's are not -- the patch's lateral edge is open rather than
+        labelled a CSF border it is not.
+    column_rounds : rounds of 1-ring pooling for the equivolume CDF, instead of the
+        count derived from the voxels per column measured here. Cortical thickness
+        and vertex density vary over a hemisphere, so a region's own measurement
+        differs a little from a whole hemisphere's; pass the ``smooth_rounds`` of a
+        whole-hemisphere run to reproduce its depths exactly.
     """
     device = device or torch.device("cpu")
+    owners = owners or columns is not None
+    if columns is not None and len(columns) != len(surfaces):
+        raise ValueError(f"columns: {len(columns)} masks for {len(surfaces)} surfaces")
     shape = tuple(int(s) for s in shape)
     affine = np.asarray(affine, np.float64)
     t0 = time.time()
@@ -408,6 +453,7 @@ def cortical_depth_volumes(
     # ~4 voxels a side: measured fastest at 0.35 mm (64 points fill a program).
     brick_mm = 4.0 * float(np.abs(np.linalg.det(affine[:3, :3])) ** (1 / 3))
     per_hemi = []
+    rounds_used: list[tuple[int, int]] = []
     for h, s in enumerate(surfaces):
         idx = np.flatnonzero(flat_owner == h + 1)
         if idx.size == 0:
@@ -448,11 +494,35 @@ def cortical_depth_volumes(
             idx_t, rho, thick, face, bary, owner_v = (
                 a[keep] for a in (idx_t, rho, thick, face, bary, owner_v)
             )
-        equivol = volume_quantile_depth(rho, face, bary, s.faces, len(s.white), column_voxels)
+        keep_t = None
+        rounds = column_rounds
+        if columns is not None:
+            keep_t = torch.as_tensor(np.asarray(columns[h], bool), device=device)[owner_v]
+            if rounds is None:
+                # Pool as a whole-hemisphere run would. The surround exists so the
+                # region's own columns are complete, but the surround's outermost
+                # columns are cut off by the crop and read as sparse; measuring the
+                # voxels per column over the region's own columns -- the same
+                # estimator, over the columns this grid actually holds whole --
+                # keeps the pooling independent of how much surround was taken.
+                vf = torch.as_tensor(s.faces, device=device)[face[keep_t]]
+                touched = vf[bary[keep_t] > 0]
+                rounds = column_smooth_rounds(
+                    int(keep_t.sum()), int(torch.unique(touched).numel()), column_voxels
+                )
+        equivol, rounds = volume_quantile_depth(
+            rho, face, bary, s.faces, len(s.white), column_voxels, rounds=rounds
+        )
+        rounds_used.append((h, rounds))
         del face, bary
+        if keep_t is not None:
+            flat_owner[np.asarray(idx_t.cpu())[~keep_t.cpu().numpy()]] = -2
+            idx_t, rho, equivol, thick, owner_v = (
+                a[keep_t] for a in (idx_t, rho, equivol, thick, owner_v)
+            )
         owner_h = torch.full_like(owner_v, h, dtype=torch.int8)
         per_hemi.append((idx_t, rho, equivol, thick, owner_h, owner_v))
-        log(f"{s.name}: depth metrics")
+        log(f"{s.name}: depth metrics ({rounds} pooling rounds)")
 
     if per_hemi:
         gm_idx = torch.cat([p[0] for p in per_hemi])
@@ -499,6 +569,8 @@ def cortical_depth_volumes(
         n_thick=int((thick > thick_limit).sum()),
         thick_limit=float(thick_limit),
         n_medial=int((flat_owner == -1).sum()),
+        n_outside=int((flat_owner == -2).sum()),
+        smooth_rounds=tuple(rounds_used),
         n_overlap=n_overlap,
         owner_hemi=host(owner_h) if owners else None,
         owner_vertex=host(owner_v) if owners else None,
@@ -563,6 +635,7 @@ def export_depth_volumes(
     pad_mm: float = 1.0,
     n_layers: int = 3,
     column_voxels: float = 64.0,
+    column_rounds: int | None = None,
     thick_limit: float = 6.0,
     device: torch.device | None = None,
     verbose: bool = False,
@@ -595,6 +668,7 @@ def export_depth_volumes(
         shape,
         n_layers,
         column_voxels=column_voxels,
+        column_rounds=column_rounds,
         thick_limit=thick_limit,
         device=device,
         verbose=verbose,
@@ -608,6 +682,270 @@ def export_depth_volumes(
         save_nifti(vol, path, affine=affine)
         written.append(path)
     return out, affine, written
+
+
+@dataclass
+class RoiDepthResult:
+    """One region's depth volumes on its own cropped grid."""
+
+    name: str
+    value: int
+    out: DepthVolumes
+    affine: np.ndarray
+    written: list[str]
+    #: Vertices the region covers, and after filling and growing, per hemisphere.
+    n_own: int = 0
+    n_filled: int = 0
+    n_grown: int = 0
+    surround_mm: float = 0.0
+    #: How far along the surface the equivolume pooling reached, mm. Beyond
+    #: ``surround_mm`` the pooling ran into the edge of the cropped grid.
+    pooled_mm: float = 0.0
+
+    @property
+    def enough_surround(self) -> bool:
+        return self.pooled_mm <= self.surround_mm + 1e-6
+
+
+def estimate_column_reach(
+    surfaces: list[RibbonSurfaces],
+    affine: np.ndarray,
+    column_voxels: float = 64.0,
+    members: list[np.ndarray] | None = None,
+    slack_rounds: int = 1,
+) -> tuple[int, float]:
+    """``(pooling rounds, how far they reach along the surface in mm)``, predicted.
+
+    The equivolume CDF pools each column with its neighbours until a column holds
+    ~``column_voxels`` voxels, so how far it reaches is set by how many voxels a
+    column holds -- its thickness times its vertex's area over the voxel volume --
+    and that is known from the meshes and the grid before anything is computed. Used
+    to size the surround a region needs (:func:`export_roi_depth_volumes`); the run
+    then reports what it actually pooled, which is the number that counts.
+
+    ``slack_rounds`` is added to the prediction because the thing predicted is a
+    small integer: the CDF counts a voxel into each of its foot face's corners, so
+    it sees a little less per column than a vertex's own area says and rounds up one
+    more time than this does -- measured on a synthetic shell, 3 predicted against 4
+    taken. A round of slack is a millimetre of surround; being a round short is a
+    wrong depth at the region's edge.
+    """
+    rounds, reach = 1, 0.0
+    vox = float(np.abs(np.linalg.det(np.asarray(affine, np.float64)[:3, :3])))
+    for h, s in enumerate(surfaces):
+        m = np.ones(len(s.white), bool) if members is None else np.asarray(members[h], bool)
+        if s.cortex is not None:
+            m = m & np.asarray(s.cortex, bool)
+        if not m.any():
+            continue
+        mid = 0.5 * (np.asarray(s.white, np.float64) + np.asarray(s.pial, np.float64))
+        thick = np.linalg.norm(np.asarray(s.pial) - np.asarray(s.white), axis=1)
+        area = vertex_areas(mid, s.faces, len(s.white))
+        per_vertex = float((thick[m] * area[m]).mean()) / max(vox, 1e-12)
+        r = _rounds_for(per_vertex, column_voxels) + int(slack_rounds)
+        rounds = max(rounds, r)
+        reach = max(reach, r * _mean_edge_mm(mid, s.faces))
+    return rounds, reach
+
+
+def _mean_edge_mm(positions: np.ndarray, faces: np.ndarray) -> float:
+    """Mean edge length, mm: one round of 1-ring pooling reaches about this far."""
+    topo = MeshTopology.from_faces(faces, len(positions))
+    e = topo.edges
+    return float(np.linalg.norm(positions[e[:, 0]] - positions[e[:, 1]], axis=1).mean())
+
+
+def grow_columns(
+    surfaces: list[RibbonSurfaces],
+    members: dict[int, np.ndarray],
+    *,
+    fill_mm: float = 2.0,
+    surround_mm: float = 10.0,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """A region's columns, filled and grown: ``(own, padded)`` vertex masks per hemisphere.
+
+    ``members`` maps a hemisphere's index to the vertices the region covers, as
+    ``processing.roi_depth`` reads an ROI file. Two steps, both along the mesh:
+
+    * **fill** (``fill_mm``): a morphological closing, so a region that came from a
+      thresholded volume spans the depth as a column should. A voxel that fell below
+      threshold leaves a hole in the patch, not a hole in the cortex.
+    * **grow** (``surround_mm``): the surround the equivolume CDF needs. Each column's
+      volume is pooled with its neighbours' for several rounds, so a column's depths
+      depend on cortex a few millimetres away; computing the region alone would leave
+      its border columns pooling against nothing. The grown patch only sets the grid
+      that gets computed -- the filled patch is what gets written.
+    """
+    from fastfuncstuff.surface.mesh import close_patch, dilate_patch
+
+    own, padded = [], []
+    for h, s in enumerate(surfaces):
+        mask = np.asarray(members.get(h, np.zeros(len(s.white), bool)), bool)
+        if not mask.any():
+            own.append(mask)
+            padded.append(mask)
+            continue
+        mid = 0.5 * (np.asarray(s.white, np.float64) + np.asarray(s.pial, np.float64))
+        topo = MeshTopology.from_faces(s.faces, len(s.white))
+        o = close_patch(mid, topo, mask, fill_mm)
+        if s.cortex is not None:  # the medial wall has no ribbon voxels to claim
+            o &= np.asarray(s.cortex, bool)
+        own.append(o)
+        padded.append(dilate_patch(mid, topo, o, surround_mm))
+    return own, padded
+
+
+def export_roi_depth_volumes(
+    surfaces: list[RibbonSurfaces],
+    master_affine: np.ndarray,
+    master_shape: tuple[int, int, int],
+    stem: str,
+    ext: str,
+    rois,
+    *,
+    dxyz=None,
+    autobox: bool = True,
+    pad_mm: float = 1.0,
+    fill_mm: float = 2.0,
+    surround_mm: float | None = None,
+    n_layers: int = 3,
+    column_voxels: float = 64.0,
+    column_rounds: int | None = None,
+    thick_limit: float = 6.0,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> list[RoiDepthResult]:
+    """:func:`export_depth_volumes` for one region at a time, each on its own crop.
+
+    Why a region cannot simply be cut out of a whole-hemisphere run's outputs: it can,
+    and that is the expensive way -- a hemisphere at 0.2 mm is tens of millions of
+    ribbon voxels for a patch that is thousands. The crop is taken *first*, around the
+    region grown by ``surround_mm`` (:func:`grow_columns`), and the depths come out the
+    same because every one of them is a local measurement: the fills, the point-to-mesh
+    distances and the column CDFs all read geometry within a column's reach of the
+    voxel. The one thing that is not local is how far the CDF pools along the surface,
+    which the grown surround covers and :attr:`RoiDepthResult.pooled_mm` checks.
+
+    ``surround_mm`` None sizes that surround per region from the grid and the meshes
+    (:func:`estimate_column_reach`, plus a quarter for the estimate's own error): the
+    pooling reaches furthest where a voxel is large next to the cortex, so one fixed
+    default would be waste at 0.2 mm and too little at 0.8 mm.
+
+    Each region writes ``{stem}_{name}_{tag}{ext}`` for every LN2_LAYERS output plus
+    ``{stem}_{name}_roi{ext}``, the region itself as a mask -- cropped, not a grid of
+    zeros around a patch, and on the master's own voxel centres so it lines up with the
+    anatomical the surfaces came from.
+    """
+    from fastfuncstuff.io.afni import save_nifti
+
+    edge_mm = [_mean_edge_mm(0.5 * (s.white + s.pial), s.faces) for s in surfaces]
+    results = []
+    for roi in rois:
+        name = _file_token(roi.name)
+        affine, shape = np.asarray(master_affine, np.float64), tuple(master_shape)
+        if dxyz is not None:
+            affine, shape = regrid(affine, shape, dxyz)
+        members = [_members_of(roi, h, len(s.white)) for h, s in enumerate(surfaces)]
+        surround = surround_mm
+        if surround is None:
+            _, reach = estimate_column_reach(surfaces, affine, column_voxels, members)
+            surround = max(4.0, 1.25 * reach)
+        own, padded = grow_columns(surfaces, roi.members, fill_mm=fill_mm, surround_mm=surround)
+        if not any(m.any() for m in own):
+            continue
+        if autobox:
+            # The grown patch's whole ribbon: its columns must be complete on this
+            # grid, or they pool against voxels the crop cut off.
+            pts = np.concatenate(
+                [a[m] for s, m in zip(surfaces, padded, strict=True) for a in (s.white, s.pial)]
+            )
+            affine, shape, _ = crop_to_points(affine, shape, pts, pad_mm)
+        n_own = sum(int(m.sum()) for m in own)
+        n_grown = sum(int((p & ~o).sum()) for o, p in zip(own, padded, strict=True))
+        if verbose:
+            vox = np.linalg.norm(affine[:3, :3], axis=0)
+            print(
+                f"{name}: {n_own:,} columns (+{n_grown:,} surround) onto "
+                f"{shape[0]}x{shape[1]}x{shape[2]} at "
+                f"{' x '.join(f'{v:.3g}' for v in vox)} mm"
+            )
+        out = cortical_depth_volumes(
+            surfaces,
+            affine,
+            shape,
+            n_layers,
+            column_voxels=column_voxels,
+            column_rounds=column_rounds,
+            columns=own,
+            thick_limit=thick_limit,
+            device=device,
+            verbose=verbose,
+        )
+        if out.n_gm == 0:
+            raise ValueError(
+                f"{name}: no GM voxel centre on this grid -- is the master aligned "
+                "to the anatomical the surfaces came from?"
+            )
+        Path(stem).parent.mkdir(parents=True, exist_ok=True)
+        written = []
+        for tag, vol in out.outputs():
+            path = f"{stem}_{name}_{tag}{ext}"
+            save_nifti(vol, path, affine=affine)
+            written.append(path)
+        path = f"{stem}_{name}_roi{ext}"
+        save_nifti(out.gm_mask(roi.rid), path, affine=affine)
+        written.append(path)
+        results.append(
+            RoiDepthResult(
+                name=name,
+                value=int(roi.rid),
+                out=out,
+                affine=affine,
+                written=written,
+                n_own=n_own,
+                n_filled=sum(int((m & ~mm).sum()) for m, mm in zip(own, members, strict=True)),
+                n_grown=n_grown,
+                surround_mm=float(surround),
+                pooled_mm=max((r * edge_mm[h] for h, r in out.smooth_rounds), default=0.0),
+            )
+        )
+    if not results:
+        raise ValueError("no region covers any cortical column of the surfaces given")
+    return results
+
+
+def _file_token(name: str) -> str:
+    """A region's name as one path component: ``cap.lh`` -> ``cap_lh``.
+
+    The names come from label tables and file stems, so they carry dots, spaces and
+    slashes; a dot in the middle of ``PREFIX_cap.lh_rim.nii.gz`` is legal but reads
+    as an extension to the eye and to half the shell one-liners that will touch it.
+    """
+    out = "".join(c if (c.isalnum() or c in "+-") else "_" for c in name).strip("_")
+    return out or "roi"
+
+
+def _members_of(roi, h: int, n: int) -> np.ndarray:
+    return np.asarray(roi.members.get(h, np.zeros(n, bool)), bool)
+
+
+def roi_report(res: RoiDepthResult) -> list[str]:
+    """One region's line, and the warning when its surround was too small."""
+    o = res.out
+    lines = [
+        f"  {res.name}: {res.n_own:,} columns"
+        + (f" (+{res.n_filled:,} filled)" if res.n_filled else "")
+        + f", {o.n_gm:,} GM voxels, pooled {res.pooled_mm:.1f} mm "
+        f"({'/'.join(str(r) for _, r in o.smooth_rounds)} rounds)"
+    ]
+    if not res.enough_surround:
+        lines.append(
+            f"WARNING: {res.name}'s equivolume depths pooled {res.pooled_mm:.1f} mm along "
+            f"the surface but only {res.surround_mm:.1f} mm of surround was computed, so "
+            "the columns near its edge pooled against cortex the crop cut off. "
+            f"Re-run with -roi_surround {np.ceil(res.pooled_mm) + 2:.0f}"
+        )
+    return lines
 
 
 def _by_hemi(paths: list[str], what: str) -> dict[str, Path]:
@@ -741,11 +1079,16 @@ __all__ = [
     "OUTPUT_TAGS",
     "DepthVolumes",
     "RibbonSurfaces",
-    "resolve_ribbon_surfaces",
+    "RoiDepthResult",
+    "column_smooth_rounds",
     "cortical_depth_volumes",
     "crop_to_points",
     "export_depth_volumes",
+    "export_roi_depth_volumes",
+    "grow_columns",
     "regrid",
+    "resolve_ribbon_surfaces",
+    "roi_report",
     "thick_report",
     "volume_quantile_depth",
 ]

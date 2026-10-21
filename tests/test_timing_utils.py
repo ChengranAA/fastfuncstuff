@@ -237,15 +237,19 @@ class TestTimingProfilerEdgeCases:
                 time.sleep(0.001)
 
         assert "repeated_op" in profiler.timings
-        assert len(profiler.timings["repeated_op"]) == 10
-
-        # Calculate statistics
         times = profiler.timings["repeated_op"]
-        mean_time = sum(times) / len(times)
-        _total_time = sum(times)
+        assert len(times) == 10
+        assert profiler.stack == []  # every entry unwound
 
-        # All times should be roughly similar (0.001s ± tolerance)
+        # Each entry covers at least its sleep. No *upper* bound: the wake-up
+        # latency of time.sleep(0.001) is the OS scheduler's, not the
+        # profiler's, and an asserted ceiling is a flake on a loaded box --
+        # this one failed at 0.002 s under a parallel run.
         for t in times:
-            assert 0.0005 <= t <= 0.002, f"Each call should be ~0.001s, got {t:.3f}s"
+            assert t >= 0.001, f"Each call should cover its sleep, got {t:.4f}s"
 
-        assert abs(mean_time - 0.001) < 0.0005, f"Mean should be ~0.001s, got {mean_time:.3f}s"
+        # What the profiler actually promises: the report's numbers are the
+        # recorded list's, not a re-measurement.
+        report = profiler.get_report()
+        assert f"{sum(times):.3f}s" in report
+        assert f"{sum(times) / len(times):.3f}s" in report

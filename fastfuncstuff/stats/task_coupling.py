@@ -355,7 +355,11 @@ def task_coupling(
     ss_tot = torch.zeros(n_vox, dtype=torch.float64, device=device)
     ss_raw = torch.zeros(n_vox, dtype=torch.float64, device=device)
 
-    chunk = estimate_chunk_size(n_vox, n_t, n_k + polort + 1, device, operation="glm")
+    # use_double: every chunk is promoted to float64 below, so budget 8 bytes per
+    # element or the planner under-sizes by exactly 2x.
+    chunk = estimate_chunk_size(
+        n_vox, n_t, n_k + polort + 1, device, operation="glm", use_double=True
+    )
     flat = f.reshape(n_vox, n_t)
     for start in range(0, n_vox, chunk):
         y = flat[start : start + chunk].to(device=device, dtype=torch.float64)
@@ -551,6 +555,7 @@ def project_task_out(
     with the motion.
     """
     from fastfuncstuff.glm.core import construct_polynomial_matrix
+    from fastfuncstuff.memory import estimate_chunk_size
 
     f = torch.as_tensor(field)
     if device is None:
@@ -566,14 +571,26 @@ def project_task_out(
     # Orthogonalize the task against drift, so the joint fit reduces to two
     # independent projections and the task part carries no drift with it.
     q_x = _orthonormal_basis(x - q_n @ (q_n.T @ x), scale=float(torch.linalg.matrix_norm(x, 2)))
-    flat = f.reshape(-1, n_t).to(dtype=torch.float64, device=device)
-    removed = (flat @ q_x) @ q_x.T
-    cleaned = flat - removed
+    # Streamed over voxels: the caller hands in whole locomoco warp fields, and a
+    # one-shot float64 promotion held the field plus `removed` and `cleaned` in float64
+    # at once (6x the float32 field). Each row's projection is independent, so the
+    # chunked result is the same; only the chunk lives in float64.
     shape = tuple(f.shape)
-    return (
-        cleaned.reshape(shape).to(f.dtype),
-        removed.reshape(shape).to(f.dtype),
+    flat = f.reshape(-1, n_t)
+    n_vox = flat.shape[0]
+    cleaned = torch.empty((n_vox, n_t), dtype=f.dtype, device=device)
+    removed = torch.empty((n_vox, n_t), dtype=f.dtype, device=device)
+    chunk = estimate_chunk_size(
+        n_vox, n_t, q_x.shape[1] + 2, device, operation="glm", use_double=True
     )
+    for start in range(0, n_vox, chunk):
+        stop = min(start + chunk, n_vox)
+        y = flat[start:stop].to(dtype=torch.float64, device=device)
+        r = (y @ q_x) @ q_x.T
+        removed[start:stop] = r.to(f.dtype)
+        cleaned[start:stop] = (y - r).to(f.dtype)
+        del y, r
+    return cleaned.reshape(shape), removed.reshape(shape)
 
 
 def design_notch_bins(
@@ -814,7 +831,9 @@ def filter_task_band(
     n_vox = int(np.prod(spatial))
     flat = f.reshape(n_vox, n_t)
     out = torch.empty_like(flat)
-    chunk = estimate_chunk_size(n_vox, n_t, q.shape[1] + 2, device, operation="glm")
+    chunk = estimate_chunk_size(
+        n_vox, n_t, q.shape[1] + 2, device, operation="glm", use_double=True
+    )
     for start in range(0, n_vox, chunk):
         y = flat[start : start + chunk].to(device=device, dtype=torch.float64)
         y = y - (y @ q) @ q.T
@@ -942,7 +961,9 @@ def component_variance_in_data(
     a_j = None if q_x is None else q_x.T @ u_j
 
     flat = f.reshape(n_vox, n_t)
-    chunk = estimate_chunk_size(n_vox, n_t, k + polort + 2, device, operation="glm")
+    chunk = estimate_chunk_size(
+        n_vox, n_t, k + polort + 2, device, operation="glm", use_double=True
+    )
     for start in range(0, n_vox, chunk):
         stop = min(start + chunk, n_vox)
         if keep is not None:

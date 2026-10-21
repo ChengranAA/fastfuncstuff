@@ -145,30 +145,47 @@ def split_half_noise_ceiling(
     """
     if data.ndim != 2:
         raise ValueError("data must have shape (n_voxels, n_timepoints)")
-    run_ends = [*run_starts[1:], n_timepoints]
-    totals = torch.zeros(data.shape[0], device=data.device, dtype=torch.float64)
-    counts = 0
+    from fastfuncstuff.memory import estimate_chunk_size
+    from fastfuncstuff.utils import accum_dtype
 
+    run_ends = [*run_starts[1:], n_timepoints]
+    # float64 off Metal (which has none); the correlations below are two-pass.
+    dtype = accum_dtype(data.device)
+    n_vox = data.shape[0]
+    totals = torch.zeros(n_vox, device=data.device, dtype=dtype)
+    usable = []
     for group in repeat_groups:
-        segments = [data[:, run_starts[index] : run_ends[index]] for index in group]
-        lengths = {segment.shape[1] for segment in segments}
-        if len(group) < 2 or len(lengths) != 1:
-            continue
-        centered = [
-            (segment.to(torch.float64) - segment.to(torch.float64).mean(dim=1, keepdim=True))
-            for segment in segments
-        ]
-        norms = [torch.linalg.vector_norm(segment, dim=1) for segment in centered]
-        for first in range(len(centered)):
-            for second in range(first + 1, len(centered)):
-                denominator = norms[first] * norms[second]
-                correlation = torch.where(
-                    denominator > 0,
-                    (centered[first] * centered[second]).sum(dim=1) / denominator.clamp_min(1e-30),
-                    torch.zeros_like(denominator),
-                )
-                totals += correlation
-                counts += 1
+        lengths = {run_ends[index] - run_starts[index] for index in group}
+        if len(group) >= 2 and len(lengths) == 1:
+            usable.append(group)
+    counts = sum(len(group) * (len(group) - 1) // 2 for group in usable)
+
+    # Streamed over voxels: the centred float64 copies of a group's runs carry the
+    # voxel axis, so a one-shot pass held up to twice the data again. Every
+    # correlation is per voxel, so chunking does not change the result.
+    chunk = estimate_chunk_size(
+        n_vox, n_timepoints, 1, data.device, operation="glm", use_double=dtype == torch.float64
+    )
+    for start in range(0, n_vox if usable else 0, max(1, chunk)):
+        stop = min(start + chunk, n_vox)
+        for group in usable:
+            segments = [data[start:stop, run_starts[index] : run_ends[index]] for index in group]
+            centered = [
+                (segment.to(dtype) - segment.to(dtype).mean(dim=1, keepdim=True))
+                for segment in segments
+            ]
+            norms = [torch.linalg.vector_norm(segment, dim=1) for segment in centered]
+            for first in range(len(centered)):
+                for second in range(first + 1, len(centered)):
+                    denominator = norms[first] * norms[second]
+                    correlation = torch.where(
+                        denominator > 0,
+                        (centered[first] * centered[second]).sum(dim=1)
+                        / denominator.clamp_min(1e-30),
+                        torch.zeros_like(denominator),
+                    )
+                    totals[start:stop] += correlation
+            del segments, centered, norms
 
     if counts == 0:
         return torch.full((data.shape[0],), torch.nan, device=data.device, dtype=data.dtype)

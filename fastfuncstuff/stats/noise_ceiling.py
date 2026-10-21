@@ -768,12 +768,36 @@ def ncsnr_noise_ceiling(
     the noise and are dropped from the noise term while still contributing to
     the signal term, which is what NSD's estimator does.
     """
+    variances = _ncsnr_variances(betas, condition_ids, min_repeats)
+    return _ncsnr_result(betas, variances, n_train_repeats)
+
+
+@dataclass
+class _NcsnrVariances:
+    """Per-voxel signal and noise variances behind every NSD-style ceiling."""
+
+    var_signal: torch.Tensor | None  # (V,) accumulator dtype; None when nothing repeated
+    var_noise: torch.Tensor | None
+    n_usable: int
+    notes: list[str]
+
+
+def _ncsnr_variances(
+    betas: torch.Tensor, condition_ids: torch.Tensor, min_repeats: int
+) -> _NcsnrVariances:
+    """One pass over the betas for :func:`ncsnr_noise_ceiling` and :func:`ncsnr`.
+
+    Streamed over voxels so only a chunk is ever promoted to float64: a whole
+    (V, trials) float64 copy is twice the betas again, and beta_space_ceiling used
+    to make it twice. Every quantity is per voxel, so chunking does not change it.
+    """
+    from fastfuncstuff.utils import accum_dtype
+
     if betas.ndim != 2:
         raise ValueError("betas must have shape (n_voxels, n_trials)")
     if condition_ids.numel() != betas.shape[1]:
         raise ValueError("condition_ids must have one entry per trial")
 
-    work = betas.to(torch.float64)
     condition_ids = condition_ids.to(betas.device)
     notes: list[str] = []
 
@@ -787,30 +811,55 @@ def ncsnr_noise_ceiling(
         )
 
     if repeated.numel() == 0:
+        notes = ["no condition repeated; a beta-space noise ceiling is not estimable"]
+        return _NcsnrVariances(None, None, 0, notes)
+
+    # float64 off Metal; MPS has none, and the two-pass (mean-centred) variances
+    # below are what make float32 tolerable there.
+    dtype = accum_dtype(betas.device)
+    n_vox, n_trials = betas.shape
+    var_signal = torch.empty(n_vox, dtype=dtype, device=betas.device)
+    var_noise = torch.empty(n_vox, dtype=dtype, device=betas.device)
+    groups = [condition_ids == condition for condition in repeated.tolist()]
+    dof = float(sum(int(g.sum()) - 1 for g in groups))
+    chunk = estimate_chunk_size(
+        n_vox, n_trials, 1, betas.device, operation="glm", use_double=dtype == torch.float64
+    )
+    for start in range(0, n_vox, max(1, chunk)):
+        stop = min(start + chunk, n_vox)
+        work = betas[start:stop].to(dtype)
+        # Unbiased within-condition variance, pooled by weighting each condition by
+        # its degrees of freedom rather than counting every condition equally: a
+        # condition seen twice says much less about the noise than one seen twenty
+        # times.
+        numerator = torch.zeros(stop - start, dtype=dtype, device=betas.device)
+        for group in groups:
+            trials = work[:, group]
+            centered = trials - trials.mean(dim=1, keepdim=True)
+            numerator += centered.square().sum(dim=1)
+        noise = numerator / max(dof, 1.0)
+        var_total = work.var(dim=1, unbiased=True)
+        var_signal[start:stop] = (var_total - noise).clamp_min(0.0)
+        var_noise[start:stop] = noise
+        del work, numerator, noise, var_total
+
+    return _NcsnrVariances(var_signal, var_noise, int(repeated.numel()), notes)
+
+
+def _ncsnr_result(
+    betas: torch.Tensor, variances: _NcsnrVariances, n_train_repeats: float | None
+) -> CeilingResult:
+    """The ceiling :func:`ncsnr_noise_ceiling` documents, from one variance pass."""
+    var_signal, var_noise = variances.var_signal, variances.var_noise
+    if var_signal is None or var_noise is None:
         return CeilingResult(
             ceiling=torch.full(
                 (betas.shape[0],), torch.nan, device=betas.device, dtype=betas.dtype
             ),
             method="ncsnr",
             n_usable=0,
-            notes=["no condition repeated; a beta-space noise ceiling is not estimable"],
+            notes=list(variances.notes),
         )
-
-    # Unbiased within-condition variance, pooled by weighting each condition by
-    # its degrees of freedom rather than counting every condition equally: a
-    # condition seen twice says much less about the noise than one seen twenty
-    # times.
-    numerator = torch.zeros(betas.shape[0], dtype=torch.float64, device=betas.device)
-    dof = 0.0
-    for condition in repeated.tolist():
-        trials = work[:, condition_ids == condition]
-        centered = trials - trials.mean(dim=1, keepdim=True)
-        numerator += centered.square().sum(dim=1)
-        dof += trials.shape[1] - 1
-    var_noise = numerator / max(dof, 1.0)
-
-    var_total = work.var(dim=1, unbiased=True)
-    var_signal = (var_total - var_noise).clamp_min(0.0)
 
     if n_train_repeats is None:
         ncsnr_sq = var_signal / var_noise.clamp_min(1e-30)
@@ -825,8 +874,8 @@ def ncsnr_noise_ceiling(
     return CeilingResult(
         ceiling=ceiling.to(betas.dtype),
         method="ncsnr",
-        n_usable=int(repeated.numel()),
-        notes=notes,
+        n_usable=variances.n_usable,
+        notes=list(variances.notes),
     )
 
 
@@ -900,8 +949,15 @@ def ncsnr(betas: torch.Tensor, condition_ids: torch.Tensor, min_repeats: int = 2
     result = ncsnr_noise_ceiling(
         betas, condition_ids, n_train_repeats=None, min_repeats=min_repeats
     )
-    ratio = result.ceiling.to(torch.float64)
-    return torch.sqrt((ratio / (1.0 - ratio).clamp_min(1e-30)).clamp_min(0.0)).to(betas.dtype)
+    return _ncsnr_from_ceiling(result.ceiling, betas.dtype)
+
+
+def _ncsnr_from_ceiling(ceiling: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Invert the NSD ceiling ``ncsnr^2 / (ncsnr^2 + 1)`` back to ncsnr (a (V,) map)."""
+    from fastfuncstuff.utils import accum_dtype
+
+    ratio = ceiling.to(accum_dtype(ceiling.device))
+    return torch.sqrt((ratio / (1.0 - ratio).clamp_min(1e-30)).clamp_min(0.0)).to(dtype)
 
 
 @dataclass
@@ -946,10 +1002,10 @@ def beta_space_ceiling(
         betas = zscore_betas_by_run(betas, run_ids)
 
     repeats = mean_train_repeats(condition_ids, run_ids, cv_splits)
-    result = ncsnr_noise_ceiling(
-        betas, condition_ids, n_train_repeats=repeats, min_repeats=min_repeats
-    )
-    ncsnr_map = ncsnr(betas, condition_ids, min_repeats=min_repeats)
+    # One variance pass serves both the fold-matched ceiling and the ncsnr map.
+    variances = _ncsnr_variances(betas, condition_ids, min_repeats)
+    result = _ncsnr_result(betas, variances, repeats)
+    ncsnr_map = _ncsnr_from_ceiling(_ncsnr_result(betas, variances, None).ceiling, betas.dtype)
 
     explainable: torch.Tensor | None = None
     withheld: str | None = None

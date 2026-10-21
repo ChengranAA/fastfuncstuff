@@ -1464,7 +1464,18 @@ def _build_basis(args) -> FLOBSBasis:
     from fastfuncstuff.design.flobs import FLOBSBasis
     from fastfuncstuff.design.hrf import make_derivative_basis
 
-    base = _resolve_shift_hrf(args.hrf, args.flobs_dt, args.flobs_window)
+    set_name = _hrf_set_name(args.hrf)
+    if set_name in ("pighs", "flobs"):
+        # A per-voxel set: each group's basis is rebuilt around its own curve
+        # (_fit_shape_groups); this one only needs to be a curve OF the set,
+        # as 'library' gets row 0 through _resolve_shift_hrf.
+        from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+        base = build_shape_library(
+            set_name, args.flobs_dt, args.flobs_window, n_hrfs=args.hrf_n_shapes
+        )[0][0]
+    else:
+        base = _resolve_shift_hrf(args.hrf, args.flobs_dt, args.flobs_window)
     G = make_derivative_basis(base, args.flobs_dt, n_basis)
     norms = np.linalg.norm(G, axis=1, keepdims=True)
     G = G / np.where(norms > 1e-12, norms, 1.0)

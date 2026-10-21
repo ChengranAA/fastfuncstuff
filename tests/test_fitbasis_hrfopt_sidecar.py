@@ -190,3 +190,15 @@ def test_shift_parametrization_writes_the_sidecar_too(tmp_path, monkeypatch, cap
     saved = torch.load(tmp_path / "s_fitbasis_hrf_library.pt", weights_only=False)
     assert saved["hrf_library"].shape[0] == 20
     assert saved["metadata"]["stim_durations"] == [1.0]
+
+
+@pytest.mark.parametrize("hrf_set", ["pighs", "flobs"])
+def test_linear_parametrization_accepts_every_named_set(tmp_path, monkeypatch, capsys, hrf_set):
+    """-hrf pighs / flobs died in _build_basis: the base curve was resolved as
+    a single -shift-hrf keyword, which knows only canonical/library/glmsingle."""
+    _fitbasis(
+        monkeypatch,
+        capsys,
+        _cli_inputs(tmp_path) + ["-hrf", hrf_set, "-prefix", str(tmp_path / hrf_set)],
+    )
+    assert (tmp_path / f"{hrf_set}_fitbasis_hrf_index.nii.gz").exists()

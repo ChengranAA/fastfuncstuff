@@ -1610,7 +1610,7 @@ def compute_bootstrap_se(
     design: torch.Tensor,
     n_task: int,
     n_boots: int = 100,
-    chunk_size: int = 5000,
+    chunk_size: int | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> np.ndarray:
@@ -1629,8 +1629,8 @@ def compute_bootstrap_se(
         Number of task regressors (first n columns)
     n_boots : int
         Number of bootstrap iterations
-    chunk_size : int
-        Voxels per batch
+    chunk_size : int, optional
+        Voxels per batch; planned by the memory module when None.
     device : torch.device
         Compute device
     verbose : bool
@@ -1647,8 +1647,22 @@ def compute_bootstrap_se(
     n_voxels, n_timepoints = data.shape
     n_regressors = design.shape[1]
 
-    # Storage for bootstrap betas
-    boot_betas = np.zeros((n_boots, n_voxels, n_task), dtype=np.float32)
+    if chunk_size is None:
+        from fastfuncstuff.memory import estimate_chunk_size
+
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=n_regressors,
+            device=device,
+            operation="glm",
+        )
+
+    # Running mean / sum of squared deviations (Welford) instead of keeping
+    # every replicate: an (n_boots, V, n_task) store is 100x the betas, tens of
+    # GB for a single-trial design at whole-brain size.
+    boot_mean = np.zeros((n_voxels, n_task), dtype=np.float64)
+    boot_m2 = np.zeros((n_voxels, n_task), dtype=np.float64)
 
     # Compute original fit once
     design_gpu = design.to(device)
@@ -1681,12 +1695,14 @@ def compute_bootstrap_se(
 
             # OLS fit
             betas_boot = (XtX_inv_boot @ design_boot.T @ data_boot.T).T  # (chunk, n_regressors)
-            boot_betas[boot_idx, chunk_start:chunk_end, :] = betas_boot[:, :n_task].cpu().numpy()
+            x = betas_boot[:, :n_task].cpu().numpy().astype(np.float64)
+            mean = boot_mean[chunk_start:chunk_end]
+            delta = x - mean
+            mean += delta / (boot_idx + 1)
+            boot_m2[chunk_start:chunk_end] += delta * (x - mean)
 
-    # Compute SE as std across bootstrap samples
-    bootstrap_se = np.std(boot_betas, axis=0)  # (n_voxels, n_task)
-
-    return bootstrap_se
+    # SE = population std across bootstrap samples (np.std's ddof=0).
+    return np.sqrt(boot_m2 / n_boots).astype(np.float32)  # (n_voxels, n_task)
 
 
 def compute_snr(

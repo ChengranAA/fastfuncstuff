@@ -2369,9 +2369,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
                 )
                 all_warped_smooth.append(warped_smooth)
 
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
-
             # Save temporally smoothed 4D
             warped_4d_smooth = torch.stack(all_warped_smooth, dim=0)
             with spinner(f"Writing {Path(prefix).name}_tsmooth{nii_ext}"):

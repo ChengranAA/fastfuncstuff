@@ -509,9 +509,9 @@ def estimate_pair_shift(
         s, c = _search_chunk(r, m, dim, lo, hi, coarse_step, fine_step, weight, extent)
         shifts[start:stop] = s.double().cpu().numpy()
         corrs[start:stop] = c.double().cpu().numpy()
+        # No per-chunk empty_cache: every chunk but the last is the same
+        # shape, so the caching allocator hands the same blocks straight back.
         del r, m, s, c
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
     return shifts, corrs
 
 
@@ -557,8 +557,6 @@ def apply_shift(
         bank = _ShiftBank(block, dim, pad)
         out[start:stop] = bank.shift(s[start:stop].to(device=device, dtype=torch.float32)).cpu()
         del block, bank
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
     return out.squeeze(0) if squeeze else out
 
 

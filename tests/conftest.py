@@ -27,6 +27,14 @@ except ValueError:
     _TEST_THREADS = 1
 _TEST_THREADS = min(_TEST_THREADS, os.cpu_count() or 1)
 for _var in (
+    # FFS_NUM_THREADS FIRST in spirit: utils.thread_budget() checks it BEFORE
+    # OMP_NUM_THREADS, so capping only the standard knob left every ffs thread
+    # pool (I/O loaders, chunked compute) running at whatever the developer's
+    # shell exported. Measured 2026-10-21 with FFS_NUM_THREADS=6 in the
+    # environment: each xdist worker burned 278% CPU with 8-9 threads, four
+    # workers saturated all 12 CPUs, and --durations reported a 20 s test as
+    # 567 s. A cap that any ambient variable can beat is not a cap.
+    "FFS_NUM_THREADS",
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",

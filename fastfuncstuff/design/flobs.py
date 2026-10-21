@@ -68,6 +68,30 @@ def _float64_solver_device(device: torch.device, label: str, *inputs: object) ->
     return (target, *(_move_to(x, target) for x in inputs))
 
 
+def _concat_runs_for_compute(
+    per_run_data: list[torch.Tensor],
+    device: torch.device,
+    *,
+    gpu_safety_fraction: float,
+) -> torch.Tensor:
+    """Concatenate runs to ``(n_voxels, total_tp)`` float32 where it can stay.
+
+    On the compute device when :func:`estimate_keep_on_cpu` says the series fits
+    beside the working set (``gpu_safety_fraction`` of free memory), else on the
+    CPU -- callers then stream voxel chunks to ``device`` and compute there.
+    """
+    from fastfuncstuff.memory import estimate_keep_on_cpu
+
+    n_voxels = int(per_run_data[0].shape[0])
+    total_tp = int(sum(int(d.shape[1]) for d in per_run_data))
+    store = device
+    if device.type != "cpu" and estimate_keep_on_cpu(
+        n_voxels, total_tp, device, gpu_safety_fraction=gpu_safety_fraction
+    ):
+        store = torch.device("cpu")
+    return torch.cat([d.to(store).float() for d in per_run_data], dim=1)
+
+
 def _solve_from_cholesky(L: Tensor, rhs: Tensor) -> Tensor:
     """Solve ``L Lᵀ x = rhs`` with kernels native to CUDA, MPS, and CPU."""
     tmp = torch.linalg.solve_triangular(L, rhs, upper=False)
@@ -1628,8 +1652,10 @@ def cv_basis_constrained_ridge(
 
     # Concatenate data + task design row-wise (no polys yet).
     # design_full: (total_tp, n_task_cols)
-    # data_full:   (n_voxels, total_tp)
-    data_full = torch.cat([d.to(device).float() for d in per_run_data], dim=1)
+    # data_full:   (n_voxels, total_tp), on the CPU when it would not fit beside
+    # the fold working set (the train/test gathers are near-full copies).
+    data_full = _concat_runs_for_compute(per_run_data, device, gpu_safety_fraction=0.25)
+    data_dev = data_full.device
     n_voxels = data_full.shape[0]
     design_full = torch.cat([t.to(device).float() for t in per_run_task_designs], dim=0)
 
@@ -1656,10 +1682,10 @@ def cv_basis_constrained_ridge(
             verbose=False,
         )
         # See fit_basis_fracridge for rationale — project_out forces
-        # CPU storage for large datasets; LORO slicing needs them on
-        # the compute device.
-        if data_clean.device != device:
-            data_clean = data_clean.to(device)
+        # CPU storage for large datasets; LORO slicing needs them where the
+        # residency gate put the data.
+        if data_clean.device != data_dev:
+            data_clean = data_clean.to(data_dev)
         if design_clean.device != device:
             design_clean = design_clean.to(device)
     else:
@@ -1688,6 +1714,21 @@ def cv_basis_constrained_ridge(
     weights_to_run: list[float | str] = list(weight_grid)
     if include_ols:
         weights_to_run = ["OLS"] + weights_to_run
+
+    # Resident data: one chunk, the whole-volume path. Offloaded: stream voxel
+    # chunks to the device for the solve and the held-out prediction.
+    if data_dev == device:
+        v_chunk = n_voxels
+    else:
+        from fastfuncstuff.memory import estimate_chunk_size
+
+        v_chunk = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=int(sum(n_tp_per_run)),
+            n_regressors=n_task_cols,
+            device=device,
+            operation="glm",
+        )
 
     n_weights = len(weights_to_run)
     r2_per_weight = np.zeros((n_voxels, n_weights), dtype=np.float32)
@@ -1723,30 +1764,28 @@ def cv_basis_constrained_ridge(
             )
             X_train = design_clean[train_rows]  # (n_tp_train, n_task)
             X_test = design_clean[test_rows]
-            y_train = data_clean[:, train_rows]  # (n_voxels, n_tp_train)
-            y_test = data_clean[:, test_rows]
+            train_rows_d = train_rows.to(data_dev)
+            test_rows_d = test_rows.to(data_dev)
 
             # Fit on train.  We treat the cleaned design as a single
             # task block (no nuisance, polort=-1) and pass through
             # fit_basis_constrained_ridge with reconstruct_hrfs=False
             # (we only need task betas).
+            L0 = None
+            all_betas = None
             if w == "OLS":
                 # OLS: closed-form via normal equations.  In CV mode
                 # everything stays in design.dtype (float32) for speed
                 # and memory; the constrained primitive uses float64
                 # internally but we cast back here.
                 XtX = X_train.T @ X_train
-                Xty = X_train.T @ y_train.T
                 try:
                     L0 = torch.linalg.cholesky(XtX)
-                    beta_chunk = torch.cholesky_solve(Xty, L0)
                 except torch.linalg.LinAlgError:
-                    beta_chunk = linalg_lstsq(X_train, y_train.T).solution
-                # beta_chunk: (n_task_cols, n_voxels)
-                task_betas = beta_chunk.T
+                    L0 = None
             else:
                 fit = fit_basis_constrained_ridge(
-                    data=y_train,
+                    data=data_clean[:, train_rows_d],  # (n_voxels, n_tp_train)
                     design_task=X_train,
                     basis_functions=basis_functions,
                     prior_mean=prior_mean,
@@ -1761,15 +1800,30 @@ def cv_basis_constrained_ridge(
                 )
                 # fit.betas is numpy float64 — cast to match X_test
                 # dtype so the matmul below works.
-                task_betas = torch.from_numpy(fit.betas[:, :n_task_cols]).to(
-                    device=device, dtype=X_test.dtype
-                )
+                all_betas = torch.from_numpy(fit.betas[:, :n_task_cols])
 
-            # Predict cleaned test data using TASK betas only.
-            y_test_pred = task_betas @ X_test.T  # (n_voxels, n_tp_test)
-            ss_res_split = ((y_test - y_test_pred) ** 2).sum(dim=1)
-            ss_res_accum += ss_res_split.cpu().double()
-            del X_train, X_test, y_train, y_test, task_betas, y_test_pred, ss_res_split
+            for v0 in range(0, n_voxels, v_chunk):
+                v1 = min(v0 + v_chunk, n_voxels)
+                if all_betas is None:
+                    y_train = data_clean[v0:v1][:, train_rows_d].to(device)
+                    Xty = X_train.T @ y_train.T
+                    if L0 is not None:
+                        beta_chunk = torch.cholesky_solve(Xty, L0)
+                    else:
+                        beta_chunk = linalg_lstsq(X_train, y_train.T).solution
+                    # beta_chunk: (n_task_cols, n_voxels)
+                    task_betas = beta_chunk.T
+                    del y_train, Xty, beta_chunk
+                else:
+                    task_betas = all_betas[v0:v1].to(device=device, dtype=X_test.dtype)
+                y_test = data_clean[v0:v1][:, test_rows_d].to(device)
+
+                # Predict cleaned test data using TASK betas only.
+                y_test_pred = task_betas @ X_test.T  # (n_voxels, n_tp_test)
+                ss_res_split = ((y_test - y_test_pred) ** 2).sum(dim=1)
+                ss_res_accum[v0:v1] += ss_res_split.cpu().double()
+                del y_test, task_betas, y_test_pred, ss_res_split
+            del X_train, X_test, L0, all_betas
 
         # Compute R² for this weight against the full ss_tot.
         r2_w = 1.0 - ss_res_accum / torch.clamp(ss_tot_full, min=1e-30)
@@ -1989,10 +2043,10 @@ def fit_basis_lss(
     # trial), no polynomial cols.  Each LSS fit then has just the
     # per-trial task block as ``task`` and the rest of the trial's
     # design as ``nuisance`` (un-penalised).
-    data_full = torch.cat(
-        [d.to(device).float() for d in per_run_data],
-        dim=1,
-    )  # (n_vox, total_tp)
+    # (n_vox, total_tp); on the CPU when it would not fit beside the per-cond
+    # batched designs, with voxel chunks streamed to the device below.
+    data_full = _concat_runs_for_compute(per_run_data, device, gpu_safety_fraction=0.5)
+    data_dev = data_full.device
     design_full = torch.cat(
         [d.to(device).float() for d in per_run_designs],
         dim=0,
@@ -2017,8 +2071,8 @@ def fit_basis_lss(
             device=device,
             verbose=False,
         )
-        if data_clean.device != device:
-            data_clean = data_clean.to(device)
+        if data_clean.device != data_dev:
+            data_clean = data_clean.to(data_dev)
         if design_clean.device != device:
             design_clean = design_clean.to(device)
     else:
@@ -2244,6 +2298,7 @@ def fit_basis_lss(
             device=device,
             operation="lss",
             n_trials=N_c,
+            empty_cache=False,  # per condition; the cond-end flush is the boundary
         )
         chunk_size_lss = max(1, min(chunk_size_lss, n_voxels))
 
@@ -2258,8 +2313,8 @@ def fit_basis_lss(
                     continue
                 vox_local = torch.where(in_bin_mask)[0]
                 vox_global = vox_local + v0
-                # Slice this bin's voxels (data on device).
-                y_chunk_b = data_clean[vox_global]  # (V_b, T)
+                # Slice this bin's voxels (streamed when data is offloaded).
+                y_chunk_b = data_clean[vox_global.to(data_dev)].to(device)  # (V_b, T)
                 # Batched RHS: (N_c, K_total, V_b).  Cast to float64
                 # only for the BLAS-3 step that needs it.
                 Xty = torch.einsum(
@@ -2381,7 +2436,10 @@ def fit_basis_fracridge(
     for n in n_tp_per_run[:-1]:
         run_starts.append(run_starts[-1] + n)
 
-    data_full = torch.cat([d.to(device).float() for d in per_run_data], dim=1)
+    # On the CPU when it would not fit beside the fold gathers; the SVD fit,
+    # prediction and σ² passes below then stream voxel chunks to the device.
+    data_full = _concat_runs_for_compute(per_run_data, device, gpu_safety_fraction=0.25)
+    data_dev = data_full.device
     n_voxels = data_full.shape[0]
     design_full = torch.cat([t.to(device).float() for t in per_run_task_designs], dim=0)
 
@@ -2406,11 +2464,11 @@ def fit_basis_fracridge(
         # project_out_nuisance_per_run allocates the result on CPU
         # when the dataset is large (>~1 GB) — its design is built
         # for streaming, not for an in-loop LORO slice.  Push back
-        # to the compute device so accelerator-resident train_rows / test_rows
+        # to where the residency gate put the data, so train_rows / test_rows
         # can index data_clean directly.  For 9.4T scale (~1.4 GB
         # data) this is ~1.4 GB of VRAM, easy on any modern card.
-        if data_clean.device != device:
-            data_clean = data_clean.to(device)
+        if data_clean.device != data_dev:
+            data_clean = data_clean.to(data_dev)
         if design_clean.device != device:
             design_clean = design_clean.to(device)
     else:
@@ -2491,15 +2549,16 @@ def fit_basis_fracridge(
         )
         X_train = design_clean[train_rows]  # (n_tp_tr, n_task)
         X_test = design_clean[test_rows]  # (n_tp_te, n_task)
-        y_train = data_clean[:, train_rows]  # (n_voxels, n_tp_tr)
-        y_test = data_clean[:, test_rows]  # (n_voxels, n_tp_te)
+        y_train = data_clean[:, train_rows.to(data_dev)]  # (n_voxels, n_tp_tr)
+        y_test = data_clean[:, test_rows.to(data_dev)]  # (n_voxels, n_tp_te)
 
         # _fit_ridge_multiple_fracs expects y as (n_samples, n_targets).
         # On accelerators we pass chunk_size to keep ``Vt.T @ ridge_flat``
         # bounded — the non-chunked path materialises a 5+ GB tensor
         # at 9.4T single-trial scale.  The chunked path returns coefs
         # on CPU; we move slices to device during prediction.
-        use_chunked = device.type != "cpu" and v_chunk < n_voxels
+        # Offloaded data must take the streaming path whatever the chunk size.
+        use_chunked = device.type != "cpu" and (v_chunk < n_voxels or data_dev != device)
         coefs = _fit_ridge_multiple_fracs(
             X=X_train,
             y=y_train.T,
@@ -2524,7 +2583,7 @@ def fit_basis_fracridge(
                 X_test,
                 coefs_chunk,
             )  # (T, n_fracs, V_c)
-            resid = y_test[v0:v1].T.unsqueeze(1) - y_pred
+            resid = y_test[v0:v1].to(device).T.unsqueeze(1) - y_pred
             ss_res_accum[:, v0:v1] += (resid**2).sum(dim=0).cpu().double()
             del coefs_chunk, y_pred, resid
 
@@ -2546,7 +2605,7 @@ def fit_basis_fracridge(
     # Same VRAM constraint as the LORO fit — use the chunked path on
     # cuda.  Result is on CPU, so the gather + numpy-cast at the end
     # happens on host (no extra D→H transfer beyond the final betas).
-    use_chunked_final = device.type != "cpu" and v_chunk < n_voxels
+    use_chunked_final = device.type != "cpu" and (v_chunk < n_voxels or data_dev != device)
     final_coefs = _fit_ridge_multiple_fracs(
         X=design_clean,
         y=data_clean.T,
@@ -2606,7 +2665,7 @@ def fit_basis_fracridge(
     for v0 in range(0, n_voxels, v_chunk):
         v1 = min(v0 + v_chunk, n_voxels)
         y_pred_chunk = betas_ols_t[v0:v1] @ Xt  # (V_c, n_t)
-        resid_chunk = data_clean[v0:v1] - y_pred_chunk
+        resid_chunk = data_clean[v0:v1].to(device) - y_pred_chunk
         sigma2_sum += float((resid_chunk**2).sum().item()) / dof
         del y_pred_chunk, resid_chunk
     sigma2_mean = sigma2_sum / max(1, n_voxels)
@@ -2735,7 +2794,9 @@ def estimate_arma11_per_voxel(
     else:
         X_full = design_task
 
-    Y_full = torch.cat([d.to(device).float() for d in per_run_data], dim=1)  # (n_vox, total_tp)
+    # (n_vox, total_tp). On the CPU when it would not fit beside the REML grid
+    # (63 cells of T×T whiteners loaded below); the search streams batches.
+    Y_full = _concat_runs_for_compute(per_run_data, device, gpu_safety_fraction=0.5)
     n_voxels = Y_full.shape[0]
 
     a_grid, b_grid = get_default_arma_grids(device)
@@ -2814,7 +2875,8 @@ def estimate_arma11_per_voxel(
 
     # The actual device the grid sits on — informs where Y must live.
     grid_device = next(iter(grid.values()))["whitener"].device
-    Y_search = Y_full.to(grid_device) if Y_full.device != grid_device else Y_full
+    # Offloaded data stays put: search_voxels_precomputed_grid moves each batch.
+    Y_search = Y_full.to(grid_device) if Y_full.device == device else Y_full
     X_search = X_full.to(grid_device) if X_full.device != grid_device else X_full
 
     # Voxel batching for the search — through the memory module so

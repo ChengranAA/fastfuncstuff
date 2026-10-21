@@ -76,7 +76,7 @@ def resample_calls(monkeypatch):
 
 def test_matching_step_uses_the_stored_curves_untouched(tmp_path, resample_calls):
     lib, path = _study(tmp_path)
-    shapes, _, index, durations = _import(path)
+    shapes, _, index, durations, _ = _import(path)
     assert resample_calls == []
     assert np.array_equal(shapes, lib)  # bit-identical, no interpolation
     assert durations == [2.0]
@@ -86,7 +86,7 @@ def test_matching_step_uses_the_stored_curves_untouched(tmp_path, resample_calls
 
 def test_other_step_is_resampled_exactly_once(tmp_path, resample_calls, capsys):
     _, path = _study(tmp_path, dt=0.05, n_t=2 * N_T)
-    shapes, _, _, _ = _import(path)
+    shapes, _, _, _, _ = _import(path)
     assert len(resample_calls) == 1
     assert shapes.shape == (4, N_T)
     assert "Resampled HRF library from 0.05 s to 0.1 s" in capsys.readouterr().out
@@ -95,7 +95,8 @@ def test_other_step_is_resampled_exactly_once(tmp_path, resample_calls, capsys):
 
 def test_duration_convolved_library_zeroes_the_durations(tmp_path):
     _, path = _study(tmp_path, duration_convolved=True)
-    _, _, _, durations = _import(path, durations=(2.0, 3.0))
+    _, _, _, durations, prov = _import(path, durations=(2.0, 3.0))
+    assert prov["duration_convolved"]
     assert durations == [0.0, 0.0]
 
 
@@ -105,11 +106,7 @@ def test_missing_sidecar_is_refused(tmp_path):
         _import(path)
 
 
-def test_cli_fits_from_the_sidecar(tmp_path, monkeypatch, capsys):
-    """End to end: no -hrf set named, the sidecar supplies the curves."""
-    from fastfuncstuff.cli.fitbasis import main
-
-    lib, path = _study(tmp_path)
+def _cli_inputs(tmp_path):
     rng = np.random.default_rng(0)
     inputs = []
     for r in range(2):
@@ -121,16 +118,52 @@ def test_cli_fits_from_the_sidecar(tmp_path, monkeypatch, capsys):
         inputs.append(str(p))
     onsets = tmp_path / "a.1D"
     onsets.write_text("5 25 40\n5 25 40\n")
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["ffs_fitbasis", "-input", *inputs, "-onsets", str(onsets), "-durations", "1"]
-        + ["-tr", "1", "-device", "cpu", "-hrf-index", path, "-prefix", str(tmp_path / "fb")],
-    )
+    return ["-input", *inputs, "-onsets", str(onsets), "-durations", "1", "-tr", "1"]
+
+
+def _fitbasis(monkeypatch, capsys, args):
+    from fastfuncstuff.cli.fitbasis import main
+
+    monkeypatch.setattr(sys, "argv", ["ffs_fitbasis", *args, "-device", "cpu"])
     rc = main()
     out = capsys.readouterr().out
     assert rc in (0, None), out[-2000:]
+    return out
+
+
+def test_cli_fits_from_the_sidecar(tmp_path, monkeypatch, capsys):
+    """End to end: no -hrf set named, the sidecar supplies the curves."""
+    _, path = _study(tmp_path)
+    out = _fitbasis(
+        monkeypatch,
+        capsys,
+        _cli_inputs(tmp_path) + ["-hrf-index", path, "-prefix", str(tmp_path / "fb")],
+    )
     assert "hrfopt sidecar" in out
+
+
+def test_fitbasis_index_map_round_trips_with_its_own_sidecar(tmp_path, monkeypatch, capsys):
+    """fitbasis's own _hrf_index has to come back in through a bare -hrf-index,
+    which now needs the library beside it -- so fitbasis writes one."""
+    common = _cli_inputs(tmp_path)
+    _fitbasis(monkeypatch, capsys, common + ["-hrf", "library", "-prefix", str(tmp_path / "a")])
+    saved = torch.load(tmp_path / "a_fitbasis_hrf_library.pt", weights_only=False)
+    shapes = np.loadtxt(tmp_path / "a_fitbasis_hrf_shapes.tsv").T
+    np.testing.assert_allclose(saved["hrf_library"].numpy(), shapes, rtol=1e-8, atol=1e-10)
+    assert saved["metadata"]["microtime_dt"] == pytest.approx(DT)
+    assert saved["duration_convolved"] is False
+
+    first = np.asanyarray(nib.load(tmp_path / "a_fitbasis_hrf_index.nii.gz").dataobj)[..., 0]
+    out = _fitbasis(
+        monkeypatch,
+        capsys,
+        common
+        + ["-hrf-index", str(tmp_path / "a_fitbasis_hrf_index.nii.gz")]
+        + ["-prefix", str(tmp_path / "b")],
+    )
+    assert "hrfopt sidecar" in out
+    second = np.asanyarray(nib.load(tmp_path / "b_fitbasis_hrf_index.nii.gz").dataobj)[..., 0]
+    np.testing.assert_array_equal(first, second)
 
 
 @pytest.mark.parametrize(
@@ -145,3 +178,15 @@ def test_auto_polort_is_afnis_longest_run_rule(run_starts, n_tp, expected):
     from fastfuncstuff.cli.fitbasis import _auto_polort_for_runs
 
     assert _auto_polort_for_runs(run_starts, n_tp, 1.0)[0] == expected
+
+
+def test_shift_parametrization_writes_the_sidecar_too(tmp_path, monkeypatch, capsys):
+    common = _cli_inputs(tmp_path)
+    _fitbasis(
+        monkeypatch,
+        capsys,
+        common + ["-parametrization", "shift", "-hrf", "library", "-prefix", str(tmp_path / "s")],
+    )
+    saved = torch.load(tmp_path / "s_fitbasis_hrf_library.pt", weights_only=False)
+    assert saved["hrf_library"].shape[0] == 20
+    assert saved["metadata"]["stim_durations"] == [1.0]

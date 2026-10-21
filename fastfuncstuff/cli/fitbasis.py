@@ -1928,7 +1928,9 @@ def _import_hrfopt_shapes(
     sidecar's step differs from the resolved ``-flobs-dt``; a different span
     is padded or truncated, never interpolated.
 
-    Returns ``(shapes, labels, index, durations)``.
+    Returns ``(shapes, labels, index, durations, provenance)``; ``provenance``
+    carries the sidecar's ``duration_convolved`` and ``canonical_mode`` for the
+    sidecar this run writes in turn (:func:`_save_shape_sidecar`).
     """
     from fastfuncstuff.cli_utils import load_hrfopt_library
     from fastfuncstuff.design.shifted_hrf import build_shape_library
@@ -1972,7 +1974,49 @@ def _import_hrfopt_shapes(
         pk = float(np.max(np.abs(c)))
         curves[i] = c / pk if pk > 0 else c
     labels = [f"lib{i:02d}" for i in range(curves.shape[0])]
-    return curves, labels, index_t.numpy(), model_durations
+    saved = torch.load(sidecar, weights_only=False, map_location="cpu")
+    provenance = {
+        "duration_convolved": bool(saved.get("duration_convolved")),
+        "canonical_mode": (saved.get("metadata") or {}).get("canonical_mode") or "spmg1",
+    }
+    return curves, labels, index_t.numpy(), model_durations, provenance
+
+
+def _save_shape_sidecar(
+    prefix: str,
+    shapes: np.ndarray,
+    index: np.ndarray,
+    *,
+    dt: float,
+    durations: list[float],
+    imported=None,
+) -> str:
+    """``{prefix}_fitbasis_hrf_library.pt`` beside ``{prefix}_fitbasis_hrf_index``.
+
+    The same format ffs_hrfopt writes, so the index map round-trips back in
+    through a bare ``-hrf-index`` (and into any other -hrfopt_prefix consumer):
+    the curves exactly as fitted, the step they are sampled at, and whether
+    they already carry the stimulus boxcar -- only when they were imported from
+    a library that did; fitbasis's own sets are impulse responses.
+    """
+    provenance = imported[4] if imported is not None else {}
+    path = f"{prefix}_fitbasis_hrf_library.pt"
+    torch.save(
+        {
+            "hrf_library": torch.from_numpy(np.ascontiguousarray(shapes, dtype=np.float64)),
+            "hrf_index": torch.from_numpy(np.asarray(index, dtype=np.int64)),
+            "metadata": {
+                "microtime_dt": float(dt),
+                "canonical_mode": provenance.get("canonical_mode", "spmg1"),
+                "stim_durations": [float(d) for d in durations],
+                "source": "ffs_fitbasis",
+            },
+            "duration_convolved": bool(provenance.get("duration_convolved", False)),
+        },
+        path,
+    )
+    print(f"  Wrote {path}")
+    return path
 
 
 def _run_shift_mode(
@@ -2043,7 +2087,7 @@ def _run_shift_mode(
     shape_source = "hrfopt sidecar" if imported is not None else _hrf_set_name(args.hrf)
     if shape_source:
         if imported is not None:
-            shapes, shape_labels, imported_index, _ = imported
+            shapes, shape_labels, imported_index = imported[0], imported[1], imported[2]
         else:
             shapes, shape_labels = build_shape_library(
                 shape_source,
@@ -2328,6 +2372,14 @@ def _run_shift_mode(
             f"{args.prefix}_fitbasis_hrf_index{nii_ext}",
             to_volume=_to_volume,
             reference_img=args.input[0],
+        )
+        _save_shape_sidecar(
+            args.prefix,
+            shapes,
+            shape_index,
+            dt=args.flobs_dt,
+            durations=condition_durations,
+            imported=imported,
         )
         curves_path = f"{args.prefix}_fitbasis_hrf_shapes.tsv"
         np.savetxt(
@@ -4065,6 +4117,17 @@ def main() -> int:
             brick_labels=labels,
         )
         print(f"  Wrote {idx_path}")
+        _save_shape_sidecar(
+            args.prefix,
+            hrf_shapes,
+            hrf_index,
+            dt=args.flobs_dt,
+            durations=[
+                float(timing.durations[c]) if timing.durations_given else 0.0
+                for c in range(len(condition_labels))
+            ],
+            imported=imported,
+        )
         shapes_path = f"{args.prefix}_fitbasis_hrf_shapes.tsv"
         np.savetxt(shapes_path, hrf_shapes.T, fmt="%.10g", delimiter="\t")
         print(f"  Wrote {shapes_path}")

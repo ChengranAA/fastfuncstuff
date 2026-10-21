@@ -406,10 +406,23 @@ class TestApplyAffineSlabChunking:
 
         reference = affine_mod.apply_affine_interp(src, m, interp, out_shape, zero_outside=True)
         # Force several slabs, including one that does not divide onz evenly.
+        #
+        # One ULP, not bit-equality: the resample IS independent per output
+        # slice, so slabbing is exact in arithmetic -- but the separable
+        # resampler is torch.compile'd, and once enough distinct kernels
+        # accumulate in a process (all five interps at four slab shapes each)
+        # some calls fall back to eager and differ in the last bit. Measured
+        # 4.8e-7 on values up to 3.6 across 429 of 9504 voxels, and WHICH slab
+        # trips it moves between runs, so an exact assert here fails on
+        # collection order rather than on anything about slabbing. Checked
+        # fresh: every interp is bit-identical at every slab in a clean
+        # process. See the dynamo recompile-cliff note.
         for slab in (1, 5, 7):
             monkeypatch.setattr(affine_mod, "_z_slab_size", lambda *a, **k: slab)
             got = affine_mod.apply_affine_interp(src, m, interp, out_shape, zero_outside=True)
-            assert torch.equal(reference, got), f"{interp} differs at slab={slab}"
+            torch.testing.assert_close(
+                got, reference, rtol=1e-6, atol=1e-6, msg=f"{interp} differs at slab={slab}"
+            )
 
     def test_slab_size_shrinks_when_budget_is_small(self, monkeypatch):
         from fastfuncstuff.processing import affine as affine_mod

@@ -1070,7 +1070,8 @@ def analyze_from_design_matrix(
     # 5. Fit GLM
     glm_poly = None if use_stimulus_only else -1
 
-    if method == "ols" and dsort_tensor is not None:
+    per_voxel_hrf = designs_by_hrf is not None and hrf_indices is not None
+    if method == "ols" and dsort_tensor is not None and not per_voxel_hrf:
         # OLS + per-voxel dsort is a per-voxel *augmented* least-squares, which the
         # shared-design fit_glm() can't express. Reuse the ARMA GLS machinery with
         # (a, b) pinned to (0, 0): an ARMA(1,1) with a=b=0 is white noise, so the
@@ -1104,12 +1105,13 @@ def analyze_from_design_matrix(
             dsort_run_bounds=dsort_run_bounds,
         )
 
-    elif method == "ols" and designs_by_hrf is not None and hrf_indices is not None:
+    elif method == "ols" and per_voxel_hrf:
         # fit_glm() fits ONE shared design to every voxel, so a per-voxel HRF run
         # with no -R* output used to fit the whole brain with whichever design came
         # first (the slowest library curve, via index -1) and report it as the
         # per-voxel fit. Group by HRF and run the GLS with (a, b) pinned to (0, 0),
-        # which is white noise and therefore exact OLS.
+        # which is white noise and therefore exact OLS. -dsort rides along here:
+        # the shared-design dsort branch above would drop the per-voxel HRF.
         from fastfuncstuff.glm.arma import fit_glm_arma11_grouped
 
         zero_ab = torch.zeros(
@@ -1137,6 +1139,9 @@ def analyze_from_design_matrix(
             want_ljung_box=want_ljung_box,
             run_starts=arma_run_starts,
             tau=arma_tau,
+            dsort=dsort_tensor,
+            dsort_labels=dsort_labels,
+            dsort_run_bounds=dsort_run_bounds,
         )
 
     elif method == "ols":

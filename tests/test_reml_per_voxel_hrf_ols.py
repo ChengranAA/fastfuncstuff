@@ -22,7 +22,10 @@ def _hrf(t, k):
     return np.where(t > 0, gamma.pdf(t, k) - gamma.pdf(t, k * 2.6) / 6, 0)
 
 
-def test_ols_only_uses_each_voxels_own_hrf(tmp_path):
+@pytest.mark.parametrize("dsort", [False, True])
+def test_ols_only_uses_each_voxels_own_hrf(tmp_path, dsort):
+    """``dsort``: OLS + -dsort took a shared-design branch of its own that
+    dropped the per-voxel HRF all over again."""
     tt = np.arange(320) * 0.1
     lib = np.stack([_hrf(tt, 3.5), _hrf(tt, 6.0)])
     lib /= lib.max(1, keepdims=True)
@@ -49,6 +52,15 @@ def test_ols_only_uses_each_voxels_own_hrf(tmp_path):
     (tmp_path / "ev.tsv").write_text(
         "onset\tduration\ttrial_type\n" + "".join(f"{o}\t0.3\ta\n" for o in onsets)
     )
+    extra = []
+    if dsort:
+        nib.save(
+            nib.Nifti1Image(
+                rng.normal(0, 1, (*SHAPE, NT)).astype(np.float32), np.diag([3, 3, 3, 1])
+            ),
+            tmp_path / "ds.nii.gz",
+        )
+        extra = ["-dsort", "ds.nii.gz"]
     res = subprocess.run(  # noqa: S603
         [
             sys.executable,
@@ -70,6 +82,7 @@ def test_ols_only_uses_each_voxels_own_hrf(tmp_path):
             "o",
             "-round_durations",
             "1",
+            *extra,
         ],
         capture_output=True,
         text=True,

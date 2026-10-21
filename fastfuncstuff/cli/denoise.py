@@ -2613,6 +2613,10 @@ def main():
                 )
             max_nuisance_cols = max(max_nuisance_cols, nuisance_per_run[run_idx].shape[1])
 
+    # Counted off the matrix, not off the blocks: a -ortvec_run block contributes
+    # its columns to one run, so summing the blocks would report them per run.
+    max_ortvec_cols = max_nuisance_cols - max_poly_cols
+
     # Tissue-map components come last: their PCA projects out the polynomials and
     # user blocks above, so they carry only what those leave unexplained. From here
     # they are ordinary nuisance -- projected out of the initial fit, the training
@@ -2677,6 +2681,21 @@ def main():
             "projected out of held-out runs only"
         )
 
+    # "10 nuisance (polynomial drift)" reads as ten drift terms, which it almost
+    # never is -- it is the drift plus the user's own regressors, and the split is
+    # what tells you whether the count is the one you asked for.
+    n_shown_cols = nuisance_per_run[0].shape[1]
+    if n_shown_cols == max_poly_cols:
+        nuisance_label = "polynomial drift"
+    else:
+        parts = [f"{max_poly_cols} polynomial drift"]
+        if max_ortvec_cols:
+            parts.append(f"{max_ortvec_cols} ortvec")
+        n_comp_cols = n_shown_cols - max_poly_cols - max_ortvec_cols
+        if n_comp_cols:
+            parts.append(f"{n_comp_cols} noise_comps")
+        nuisance_label = " + ".join(parts)
+
     # Summary
     if task_design is not None:
         if is_fir_model:
@@ -2687,7 +2706,7 @@ def main():
         else:
             # Canonical: Show condition names
             print(f"  Task predictors: {task_design.shape[1]} ({', '.join(condition_labels)})")
-        print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
+        print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} ({nuisance_label})")
         print(
             f"  Total columns per run: {task_design.shape[1]} task + {nuisance_per_run[0].shape[1]} nuisance = {task_design.shape[1] + nuisance_per_run[0].shape[1]}"
         )
@@ -2699,7 +2718,7 @@ def main():
         first_hrf_idx = list(designs_by_hrf.keys())[0]
         n_task_cols = designs_by_hrf[first_hrf_idx].shape[1]
         print(f"  Task predictors: {n_task_cols} ({', '.join(condition_labels)})")
-        print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} (polynomial drift)")
+        print(f"  Nuisance predictors per run: {nuisance_per_run[0].shape[1]} ({nuisance_label})")
         print(
             f"  Total columns per run: {n_task_cols} task + {nuisance_per_run[0].shape[1]} nuisance = {n_task_cols + nuisance_per_run[0].shape[1]}"
         )

@@ -915,8 +915,8 @@ def test_load_shape_index_map_converts_base_and_checks_range(tmp_path):
     got = _load_shape_index_map(
         str(path), n_shapes=20, volume_shape=vol_shape, mask=mask, n_voxels=6
     )
-    # 1-based → 0-based; the unset 0 voxel falls back to shape 0
-    np.testing.assert_array_equal(got, np.array([0, 1, 2, 19, 0, 4]))
+    # 1-based → 0-based; the unset 0 voxel stays -1 for assign_unassigned_hrf
+    np.testing.assert_array_equal(got, np.array([0, 1, 2, 19, -1, 4]))
 
     with pytest.raises(ValueError, match="only 5 curves"):
         _load_shape_index_map(str(path), n_shapes=5, volume_shape=vol_shape, mask=mask, n_voxels=6)

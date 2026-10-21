@@ -468,9 +468,12 @@ def create_parser() -> argparse.ArgumentParser:
         help=(
             "Skip selection and IMPORT the per-voxel curve assignment — "
             "sub-brick 0 of {prefix}_hrf_index.nii.gz from ffs_hrfopt or from "
-            "an earlier ffs_fitbasis run (1-based).  -hrf must then name the "
-            "SAME set the indices were fit against (default 'library'); "
-            "nothing can detect a mismatch beyond the index range.  Must be on "
+            "an earlier ffs_fitbasis run (1-based).  The curves come from the "
+            "{prefix}_hrf_library.pt beside it (resampled once onto -flobs-dt "
+            "only if its step differs; a duration-convolved library is used "
+            "with impulse onsets).  Without that file -hrf must name the SAME "
+            "set the indices were fit against, or the run is refused.  "
+            "Unassigned voxels take the curve closest to canonical.  Must be on "
             "the -input grid, from the same -mask."
         ),
     )
@@ -1839,9 +1842,9 @@ def _load_shape_index_map(
     codebase knows about the off-by-one.
 
     Voxels outside the mask never reach the fit; voxels the selection left
-    at 0 (no valid index — e.g. a voxel hrfopt's own mask excluded) fall
-    back to shape 0 rather than aborting, since a mask mismatch at the
-    edges is normal and shape 0 is a real curve.
+    at 0 (no valid index — e.g. a voxel hrfopt's own mask excluded) come
+    back as -1 for ``cli_utils.assign_unassigned_hrf`` to resolve against
+    the library in hand, since a mask mismatch at the edges is normal.
     """
     from fastfuncstuff.io.afni import load_nifti
 
@@ -1866,8 +1869,8 @@ def _load_shape_index_map(
             f"-hrf-index {path!r} yielded {idx.size} voxels but the "
             f"data has {n_voxels}.  Use the same -mask as the ffs_hrfopt run."
         )
-    # 1-based (hrfopt convention) → 0-based; unset voxels (0) become shape 0.
-    out = np.clip(idx - 1, 0, None)
+    # 1-based (hrfopt convention) → 0-based; unset voxels (0) become -1.
+    out = np.clip(idx - 1, -1, None)
     too_big = out >= n_shapes
     if too_big.any():
         raise ValueError(
@@ -1877,6 +1880,84 @@ def _load_shape_index_map(
             "library — pass it via -shift-shapes."
         )
     return out
+
+
+def _hrfopt_sidecar_for(index_path: str):
+    """``{prefix}_hrf_library.pt`` beside an ``{prefix}_hrf_index`` map."""
+    import re
+
+    from fastfuncstuff.cli_utils import hrf_library_path
+
+    prefix = re.sub(r"_hrf_index(\.[^/]*)?$", "", str(index_path))
+    return prefix, hrf_library_path(prefix)
+
+
+def _import_hrfopt_shapes(
+    index_path: str,
+    *,
+    dt: float,
+    duration: float,
+    volume_shape,
+    mask,
+    n_voxels: int,
+    durations: list[float],
+):
+    """Curves + per-voxel assignment from ffs_hrfopt's sidecar beside *index_path*.
+
+    The indices number rows of the library they were chosen from, which
+    ``{prefix}_hrf_library.pt`` holds; rebuilding a stock set here would fit
+    the wrong curve wherever the two differ.  Read through the shared loader,
+    so the refusal rules, ``duration_convolved`` (durations come back zeroed:
+    the boxcar is already in the curves) and the unassigned-voxel fallback are
+    the other consumers'.  The curves are resampled once, only when the
+    sidecar's step differs from the resolved ``-flobs-dt``; a different span
+    is padded or truncated, never interpolated.
+
+    Returns ``(shapes, labels, index, durations)``.
+    """
+    from fastfuncstuff.cli_utils import load_hrfopt_library
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    prefix, sidecar = _hrfopt_sidecar_for(index_path)
+    if not sidecar.exists():
+        raise FileNotFoundError(
+            f"-hrf-index {index_path!r}: {sidecar} not found.  The "
+            "indices mean nothing without the library they were chosen from; "
+            "re-run ffs_hrfopt, or name that set with -hrf."
+        )
+    index = _load_shape_index_map(
+        index_path,
+        n_shapes=np.iinfo(np.int64).max,  # range is checked against the real library below
+        volume_shape=volume_shape,
+        mask=mask,
+        n_voxels=n_voxels,
+    )
+    index_t = torch.from_numpy(index)
+    lib, model_durations = load_hrfopt_library(
+        prefix,
+        index_t,
+        microtime_dt=dt,
+        device=torch.device("cpu"),
+        model_durations=list(durations),
+        resample=True,
+    )
+    assert model_durations is not None
+    curves = lib.detach().cpu().double().numpy()
+    n_t = build_shape_library("canonical", dt, duration)[0].shape[1]
+    if curves.shape[1] >= n_t:
+        curves = curves[:, :n_t].copy()
+    else:
+        curves = np.pad(curves, ((0, 0), (0, n_t - curves.shape[1])))
+    # Same orientation + peak normalisation build_shape_library applies, so
+    # amplitudes stay in data units whichever source the shapes came from.
+    for i in range(curves.shape[0]):
+        c = curves[i]
+        if abs(c.min()) > abs(c.max()):
+            c = -c
+        pk = float(np.max(np.abs(c)))
+        curves[i] = c / pk if pk > 0 else c
+    labels = [f"lib{i:02d}" for i in range(curves.shape[0])]
+    return curves, labels, index_t.numpy(), model_durations
 
 
 def _run_shift_mode(
@@ -1896,6 +1977,7 @@ def _run_shift_mode(
     nii_ext: str,
     extra_regs_per_run: list[torch.Tensor] | None = None,
     roi_set=None,
+    imported=None,
 ) -> int:
     """-parametrization shift: per-block amplitude + bounded latency.
 
@@ -1943,17 +2025,22 @@ def _run_shift_mode(
     # An imported index map only says WHICH curve each voxel took; the curves
     # themselves still have to be rebuilt here, and the default library is
     # what ffs_hrfopt uses unless the user pointed it elsewhere.
-    shape_source = _hrf_set_name(args.hrf) or ("library" if args.hrf_index else None)
+    shape_source = "hrfopt sidecar" if imported is not None else _hrf_set_name(args.hrf)
     if shape_source:
-        shapes, shape_labels = build_shape_library(
-            shape_source,
-            args.flobs_dt,
-            args.flobs_window,
-            n_hrfs=args.hrf_n_shapes,
-            drop_empty=args.hrf_index is None,
-        )
+        if imported is not None:
+            shapes, shape_labels, imported_index, _ = imported
+        else:
+            shapes, shape_labels = build_shape_library(
+                shape_source,
+                args.flobs_dt,
+                args.flobs_window,
+                n_hrfs=args.hrf_n_shapes,
+                drop_empty=args.hrf_index is None,
+            )
         hrf = shapes[0]
-        if args.hrf_index:
+        if args.hrf_index and imported is None:
+            from fastfuncstuff.cli_utils import assign_unassigned_hrf
+
             try:
                 imported_index = _load_shape_index_map(
                     args.hrf_index,
@@ -1965,18 +2052,21 @@ def _run_shift_mode(
             except (FileNotFoundError, ValueError) as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
+            assign_unassigned_hrf(imported_index, shapes, args.flobs_dt)
+        if args.hrf_index:
             n_used = int(sorted_unique(imported_index).size)
             print(
                 f"  Shape source: {shape_source} — {shapes.shape[0]} curves, "
                 f"assignment IMPORTED from {args.hrf_index} "
                 f"({n_used} distinct shape(s) in the mask)"
             )
-            print(
-                "  NOTE: the imported indices must come from THIS library.  A\n"
-                "        different library (or a different -hrf_mode) makes each\n"
-                "        index point at an unrelated curve, and nothing here can\n"
-                "        detect that — only the range is checked."
-            )
+            if imported is None:
+                print(
+                    "  NOTE: the imported indices must come from THIS library.  A\n"
+                    "        different library (or a different -hrf_mode) makes each\n"
+                    "        index point at an unrelated curve, and nothing here can\n"
+                    "        detect that — only the range is checked."
+                )
         else:
             print(
                 f"  Shape source: {shape_source} — {shapes.shape[0]} candidates, "
@@ -2693,6 +2783,35 @@ def main() -> int:
 
     n_blocks = len(block_labels)
 
+    # ── -hrf-index without a named set: ffs_hrfopt's own library ──────
+    # Resolved before any duration is read: a duration-convolved library
+    # zeroes the durations, so no design below convolves the boxcar twice.
+    # The sidecar wins whenever it exists -- the indices mean nothing against
+    # any other library; a named -hrf set stands in only when it is missing.
+    imported = None
+    if args.hrf_index and (
+        _hrfopt_sidecar_for(args.hrf_index)[1].exists() or _hrf_set_name(args.hrf) is None
+    ):
+        if _hrf_set_name(args.hrf) is not None:
+            print(
+                f"  NOTE: -hrf {args.hrf} ignored for the curves: -hrf-index comes with "
+                "its own library, which is what its indices number into."
+            )
+        try:
+            imported = _import_hrfopt_shapes(
+                args.hrf_index,
+                dt=args.flobs_dt,
+                duration=args.flobs_window,
+                volume_shape=volume_shape,
+                mask=mask,
+                n_voxels=data.shape[0],
+                durations=list(timing.durations),
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        timing.durations = list(imported[3])
+
     # ── Stimulus durations into the basis ──────────────────────────
     # Previously the linear path built impulse regressors and ignored
     # -durations entirely, which delays the modelled peak by ~D/2 and
@@ -2738,6 +2857,7 @@ def main() -> int:
             nii_ext=nii_ext,
             extra_regs_per_run=extra_regs_per_run,
             roi_set=roi_set,
+            imported=imported,
         )
 
     # ── Per-voxel HRF shape (shared by both parametrisations) ──────
@@ -2745,8 +2865,11 @@ def main() -> int:
     hrf_shape_labels: list[str] = []
     hrf_index: np.ndarray | None = None
     hrf_index_score: np.ndarray | None = None
-    shape_source = _hrf_set_name(args.hrf) or ("library" if args.hrf_index else None)
-    if shape_source:
+    shape_source = "hrfopt sidecar" if imported is not None else _hrf_set_name(args.hrf)
+    if imported is not None:
+        hrf_shapes, hrf_shape_labels = imported[0], imported[1]
+        print(f"  HRF shape candidates: {hrf_shapes.shape[0]} ({shape_source})")
+    elif shape_source:
         from fastfuncstuff.design.shifted_hrf import build_shape_library
 
         hrf_shapes, hrf_shape_labels = build_shape_library(
@@ -3038,7 +3161,12 @@ def main() -> int:
                 )
                 return 1
 
-            if args.hrf_index:
+            if imported is not None:
+                hrf_index = imported[2]
+                print(f"  HRF assignment IMPORTED from {args.hrf_index}")
+            elif args.hrf_index:
+                from fastfuncstuff.cli_utils import assign_unassigned_hrf
+
                 try:
                     hrf_index = _load_shape_index_map(
                         args.hrf_index,
@@ -3050,6 +3178,7 @@ def main() -> int:
                 except (FileNotFoundError, ValueError) as exc:
                     print(f"ERROR: {exc}", file=sys.stderr)
                     return 1
+                assign_unassigned_hrf(hrf_index, hrf_shapes, args.flobs_dt)
                 print(f"  HRF assignment IMPORTED from {args.hrf_index}")
             elif args.hrf_select == "none":
                 hrf_index = np.zeros(per_run_data[0].shape[0], dtype=np.int64)

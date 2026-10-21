@@ -1039,6 +1039,19 @@ def hrf_library_path(prefix: str) -> Path:
     return Path(f"{parse_prefix(prefix).stem}_hrf_library.pt")
 
 
+def _resample_hrf_curves(curves: torch.Tensor, src_dt: float, dst_dt: float) -> torch.Tensor:
+    """(n, n_t) curves sampled every ``src_dt`` -> the same span every ``dst_dt``.
+
+    Linear interpolation, applied once, straight from the stored samples.
+    """
+    src = curves.detach().cpu().double().numpy()
+    t_src = np.arange(src.shape[1]) * float(src_dt)
+    n_dst = int(round((src.shape[1] - 1) * float(src_dt) / float(dst_dt))) + 1
+    t_dst = np.arange(n_dst) * float(dst_dt)
+    out = np.stack([np.interp(t_dst, t_src, row) for row in src])
+    return torch.from_numpy(out).to(curves.dtype)
+
+
 def load_hrfopt_library(
     prefix: str,
     hrf_indices: torch.Tensor,
@@ -1048,6 +1061,7 @@ def load_hrfopt_library(
     library_path: str | None = None,
     model_durations: list[float] | None = None,
     verbose: bool = True,
+    resample: bool = False,
 ) -> tuple[torch.Tensor, list[float] | None]:
     """The library the ``-hrfopt_prefix`` indices were chosen from, plus model durations.
 
@@ -1068,6 +1082,11 @@ def load_hrfopt_library(
     An explicit ``library_path`` (``-hrf_library`` / ``-hrf_library_raw``)
     wins, for the case where the saved file is gone; its size is still checked
     against the indices.  Without either, it is a refusal, not a fallback.
+
+    ``resample=True`` (for a consumer whose grid is fixed elsewhere, e.g.
+    ffs_fitbasis's ``-flobs-dt``) resamples a sidecar stored at another step
+    onto ``microtime_dt`` once, instead of refusing; curves already on that step
+    are returned untouched.
 
     Voxels still carrying ``-1`` (no assignment) are set **in place** in
     ``hrf_indices`` to the library curve closest to the canonical HRF (see
@@ -1090,7 +1109,20 @@ def load_hrfopt_library(
         # every voxel gets a shape ffs_hrfopt never chose -- silently.
         saved_meta = saved.get("metadata") or {}
         saved_dt = saved_meta.get("microtime_dt")
-        if saved_dt is not None and abs(float(saved_dt) - float(microtime_dt)) > 1e-9:
+        dt_differs = saved_dt is not None and abs(float(saved_dt) - float(microtime_dt)) > 1e-9
+        if resample and saved_dt is None:
+            sys.exit(
+                f"ERROR: {sidecar.name} does not record the step its curves were sampled "
+                f"at, so they cannot be put on a {microtime_dt} s grid.\n       Re-run "
+                f"ffs_hrfopt, or name the library explicitly."
+            )
+        if resample and dt_differs:
+            hrf_library = _resample_hrf_curves(
+                hrf_library.cpu(), float(saved_dt), float(microtime_dt)
+            ).to(device)
+            if verbose:
+                print(f"  Resampled HRF library from {saved_dt} s to {microtime_dt} s")
+        elif dt_differs:
             sys.exit(
                 f"ERROR: {sidecar.name} was sampled at -microtime_dt {saved_dt}, but this "
                 f"run uses {microtime_dt}.\n       The curves would be stretched in time; "

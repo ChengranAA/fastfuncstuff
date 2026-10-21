@@ -3092,3 +3092,31 @@ def test_tiles_show_each_image_on_one_shared_view(win, qapp):
     qapp.processEvents()
     assert w.view_stack.currentWidget() is w.pane and not w._active_tiles()
     assert w.size() == size
+
+
+def test_ticking_a_layer_on_selects_it(win, qapp):
+    from PySide6 import QtCore
+
+    win.layer_list.setCurrentRow(0)  # the overlay
+    bottom = win.layer_list.item(1)
+    key = bottom.data(QtCore.Qt.ItemDataRole.UserRole)
+    # What a click on the box does, off and then on again.
+    bottom.setCheckState(QtCore.Qt.CheckState.Unchecked)
+    qapp.processEvents()
+    assert not win.session.state.layers.get(key).visible
+    assert win.current_key() != key
+    bottom.setCheckState(QtCore.Qt.CheckState.Checked)
+    qapp.processEvents()
+    assert win.session.state.layers.get(key).visible
+    assert win.current_key() == key
+    assert win.layer_list.currentRow() == 1
+
+
+def test_ticking_a_layer_off_leaves_the_selection(win, qapp):
+    from PySide6 import QtCore
+
+    win.layer_list.setCurrentRow(0)
+    selected = win.current_key()
+    win.layer_list.item(1).setCheckState(QtCore.Qt.CheckState.Unchecked)
+    qapp.processEvents()
+    assert win.current_key() == selected

@@ -2163,6 +2163,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if layer is None or layer.visible == wanted:
             return
         self._dispatch(SetLayerVisible(key, wanted))
+        # Ticking a layer on is choosing to look at it, so the controls follow
+        # it there -- through the row, so the selection takes the one path a
+        # click on the name does.
+        if wanted and self.layer_list.currentItem() is not item:
+            self.layer_list.setCurrentItem(item)
 
     def _cycle_layer(self, delta: int) -> None:
         n = self.layer_list.count()

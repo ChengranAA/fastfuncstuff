@@ -41,29 +41,31 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives, pighs_halfcos
-from fastfuncstuff.utils import get_device, linalg_lstsq, warn_mps_cpu_fallback
+from fastfuncstuff.utils import get_device, linalg_device, linalg_lstsq, warn_mps_cpu_fallback
 
 
-def _move_mps_to_cpu(obj: object) -> object:
-    """Recursively move MPS tensors (and lists/tuples of them) to CPU."""
+def _move_to(obj: object, device: torch.device) -> object:
+    """Recursively move tensors (and lists/tuples of them) onto *device*."""
     if isinstance(obj, torch.Tensor):
-        return obj.cpu() if obj.device.type == "mps" else obj
+        return obj if obj.device == device else obj.to(device)
     if isinstance(obj, (list, tuple)):
-        return type(obj)(_move_mps_to_cpu(x) for x in obj)
+        return type(obj)(_move_to(x, device) for x in obj)
     return obj
 
 
-def _cpu_if_mps(device: torch.device, *inputs: object) -> tuple:
-    """Redirect a float64-only FLOBS solver to CPU on MPS (no float64 on Metal).
+def _float64_solver_device(device: torch.device, label: str, *inputs: object) -> tuple:
+    """Route a float64-only FLOBS solver through :func:`linalg_device`.
 
-    Returns ``(device, *moved)`` where ``device`` becomes CPU on MPS and any
-    MPS tensor input (or list/tuple of tensors) is moved to CPU so downstream
-    ``.to(cpu, float64)`` casts are safe (a combined device+dtype cast on an MPS
-    tensor would raise).
+    Returns ``(device, *moved)``. Where float64 is unavailable (Metal) the
+    device becomes the linalg device and every input tensor (or list/tuple of
+    tensors) is moved there first, so the solver's later combined
+    device+dtype casts are safe -- such a cast on an MPS tensor would raise.
     """
-    if device.type != "mps":
+    target = linalg_device(device)
+    if target == device:
         return (device, *inputs)
-    return (torch.device("cpu"), *(_move_mps_to_cpu(x) for x in inputs))
+    warn_mps_cpu_fallback(label)
+    return (target, *(_move_to(x, target) for x in inputs))
 
 
 def _solve_from_cholesky(L: Tensor, rhs: Tensor) -> Tensor:
@@ -1257,9 +1259,9 @@ def fit_basis_cone_prior(
     """
     if device is None:
         device = get_device()
-    if device.type == "mps":
-        warn_mps_cpu_fallback("FLOBS cone prior")
-    device, data, design_task, nuisance = _cpu_if_mps(device, data, design_task, nuisance)
+    device, data, design_task, nuisance = _float64_solver_device(
+        device, "FLOBS cone prior", data, design_task, nuisance
+    )
     if lambda_mode not in ("global", "voxelwise"):
         raise ValueError(f"lambda_mode must be 'global' or 'voxelwise'; got {lambda_mode!r}")
 
@@ -1895,9 +1897,9 @@ def fit_basis_lss(
 
     if device is None:
         device = get_device()
-    if device.type == "mps":
-        warn_mps_cpu_fallback("FLOBS LSS")
-    device, per_run_data, per_run_designs = _cpu_if_mps(device, per_run_data, per_run_designs)
+    device, per_run_data, per_run_designs = _float64_solver_device(
+        device, "FLOBS LSS", per_run_data, per_run_designs
+    )
     if lss_exclude is None:
         lss_exclude = []
     excluded_set = set(lss_exclude)
@@ -3102,9 +3104,7 @@ def compute_vb_block_trace(
     """
     if device is None:
         device = get_device()
-    if device.type == "mps":
-        warn_mps_cpu_fallback("FLOBS VB block-trace")
-    device, design = _cpu_if_mps(device, design)
+    device, design = _float64_solver_device(device, "FLOBS VB block-trace", design)
 
     X = design.to(device=device, dtype=torch.float64)
     n_cols = X.shape[1]
@@ -3345,9 +3345,7 @@ def compute_xval_r2_per_voxel(
 
     if device is None:
         device = get_device()
-    if device.type == "mps":
-        warn_mps_cpu_fallback("FLOBS xval R²")
-    device, per_run_data = _cpu_if_mps(device, per_run_data)
+    device, per_run_data = _float64_solver_device(device, "FLOBS xval R²", per_run_data)
 
     n_runs = len(per_run_data)
     if n_runs < 2:

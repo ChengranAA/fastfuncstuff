@@ -31,6 +31,7 @@ import torch
 
 from fastfuncstuff.glm.arma import build_arma11_covariance
 from fastfuncstuff.glm.xval import _compute_projection_matrix
+from fastfuncstuff.memory import estimate_chunk_size
 
 
 def _run_local_segments(
@@ -122,6 +123,84 @@ def censor_xval_inputs(
     return data[:, keep.to(data.device)], design, run_starts_kept, tau
 
 
+def _score_voxel_chunk(
+    data: torch.Tensor,
+    inverse: torch.Tensor,
+    pairs: torch.Tensor,
+    voxel_offset: int,
+    *,
+    train_tps: list[int],
+    test_tps: list[int],
+    train_design: torch.Tensor,
+    train_segments: list[tuple[int, int, int]],
+    train_tau: torch.Tensor | None,
+    train_present: torch.Tensor,
+    stim_indices: list[int],
+    test_stim: torch.Tensor,
+    q_test: torch.Tensor | None,
+    cholesky_cache: dict[tuple, torch.Tensor],
+    accumulators: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    device: torch.device,
+) -> None:
+    """One fold's GLS fit and held-out sums for a contiguous block of voxels.
+
+    ``data``/``inverse`` are the block's rows; ``voxel_offset`` places them in
+    the full-length accumulators. Every quantity is per voxel or per (a, b)
+    group, so splitting the voxel axis changes nothing but peak memory.
+    """
+    ss_residual, sum_actual, sum_sq_actual = accumulators
+    accumulator_device = ss_residual.device
+
+    train_data_all = data[:, train_tps].to(device)
+    test_data_all = data[:, test_tps].to(device)
+    if q_test is not None:
+        test_data_all = test_data_all - (test_data_all @ q_test) @ q_test.T
+
+    for group_idx in torch.unique(inverse).tolist():
+        voxel_mask = inverse == group_idx
+        a = float(pairs[group_idx, 0])
+        b = float(pairs[group_idx, 1])
+
+        group_data = train_data_all[voxel_mask.to(train_data_all.device)]
+        design_white, data_white = _whiten_per_run(
+            train_design,
+            group_data.T.contiguous(),
+            train_segments,
+            a,
+            b,
+            cholesky_cache,
+            tau=train_tau,
+        )
+
+        # GLS betas = OLS on the whitened pair. The full design is fitted so
+        # the nuisance columns absorb what they should; only the task betas
+        # go on to predict.
+        keep = torch.ones(design_white.shape[1], dtype=torch.bool, device=device)
+        for column, present in zip(stim_indices, train_present.tolist(), strict=True):
+            keep[column] = present
+        fit_design = design_white[:, keep]
+        gram = fit_design.T @ fit_design
+        gram_inv = torch.linalg.inv(gram + 1e-6 * torch.eye(gram.shape[0], device=device))
+        betas_kept = (gram_inv @ fit_design.T) @ data_white  # (n_kept, n_group_voxels)
+
+        betas_full = torch.zeros(
+            design_white.shape[1], betas_kept.shape[1], device=device, dtype=betas_kept.dtype
+        )
+        betas_full[keep] = betas_kept
+        task_betas = betas_full[stim_indices]  # (n_stim, n_group_voxels)
+
+        predicted = (test_stim @ task_betas).T  # (n_group_voxels, n_test_tps)
+        actual = test_data_all[voxel_mask.to(test_data_all.device)]
+
+        residual = (actual - predicted).to(torch.float64)
+        index = voxel_mask.nonzero(as_tuple=True)[0].to(accumulator_device) + voxel_offset
+        ss_residual[index] += residual.square().sum(dim=1).to(accumulator_device)
+        sum_actual[index] += actual.to(torch.float64).sum(dim=1).to(accumulator_device)
+        sum_sq_actual[index] += actual.to(torch.float64).square().sum(dim=1).to(accumulator_device)
+
+        del group_data, design_white, data_white, predicted, actual, residual
+
+
 def compute_xval_r2_arma(
     data: torch.Tensor,
     design_matrix: torch.Tensor | np.ndarray,
@@ -193,6 +272,19 @@ def compute_xval_r2_arma(
 
     cholesky_cache: dict[tuple, torch.Tensor] = {}
 
+    # Per voxel a fold holds its train and test rows, the whitened copy, the
+    # prediction and a float64 residual: within the "xval" model's 8T budget.
+    voxel_chunk = max(
+        1,
+        estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=design_matrix.shape[1],
+            device=device,
+            operation="xval",
+        ),
+    )
+
     for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
         # Only the training block is whitened: the test prediction and its R2
         # live in unwhitened space by design (see the module docstring).
@@ -226,68 +318,38 @@ def compute_xval_r2_arma(
         if not train_present.any():
             continue
 
-        train_data_all = data[:, train_tps].to(device)
-        test_data_all = data[:, test_tps].to(device)
-        if q_test is not None:
-            test_data_all = test_data_all - (test_data_all @ q_test) @ q_test.T
-
-        for group_idx in range(len(pairs)):
-            voxel_mask = inverse == group_idx
-            if not bool(voxel_mask.any()):
-                continue
-            a = float(pairs[group_idx, 0])
-            b = float(pairs[group_idx, 1])
-
-            group_data = train_data_all[voxel_mask.to(train_data_all.device)]
-            design_white, data_white = _whiten_per_run(
-                train_design,
-                group_data.T.contiguous(),
-                train_segments,
-                a,
-                b,
-                cholesky_cache,
-                tau=train_tau,
+        # Voxel chunks, not the whole brain: each fold's train and test slices
+        # come to the device one planned chunk at a time.
+        for v0 in range(0, n_voxels, voxel_chunk):
+            v1 = min(v0 + voxel_chunk, n_voxels)
+            _score_voxel_chunk(
+                data[v0:v1],
+                inverse[v0:v1],
+                pairs,
+                v0,
+                train_tps=train_tps,
+                test_tps=test_tps,
+                train_design=train_design,
+                train_segments=train_segments,
+                train_tau=train_tau,
+                train_present=train_present,
+                stim_indices=stim_indices,
+                test_stim=test_stim,
+                q_test=q_test,
+                cholesky_cache=cholesky_cache,
+                accumulators=(ss_residual, sum_actual, sum_sq_actual),
+                device=device,
             )
-
-            # GLS betas = OLS on the whitened pair. The full design is fitted so
-            # the nuisance columns absorb what they should; only the task betas
-            # go on to predict.
-            keep = torch.ones(design_white.shape[1], dtype=torch.bool, device=device)
-            for column, present in zip(stim_indices, train_present.tolist(), strict=True):
-                keep[column] = present
-            fit_design = design_white[:, keep]
-            gram = fit_design.T @ fit_design
-            gram_inv = torch.linalg.inv(gram + 1e-6 * torch.eye(gram.shape[0], device=device))
-            betas_kept = (gram_inv @ fit_design.T) @ data_white  # (n_kept, n_group_voxels)
-
-            betas_full = torch.zeros(
-                design_white.shape[1], betas_kept.shape[1], device=device, dtype=betas_kept.dtype
-            )
-            betas_full[keep] = betas_kept
-            task_betas = betas_full[stim_indices]  # (n_stim, n_group_voxels)
-
-            predicted = (test_stim @ task_betas).T  # (n_group_voxels, n_test_tps)
-            actual = test_data_all[voxel_mask.to(test_data_all.device)]
-
-            residual = (actual - predicted).to(torch.float64)
-            index = voxel_mask.nonzero(as_tuple=True)[0].to(accumulator_device)
-            ss_residual[index] += residual.square().sum(dim=1).to(accumulator_device)
-            sum_actual[index] += actual.to(torch.float64).sum(dim=1).to(accumulator_device)
-            sum_sq_actual[index] += (
-                actual.to(torch.float64).square().sum(dim=1).to(accumulator_device)
-            )
-
-            del group_data, design_white, data_white, predicted, actual, residual
 
         n_scored += len(test_tps)
-        del train_data_all, test_data_all
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
         if verbose:
             print(
                 f"  Split {split_idx + 1}/{len(cv_splits)}: train {train_runs} | test {test_runs}"
             )
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     if n_scored == 0:
         return {"r2": torch.full((n_voxels,), torch.nan, device=data.device), "n_splits": 0}

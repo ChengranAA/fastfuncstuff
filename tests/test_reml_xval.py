@@ -84,6 +84,37 @@ class TestArmaXval:
         )
         assert result["n_groups"] == 3
 
+    def test_voxel_chunking_does_not_change_the_score(self, monkeypatch):
+        """Chunks that split (a, b) groups across their boundaries must score
+        exactly as one whole-brain pass: every quantity is per voxel or per group."""
+        import fastfuncstuff.glm.reml_xval as reml_xval
+
+        design, run_starts, n_timepoints, n_conditions = _design(n_runs=4, run_length=120)
+        generator = torch.Generator().manual_seed(7)
+        betas = torch.randn(37, design.shape[1], generator=generator)
+        data = betas @ torch.from_numpy(design).T + torch.randn(
+            37, n_timepoints, generator=generator
+        )
+        params = torch.zeros(37, 2)
+        params[::3, 0] = 0.4
+        params[1::3, 1] = 0.2
+        common = dict(
+            data=data,
+            design_matrix=design,
+            run_starts=run_starts,
+            stim_indices=list(range(n_conditions)),
+            nuisance_indices=list(range(n_conditions, design.shape[1])),
+            cv_splits=_splits(4),
+            arma_params=params,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
+        whole = compute_xval_r2_arma(**common)["r2"]
+        monkeypatch.setattr(reml_xval, "estimate_chunk_size", lambda **_: 5)
+        chunked = compute_xval_r2_arma(**common)["r2"]
+        # BLAS blocking may differ with the column count: ULP-level tolerance.
+        torch.testing.assert_close(chunked, whole, rtol=1e-5, atol=1e-6)
+
     def test_gls_beats_ols_under_strong_autocorrelation(self):
         """The point of prewhitening: correlated noise should favour the GLS fit."""
         design, run_starts, n_timepoints, n_conditions = _design(n_runs=8, run_length=200, seed=3)

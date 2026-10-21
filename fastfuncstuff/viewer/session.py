@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -194,6 +195,19 @@ class ValueLine(str):
         line = super().__new__(cls, name + values)
         line.name_end = len(name)
         return line
+
+
+@dataclass(frozen=True)
+class LayerReading:
+    """A layer's value(s) at the crosshair, said two ways.
+
+    ``short`` is numbers only (``1.23 / 4.5``: shown, then threshold), for a
+    row of the layer list where the layer's name is already beside it;
+    ``long`` names the sub-bricks, for a line that has to stand on its own.
+    """
+
+    short: str
+    long: str
 
 
 def resample_mask_nearest(
@@ -1066,8 +1080,6 @@ class ViewerSession:
         names the region. The layer's name leads only when there are several
         overlays, because with one it is already on screen in the picker.
         """
-        from fastfuncstuff.viewer.slicing import voxel_value
-
         st = self.state
         if st.grid is None:
             return []
@@ -1076,35 +1088,58 @@ class ViewerSession:
         overlays = [ly for i, ly in enumerate(st.layers) if ly.visible and (i > 0 or ly.colour)]
         lines: list[str] = []
         for layer in reversed(overlays):
+            reading = self.layer_reading(layer)
+            if reading is None:
+                continue
             prefix = f"{_short(layer.name)}  " if len(overlays) > 1 else ""
-            if layer.colour:
-                # Before display_volume: for a colour layer that is a whole
-                # volume of the scalar stand-in, built and copied to the host
-                # on every frame just to be ignored here.
-                source = self.colour_sources.get(layer.key)
-                if source is not None:
-                    ijk = self.layer_voxel(layer.affine, st.crosshair)
-                    lines.append(ValueLine(prefix, source.readout(ijk, self.layer_time(layer))))
-                continue
-            volume = self.display_volume(layer.key)
-            if volume is None:
-                continue
-            if layer.roi:
-                value = voxel_value(volume, st.grid, layer.affine, st.crosshair)
-                lines.append(f"{prefix}{self.region_name(layer, value)}")
-                continue
-            value = voxel_value(volume, st.grid, layer.affine, st.crosshair)
-            parts = [f"{_brick_name(layer, layer.volume_index)}{_fmt(value)}"]
-            if layer.threshold_index is not None and layer.threshold_index != layer.volume_index:
-                stat_vol = self.display_volume(layer.key, index=layer.threshold_index)
-                if stat_vol is not None:
-                    stat = voxel_value(stat_vol, st.grid, layer.affine, st.crosshair)
-                    parts.append(f"{_brick_name(layer, layer.threshold_index)}{_fmt(stat)}")
-            lines.append(ValueLine(prefix, "   ".join(parts)))
+            lines.append(
+                ValueLine(prefix, reading.long) if not layer.roi else prefix + reading.long
+            )
         # The region the crosshair is in, from the subject's own parcellation
         # and label volume -- whatever else is loaded.
         lines.extend(self.surfaces.region_lines(st.crosshair_mm, st.surface_annot, st.volume_atlas))
         return lines
+
+    def layer_reading(self, layer: Layer) -> LayerReading | None:
+        """One layer's value(s) under the crosshair, or ``None`` with no data to read.
+
+        The single lookup behind every readout -- the layer list's value column,
+        the status bar, the optional box on the image -- so they cannot disagree
+        and a crosshair move pays for each layer once. A stats overlay cut on
+        another sub-brick reads both: the beta you colour by and the t that
+        decides whether it is drawn.
+        """
+        from fastfuncstuff.viewer.slicing import voxel_value
+
+        st = self.state
+        if st.grid is None:
+            return None
+        if layer.colour:
+            # Before display_volume: for a colour layer that is a whole volume
+            # of the scalar stand-in, built and copied to the host on every
+            # frame just to be ignored here.
+            source = self.colour_sources.get(layer.key)
+            if source is None:
+                return None
+            ijk = self.layer_voxel(layer.affine, st.crosshair)
+            text = source.readout(ijk, self.layer_time(layer))
+            return LayerReading(short=text.split("  |  ")[0], long=text)
+        volume = self.display_volume(layer.key)
+        if volume is None:
+            return None
+        value = voxel_value(volume, st.grid, layer.affine, st.crosshair)
+        if layer.roi:
+            name = self.region_name(layer, value)
+            return LayerReading(short=name, long=name)
+        short = [_fmt(value)]
+        long = [f"{_brick_name(layer, layer.volume_index)}{_fmt(value)}"]
+        if layer.threshold_index is not None and layer.threshold_index != layer.volume_index:
+            stat_vol = self.display_volume(layer.key, index=layer.threshold_index)
+            if stat_vol is not None:
+                stat = voxel_value(stat_vol, st.grid, layer.affine, st.crosshair)
+                short.append(_fmt(stat))
+                long.append(f"{_brick_name(layer, layer.threshold_index)}{_fmt(stat)}")
+        return LayerReading(short=" / ".join(short), long="   ".join(long))
 
     # -- overlay colour per voxel ---------------------------------------
 

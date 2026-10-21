@@ -102,6 +102,10 @@ class ImageWindow(QtWidgets.QWidget):
         self.vid = vid
         self.session = session
         self._dispatch = dispatch
+        #: The values-at-the-crosshair box over the image. Off: it covered the
+        #: voxels being read, and the controller's layer list now carries each
+        #: layer's value beside its name.
+        self.value_box = False
         self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
         self.setStyleSheet(theme.stylesheet())
 
@@ -346,6 +350,12 @@ class ImageWindow(QtWidgets.QWidget):
                     "\\",
                     "tile the visible images, one per pane, zoom and pan shared (every window)",
                     self._request_tiles,
+                    group="view",
+                ),
+                Binding(
+                    "alt+v",
+                    "values at the crosshair over the image on / off",
+                    self._toggle_value_box,
                     group="view",
                 ),
                 Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
@@ -1877,9 +1887,14 @@ class ImageWindow(QtWidgets.QWidget):
             tile.set_zoomed(not view.is_identity)
             tile.set_tilt(tilt)
         self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
-        self.pane.set_readout(self.session.overlay_readout())
+        # Not even computed while hidden: it is a device-to-host read per layer.
+        self.pane.set_readout(self.session.overlay_readout() if self.value_box else [])
         self.pane.set_handle(self._handle_position())
         self.pane.set_regions(self._mode_regions())
+
+    def _toggle_value_box(self) -> None:
+        self.value_box = not self.value_box
+        self.redraw_crosshair()
 
     def _graph_coverage(self, plane: Plane, row: int, col: int) -> list[tuple[int, int, int, int]]:
         """Footprints of the graphs reading this plane, in image indices.

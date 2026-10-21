@@ -562,6 +562,8 @@ def test_the_image_corner_follows_the_crosshair(win, qapp):
         for w in win.manager.windows.values()
         if getattr(w, "pane", None) is not None and w.pane.plane is Plane.AXIAL
     )
+    window = next(w for w in win.manager.windows.values() if getattr(w, "pane", None) is pane)
+    window.value_box = True  # off by default: it covered the voxels being read
     win.refresh(win.session.do(SetIJK(3, 3, 2)))
     qapp.processEvents()
     first = list(pane._readout)
@@ -569,6 +571,15 @@ def test_the_image_corner_follows_the_crosshair(win, qapp):
     qapp.processEvents()
     assert pane._readout and pane._readout != first
     assert pane._readout == win.session.overlay_readout()
+
+
+def test_the_image_value_box_is_off_by_default(win, qapp):
+    from fastfuncstuff.viewer.vocab import SetIJK
+
+    win.refresh(win.session.do(SetIJK(4, 5, 2)))
+    qapp.processEvents()
+    panes = [w.pane for w in win.manager.windows.values() if getattr(w, "pane", None) is not None]
+    assert panes and all(not pane._readout for pane in panes)
 
 
 def test_clicking_the_colour_bar_thresholds_and_shift_click_reverses_it(win, qapp):

@@ -52,7 +52,6 @@ from fastfuncstuff.viewer.layers import AlphaMode, SignMode
 from fastfuncstuff.viewer.modes import registry
 from fastfuncstuff.viewer.modes.base import ActionControl, OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
-from fastfuncstuff.viewer.slicing import voxel_value
 from fastfuncstuff.viewer.state import Plane, grid_res_choices
 from fastfuncstuff.viewer.surfaces import next_outlines
 from fastfuncstuff.viewer.ui import theme
@@ -68,7 +67,12 @@ from fastfuncstuff.viewer.ui.shortcuts import (
 )
 from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.tooldialog import ToolDialog
-from fastfuncstuff.viewer.ui.widgets import RowSizedList, install_combo_pickers
+from fastfuncstuff.viewer.ui.widgets import (
+    VALUE_ROLE,
+    RowSizedList,
+    ValueColumnDelegate,
+    install_combo_pickers,
+)
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
@@ -166,6 +170,8 @@ RESCAN_QUIET_MS = 1200
 #: output and a couple of kept copies -- past that the list is being used as a
 #: workspace and scrolling it is better than spending the panel on it.
 LAYER_ROWS = 6
+#: Fastest the layer list's value column follows a moving crosshair.
+VALUES_EVERY_MS = 40
 BACKGROUND = QtCore.Qt.ItemDataRole.BackgroundRole
 FOREGROUND = QtCore.Qt.ItemDataRole.ForegroundRole
 
@@ -1395,8 +1401,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.layer_list = RowSizedList(max_rows=LAYER_ROWS, min_rows=2)
         self.layer_list.setToolTip(
             "[ and ] step through the stack; space or the tick box hides a layer.\n"
-            "A soloed image window draws whichever one is selected here."
+            "A soloed image window draws whichever one is selected here.\n"
+            "Right of each shown layer: its value at the crosshair\n"
+            "(value / threshold when it is cut on another sub-brick)."
         )
+        # The values at the crosshair live here, beside the names they belong
+        # to, rather than in a box over the image that hid the very voxels
+        # being read. Coalesced: a drag moves the crosshair faster than
+        # anyone reads numbers, and each value is a device-to-host copy.
+        self.layer_list.setItemDelegate(ValueColumnDelegate(self.layer_list))
+        self._values_timer = QtCore.QTimer(self)
+        self._values_timer.setSingleShot(True)
+        self._values_timer.timeout.connect(self._update_values)
+        self._values_clock = QtCore.QElapsedTimer()
+        # Rows scrolled into view were skipped while out of it.
+        self.layer_list.verticalScrollBar().valueChanged.connect(self._schedule_values)
         self.layer_list.currentRowChanged.connect(self._row_selected)
         # Visibility used to be a glyph in the row's text, which looked like a
         # tick box and was not one -- clicking it only selected the row. A real
@@ -2654,25 +2673,66 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.time_spin.blockSignals(False)
         self.time_label.setText(f"/ {hi}" if hi else "")
         self.mode_label.setText(self.session.mode.status())
-        parts: list[str] = []
-        for layer in reversed(list(st.layers)):
-            if not layer.visible:
-                continue
-            vol = self.session.display_volume(layer.key)
-            if vol is None:
-                continue
-            val = voxel_value(vol, st.grid, layer.affine, st.crosshair)
-            if layer.roi:
-                # "37" is not what you want to know when you are pointing at
-                # the thalamus, and it is the one readout that has to survive
-                # being outside every region -- hence "--", not "0".
-                parts.append(f"{layer.name}={self.session.region_name(layer, val)}")
-                continue
-            # Only where the header actually named something: appending "#0" to
-            # every 3-D anatomy would be noise dressed as information.
-            tag = f" {layer.sub_brick()}" if layer.labels else ""
-            parts.append(f"{layer.name}{tag}={'--' if val is None else f'{val:.4g}'}")
-        self.value_label.setText("   ".join(parts[:3]))
+        self._schedule_values()
+
+    def _schedule_values(self, *_args) -> None:
+        """Bring the value column up to date -- now, or once the throttle allows."""
+        if self._values_timer.isActive():
+            return
+        wait = VALUES_EVERY_MS - (
+            self._values_clock.elapsed() if self._values_clock.isValid() else VALUES_EVERY_MS
+        )
+        if wait <= 0:
+            self._update_values()
+        else:
+            self._values_timer.start(int(wait))
+
+    def _update_values(self) -> None:
+        """Each shown layer's value at the crosshair, beside its row in the list.
+
+        Only rows on screen are read: a stack scrolled past its cap would
+        otherwise pay a device-to-host copy per off-screen layer per move. A
+        row's data is written only when its text changed, so the repaint is
+        the rows whose numbers moved and the list is never rebuilt. The status
+        bar names what the selected layer's numbers are, plus the subject's
+        own atlas regions -- the readout lines that have no row.
+        """
+        self._values_clock.restart()
+        st = self.session.state
+        if st.grid is None:
+            self.value_label.setText("")
+            return
+        listed = self.layer_list
+        view = listed.viewport().rect()
+        selected = self.current_key()
+        selected_text = ""
+        listed.blockSignals(True)
+        try:
+            for row in range(listed.count()):
+                item = listed.item(row)
+                key = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                layer = st.layers.find(key) if key is not None else None
+                text = ""
+                # The selected layer is read wherever it is scrolled to: the
+                # status bar speaks for it.
+                if (
+                    layer is not None
+                    and layer.visible
+                    and (key == selected or listed.visualItemRect(item).intersects(view))
+                ):
+                    reading = self.session.layer_reading(layer)
+                    if reading is not None:
+                        text = reading.short
+                        if key == selected:
+                            selected_text = f"{layer.name}  {reading.long}"
+                if (item.data(VALUE_ROLE) or "") != text:
+                    item.setData(VALUE_ROLE, text)
+        finally:
+            listed.blockSignals(False)
+        regions = self.session.surfaces.region_lines(
+            st.crosshair_mm, st.surface_annot, st.volume_atlas
+        )
+        self.value_label.setText("   ".join([t for t in (selected_text, *regions) if t]))
 
     def dock_left(self) -> None:
         """Park the controller at the top-left of its screen, as tall as it needs.

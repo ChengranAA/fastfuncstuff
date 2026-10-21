@@ -639,8 +639,67 @@ def test_the_threshold_can_read_a_different_sub_brick(winstats, qapp):
 
 def test_the_readout_names_the_sub_brick(winstats, qapp):
     winstats.refresh(Aspect.SLICES)
-    qapp.processEvents()
+    winstats._update_values()  # the throttle may have deferred it
     assert "Full_Fstat" in winstats.value_label.text()
+
+
+def _row_values(win):
+    from fastfuncstuff.viewer.ui.widgets import VALUE_ROLE
+
+    return [win.layer_list.item(r).data(VALUE_ROLE) for r in range(win.layer_list.count())]
+
+
+def test_each_shown_layer_reads_its_value_beside_its_row(win, qapp):
+    """The values live in the layer list now, not in a box over the image."""
+    from fastfuncstuff.viewer.slicing import voxel_value
+    from fastfuncstuff.viewer.vocab import SetIJK
+
+    win.refresh(win.session.do(SetIJK(3, 4, 2)))
+    win._update_values()
+    st = win.session.state
+    want = []
+    for layer in reversed(list(st.layers)):
+        vol = win.session.display_volume(layer.key)
+        want.append(f"{voxel_value(vol, st.grid, layer.affine, st.crosshair):.4g}")
+    assert _row_values(win) == want
+
+    items = [win.layer_list.item(r) for r in range(win.layer_list.count())]
+    win.refresh(win.session.do(SetIJK(5, 6, 3)))
+    win._update_values()
+    # Updated in place: the same items, so no rebuild and no scroll reset.
+    assert [win.layer_list.item(r) for r in range(win.layer_list.count())] == items
+    assert _row_values(win) != want
+
+
+def test_a_hidden_layer_shows_no_value(win, qapp):
+    from fastfuncstuff.viewer.vocab import SetLayerVisible
+
+    key = win.session.state.layers.overlay.key
+    win.refresh(win.session.do(SetLayerVisible(key, False)))
+    win._update_values()
+    assert not _row_values(win)[0]
+    assert _row_values(win)[1]
+
+
+def test_the_value_column_is_throttled(win, qapp, monkeypatch):
+    from fastfuncstuff.viewer.ui import window as window_mod
+    from fastfuncstuff.viewer.vocab import SetIJK
+
+    # Long enough that a slow refresh cannot outlast it and make this flaky.
+    monkeypatch.setattr(window_mod, "VALUES_EVERY_MS", 60_000)
+    win._update_values()
+    calls = []
+    real = win.session.layer_reading
+    win.session.layer_reading = lambda layer: calls.append(layer.key) or real(layer)
+    try:
+        for i in range(5):
+            win.refresh(win.session.do(SetIJK(i, 2, 2)))
+        # Five moves inside one throttle window: nothing read yet, one pending.
+        assert calls == []
+        assert win._values_timer.isActive()
+    finally:
+        win.session.layer_reading = real
+        win._values_timer.stop()
 
 
 def test_a_time_series_offers_no_sub_brick_picker(win4d, qapp):

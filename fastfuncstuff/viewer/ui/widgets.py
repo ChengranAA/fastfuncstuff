@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 
 class RowSizedList(QtWidgets.QListWidget):
@@ -51,6 +51,61 @@ class RowSizedList(QtWidgets.QListWidget):
     def rows_changed(self) -> None:
         """Call after adding or removing items, so the layout re-measures."""
         self.updateGeometry()
+
+
+#: Item data role a :class:`ValueColumnDelegate` draws at the row's right edge.
+VALUE_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+
+
+class ValueColumnDelegate(QtWidgets.QStyledItemDelegate):
+    """A list row with a second, right-aligned text: the row's value.
+
+    The value is item data rather than part of the row's text so that the
+    name stays the name -- to the tests, to the tick box, to anything that
+    reads ``item.text()`` -- and a value changing repaints that one row
+    without re-laying-out the list. The name gives way first, elided in the
+    middle, because the number is what changes and what was asked for.
+    """
+
+    def paint(self, painter, option, index) -> None:  # noqa: D102
+        value = index.data(VALUE_ROLE)
+        if not value:
+            super().paint(painter, option, index)
+            return
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget is not None else QtWidgets.QApplication.style()
+        text_rect = style.subElementRect(
+            QtWidgets.QStyle.SubElement.SE_ItemViewItemText, opt, widget
+        )
+        # opt.font, not opt.fontMetrics: under the theme stylesheet the two
+        # differ, and measuring with one while drawing with the other clips.
+        metrics = QtGui.QFontMetrics(opt.font)
+        gap = metrics.horizontalAdvance("  ")
+        # Never more than two thirds of the row: a long region name must not
+        # push the layer's own name off entirely.
+        # +2: the advance is rounded and elidedText measures unrounded, so an
+        # exact fit came out as "36...".
+        room = max(0, min(metrics.horizontalAdvance(value) + 2, text_rect.width() * 2 // 3))
+        opt.text = metrics.elidedText(
+            opt.text, QtCore.Qt.TextElideMode.ElideMiddle, max(0, text_rect.width() - room - gap)
+        )
+        style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        selected = bool(opt.state & QtWidgets.QStyle.StateFlag.State_Selected)
+        role = (
+            QtGui.QPalette.ColorRole.HighlightedText if selected else QtGui.QPalette.ColorRole.Text
+        )
+        painter.save()
+        painter.setPen(opt.palette.color(role))
+        painter.setFont(opt.font)
+        shown = metrics.elidedText(value, QtCore.Qt.TextElideMode.ElideRight, room)
+        painter.drawText(
+            text_rect,
+            int(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter),
+            shown,
+        )
+        painter.restore()
 
 
 class ComboPicker(QtWidgets.QDialog):

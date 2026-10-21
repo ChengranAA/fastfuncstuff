@@ -3684,3 +3684,52 @@ def test_medic_owns_inplane_unless_asked_to_keep_locomocos(acq_3d):
         assert "locomoco" not in plan.runs[0].warp_chain and not plan.options.locomoco
         assert "== stage03: locomoco ==" not in s
         assert "locomoco" in keep.runs[0].warp_chain and "== stage03: locomoco ==" in k
+
+
+def test_nlanat_segment_is_told_which_grid_the_anat_matrix_was_fitted_on():
+    """[[project_oblique_frame_slip]]: the anat aff12's -base is the AUTOBOX, while the
+    subject TPM sits on the uncropped anat. An .aff12.1D is read in its base grid's
+    cardinal mm frame, which keeps that grid's own origin, so on an oblique anat the
+    two frames differ by a fixed shift (6.59 mm on the 5.04 deg subject that caught
+    this) and ffs_segment starts the fit that far off, silently.
+    """
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+
+    # Own anat: the matrix's base is the local autobox.
+    s = write_script(
+        build_plan(subj, Options(anat_nonlin=True, tpm="/tpm.nii", anat_path="/anat.nii.gz")),
+        "wd",
+        bids_root="/bids",
+    )
+    assert "-1Dmatrix stage09.anat.aff12.1D" in s
+    assert '-matrix_base "stage09.anat_autobox.nii.gz"' in s
+    # and that really is what the allineate used as -base
+    assert '-base "stage09.anat_autobox.nii.gz"' in s
+
+    # Borrowed anat matrix: its base is the autobox in the REFERENCE dir.
+    s = write_script(
+        build_plan(
+            subj,
+            Options(grand_reference="/floc.results", anat_nonlin=True, tpm="/tpm.nii"),
+        ),
+        "wd",
+        bids_root="/bids",
+    )
+    assert '-matrix_base "/floc.results/stage09.anat_autobox.nii.gz"' in s
+
+    # User-supplied -ref_transforms: we cannot know their base, so say nothing and let
+    # ffs_segment refuse rather than slip (it only refuses on an oblique TPM).
+    s = write_script(
+        build_plan(
+            subj,
+            Options(
+                ref_file="/ref_epi.nii.gz",
+                ref_transforms=["/r2a.1D"],
+                anat_nonlin=True,
+                tpm="/tpm.nii",
+            ),
+        ),
+        "wd",
+        bids_root="/bids",
+    )
+    assert "-matrix_base" not in s

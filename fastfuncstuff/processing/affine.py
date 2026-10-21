@@ -1418,6 +1418,9 @@ def load_matrix_chain(
     paths: list[str] | str,
     base_affine: np.ndarray,
     source_affine: np.ndarray,
+    *,
+    fitted_base_affine: np.ndarray | None = None,
+    fitted_source_affine: np.ndarray | None = None,
 ) -> Tensor:
     """Load and compose a stack of ``.aff12.1D`` affines into one voxel matrix.
 
@@ -1433,12 +1436,27 @@ def load_matrix_chain(
     final ``base_affine`` (output grid) and ``source_affine`` (the volume the
     composite maps *into*) are used, to convert the composite to voxel indices.
 
+    DICOM mm is a physical space, but it is the grid's **cardinal** one (AFNI's
+    ``ijk_to_dicom``), and :func:`cardinal_affine` keeps each grid's own origin.
+    So on an oblique dataset a *crop* of the base — same anatomy, same sform,
+    shifted origin — has a different mm frame than its parent, and reading the
+    matrix against the wrong one lands the data millimetres away with nothing to
+    show it (6.6 mm on a 5° anat; see [[project_oblique_frame_slip]]).
+    ``fitted_base_affine`` / ``fitted_source_affine`` name the grids the matrix
+    was actually fitted against when they differ from the output grids, and the
+    rebase is applied in true sform space, where a crop *is* invisible. Leave
+    them out and the output grids are assumed to be the fitted ones.
+
     A single-element list reproduces ``load_matrix_1D(path, base, source)``.
 
     Args:
         paths: one ``.aff12.1D`` path or a base-side→source-side list of them.
         base_affine: NIfTI affine of the final base (output) grid.
         source_affine: NIfTI affine of the final source grid.
+        fitted_base_affine: NIfTI affine of the grid the leftmost matrix's *base*
+            was fitted on. Default: ``base_affine``.
+        fitted_source_affine: NIfTI affine of the grid the rightmost matrix's
+            *source* was fitted on. Default: ``source_affine``.
 
     Returns:
         (4, 4) voxel-index matrix mapping base voxels → source voxels.
@@ -1451,7 +1469,23 @@ def load_matrix_chain(
     c = torch.eye(4, dtype=torch.float64)
     for p in paths:
         c = load_matrix_1D(p).to(torch.float64) @ c
-    return dicom_matrix_to_voxel(c.to(torch.float32), base_affine, source_affine)
+    fit_base = base_affine if fitted_base_affine is None else fitted_base_affine
+    fit_src = source_affine if fitted_source_affine is None else fitted_source_affine
+    m = dicom_matrix_to_voxel(c.to(torch.float32), fit_base, fit_src)
+    # Naming a grid that IS the output grid is a no-op, so take the plain path and stay
+    # bit-identical to the two-argument call rather than round-tripping through inv().
+    if np.array_equal(fit_base, base_affine) and np.array_equal(fit_src, source_affine):
+        return m
+    # Hop through true sform space at each end: output-base voxel → fitted-base
+    # voxel, and fitted-source voxel → output-source voxel.
+    pre = np.linalg.inv(np.asarray(fit_base, dtype=np.float64)) @ np.asarray(
+        base_affine, dtype=np.float64
+    )
+    post = np.linalg.inv(np.asarray(source_affine, dtype=np.float64)) @ np.asarray(
+        fit_src, dtype=np.float64
+    )
+    out = torch.from_numpy(post) @ m.to(torch.float64).cpu() @ torch.from_numpy(pre)
+    return out.to(m.dtype).to(m.device)
 
 
 # ---------------------------------------------------------------------------

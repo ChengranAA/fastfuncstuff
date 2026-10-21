@@ -2914,9 +2914,12 @@ def _stage_anat(plan: Plan) -> str:
         out.append(
             f'ANAT="{anat_ph}"\n'
             "# Crop the anat's air away first: the alignment base, every EPI-in-anat\n"
-            "# output, and the final grid all inherit this FOV, and the aff12 matrix is\n"
-            "# in DICOM mm — cropping the base moves nothing, it only shrinks the search\n"
+            "# output, and the final grid all inherit this FOV, and it shrinks the search\n"
             "# space and the volume-sized allocations. Doubles as the viewing underlay.\n"
+            "# The aff12 is in DICOM mm, but that is the BASE's cardinal frame, which\n"
+            "# keeps the base's own origin — so on an oblique anat this crop is NOT a\n"
+            "# free lunch: anything reading the matrix against the uncropped anat must\n"
+            "# be told the crop was the base, or it slips by a fixed shift.\n"
             f'[ -f "{box}" ] || \\\n{boxing}\n'
             'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.anat.aff12.1D" ]; then\n'
             "  # cross-modal rigid lpc: base=anat → matrix maps anat→EPI (chain head).\n"
@@ -2947,6 +2950,9 @@ def _stage_anat(plan: Plan) -> str:
         )
         # The FS-derived TPM has 8 hard-edge classes → its own ngaus/cleanup params.
         seg_tune = _split_flags(config.DEFAULT_OPTS["segment_fstpm" if opt.fs_tpm else "segment"])
+        # The matrix's base is the anat autobox; the TPM is on the uncropped anat. On an
+        # oblique anat those are different cardinal frames, so say which one it was.
+        seg_base = _anat_matrix_base(opt)
         seg = _ffs(
             "ffs_segment",
             [
@@ -2955,6 +2961,7 @@ def _stage_anat(plan: Plan) -> str:
                 f"-tpm {tpm}",
                 (f"-tpm_source {shlex.quote(tpm_src_path)}" if tpm_src_path else ""),
                 f"-1Dmatrix {seg_mats}",
+                (f'-matrix_base "{seg_base}"' if seg_base else ""),
                 '-prefix "stage09.nlanat.nii$FMT"',
                 *seg_tune,
                 '-device "$DEVICE"',
@@ -3901,7 +3908,7 @@ def _surface_args(plan: Plan) -> str:
         return ""
     assert opt.fs_subject is not None
     meshes = " ".join(shlex.quote(m) for m in opt.surface_target)
-    base = _surf_chain_base(opt)
+    base = _anat_matrix_base(opt)
     return (
         f" -surf {shlex.quote(opt.fs_subject)} -surf_mesh {meshes}"
         ' -surf_prefix \\"stage10s.surf.${FRAG[$k]}\\" -surf_master \\"$ANAT\\"'
@@ -3911,13 +3918,16 @@ def _surface_args(plan: Plan) -> str:
     )
 
 
-def _surf_chain_base(opt) -> str | None:
-    """The grid SURFCHAIN's head (the anat matrix) was fitted on, for -surf_chain_base.
+def _anat_matrix_base(opt) -> str | None:
+    """The grid the anat matrix was fitted on — every reader of it needs to be told.
 
-    The surface master is the raw $ANAT but the matrix's base is its autobox crop:
-    on an oblique anat the two share a rotation, not an origin, and the cardinal
-    frame the chain runs in would put the points mm off. None for -ref_file, whose
-    transforms' base this script cannot know."""
+    The matrix's base is the anat's autobox crop, while the things it gets read
+    against are the raw $ANAT (the surface master) and the subject TPM (the
+    uncropped anat). On an oblique anat those share a rotation, not an origin, so
+    the cardinal mm frame an .aff12.1D lives in differs and the data lands mm away
+    — 6.6 mm on a 5 degree anat; see [[project_oblique_frame_slip]]. Feeds
+    ffs_nwarp -surf_chain_base and ffs_segment -matrix_base. None for -ref_file,
+    whose transforms' base this script cannot know."""
     if opt.ref_file is not None:
         return None
     if opt.grand_reference:

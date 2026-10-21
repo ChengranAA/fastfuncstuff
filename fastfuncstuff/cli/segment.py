@@ -28,6 +28,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 # rather than enforced, since resolve_pe_axis is case- and sign-tolerant.
 PE_AXIS_WORDS = ("x", "y", "z", "i", "j", "k", "AP", "PA", "LR", "RL", "IS", "SI")
 from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
+from fastfuncstuff.io.dsetinfo import obliquity_deg, read_info
 from fastfuncstuff.processing.affine import load_matrix_chain, save_matrix_1D
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
 from fastfuncstuff.processing.locomoco import normalize_axis_argv, resolve_pe_axis
@@ -170,6 +171,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "                     source-side (AFNI -nwarp order). WITHOUT it the input is\n"
             "                     assumed already in template space (identity) — fine for\n"
             "                     AC-PC'd anatomicals, risky otherwise.\n"
+            "  -matrix_base D     The dataset that matrix's -base WAS, if it is not the\n"
+            "                     -tpm grid (e.g. an autobox crop of the anat the TPM sits\n"
+            "                     on). An .aff12.1D lives in its base's CARDINAL mm frame,\n"
+            "                     and that frame keeps the grid's own origin — so on an\n"
+            "                     OBLIQUE base, a crop is a different frame and the matrix\n"
+            "                     silently lands the data mm away. Required when the TPM\n"
+            "                     grid is oblique.\n"
             "\n"
             "EPI / PE-MODE (distortion correction, the novel use):\n"
             "  Segment the EPI itself with -pe_axis set to the phase-encode axis. The\n"
@@ -238,6 +246,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="The .aff12.1D aligning input->template (as written by ffs_allineate "
         "-base template -source input); pass as-is, base-side->source-side. Omit to "
         "register the input to the TPM itself (-affreg).",
+    )
+    aff.add_argument(
+        "-matrix_base",
+        "-matrix-base",
+        default=None,
+        metavar="DSET",
+        help="The dataset -1Dmatrix's leftmost matrix was fitted against (its -base), "
+        "when that is NOT the -tpm grid — e.g. the anat autobox, where the TPM is on the "
+        "uncropped anat. An .aff12.1D is in its base's CARDINAL mm frame, which keeps that "
+        "grid's origin, so on an oblique base a crop of it is a different frame and the "
+        "matrix lands the data mm away (6.6 mm on a 5-degree anat). Required when "
+        "-1Dmatrix is given and the TPM grid is oblique; pass the -tpm itself if the "
+        "matrix really was fitted on that grid.",
     )
     aff.add_argument(
         "-affreg",
@@ -875,8 +896,35 @@ def main(argv: list[str] | None = None) -> int:
     # inverse. Without one, -affreg already set world_affine (or "off": identity).
     vox2vox: torch.Tensor | None = None
     if args.matrix:
+        tpm_affine_np = np.asarray(tpm_affine.cpu(), dtype=np.float64)
+        # The matrix was fitted against SOME base grid and SOME source grid, and both
+        # ends can differ from the grids we read it against: -matrix_base names a base
+        # that is not the TPM (an autobox crop of the anat), and -autobox moves the
+        # source grid under us. Either is invisible in true sform space and a hard
+        # offset in the cardinal mm frame the .aff12.1D lives in, so name both ends.
+        matrix_base_np = tpm_affine_np
+        if args.matrix_base:
+            info = read_info(args.matrix_base)  # header only: all we want is its grid
+            if not info.exists:
+                raise SystemExit(f"-matrix_base not found: {args.matrix_base}")
+            matrix_base_np = np.asarray(info.affine, dtype=np.float64)
+        elif obliquity_deg(tpm_affine_np) > 0.0005:
+            raise SystemExit(
+                "-1Dmatrix on an oblique template needs -matrix_base: the TPM grid is "
+                f"{obliquity_deg(tpm_affine_np):.3f} deg oblique, and an .aff12.1D is read in "
+                "its base grid's CARDINAL mm frame, which keeps that grid's own origin. If "
+                "the matrix's -base was a different grid from the -tpm (an autobox crop of "
+                "the same anat, say), the two frames disagree by a pure shift and the fit "
+                "starts that far off with nothing to show it. Pass -matrix_base <the "
+                "dataset that matrix's -base was>, or -matrix_base <the -tpm> if it really "
+                "was fitted on the TPM grid."
+            )
         tpm_to_input = load_matrix_chain(
-            args.matrix, base_affine=np.asarray(tpm_affine.cpu()), source_affine=fit_affine_np
+            args.matrix,
+            base_affine=tpm_affine_np,
+            source_affine=fit_affine_np,
+            fitted_base_affine=matrix_base_np,
+            fitted_source_affine=np.asarray(hdr["affine"], dtype=np.float64),
         ).to(dtype=torch.float64, device=device)
         vox2vox = torch.linalg.inv(tpm_to_input)  # input(subject) vox -> tpm vox
     elif world_affine is None:

@@ -754,13 +754,25 @@ def _loro_r2_per_voxel(
     designs_clean: list[torch.Tensor],
     n_vox: int,
     device: torch.device,
-    chunk: int = 20000,
+    chunk: int | None = None,
 ) -> np.ndarray:
     """
     LORO CV: fit shared HRF on N-1 runs, predict on held-out run.
     Returns per-voxel median R² across folds, shape (n_vox,).
     """
     n_runs = len(data_clean)
+    if chunk is None:
+        from fastfuncstuff.memory import estimate_chunk_size
+
+        # Called once per candidate window: plan without a cache flush.
+        chunk = estimate_chunk_size(
+            n_voxels=max(1, n_vox),
+            n_timepoints=sum(int(d.shape[1]) for d in data_clean),
+            n_regressors=int(designs_clean[0].shape[1]),
+            device=device,
+            operation="xval",
+            empty_cache=False,
+        )
     fold_r2s: list[np.ndarray] = []
 
     for held_out in range(n_runs):

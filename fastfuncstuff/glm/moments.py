@@ -53,7 +53,7 @@ def compute_run_moments(
     store_device: torch.device | None = None,
     voxel_mask: torch.Tensor | None = None,
     runs: list[int] | None = None,
-    chunk_size: int = 20000,
+    chunk_size: int | None = None,
 ) -> RunMoments:
     """Project each run's nuisance out and accumulate its normal-equation blocks.
 
@@ -78,8 +78,9 @@ def compute_run_moments(
     runs : list of int, optional
         Only build blocks for these runs. Entries for other runs are omitted, so
         the returned lists are indexed by position in ``runs``, not run index.
-    chunk_size : int, default=20000
-        Voxels per ``X'y`` chunk.
+    chunk_size : int, optional
+        Voxels per ``X'y`` chunk. Planned by :func:`memory.estimate_chunk_size`
+        when omitted.
 
     Returns
     -------
@@ -96,6 +97,27 @@ def compute_run_moments(
 
     xtx_blocks: list[torch.Tensor] = []
     xty_blocks: list[torch.Tensor] = []
+
+    if chunk_size is None:
+        from fastfuncstuff.memory import estimate_chunk_size
+
+        n_vox_total = int(voxel_mask.sum()) if voxel_mask is not None else data.shape[0]
+        longest_run = max(
+            (
+                end - start
+                for start, end in (run_bounds(run_starts, n_timepoints, r) for r in wanted)
+            ),
+            default=1,
+        )
+        # Callers build moments inside target / arm loops: plan without a flush.
+        chunk_size = estimate_chunk_size(
+            n_voxels=max(1, n_vox_total),
+            n_timepoints=longest_run,
+            n_regressors=n_cols,
+            device=device,
+            operation="glm",
+            empty_cache=False,
+        )
 
     for run_idx in wanted:
         start, end = run_bounds(run_starts, n_timepoints, run_idx)

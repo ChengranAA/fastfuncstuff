@@ -48,9 +48,29 @@ def test_indices_past_the_library_end_are_an_explained_error(tmp_path):
         load_hrfopt_library(prefix, torch.tensor([0, 25]), microtime_dt=0.1)
 
 
-def test_missing_library_falls_back_to_the_stock_one(tmp_path):
-    lib, _ = load_hrfopt_library(str(tmp_path / "nothing"), torch.tensor([0, 19]), microtime_dt=0.1)
-    assert len(lib) == 20
+def test_missing_library_is_refused_not_guessed(tmp_path):
+    """The stock library is the same size as many real ones, so guessing it fits
+    silently with the wrong shapes; and its duration_convolved flag is unknown."""
+    with pytest.raises(SystemExit, match="not found"):
+        load_hrfopt_library(str(tmp_path / "nothing"), torch.tensor([0, 19]), microtime_dt=0.1)
+
+
+def _custom_tsv(tmp_path, n_hrfs=7):
+    t = np.arange(301) * 0.1
+    cols = [t**5 * np.exp(-t / (0.5 + 0.1 * k)) for k in range(n_hrfs)]
+    path = tmp_path / "custom_hrflibrary.tsv"
+    np.savetxt(path, np.stack(cols, axis=1), delimiter="\t")
+    return str(path)
+
+
+def test_explicit_library_stands_in_for_a_missing_sidecar(tmp_path):
+    lib, _ = load_hrfopt_library(
+        str(tmp_path / "nothing"),
+        torch.tensor([0, 6]),
+        microtime_dt=0.1,
+        library_path=_custom_tsv(tmp_path),
+    )
+    assert len(lib) == 7
 
 
 def test_library_sampled_at_another_microtime_dt_is_refused(tmp_path):
@@ -68,10 +88,12 @@ def test_library_sampled_at_another_microtime_dt_is_refused(tmp_path):
 
 def test_unassigned_voxels_take_the_middle_curve_without_the_sidecar(tmp_path):
     """load_hrf_index_for_input can only fill -1 when the sidecar sizes the
-    library; with the stock fallback (or -hrf_library) they used to stay -1 and
-    be fit with library[-1], the slowest curve."""
+    library; under -hrf_library they used to stay -1 and be fit with
+    library[-1], the slowest curve."""
     idx = torch.tensor([-1, 3, -1])
-    lib, _ = load_hrfopt_library(str(tmp_path / "nothing"), idx, microtime_dt=0.1)
+    lib, _ = load_hrfopt_library(
+        str(tmp_path / "nothing"), idx, microtime_dt=0.1, library_path=_custom_tsv(tmp_path)
+    )
     assert idx.tolist() == [len(lib) // 2, 3, len(lib) // 2]
 
 

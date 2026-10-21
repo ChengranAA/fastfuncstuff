@@ -1075,7 +1075,7 @@ def load_hrfopt_library(
 
     An explicit ``library_path`` (``-hrf_library`` / ``-hrf_library_raw``)
     wins, for the case where the saved file is gone; its size is still checked
-    against the indices.
+    against the indices.  Without either, it is a refusal, not a fallback.
 
     Voxels still carrying ``-1`` (no assignment) are set **in place** in
     ``hrf_indices`` to the middle curve of the library returned.
@@ -1109,6 +1109,14 @@ def load_hrfopt_library(
                     "IMPULSES\n  (the duration is already inside the curves, not applied here)"
                 )
     else:
+        if library_path is None:
+            # Guessing the stock library here fits a same-sized different one
+            # silently, and its duration_convolved flag is unknowable.
+            sys.exit(
+                f"ERROR: {sidecar} not found. The HRF indices from -hrfopt_prefix "
+                f"{prefix} mean nothing without the library they were chosen from;\n"
+                f"       re-run ffs_hrfopt, or pass that library with -hrf_library."
+            )
         hrf_library = get_hrf_library(
             mode="library",
             stim_duration=0.0,
@@ -1117,10 +1125,7 @@ def load_hrfopt_library(
             device=device,
         )
         if verbose:
-            if library_path:
-                print(f"  Loaded custom HRF library from {library_path}")
-            else:
-                print(f"  {sidecar} not found: falling back to the stock HRF library")
+            print(f"  Loaded custom HRF library from {library_path}")
             print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
     # load_hrf_index_for_input fills unassigned voxels (outside ffs_hrfopt's

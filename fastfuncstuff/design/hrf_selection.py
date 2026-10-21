@@ -26,7 +26,7 @@ from fastfuncstuff.glm.xval import (
     generate_cv_splits,
     project_out_nuisance_per_run,
 )
-from fastfuncstuff.memory import dyn_chunk_estimator, estimate_chunk_size, estimate_keep_on_cpu
+from fastfuncstuff.memory import estimate_chunk_size, estimate_keep_on_cpu
 from fastfuncstuff.utils import cpu_if_mps, get_device, linalg_lstsq, to_tensor
 
 from .hrf import get_hrf_library
@@ -624,8 +624,6 @@ def _evaluate_hrfs_batched(
         r2_out[cs:ce] = scores.to(output_device)
 
         del xty_by_run, xty_by_run_t, xty_train, fold_betas, mean_betas_by_run
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     del designs_stack_by_run, xtx_by_run, pinv_xtx
     return r2_out.cpu()
@@ -733,8 +731,6 @@ def _evaluate_hrfs_insample(
             r2_out[cs:ce, d_idx] = _cod_ratio(ss_res, ss_tot_chunk).to(output_device)
 
         del data_chunk
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     del pinvs, designs_gpu
     return r2_out.cpu()
@@ -1982,6 +1978,7 @@ def _fit_voxelwise_hrf(
             device=device,
             operation="glm",
             max_chunk_size=n_group_voxels,
+            empty_cache=False,
         )
         n_chunks = (n_group_voxels + max_voxels_per_chunk - 1) // max_voxels_per_chunk
 
@@ -2046,8 +2043,6 @@ def _fit_voxelwise_hrf(
                 all_fstats[voxel_idx] = fstats_to_store
 
             del subset_data, subset_results
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
         if n_chunks > 1:
             hrf_iterator.set_postfix_str(f"{n_group_voxels:,} voxels in {n_chunks} chunks")
@@ -2336,24 +2331,18 @@ def _fit_voxelwise_hrf_single_trial(
 
         # Build full design: [single_trial | nuisance] so drift is modeled
         full_design = torch.cat([st_design, nuisance_design.to(st_design.device)], dim=1)
-        _n_full_regressors = full_design.shape[1]
+        n_full_regressors = full_design.shape[1]
 
-        # Determine chunk size using dynamic estimator
-        # Single-trial GLM (many trial regressors)
-        voxel_chunk_size = dyn_chunk_estimator(
+        # Single-trial GLM over [trials | nuisance]. Planned per HRF group, so
+        # it must not flush the cache (empty_cache=False); the config floor and
+        # device-appropriate safety factor apply.
+        voxel_chunk_size = estimate_chunk_size(
             n_voxels=n_group_voxels,
             n_timepoints=n_timepoints,
-            n_task_regressors=st_design.shape[1],  # Number of trials
-            n_nuisance_regressors=nuisance_design.shape[1],
+            n_regressors=n_full_regressors,
             device=device,
             operation="glm",
-            cv_strategy=None,  # This is final fit, not CV
-            n_runs=len(run_starts),
-            data_location="auto",
-            min_chunk_size=10000,
-            max_chunk_size=None,  # Use default
-            safety_factor=0.5,
-            verbose=False,
+            empty_cache=False,
         )
 
         n_chunks = (n_group_voxels + voxel_chunk_size - 1) // voxel_chunk_size
@@ -2405,8 +2394,6 @@ def _fit_voxelwise_hrf_single_trial(
                 chunk_predictions,
                 chunk_r2,
             )
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
     # Build results object
     results = GLMResults()

@@ -19,6 +19,7 @@ from fastfuncstuff.design.matrices import (
     commensurate_microtime_dt,
 )
 from fastfuncstuff.glm.arma import ARMA11Results, fit_glm_arma11, get_default_arma_grids
+from fastfuncstuff.glm.conjunction import apply_conjunctions
 from fastfuncstuff.glm.core import GLMResults, fit_glm, fit_glm_hrf_library
 from fastfuncstuff.io.afni import (
     extract_stimulus_columns,
@@ -1214,6 +1215,7 @@ def analyze_from_design_matrix(
 
                 ols_results.original_shape = shape_to_use
                 ols_results.affine = affine_to_use
+                apply_conjunctions(ols_results, design_info.get("glt_conjunctions"))
 
                 # Extract contrast information if available (GLT contrasts)
                 contrast_names = getattr(ols_results, "contrast_labels", None)
@@ -1639,6 +1641,12 @@ def analyze_from_design_matrix(
             results.ols_results.nifti_header = nifti_header
         if _nods is not None:
             _nods.nifti_header = nifti_header
+
+    # Conjunction components were fit as extra GLTs; fold them into their
+    # conjunction columns here, on every result object a writer may reach.
+    _conj_plan = design_info.get("glt_conjunctions")
+    for _res in (results, _nods, getattr(results, "ols_results", None)):
+        apply_conjunctions(_res, _conj_plan)
 
     # Per-HRF mode defers the OLS write callback so it fires once on the
     # merged OLS result instead of partial per-HRF outputs. Fire it now that

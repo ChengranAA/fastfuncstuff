@@ -1099,7 +1099,27 @@ Examples:
             "tables (the same fragment a design TOML takes; e.g. label = 'all_con', "
             "sym = 'SYM: +0.5*a +0.5*b'). Needs -events/-onsets. Written to the "
             "bucket beside the conditions, with the fit's own per-voxel HRFs and noise "
-            "model behind the t-stats. t-tests only."
+            "model behind the t-stats. t-tests only. [[conjunctions]] tables in the "
+            "same files are computed too (see -conj)."
+        ),
+    )
+    onset_group.add_argument(
+        "-conj",
+        nargs=2,
+        action="append",
+        metavar=("LABEL", "COMPONENTS"),
+        default=None,
+        help=(
+            "Minimum-statistic conjunction (Nichols et al. 2005), repeatable: "
+            "-conj AandB 'A B'. COMPONENTS (space or comma separated, at least two) "
+            "name conditions/design columns or contrasts of this fit; '-A' negates "
+            "one. Written as LABEL#0_Coef / LABEL#0_Tstat beside the contrasts on "
+            "every bucket: t = voxelwise minimum of the component t-stats (same DoF, "
+            "so the usual t threshold tests 'every component is active'), Coef = "
+            "voxelwise minimum of the component coefficients (not the argmin-t "
+            "one's). Positive conjunction only: negate every component for 'all "
+            "negative'. Works with -events/-onsets, -matrix and -spec; a design TOML "
+            "takes the same as [[conjunctions]] label = '...' components = ['A', 'B']."
         ),
     )
     add_round_onsets_arguments(onset_group, hyphen=False)
@@ -2068,6 +2088,7 @@ def main():
         sys.exit(1)
 
     _matrix_from_spec = False
+    conjunction_requests: list[tuple[str, list[str] | str]] = []
 
     # ── -spec handling: compile to xmat *before* loading any data ────────
     # We do this early so a syntax error or missing event file fails fast
@@ -2115,6 +2136,12 @@ def main():
             sys.exit(rc)
         args.matrix = str(compiled_xmat)
         args.spec = None  # downstream branches key off args.matrix from here
+        # The xmat has no field for conjunctions, so they come from the spec itself.
+        from fastfuncstuff.design.spec import load_spec as _load_design_spec
+
+        conjunction_requests += [
+            (c.label, c.components) for c in _load_design_spec(spec_path).conjunctions
+        ]
         _matrix_from_spec = True
 
     # Auto-write Rvar alongside Rbuck so future ffs_concalc has the per-voxel
@@ -2161,6 +2188,13 @@ def main():
                 "rewritten to one column per trial, so the condition names no longer exist."
             )
             sys.exit(1)
+
+    if args.conj and args.single_trials:
+        print(
+            "ERROR: -conj cannot be combined with -single_trials: the design is "
+            "rewritten to one column per trial, so the condition names no longer exist."
+        )
+        sys.exit(1)
 
     # Single-trial design needs onset times; -matrix lacks per-event structure.
     if args.single_trials and not (args.events or args.onsets):
@@ -3074,10 +3108,27 @@ def main():
             except ValueError as exc:
                 sys.exit(f"ERROR: {exc}")
             print(f"  Contrasts: {', '.join(design_info['glt_labels'])}")
+            from fastfuncstuff.design.spec import parse_conjunctions_text
+
+            for _path in args.contrasts:
+                conjunction_requests += [
+                    (c.label, c.components)
+                    for c in parse_conjunctions_text(Path(_path).read_text(), str(_path))
+                ]
 
         print()
         print("=" * 70)
         print()
+
+    conjunction_requests += [(label, comps) for label, comps in (args.conj or [])]
+    if conjunction_requests:
+        from fastfuncstuff.glm.conjunction import plan_conjunctions
+
+        try:
+            plan_conjunctions(conjunction_requests, design_info)
+        except ValueError as exc:
+            sys.exit(f"ERROR: {exc}")
+        print(f"  Conjunctions: {', '.join(label for label, _ in conjunction_requests)}")
 
     # Setup OLS write callback if any OLS output is requested
     _ols_write_callback = None
@@ -4037,7 +4088,9 @@ def main():
         results, design_info = analyze_from_design_matrix(
             fmri_data=fmri_data_to_use,
             design_matrix_file=args.matrix,
-            design_info=design_info if (args.onsets or args.events or args.noise_comps) else None,
+            design_info=design_info
+            if (args.onsets or args.events or args.noise_comps or conjunction_requests)
+            else None,
             method=analysis_method,
             arma_a_grid=a_grid,
             arma_b_grid=b_grid,

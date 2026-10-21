@@ -139,12 +139,26 @@ class ContrastSpec:
 
 
 @dataclass
+class ConjunctionSpec:
+    """Minimum-statistic conjunction (Nichols et al. 2005) over ``components``.
+
+    Each component names a condition (stim label or design column) or a
+    contrast label; a leading ``-`` negates it. See
+    :mod:`fastfuncstuff.glm.conjunction` for what the fit writes.
+    """
+
+    label: str
+    components: list[str]
+
+
+@dataclass
 class Spec:
     meta: MetaSpec
     events: list[EventSpec]
     nuisance: list[NuisanceSpec] = field(default_factory=list)
     stim_vec: list[StimVecSpec] = field(default_factory=list)
     contrasts: list[ContrastSpec] = field(default_factory=list)
+    conjunctions: list[ConjunctionSpec] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -299,21 +313,14 @@ def predicted_stim_labels(
 
 
 def parse_contrasts_text(text: str, source: str = "<contrasts>") -> list[ContrastSpec]:
-    """Parse a TOML fragment holding only ``[[contrasts]]`` tables.
+    """Parse a TOML fragment holding only ``[[contrasts]]`` (and ``[[conjunctions]]``) tables.
 
     Anything else is refused: the fragment is pasted verbatim into a design TOML
     that already has [meta] and [[events]], so a stray table would duplicate or
-    silently override part of the model.
+    silently override part of the model. The conjunctions themselves are read by
+    :func:`parse_conjunctions_text`; a fragment of only conjunctions returns ``[]``.
     """
-    try:
-        raw = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"{source}: not valid TOML: {exc}") from None
-    extra = sorted(set(raw) - {"contrasts"})
-    if extra:
-        raise ValueError(
-            f"{source}: only [[contrasts]] tables are allowed (found {', '.join(extra)})"
-        )
+    raw = _load_fragment(text, source)
     out: list[ContrastSpec] = []
     for i, c_raw in enumerate(raw.get("contrasts", [])):
         try:
@@ -323,8 +330,56 @@ def parse_contrasts_text(text: str, source: str = "<contrasts>") -> list[Contras
         if c.balance not in ("none", "sum1", "zero"):
             raise ValueError(f"{source}: contrast '{c.label}': balance must be none|sum1|zero")
         out.append(c)
-    if not out:
+    if not out and not raw.get("conjunctions"):
         raise ValueError(f"{source}: no [[contrasts]] tables found")
+    return out
+
+
+def _load_fragment(text: str, source: str) -> dict:
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"{source}: not valid TOML: {exc}") from None
+    extra = sorted(set(raw) - {"contrasts", "conjunctions"})
+    if extra:
+        raise ValueError(
+            f"{source}: only [[contrasts]] and [[conjunctions]] tables are allowed "
+            f"(found {', '.join(extra)})"
+        )
+    return raw
+
+
+def parse_conjunctions_text(text: str, source: str = "<contrasts>") -> list[ConjunctionSpec]:
+    """The ``[[conjunctions]]`` tables of a contrasts fragment (may be empty)."""
+    return conjunctions_from_raw(_load_fragment(text, source).get("conjunctions", []), source)
+
+
+def conjunctions_from_raw(tables: list, source: str) -> list[ConjunctionSpec]:
+    """Build and structurally check ``[[conjunctions]]`` tables.
+
+    Whether each component exists is a question for the compiled design, so
+    that is checked where the fit resolves them
+    (:func:`fastfuncstuff.glm.conjunction.plan_conjunctions`).
+    """
+    out: list[ConjunctionSpec] = []
+    for i, c_raw in enumerate(tables):
+        try:
+            c = ConjunctionSpec(**c_raw)
+        except TypeError as exc:
+            raise ValueError(
+                f"{source}: conjunction #{i + 1}: {exc} (expected label = '...', "
+                "components = ['A', 'B', ...])"
+            ) from None
+        if isinstance(c.components, str):
+            c.components = c.components.split()
+        if not isinstance(c.label, str) or not c.label:
+            raise ValueError(f"{source}: conjunction #{i + 1}: label must be a non-empty string")
+        if len(c.components) < 2 or not all(isinstance(x, str) for x in c.components):
+            raise ValueError(
+                f"{source}: conjunction '{c.label}': components must list at least two "
+                f"condition or contrast names (got {c.components!r})"
+            )
+        out.append(c)
     return out
 
 
@@ -606,6 +661,7 @@ def load_spec(path: str | Path) -> Spec:
         seen_sv.add(sv.label)
 
     contrasts = [ContrastSpec(**c) for c in raw.get("contrasts", [])]
+    conjunctions = conjunctions_from_raw(raw.get("conjunctions", []), str(path))
 
     # Validate enums
     for ev in events:
@@ -621,6 +677,7 @@ def load_spec(path: str | Path) -> Spec:
         nuisance=nuisance,
         stim_vec=stim_vec,
         contrasts=contrasts,
+        conjunctions=conjunctions,
     )
 
 
@@ -1060,6 +1117,12 @@ def write_spec(
         lines.append('# label = "any_stim_F"')
         lines.append('# sym = ["SYM: +1*stimA", "SYM: +1*stimB"]')
         lines.append('# balance = "none"')
+        lines.append("#")
+        lines.append(
+            "# [[conjunctions]]                    # minimum statistic: A AND B (ffs_reml)"
+        )
+        lines.append('# label = "stimA_and_stimB"            # conditions or contrast labels;')
+        lines.append('# components = ["stimA", "stimB"]     # "-stimA" negates one')
     for c in spec.contrasts:
         lines.append("")
         lines.append("[[contrasts]]")
@@ -1072,6 +1135,11 @@ def write_spec(
         else:
             lines.append(f'sym = "{c.sym}"')
         lines.append(f'balance = "{c.balance}"')
+    for j in spec.conjunctions:
+        lines.append("")
+        lines.append("[[conjunctions]]")
+        lines.append(f'label = "{j.label}"')
+        lines.append(f"components = {_toml_value(list(j.components))}")
 
     Path(path).write_text("\n".join(lines) + "\n")
 

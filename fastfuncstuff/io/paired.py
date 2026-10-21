@@ -144,9 +144,9 @@ def _declared_tr(path: str) -> float | None:
         return float(value) if value else None
     if len(img.shape) != 4:
         raise ValueError(f"Expected 4-D run: {path}")
-    _, time_unit = img.header.get_xyzt_units()
-    scale = {"sec": 1.0, "msec": 0.001, "usec": 0.000001}.get(time_unit)
-    return float(img.header.get_zooms()[3]) * scale if scale is not None else None
+    from fastfuncstuff.io.headers import header_tr
+
+    return header_tr(img, require_units=True)
 
 
 def load_paired_runs(

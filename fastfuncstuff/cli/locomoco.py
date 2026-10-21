@@ -56,6 +56,7 @@ from fastfuncstuff.cli_utils import (
     run_batch_jobs,
     setup_device,
 )
+from fastfuncstuff.io.headers import header_tr
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
@@ -1971,7 +1972,7 @@ def _apply_preset(args) -> str | None:
 
 
 def _resolve_tr(args, img) -> float | None:
-    """TR for the task design: -tr wins, else the header's pixdim[4].
+    """TR for the task design: -tr wins, else the header's TR (pixdim[4] in its unit).
 
     Returns None (with a message) rather than guessing — a wrong TR misaligns every
     block, and the failure is silent in the worst way: the design still builds, still
@@ -1984,8 +1985,7 @@ def _resolve_tr(args, img) -> float | None:
     """
     if args.tr is not None:
         return float(args.tr)
-    zooms = img.header.get_zooms()
-    tr = float(zooms[3]) if len(zooms) > 3 else 0.0
+    tr = header_tr(img) or 0.0
 
     def _refuse(why: str) -> None:
         print(f"  ⚠️  task coupling skipped: {why}")
@@ -4388,7 +4388,7 @@ def _run_multiecho(
             tr_sec = _resolve_tr(args, img) if args.events else None
             # Not gated on -events: every OUTPUT this run writes is on the source
             # series' own clock, whether or not the task-coupling design ran.
-            out_tr = float(img.header.get_zooms()[3])
+            out_tr = header_tr(img) or 0.0
         datas.append(d)
 
     # -detask filter/fit: cut the task out of the images the ESTIMATOR sees. The raw
@@ -5445,7 +5445,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # (ffs_nwarp's -source, ffs_reml without an explicit -TR) read pixdim[4] off
     # this file, so a wrong value here silently mis-times the whole rest of the
     # pipeline -- see ../fmri_wiki/log.md 2026-09-03.
-    out_tr = float(img.header.get_zooms()[3])
+    out_tr = header_tr(img) or 0.0
 
     phases_in = None
     if args.phase:
@@ -5564,7 +5564,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     if args.est_lev_fwhm and fwhm_polort is None:
         from fastfuncstuff.stats.task_coupling import default_polort
 
-        tr_for_polort = float(args.tr) if args.tr is not None else float(img.header.get_zooms()[3])
+        tr_for_polort = float(args.tr) if args.tr is not None else (header_tr(img) or 0.0)
         if 0.05 < tr_for_polort < 20.0:
             fwhm_polort = 2 * default_polort(data.shape[3], tr_for_polort)
         else:

@@ -30,6 +30,7 @@ from fastfuncstuff.cli_utils import (
     resolve_event_filters,
     spinner,
 )
+from fastfuncstuff.io.headers import header_tr
 
 _DESCRIPTION = """\
 Remove the phase-explained (macrovascular) part of magnitude BOLD.
@@ -600,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         n_tp_per_run.append(int(mag_shape[3]))
-        tr_values.append(float(mag_hdr.get_zooms()[3]))
+        tr_values.append(header_tr(mag_hdr) or 0.0)
         if args.verb >= 1:
             print(f"  Run {len(n_tp_per_run)}: {mag_path} ({mag_shape[3]} TRs)")
 

@@ -149,8 +149,9 @@ def main(argv: list[str] | None = None) -> int:
         device = setup_device(args.device)
         data, img = _load(args.input, "-input")
         n_t = data[0].shape[3]
-        zooms = img.header.get_zooms()
-        tr = args.tr if args.tr is not None else (float(zooms[3]) if len(zooms) > 3 else None)
+        from fastfuncstuff.io.headers import header_tr
+
+        tr = args.tr if args.tr is not None else header_tr(img)
         polort = _resolve_polort(args.polort, n_t, tr)
         mask = None
         if args.mask:

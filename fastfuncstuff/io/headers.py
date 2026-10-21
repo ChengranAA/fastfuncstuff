@@ -331,6 +331,63 @@ def read_nifti_header(
     raise ValueError(f"Not a recognizable NIfTI-1/2 header (bad sizeof_hdr) in {filepath}")
 
 
+_TIME_UNIT_SCALE = {"sec": 1.0, "msec": 1e-3, "usec": 1e-6}
+PLAUSIBLE_TR_RANGE_S = (0.05, 20.0)
+
+
+def header_tr(
+    img_or_header: Any, *, require_units: bool = False, warn: bool = True
+) -> float | None:
+    """The repetition time in SECONDS from an image or its header.
+
+    ``pixdim[4]`` alone is not a TR: NIfTI stores it in whatever unit
+    ``xyzt_units`` declares, and a scanner-converted ``msec`` header reads 2000
+    for a 2 s TR. Every reader goes through here so that unit is applied once.
+
+    Returns None when there is no time axis (fewer than four zooms, or a
+    non-positive step). A header whose time unit is unset or non-temporal is
+    taken as seconds -- the overwhelmingly common case -- unless
+    ``require_units`` is set, for callers that must tell a declared TR apart
+    from NIfTI's default ``pixdim[4] = 1``; those get None instead.
+
+    A value outside :data:`PLAUSIBLE_TR_RANGE_S` is returned but warned about:
+    3-D EPI headers often hold the shot time, and a mislabelled unit is
+    otherwise silent until the design is already wrong. ``warn=False`` is for
+    tools that only report the value.
+    """
+    import math
+    import warnings
+
+    hdr = getattr(img_or_header, "header", img_or_header)
+    try:
+        zooms = hdr.get_zooms()
+    except Exception:
+        return None
+    if len(zooms) < 4:
+        return None
+    raw = float(zooms[3])
+    if not math.isfinite(raw) or raw <= 0:
+        return None
+    try:
+        unit = hdr.get_xyzt_units()[1]
+    except Exception:  # AFNI HEAD headers: nibabel already reports seconds
+        unit = "sec"
+    scale = _TIME_UNIT_SCALE.get(unit)
+    if scale is None:
+        if require_units:
+            return None
+        scale = 1.0
+    tr = raw * scale
+    lo, hi = PLAUSIBLE_TR_RANGE_S
+    if warn and not lo <= tr <= hi:
+        warnings.warn(
+            f"header TR is {tr:g} s (pixdim[4]={raw:g}, time unit {unit!r}), outside the "
+            f"plausible fMRI range {lo:g}-{hi:g} s; pass -tr explicitly if this is wrong",
+            stacklevel=2,
+        )
+    return tr
+
+
 def nifti_shape(filepath: str | Path) -> tuple[int, ...]:
     """Return a NIfTI image's shape without decompressing its payload.
 

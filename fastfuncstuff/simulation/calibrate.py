@@ -243,14 +243,9 @@ def _header_tr(header) -> float | None:
     if isinstance(info, dict):  # AFNI: TAXIS_FLOATS = [origin, TR, ...], seconds
         taxis = info.get("TAXIS_FLOATS")
         return float(taxis[1]) if taxis is not None and float(taxis[1]) > 0 else None
-    try:
-        units = header.get_xyzt_units()[1]
-        value = float(header["pixdim"][4])
-    except Exception:
-        return None
-    if value <= 0 or units not in ("sec", "msec", "usec"):
-        return None
-    return value * {"sec": 1.0, "msec": 1e-3, "usec": 1e-6}[units]
+    from fastfuncstuff.io.headers import header_tr
+
+    return header_tr(header, require_units=True)
 
 
 def noise_profile_from_reml(

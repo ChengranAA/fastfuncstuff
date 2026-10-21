@@ -29,6 +29,7 @@ from fastfuncstuff.io.headers import (
     _read_leading_bytes,
     _read_nifti_header_with_ext,
     _resolve_indices,
+    header_tr,
     parse_subbrick_selector,
     read_brick_labels,
     read_brick_stataux,
@@ -465,11 +466,7 @@ def _read_nifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
     _common(info, affine, shape3, zooms)
 
     units = hdr.get_xyzt_units()
-    tr = float(hdr.get_zooms()[3]) if len(hdr.get_zooms()) > 3 else 0.0
-    if units and len(units) > 1 and units[1] == "msec":
-        tr /= 1000.0
-    elif units and len(units) > 1 and units[1] == "usec":
-        tr /= 1e6
+    tr = header_tr(hdr, warn=False) or 0.0
     info.tr = tr if n_vol > 1 or tr > 0 else 0.0
 
     info.slice_timing = _slice_timing_from(hdr, ext_text, shape3[2])

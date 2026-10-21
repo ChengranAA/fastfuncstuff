@@ -654,9 +654,10 @@ def load_and_preprocess_runs(
 
     # Get TR
     if tr is None:
-        if len(zooms) > 3 and zooms[3] > 0:
-            tr = float(zooms[3])
-        else:
+        from fastfuncstuff.io.headers import header_tr
+
+        tr = header_tr(first_img)
+        if tr is None:
             print("ERROR: Could not determine TR from header. Please specify with -tr")
             sys.exit(1)
 

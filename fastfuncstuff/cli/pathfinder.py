@@ -1464,9 +1464,10 @@ def main():
 
     # Get TR
     if args.tr is None:
-        zooms = first_img.header.get_zooms()
-        if len(zooms) > 3 and zooms[3] > 0:
-            args.tr = float(zooms[3])
+        from fastfuncstuff.io.headers import header_tr
+
+        args.tr = header_tr(first_img)
+        if args.tr is not None:
             print(f"  TR (from header): {args.tr}s")
         else:
             print("ERROR: Could not determine TR. Please specify with -tr")

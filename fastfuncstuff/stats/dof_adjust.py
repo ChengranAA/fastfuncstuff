@@ -386,8 +386,9 @@ def update_dof_in_file(
 
     result = adjust_stats_dof(data, stataux, labels, dof_adjust, verbose=verbose)
 
-    zooms = img.header.get_zooms()
-    tr = float(zooms[3]) if len(zooms) > 3 else None
+    from fastfuncstuff.io.headers import header_tr
+
+    tr = header_tr(img)
     save_nifti(
         result.data,
         output_path,

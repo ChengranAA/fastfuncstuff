@@ -24,6 +24,7 @@ from fastfuncstuff.cli_utils import (
 )
 from fastfuncstuff.denoise.nordic import NordicConfig, run_nordic, run_nordic_multiecho
 from fastfuncstuff.denoise.nordic_sweep import run_nordic_factor_sweep
+from fastfuncstuff.io.headers import header_tr
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -809,7 +810,7 @@ def _resolve_task_design(args, magnitude_file: str):
     # The header alone: load_nifti decodes a whole .nii.zst to hand it back.
     hdr = read_nifti_header(magnitude_file)
     n_t = int(hdr.get_data_shape()[3])
-    tr = args.tr if args.tr is not None else float(hdr["pixdim"][4])
+    tr = args.tr if args.tr is not None else (header_tr(hdr) or 0.0)
     if tr <= 0:
         raise ValueError(
             f"the input header gives TR={tr:g}s, which cannot build a design - pass -tr SEC."
@@ -995,7 +996,7 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
         raise RuntimeError("the task-leak diagnostic needs the loss series but none was written")
 
     src = load_nifti(magnitude_file)
-    tr = args.tr if args.tr is not None else float(src.header["pixdim"][4])
+    tr = args.tr if args.tr is not None else (header_tr(src) or 0.0)
     if tr <= 0:
         raise ValueError(
             f"the input header gives TR={tr:g}s, which cannot build a design — pass -tr SEC."

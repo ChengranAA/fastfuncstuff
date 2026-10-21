@@ -176,7 +176,9 @@ def _build_synthetic_case(ctx: BenchmarkContext, task: str, run: int) -> None:
 
     clean = torch.from_numpy(np.asarray(img.dataobj[:, :, z0:z1, :t1], dtype=np.float32))
     pe_axis = "xyz".index(_pe_axis(ctx, task, run))
-    tr = float(img.header.get_zooms()[3]) or 1.5
+    from fastfuncstuff.io.headers import header_tr
+
+    tr = header_tr(img) or 1.5
     field = synthetic_pe_field(
         tuple(clean.shape[:3]), clean.shape[3], amplitude=SYNTH_AMPLITUDE_VOX, tr=tr
     )

@@ -1076,6 +1076,9 @@ def load_hrfopt_library(
     An explicit ``library_path`` (``-hrf_library`` / ``-hrf_library_raw``)
     wins, for the case where the saved file is gone; its size is still checked
     against the indices.
+
+    Voxels still carrying ``-1`` (no assignment) are set **in place** in
+    ``hrf_indices`` to the middle curve of the library returned.
     """
     from fastfuncstuff.design.hrf import get_hrf_library
 
@@ -1088,6 +1091,16 @@ def load_hrfopt_library(
         hrf_library = saved["hrf_library"].to(device)
         if verbose:
             print(f"  Loaded HRF library from {sidecar}: {tuple(hrf_library.shape)}")
+        # The curves are bare samples: their spacing lives only in the metadata.
+        # Convolved at another -microtime_dt they stretch or shrink in time, and
+        # every voxel gets a shape ffs_hrfopt never chose -- silently.
+        saved_dt = (saved.get("metadata") or {}).get("microtime_dt")
+        if saved_dt is not None and abs(float(saved_dt) - float(microtime_dt)) > 1e-9:
+            sys.exit(
+                f"ERROR: {sidecar.name} was sampled at -microtime_dt {saved_dt}, but this "
+                f"run uses {microtime_dt}.\n       The curves would be stretched in time; "
+                f"pass -microtime_dt {saved_dt}."
+            )
         if saved.get("duration_convolved") and model_durations is not None:
             model_durations = [0.0] * len(model_durations)
             if verbose:
@@ -1109,6 +1122,20 @@ def load_hrfopt_library(
             else:
                 print(f"  {sidecar} not found: falling back to the stock HRF library")
             print(f"  Using HRF library with {len(hrf_library)} HRFs")
+
+    # load_hrf_index_for_input fills unassigned voxels (outside ffs_hrfopt's
+    # mask, -1 on load) only when it can size the library from the sidecar.
+    # Without it they reach here as -1, which Python reads as the LAST, slowest
+    # curve; give them the middle of the library actually in hand instead.
+    unassigned = hrf_indices < 0
+    if bool(unassigned.any()):
+        hrf_indices[unassigned] = len(hrf_library) // 2
+        if verbose:
+            print(
+                f"  {int(unassigned.sum()):,} voxel(s) have no ffs_hrfopt assignment "
+                f"(outside its mask): using the library's middle curve "
+                f"(index {len(hrf_library) // 2})"
+            )
 
     if n_needed > len(hrf_library):
         sys.exit(

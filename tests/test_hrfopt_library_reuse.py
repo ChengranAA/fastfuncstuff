@@ -53,6 +53,28 @@ def test_missing_library_falls_back_to_the_stock_one(tmp_path):
     assert len(lib) == 20
 
 
+def test_library_sampled_at_another_microtime_dt_is_refused(tmp_path):
+    """The curves carry no time axis of their own: a 0.05 s library convolved
+    at 0.1 s is silently twice as slow."""
+    torch.save(
+        {"hrf_library": torch.ones(20, 640), "metadata": {"microtime_dt": 0.05}},
+        tmp_path / "hrf_hrf_library.pt",
+    )
+    with pytest.raises(SystemExit, match="microtime_dt 0.05"):
+        load_hrfopt_library(str(tmp_path / "hrf"), torch.tensor([0]), microtime_dt=0.1)
+    lib, _ = load_hrfopt_library(str(tmp_path / "hrf"), torch.tensor([0]), microtime_dt=0.05)
+    assert len(lib) == 20
+
+
+def test_unassigned_voxels_take_the_middle_curve_without_the_sidecar(tmp_path):
+    """load_hrf_index_for_input can only fill -1 when the sidecar sizes the
+    library; with the stock fallback (or -hrf_library) they used to stay -1 and
+    be fit with library[-1], the slowest curve."""
+    idx = torch.tensor([-1, 3, -1])
+    lib, _ = load_hrfopt_library(str(tmp_path / "nothing"), idx, microtime_dt=0.1)
+    assert idx.tolist() == [len(lib) // 2, 3, len(lib) // 2]
+
+
 def test_ridge_cli_fits_a_forty_curve_library(tmp_path, monkeypatch):
     """The reported crash, end to end: indices 20..39 against a stock-20 guess."""
     from fastfuncstuff.cli.ridge import main

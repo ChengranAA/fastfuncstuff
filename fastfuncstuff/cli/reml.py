@@ -2758,22 +2758,20 @@ def main():
                 )
             except (FileNotFoundError, ValueError) as exc:
                 sys.exit(f"ERROR: {exc}")
-            from fastfuncstuff.cli_utils import spinner
+            from fastfuncstuff.cli_utils import load_hrfopt_library
 
-            with spinner(f"Loading {Path(hrf_lib_file).name}"):
-                hrf_lib_data = torch.load(hrf_lib_file, weights_only=False)
-            hrf_library_obj = hrf_lib_data["hrf_library"].to(device)
-            # A duration-convolved library carries the boxcar itself, so this
-            # design must be built from impulses.  ffs_hrfopt records which
-            # kind it saved; inheriting the fact beats asking the user to
-            # remember, since getting it wrong is silent either way.
-            if hrf_lib_data.get("duration_convolved"):
-                model_durations = [0.0] * len(durations)
-                print(
-                    "  Library is duration-convolved: building the design's "
-                    "onsets as IMPULSES\n  (the duration is already inside the "
-                    "curves, not applied here)"
-                )
+            # The shared loader inherits duration_convolved (impulse onsets for a
+            # library that carries the boxcar) and checks the indices and the
+            # -microtime_dt against the saved library.
+            hrf_library_obj, _durations = load_hrfopt_library(
+                args.hrfopt_prefix,
+                hrf_indices_obj,
+                microtime_dt=args.microtime_dt,
+                device=device,
+                model_durations=list(durations),
+            )
+            assert _durations is not None
+            model_durations = _durations
             unique_hrfs, counts = torch.unique(hrf_indices_obj, return_counts=True)
             print(f"  HRF library shape: {tuple(hrf_library_obj.shape)}")
             print(

@@ -33,8 +33,17 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.memory import bytes_per_voxel_arma, make_vram_debugger
-from fastfuncstuff.utils import full_fp32_matmul, get_device, to_tensor, warn_mps_float32_precision
+from fastfuncstuff.memory import bytes_per_voxel_arma, get_available_memory, make_vram_debugger
+from fastfuncstuff.utils import accum_dtype as _accum_dtype_of
+from fastfuncstuff.utils import (
+    cpu_if_mps,
+    full_fp32_matmul,
+    get_device,
+    linalg_device,
+    to_tensor,
+    warn_mps_float32_precision,
+    widest_float_dtype,
+)
 
 from .whiten import (
     RunWhitener,
@@ -235,120 +244,43 @@ def check_cuda_memory_before_batch(
     n_regressors: int,
     device: torch.device,
     verbose: bool = False,
-    use_qr: bool = False,
     has_glts: bool = True,
-    persistent_tensors: dict | None = None,  # NEW: Account for data already on GPU
     use_double: bool = False,
 ) -> int:
-    """
-    Check available CUDA memory and adjust batch size if needed.
+    """Shrink a GLS sub-batch so it fits the memory free right now.
 
-    This is the forward-looking logic to prevent OOM before it happens!
-
-    Parameters
-    ----------
-    batch_voxels : int
-        Desired batch size
-    n_timepoints : int
-        Number of timepoints
-    n_regressors : int
-        Number of regressors
-    device : torch.device
-        Device to check
-    verbose : bool
-        Print warnings if adjustment needed
+    Called once per (a, b) group, after that group's whitener and whitened
+    design are resident, so it is sized against what is actually left. A thin
+    wrapper over :func:`fastfuncstuff.memory.estimate_chunk_size` with
+    ``operation="arma_gls"`` (see :func:`memory.bytes_per_voxel_arma_gls`): the
+    budget honours ``MemoryConfig`` / ``FFS_GPU_SAFETY_FACTOR`` like every other
+    planner, and it does not flush the allocator cache -- a flush per group is a
+    device sync per group, and the planner counts cached-but-free blocks as
+    available anyway.
 
     Returns
     -------
     int
-        Adjusted batch size that will fit in available memory
+        ``batch_voxels`` when it fits, otherwise the largest batch that does
+        (never below 100 voxels).
     """
-    if device.type != "cuda":
-        return batch_voxels
+    from fastfuncstuff.memory import estimate_chunk_size
 
-    # Clear cache first to get accurate reading
-    torch.cuda.empty_cache()
-
-    # Calculate required memory for GLS solve
-    # MAJOR OPTIMIZATION: X'X is precomputed at GROUP level (once per (a,b) pair)
-    # Per-batch allocations are now TINY - just voxel-specific data!
-    bpe = 8 if use_double else 4  # bytes per element
-    # Per-batch (batch, n_time) tensors that coexist on GPU during the GLS step:
-    #   Y_batch_dev (raw), y_w_batch (prewhitened), pred_w_batch, resid_w_batch,
-    #   pred_orig_batch, resid_orig_batch  → 6 copies
-    # Plus the transient fp64 accumulator inside `(x**2).sum(..., dtype=torch.float64)`
-    # peaks at +1 fp32-equivalent copy worth of workspace.
-    bnt_copies = 6
-    fp64_accum_peak = batch_voxels * n_timepoints * 4  # cuSOLVER/sum workspace ≈ one fp32 copy
-    common_time = batch_voxels * n_timepoints * bpe * bnt_copies + fp64_accum_peak
-    common_reg = batch_voxels * n_regressors * bpe * 2  # X'y + betas
-
-    if use_qr:
-        # QR path: Q and R precomputed at group level
-        required_bytes = common_time + common_reg
-    else:
-        # X'X path: (X'X)^{-1} precomputed at group level
-        required_bytes = common_time + common_reg
-
-    # F-stat path with no GLTs no longer materializes (batch, n_reg, n_reg) —
-    # constant A_task^{-1} at group level handles it (see fit_glm_arma11).
-    # With GLTs we still build var_beta_batch + the per-batch contrast tensors.
-    if has_glts:
-        required_bytes += batch_voxels * n_regressors * n_regressors * bpe  # var_beta_batch
-
-    # Get available memory
-    total_mem = torch.cuda.mem_get_info(device)[1]
-    free_mem = torch.cuda.mem_get_info(device)[0]
-    reserved_mem = torch.cuda.memory_reserved(device)
-    allocated_mem = torch.cuda.memory_allocated(device)
-
-    # Available = free + any reserved-but-unallocated memory
-    # But if allocated > reserved (shouldn't happen, but be safe), just use free
-    unallocated_reserved = max(0, reserved_mem - allocated_mem)
-    available_mem = free_mem + unallocated_reserved
-
-    # CRITICAL FIX: Persistent tensors (L_inv, X_w, design) are ALREADY on GPU
-    # They're already counted in allocated_mem, so free_mem already excludes them.
-    # We should NOT subtract them from available (that's double-counting!)
-    # Instead, we need to exclude them from required_bytes calculation below.
-    #
-    # Track persistent tensors for later use (don't subtract from available!)
-    persistent_mem_info = {}
-    if persistent_tensors is not None and verbose:
-        for name, tensor in persistent_tensors.items():
-            if (
-                tensor is not None
-                and isinstance(tensor, torch.Tensor)
-                and tensor.device.type == "cuda"
-            ):
-                tensor_bytes = tensor.numel() * tensor.element_size()
-                persistent_mem_info[name] = tensor_bytes
-
-    # Use 50% of available — headroom for PyTorch fragmentation, internal buffers,
-    # and the fp64-accumulator workspace inside reductions. Was 60%, but OOMs at
-    # later groups (~11/82) showed fragmentation eats more than that on 16 GB cards
-    # once the 7.5 GB grid is resident.
-    usable_mem = available_mem * 0.50
-
-    if required_bytes > usable_mem:
-        # Need to reduce batch size
-        reduction_factor = usable_mem / required_bytes
-        new_batch = int(batch_voxels * reduction_factor * 0.85)  # Extra 15% safety for peak memory
-        new_batch = max(new_batch, 100)  # Minimum batch (reduced from 500)
-
-        if verbose:
-            print(
-                f"\n⚠️  Memory check: batch needs {required_bytes / 1e9:.2f} GB, "
-                f"but {usable_mem / 1e9:.2f} GB usable (60% of {available_mem / 1e9:.2f} GB free)"
-            )
-            print(
-                f"  GPU: {allocated_mem / 1e9:.2f} GB allocated, {free_mem / 1e9:.2f} GB free / {total_mem / 1e9:.2f} GB total"
-            )
-            print(f"  📉 Reducing batch: {batch_voxels:,} → {new_batch:,} voxels")
-            print("  ℹ️  Conservative: Accounts for peak memory during Cholesky/solve operations\n")
-
-        return new_batch
-    return batch_voxels
+    sub_batch = estimate_chunk_size(
+        n_voxels=batch_voxels,
+        n_timepoints=n_timepoints,
+        n_regressors=n_regressors,
+        device=device,
+        operation="arma_gls",
+        min_chunk_size=min(100, batch_voxels),
+        max_chunk_size=batch_voxels,
+        use_double=use_double,
+        n_trials=2 if has_glts else 1,
+        empty_cache=False,
+    )
+    if verbose and sub_batch < batch_voxels:
+        print(f"\n  Memory check: reducing GLS batch {batch_voxels:,} -> {sub_batch:,} voxels\n")
+    return sub_batch
 
 
 def estimate_valid_grid_pairs(
@@ -1199,14 +1131,10 @@ def compute_reml_likelihood(X: torch.Tensor, Y: torch.Tensor, R: torch.Tensor) -
     Y_2d = Y.unsqueeze(1) if Y.ndim == 1 else Y
 
     try:
-        # Cholesky decomposition: R = L L'
-        # Conservative CPU fallback on MPS (the result is float32 here, since
-        # use_double is forced off on MPS) — factor on CPU, move back.
-        if device.type == "mps":
-            R_cpu = R.cpu()
-            L = torch.linalg.cholesky(R_cpu).to(device)
-        else:
-            L = torch.linalg.cholesky(R)
+        # Cholesky decomposition: R = L L'. Factor where cpu_if_mps routes it
+        # (the CPU on Metal) and bring the factor back.
+        factor_dev = cpu_if_mps(device, "cholesky")
+        L = torch.linalg.cholesky(R.to(factor_dev)).to(device)
 
         # Term 1: log(det(R)) = 2 * sum(log(diag(L)))
         term1 = 2 * torch.sum(torch.log(torch.diag(L) + 1e-10))
@@ -1524,14 +1452,15 @@ def precompute_reml_grid(
     bpe = torch.empty(0, dtype=dtype).element_size()
     per_pair = n_t * n_k * bpe * 4  # X_w, Q, the triangular-solve workspace, margin
     if storage.type == "cuda":
-        # X_w and Q only stay on the card when they fit comfortably; the search
-        # streams them per pair from the CPU otherwise.
-        free, _ = torch.cuda.mem_get_info(storage)
-        if 2 * n_valid * n_t * n_k * bpe > 0.4 * free:
+        # X_w and Q only stay on the card when they fit comfortably (80% of the
+        # planner's budget); the search streams them per pair from the CPU
+        # otherwise.
+        budget = get_available_memory(storage, empty_cache=False)
+        if 2 * n_valid * n_t * n_k * bpe > 0.8 * budget:
             storage = torch.device("cpu")
     if work.type == "cuda":
-        free, _ = torch.cuda.mem_get_info(work)
-        chunk = max(1, min(n_valid, int(free * 0.5 // per_pair)))
+        budget = get_available_memory(work, empty_cache=False)
+        chunk = max(1, min(n_valid, int(budget // per_pair)))
     else:
         chunk = n_valid
     if verbose:
@@ -1999,7 +1928,7 @@ def search_voxels_precomputed_grid(
     _dtype = Y_batch.dtype
     # float64 RSS accumulation guards the Pythagorean cancellation; MPS has no
     # float64 so it keeps the input dtype there.
-    _acc_dtype = _dtype if device.type == "mps" else torch.float64
+    _acc_dtype = _accum_dtype_of(device)
     best_params = torch.zeros(n_voxels_batch, 2, device=device, dtype=_dtype)
     best_likelihoods = torch.full((n_voxels_batch,), float("inf"), device=device, dtype=_dtype)
 
@@ -2123,7 +2052,7 @@ def search_voxels_precomputed_grid_hierarchical(
     n_voxels_batch = Y_batch.shape[0]
     n_timepoints, n_regressors = X.shape
     _dtype = Y_batch.dtype
-    _acc_dtype = _dtype if device.type == "mps" else torch.float64
+    _acc_dtype = _accum_dtype_of(device)
     T_minus_K = n_timepoints - n_regressors
 
     if Y_batch.device != device:
@@ -2547,15 +2476,9 @@ def determine_adaptive_batching_strategy(
     grid_mem_total = n_grid_points * grid_mem_per_point
     data_mem = n_voxels * n_timepoints * bytes_per_elem
 
-    # Get available memory
-    if device.type == "cuda":
-        total_mem = torch.cuda.get_device_properties(device).total_memory
-        free_mem, _ = torch.cuda.mem_get_info(device)
-        # Use conservative estimate: 60% of total OR 80% of free
-        available = min(total_mem * 0.6, free_mem * 0.8)
-    else:
-        # For CPU, assume we have plenty (32GB)
-        available = 32 * 1024**3
+    # Free memory from the memory module: driver-reported on CUDA (other
+    # processes excluded), real RAM on CPU, with MemoryConfig's safety factor.
+    available = get_available_memory(device)
 
     # Estimate per-voxel batch overhead (whitening, fitting, etc.)
     # Factor of 2-3x for intermediate computations
@@ -3556,13 +3479,13 @@ def _fit_dsort_gls_pass(
             if want_predicted:
                 results.predicted[idx] = pred.cpu()
 
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
         if pbar is not None:
             pbar.update(1)
     if pbar is not None:
         pbar.close()
+    # Flush once at the end of the pass, not per sub-batch (a device sync each).
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def _store_partial_semipartial(
@@ -3819,25 +3742,25 @@ def fit_glm_arma11(
     # MPS has no float64. Honour an explicit full-precision request by running on
     # CPU rather than silently downgrading — and CPU is faster for the REML path
     # anyway (MPS's batched Cholesky/triangular-solve is ~5x slower than LAPACK).
-    if use_double and device.type == "mps":
+    if use_double and widest_float_dtype(device) != torch.float64:
         warnings.warn(
             "use_double requested but MPS has no float64; running ARMA on CPU to "
             "honour the full-precision request. Pass -device cpu to silence this, "
             "or drop use_double to run float32 on MPS.",
             stacklevel=2,
         )
-        device = torch.device("cpu")
+        device = linalg_device(device)
         # Move inputs off MPS before the float64 cast below (MPS can't cast f64).
-        if isinstance(data, torch.Tensor) and data.device.type == "mps":
-            data = data.cpu()
-        if isinstance(design, torch.Tensor) and design.device.type == "mps":
-            design = design.cpu()
+        if isinstance(data, torch.Tensor):
+            data = data.to(device)
+        if isinstance(design, torch.Tensor):
+            design = design.to(device)
     dtype = torch.float64 if use_double else torch.float32
 
     # On CUDA/CPU the fp64 accumulator eliminates rounding in sum-of-squares;
     # MPS cannot hold float64 so it accumulates in float32.
-    _accum_dtype = dtype if device.type == "mps" else torch.float64
-    if device.type == "mps":
+    _accum_dtype = _accum_dtype_of(device)
+    if _accum_dtype != torch.float64:
         warn_mps_float32_precision("ARMA RSS accumulation")
     storage_device = torch.device("cpu")
 
@@ -4496,14 +4419,14 @@ def fit_glm_arma11(
                     bytes_per_matrix = whitener_elements(n_timepoints, run_starts, tau) * 4
                     cholesky_peak_gb = (bytes_per_matrix * n_grid_estimate * 6) / 1e9
 
-                    # Get available GPU memory
-                    gpu_props = torch.cuda.get_device_properties(device)
-                    total_gb = gpu_props.total_memory / 1e9
-                    # Reserve 2GB for other operations
-                    available_gb = total_gb - 2.0
+                    # Free memory as the planner sees it (driver-reported, other
+                    # processes excluded, safety factor applied) -- not the card's
+                    # total, which counted everyone else's allocations as ours.
+                    # The cache was flushed just above.
+                    available_gb = get_available_memory(device, empty_cache=False) / 1e9
 
                     # Use GPU Cholesky only if peak workspace fits
-                    if cholesky_peak_gb < (available_gb * 0.7):
+                    if cholesky_peak_gb < available_gb:
                         use_gpu_cholesky = True
                         if verbose:
                             print(
@@ -4871,29 +4794,15 @@ def fit_glm_arma11(
             t_stats_total = 0.0
             t_glt_total = 0.0
 
-            # Process voxels in this group using sub-batches (memory-aware)
-            # Determine sub-batch size based on available GPU memory
-            # CRITICAL: Pass persistent tensors that stay on GPU (whitener, X_w, design, etc)
-            persistent_gpu_tensors = {
-                # the largest block; per-run blocks of shorter runs are views of it
-                "whitener": max((g.block for g in whitener.groups), key=lambda t: t.numel()),
-                "X_w": X_w,
-                "design": design if design.device.type == "cuda" else None,
-            }
-            if use_qr:
-                persistent_gpu_tensors["Q_group"] = Q_group
-                persistent_gpu_tensors["R_qr_group"] = R_qr_group
-                persistent_gpu_tensors["XwTXw_inv_group"] = XwTXw_inv_group
-
+            # Sub-batch against what is free now, with this group's whitener and
+            # X_w already resident (and so already out of the free figure).
             sub_batch_size = check_cuda_memory_before_batch(
                 batch_size,  # Start with original batch size
                 n_timepoints,
                 n_regressors,
                 device,
                 verbose=(verbose and group_idx == 0),  # Only warn for first group
-                use_qr=use_qr,
                 has_glts=(glt_contrasts_tensor is not None),
-                persistent_tensors=persistent_gpu_tensors,
                 use_double=use_double,
             )
 
@@ -5540,10 +5449,6 @@ def fit_glm_arma11(
                     del resid_w_batch
                 if want_predicted:
                     del pred_orig_batch
-
-                # Aggressive GPU cache clearing after each sub-batch (helps on smaller GPUs)
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
             _gls_dbg.__exit__(None, None, None)
 
             # End of sub-batch loop - all voxels for this (a,b) group processed
@@ -5552,16 +5457,18 @@ def fit_glm_arma11(
             del whitener, X_w
             if use_qr:
                 del Q_group, R_qr_group, R_inv_group, XwTXw_inv_group
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
             # Update progress bar (one update per group)
             if pbar is not None:
                 pbar.update(1)
 
-        # End of group loop - close progress bar
+        # End of group loop - close progress bar. One flush here, at the stage
+        # boundary: flushing per group or sub-batch was a device sync each time
+        # and handed back blocks the next group reallocates at once.
         if pbar is not None:
             pbar.close()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         if verbose:
             print(f"\n✓ Processed all {n_unique_pairs} unique (a,b) groups")

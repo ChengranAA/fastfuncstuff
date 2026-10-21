@@ -776,6 +776,61 @@ def bytes_per_voxel_arma_dsort(
     return (n_timepoints * p_ext + 3 * p_ext * p_ext + (3 + n_dsort) * n_timepoints) * 4
 
 
+def bytes_per_voxel_arma_gls(
+    n_timepoints: int,
+    n_regressors: int,
+    has_glts: bool = True,
+) -> int:
+    """Memory per voxel for one sub-batch of the shared-design ARMA GLS pass.
+
+    The per-(a, b)-group matrices (whitener, X_w, (X_w'X_w)^-1) are already
+    resident when this is planned, so they are not in the per-voxel figure;
+    the driver-reported free memory has them excluded already.
+
+    Per voxel, live together in ``fit_glm_arma11``'s sub-batch loop:
+    - raw, whitened, predicted and residual rows in whitened and original
+      space: 6 x n_timepoints
+    - the float64 sum-of-squares accumulator's workspace: ~1 x n_timepoints
+    - X'y and betas: 2 x n_regressors
+    - with GLTs, the per-voxel beta covariance: n_regressors^2
+
+    Scaled by 1/0.85 for the Cholesky/solve transients -- the margin the
+    hand-rolled check this replaces applied on top of its 50% budget, after
+    OOMs at later (a, b) groups once a large grid was resident.
+
+    Returned in float32 bytes; ``estimate_chunk_size`` scales for float64.
+    """
+    elems = 7 * n_timepoints + 2 * n_regressors
+    if has_glts:
+        elems += n_regressors * n_regressors
+    return int(elems * 4 / 0.85)
+
+
+def bytes_per_voxel_ridge_cv(
+    n_timepoints: int,
+    n_regressors: int,
+    n_fractions: int,
+) -> int:
+    """Memory per voxel for one chunk of ``glm.ridge``'s cross-validated fit.
+
+    :func:`bytes_per_voxel_ridge` charges ``n_fractions`` only for betas, but the
+    CV chunk keeps a whole held-out prediction timeseries *per fraction* for
+    every fold to land in, so the dominant term is ``n_fractions x
+    n_timepoints``. Per voxel:
+    - GLM working set (data, cleaned data, projections): see
+      :func:`bytes_per_voxel_glm`
+    - per-fraction prediction accumulators: n_fractions x n_timepoints
+    - one fold's (n_test, n_fractions) prediction before the scatter: bounded
+      by n_fractions x n_timepoints
+    - train/final coefficient stacks and condition-average betas:
+      3 x n_fractions x n_regressors
+    - CV R² per fraction: n_fractions
+    """
+    base = bytes_per_voxel_glm(n_timepoints, n_regressors)
+    per_frac = 2 * n_timepoints + 3 * n_regressors + 1
+    return base + n_fractions * per_frac * 4
+
+
 _MOCO_RESAMPLE_NTAPS = {"wsinc5": 11, "heptic": 8, "quintic": 6, "cubic": 4, "linear": 1}
 
 
@@ -1651,6 +1706,14 @@ def estimate_chunk_size(
         # n_trials carries the dsort regressor count q (per the lss precedent of
         # overloading n_trials for an operation-specific multiplicity).
         bytes_per_voxel = bytes_per_voxel_arma_dsort(n_timepoints, n_regressors, n_dsort=n_trials)
+    elif operation == "arma_gls":
+        # n_trials > 1 flags GLT contrasts (per-voxel beta covariance), per the
+        # phasereg precedent of overloading n_trials as a flag.
+        bytes_per_voxel = bytes_per_voxel_arma_gls(
+            n_timepoints, n_regressors, has_glts=n_trials > 1
+        )
+    elif operation == "ridge_cv":
+        bytes_per_voxel = bytes_per_voxel_ridge_cv(n_timepoints, n_regressors, n_fractions)
     elif operation == "lss":
         bytes_per_voxel = bytes_per_voxel_lss(
             n_timepoints,

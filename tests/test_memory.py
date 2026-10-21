@@ -733,3 +733,35 @@ class TestReservedAndAllocated:
         from fastfuncstuff.memory import get_available_memory
 
         assert get_available_memory(torch.device("cpu")) > 0
+
+
+class TestGlmPlannerHelpers:
+    """Planners that replaced hand-rolled sizing in glm/arma.py and glm/ridge.py."""
+
+    def test_arma_gls_shrinks_to_budget_and_floors_at_100(self):
+        from fastfuncstuff.glm.arma import check_cuda_memory_before_batch
+        from fastfuncstuff.memory import bytes_per_voxel_arma_gls
+
+        bpv = bytes_per_voxel_arma_gls(200, 10, has_glts=True)
+        cpu = torch.device("cpu")
+        with patch("fastfuncstuff.memory.get_available_memory", return_value=bpv * 5000):
+            assert check_cuda_memory_before_batch(20000, 200, 10, cpu) == 5000
+            assert check_cuda_memory_before_batch(3000, 200, 10, cpu) == 3000
+        with patch("fastfuncstuff.memory.get_available_memory", return_value=bpv * 10):
+            assert check_cuda_memory_before_batch(20000, 200, 10, cpu) == 100
+
+    def test_arma_gls_glts_add_covariance(self):
+        from fastfuncstuff.memory import bytes_per_voxel_arma_gls
+
+        with_glts = bytes_per_voxel_arma_gls(200, 10, has_glts=True)
+        without = bytes_per_voxel_arma_gls(200, 10, has_glts=False)
+        assert with_glts - without == pytest.approx(10 * 10 * 4 / 0.85, abs=2)
+
+    def test_ridge_cv_charges_per_fraction_timeseries(self):
+        """The per-fraction prediction accumulators dominate: n_fracs x T."""
+        from fastfuncstuff.memory import bytes_per_voxel_ridge_cv
+
+        small = bytes_per_voxel_ridge_cv(300, 20, n_fractions=1)
+        large = bytes_per_voxel_ridge_cv(300, 20, n_fractions=21)
+        assert large - small >= 20 * 2 * 300 * 4
+        assert large > bytes_per_voxel_ridge(300, 20, n_fractions=21)

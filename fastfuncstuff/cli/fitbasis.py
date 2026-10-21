@@ -1892,6 +1892,21 @@ def _hrfopt_sidecar_for(index_path: str):
     return prefix, hrf_library_path(prefix)
 
 
+def _auto_polort_for_runs(run_starts: list[int], n_timepoints: int, tr: float) -> tuple[int, float]:
+    """AFNI's ``-polort A``: one degree, ``1 + floor(D / 150)`` for the LONGEST run.
+
+    The same formula as every other tool (``cli_utils.auto_polort``) and the
+    same run AFNI sizes it from (3dDeconvolve.c, "longest block").  The old
+    ``round(mean_minutes / 2)`` gave a 1-minute run no drift term at all and let
+    short runs drag down the degree a long one needs.
+    """
+    from fastfuncstuff.cli_utils import auto_polort
+
+    bounds = [*run_starts, n_timepoints]
+    longest_s = max(bounds[i + 1] - bounds[i] for i in range(len(run_starts))) * float(tr)
+    return auto_polort(longest_s, formula="afni"), longest_s
+
+
 def _import_hrfopt_shapes(
     index_path: str,
     *,
@@ -2692,9 +2707,8 @@ def main() -> int:
 
     # ── Polort resolution ─────────────────────────────────────────
     if args.polort is None:
-        run_dur_min = (n_timepoints / n_runs) * tr / 60.0
-        polort_resolved = max(0, round(run_dur_min / 2))
-        print(f"  Polort auto: {polort_resolved} (run ≈ {run_dur_min:.1f} min)")
+        polort_resolved, longest_s = _auto_polort_for_runs(list(run_starts), n_timepoints, tr)
+        print(f"  Polort auto: {polort_resolved} (longest run {longest_s:.0f} s)")
     else:
         polort_resolved = int(args.polort)
 

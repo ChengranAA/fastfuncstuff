@@ -131,3 +131,17 @@ def test_cli_fits_from_the_sidecar(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc in (0, None), out[-2000:]
     assert "hrfopt sidecar" in out
+
+
+@pytest.mark.parametrize(
+    ("run_starts", "n_tp", "expected"),
+    [
+        ([0], 60, 1),  # a 1-minute run: AFNI gives 1, round(0.5) gave 0
+        ([0, 60], 460, 3),  # 60 s + 400 s: the longest run sets it (mean gave 2)
+        ([0, 300], 600, 3),  # equal 300 s runs
+    ],
+)
+def test_auto_polort_is_afnis_longest_run_rule(run_starts, n_tp, expected):
+    from fastfuncstuff.cli.fitbasis import _auto_polort_for_runs
+
+    assert _auto_polort_for_runs(run_starts, n_tp, 1.0)[0] == expected

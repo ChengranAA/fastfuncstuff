@@ -1095,9 +1095,16 @@ def partition_variance(
 
         del partials, target, acc, sv_all, y
 
-    ncsnr, noise_ceiling = _compute_ncsnr(betas_t.to(device), cell_flat, n_cells)
-    ncsnr = ncsnr.cpu()
-    ceiling_cpu = noise_ceiling.cpu()
+    # Per voxel, so it streams through the same chunks as the fit: moving the whole
+    # beta matrix over at once put it on the device beside its means and residuals.
+    ncsnr = torch.empty(n_vox)
+    ceiling_cpu = torch.empty(n_vox)
+    for c0 in range(0, n_vox, chunk_size):
+        c1 = min(c0 + chunk_size, n_vox)
+        nc_snr, nc = _compute_ncsnr(betas_t[c0:c1].to(device), cell_flat, n_cells)
+        ncsnr[c0:c1] = nc_snr.cpu()
+        ceiling_cpu[c0:c1] = nc.cpu()
+        del nc_snr, nc
     obtainable = ceiling_cpu > NC_FLOOR_FOR_RATIO
 
     # Rank selection wants to be one-sided in its errors: below ncsnr ~0.75 a real rank-1
@@ -1251,7 +1258,7 @@ def partition_variance(
         pair_nuclear_gain=nuclear_gain_out if n_taus > 0 else {},
         pair_gain_alignment=pair_align,
         ncsnr=ncsnr,
-        noise_ceiling=noise_ceiling.cpu(),
+        noise_ceiling=ceiling_cpu,
         heldout_sst=heldout_sst_out,
         diagnostics=diagnostics,
     )

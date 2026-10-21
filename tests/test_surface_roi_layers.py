@@ -161,6 +161,8 @@ def test_a_hemisphere_the_region_misses_is_dropped_unmeasured():
     assert [h for h, _ in out.smooth_rounds] == [0], out.smooth_rounds
     assert out.n_gm > 0 and all(r < 500 for _, r in out.smooth_rounds)
     assert time.time() - t0 < 60
+    # Its voxels are still accounted for, as dropped.
+    assert out.n_outside > out.n_gm
 
 
 def test_a_partial_depth_volume_roi_becomes_whole_columns(tmp_path):

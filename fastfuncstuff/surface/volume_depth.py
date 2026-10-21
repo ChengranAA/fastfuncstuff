@@ -464,6 +464,13 @@ def cortical_depth_volumes(
         idx = np.flatnonzero(flat_owner == h + 1)
         if idx.size == 0:
             continue
+        if columns is not None and not np.asarray(columns[h], bool).any():
+            # No column of the region is on this hemisphere at all: its voxels are
+            # here only because the other one's crop reached over the midline, and
+            # every one of them is about to be dropped. Don't measure them.
+            flat_owner[idx] = -2
+            log(f"{s.name}: not in the region, {idx.size:,} GM voxels dropped unmeasured")
+            continue
         ijk = np.stack(np.unravel_index(idx, shape), 1).astype(np.float64)
         pts = ijk @ affine[:3, :3].T + affine[:3, 3]
         del ijk

@@ -19,6 +19,19 @@ from fastfuncstuff.processing.interp import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _report_a_multicore_box(monkeypatch):
+    """The split's lane count IS ``torch.get_num_threads()``, so on the suite's
+    one-thread workers every test here would decline the split and pass for the
+    wrong reason -- the three that assert ``is None`` would stop testing their
+    own condition, and the gradient test failed outright. Report four threads
+    instead of raising the real cap: the lanes are a reshape, so four lanes on
+    one thread run sequentially and stay bit-identical, which is the claim.
+    ``test_single_thread_runtime_declines_the_split`` re-patches this to 1.
+    """
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 4)
+
+
 def _stock(inp, grid, mode="bilinear"):
     return F.grid_sample(inp, grid, mode=mode, padding_mode="border", align_corners=True)
 

@@ -97,8 +97,20 @@ def restore_components(
     if bad:
         raise ValueError(f"component index out of range for {maps_kv.shape[0]} components: {bad}")
 
-    lost = removed.reshape(n_vox, n_t).double()
-    total_ss = float((lost**2).sum())
+    # Float64 for the fit, but never across the whole (V, T) series at once: the
+    # old whole-volume path held ~4 float64 copies of it (8x the float32 data).
+    # Everything that touches the voxel axis goes a planned voxel chunk at a time.
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    chunk = estimate_chunk_size(
+        n_voxels=n_vox,
+        n_timepoints=n_t,
+        n_regressors=len(indices),
+        device=denoised.device,
+        operation="glm",
+        use_double=True,
+    )
+    lost_vt = removed.reshape(n_vox, n_t)
     a_sel = mixing_tk[:, indices].double()  # (T, n_sel)
     s_sel = maps_kv[indices].double()  # (n_sel, V)
     zero = [
@@ -110,15 +122,29 @@ def restore_components(
         raise ValueError(f"component(s) {zero} have a zero time course or a zero map")
 
     gram = (s_sel @ s_sel.T) * (a_sel.T @ a_sel)  # (n_sel, n_sel)
-    rhs = (s_sel * (lost @ a_sel).T).sum(dim=1)  # (n_sel,)
+    total_ss = 0.0
+    rhs = torch.zeros(len(indices), dtype=torch.float64, device=s_sel.device)
+    for v0 in range(0, n_vox, chunk):
+        v1 = min(v0 + chunk, n_vox)
+        lost = lost_vt[v0:v1].double()
+        total_ss += float((lost**2).sum())
+        rhs += (s_sel[:, v0:v1] * (lost @ a_sel).T).sum(dim=1)  # (n_sel,)
+        del lost
     # lstsq rather than solve: two components can be near-duplicates after an ICA that
     # split one source, and a singular Gram should give the minimum-norm answer instead
     # of a crash the user cannot act on.
     gammas = linalg_lstsq(gram, rhs.unsqueeze(1)).solution.squeeze(1)
 
-    out = denoised.reshape(n_vox, n_t).clone().double()
-    added = (s_sel * gammas.unsqueeze(1)).T @ a_sel.T  # (V, T)
-    out += added
+    den_vt = denoised.reshape(n_vox, n_t)
+    out = torch.empty_like(den_vt)
+    weighted = (s_sel * gammas.unsqueeze(1)).T  # (V, n_sel)
+    added_ss = 0.0
+    for v0 in range(0, n_vox, chunk):
+        v1 = min(v0 + chunk, n_vox)
+        added = weighted[v0:v1] @ a_sel.T  # (V_c, T)
+        added_ss += float((added**2).sum())
+        out[v0:v1] = (den_vt[v0:v1].double() + added).to(out.dtype)
+        del added
     shares = np.asarray(
         [
             float(g) ** 2
@@ -130,10 +156,10 @@ def restore_components(
         dtype=np.float64,
     )
     return RestoreResult(
-        restored=out.reshape(denoised.shape).to(denoised.dtype),
+        restored=out.reshape(denoised.shape),
         gammas=gammas.cpu().numpy().astype(np.float64),
         var_returned=shares,
-        var_returned_total=float((added**2).sum()) / max(total_ss, 1e-30),
+        var_returned_total=added_ss / max(total_ss, 1e-30),
         indices=list(indices),
         # One per component, by construction: a rank-1 term costs one direction of the
         # time axis, whatever its spatial extent.

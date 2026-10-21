@@ -2,6 +2,7 @@
 
 import nibabel as nib
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.denoise.restore import restore_components
@@ -159,3 +160,20 @@ def test_selection_and_restore_pick_the_task_component_over_a_decoy():
     # The task component came back where its map is; the decoy's territory is untouched.
     assert np.abs(delta[:40]).max() > 0.5
     assert np.abs(delta[40:80]).max() < 1e-4
+
+
+def test_voxel_chunked_restore_matches_single_chunk(monkeypatch):
+    """The float64 fit and the restored series are built a voxel chunk at a time;
+    chunking must not move the result."""
+    import fastfuncstuff.memory as memory
+
+    denoised, removed, maps, mixing, _ = _rank1_case(seed=3)
+    args = [torch.as_tensor(a) for a in (denoised, removed, maps, mixing)]
+    monkeypatch.setattr(memory, "estimate_chunk_size", lambda *a, **k: k["n_voxels"])
+    whole = restore_components(*args, [0, 2])
+    monkeypatch.setattr(memory, "estimate_chunk_size", lambda *a, **k: 7)
+    chunked = restore_components(*args, [0, 2])
+    np.testing.assert_allclose(chunked.gammas, whole.gammas, rtol=1e-12)
+    assert chunked.var_returned_total == pytest.approx(whole.var_returned_total, rel=1e-12)
+    assert chunked.restored.dtype == whole.restored.dtype == torch.float32
+    torch.testing.assert_close(chunked.restored, whole.restored, rtol=1e-6, atol=1e-6)

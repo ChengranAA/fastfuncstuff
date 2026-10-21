@@ -71,6 +71,7 @@ try:
         get_average_run_duration,
         load_and_preprocess_runs,
         load_hrf_index_for_input,
+        load_hrfopt_library,
         microtime_offset_bins,
         parse_cv_strategy,
         parse_prefix,
@@ -86,7 +87,6 @@ try:
         trim_spec_from_args,
         validate_paired_surface_args,
     )
-    from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.stim_vec import (
         add_stim_vec_arguments,
         build_stim_vec_design,
@@ -271,9 +271,13 @@ Notes:
     integ_opts = parser.add_argument_group("Integration Options")
     integ_opts.add_argument(
         "-hrf_opt",
+        "-hrfopt_prefix",
+        dest="hrf_opt",
         type=str,
         default=None,
-        help="HRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz (.shape.gii for surface input; both when paired).",
+        help="ffs_hrfopt output prefix. Loads {prefix}_hrf_index.nii.gz (.shape.gii for\n"
+        "surface input; both when paired) and the {prefix}_hrf_library.pt the indices\n"
+        "point into. -hrfopt_prefix is a synonym, as in ffs_reml.",
     )
     integ_opts.add_argument(
         "-denoise",
@@ -607,19 +611,14 @@ def main():
         hrf_indices = load_hrf_index_for_input(args.hrf_opt, nifti_header, mask)
         print(f"  Loaded HRF indices: {hrf_indices.shape}")
 
-        # Load HRF library (reconstruct from metadata or use default)
-        # For now, use default library
-        hrf_library = get_hrf_library(
-            mode="library",
-            stim_duration=0.0,
+        hrf_library, model_durations = load_hrfopt_library(
+            args.hrf_opt,
+            hrf_indices,
             microtime_dt=args.microtime_dt,
-            n_hrfs=20,
-            library_path=args.hrf_library,
             device=device,
+            library_path=args.hrf_library,
+            model_durations=model_durations,
         )
-        if args.hrf_library:
-            print(f"  Loaded custom HRF library from {args.hrf_library}")
-        print(f"  Using HRF library with {len(hrf_library)} HRFs")
 
     # Load noise PCs if provided
     noise_pcs = None

@@ -65,6 +65,7 @@ try:
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         load_hrf_index_for_input,
+        load_hrfopt_library,
         microtime_offset_bins,
         parse_input_files,
         parse_prefix,
@@ -86,7 +87,6 @@ try:
         plot_singleton_contributions,
     )
     from fastfuncstuff.denoise.sequential import select_noise_pool_voxels
-    from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
     from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.io.afni import save_nifti
@@ -469,11 +469,14 @@ Notes:
     proc_opts = parser.add_argument_group("Processing Options")
     proc_opts.add_argument(
         "-hrf_opt",
+        "-hrfopt_prefix",
+        dest="hrf_opt",
         type=str,
         default=None,
-        help="3dHRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz (.shape.gii for surface input) for "
-        "per-voxel HRF optimization. Each voxel uses its assigned HRF for "
-        "design construction. Mutually exclusive with -canonical.",
+        help="ffs_hrfopt output prefix. Loads {prefix}_hrf_index.nii.gz (.shape.gii for "
+        "surface input) and the {prefix}_hrf_library.pt the indices point into, so each "
+        "voxel's design is built with its assigned HRF. -hrfopt_prefix is a synonym, as "
+        "in ffs_reml. Mutually exclusive with -canonical.",
     )
     proc_opts.add_argument(
         "-mask",
@@ -1274,26 +1277,13 @@ def main():
         hrf_indices = hrf_indices.to(data.device)
         print(f"  Loaded HRF indices: {hrf_indices.shape}")
 
-        # Load or reconstruct HRF library
-        hrf_lib_file = f"{args.hrf_opt}_hrf_library.pt"
-        if Path(hrf_lib_file).exists():
-            from fastfuncstuff.cli_utils import spinner
-
-            with spinner(f"Loading {Path(hrf_lib_file).name}"):
-                hrf_lib_data = torch.load(hrf_lib_file, weights_only=False)
-            hrf_library = hrf_lib_data["hrf_library"]
-            print(f"  Loaded HRF library from {hrf_lib_file}: {hrf_library.shape}")
-        else:
-            # Determine n_hrfs from the unique indices
-            n_hrfs = int(hrf_indices.max().item()) + 1
-            hrf_library = get_hrf_library(
-                mode="library",
-                tr=args.tr,
-                n_hrfs=n_hrfs,
-                microtime_dt=args.microtime_dt,
-                device=device,
-            )
-            print(f"  Using default HRF library with {hrf_library.shape[0]} HRFs")
+        hrf_library, durations = load_hrfopt_library(
+            args.hrf_opt,
+            hrf_indices,
+            microtime_dt=args.microtime_dt,
+            device=device,
+            model_durations=durations,
+        )
 
         # Show HRF distribution
         unique_hrfs, counts = torch.unique(hrf_indices, return_counts=True)

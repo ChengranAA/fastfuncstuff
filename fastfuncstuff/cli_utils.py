@@ -1036,10 +1036,89 @@ def hrf_index_path(prefix: str, surface: bool) -> str:
 
 def _hrf_library_size(prefix: str) -> int | None:
     """Curve count of ``<prefix>_hrf_library.pt`` (None if the file is not there)."""
-    lib = Path(f"{parse_prefix(prefix).stem}_hrf_library.pt")
+    lib = hrf_library_path(prefix)
     if not lib.exists():
         return None
     return int(torch.load(lib, weights_only=False, map_location="cpu")["hrf_library"].shape[0])
+
+
+def hrf_library_path(prefix: str) -> Path:
+    """``ffs_hrfopt``'s saved library for *prefix*."""
+    return Path(f"{parse_prefix(prefix).stem}_hrf_library.pt")
+
+
+def load_hrfopt_library(
+    prefix: str,
+    hrf_indices: torch.Tensor,
+    *,
+    microtime_dt: float,
+    device: torch.device | None = None,
+    library_path: str | None = None,
+    model_durations: list[float] | None = None,
+    verbose: bool = True,
+) -> tuple[torch.Tensor, list[float] | None]:
+    """The library the ``-hrfopt_prefix`` indices were chosen from, plus model durations.
+
+    ffs_hrfopt saves the curves it picked from beside its index map, so the
+    library is never a thing to guess: the indices mean nothing except against
+    it.  Guessing the stock 20-curve library instead -- which is what every
+    consumer but ffs_reml used to do -- is wrong twice over.  With a bigger
+    library (``-hrf_library``, PIGHS, a multi-group ffs_librarian set) it dies
+    with ``IndexError: index 20 is out of bounds``; with a same-sized but
+    different one it silently fits every voxel with the wrong shape.
+
+    It also carries ``duration_convolved``, which decides whether the design's
+    onsets are boxcars or impulses -- getting that wrong is silent either way
+    (see :func:`resolve_hrf_library_spec`), so the fact is inherited rather
+    than asked for.  ``model_durations`` comes back zeroed in that case, and
+    unchanged (``None`` stays ``None``) otherwise.
+
+    An explicit ``library_path`` (``-hrf_library`` / ``-hrf_library_raw``)
+    wins, for the case where the saved file is gone; its size is still checked
+    against the indices.
+    """
+    from fastfuncstuff.design.hrf import get_hrf_library
+
+    sidecar = hrf_library_path(prefix)
+    n_needed = int(hrf_indices.max().item()) + 1 if hrf_indices.numel() else 0
+
+    if library_path is None and sidecar.exists():
+        with spinner(f"Loading {sidecar.name}"):
+            saved = torch.load(sidecar, weights_only=False, map_location="cpu")
+        hrf_library = saved["hrf_library"].to(device)
+        if verbose:
+            print(f"  Loaded HRF library from {sidecar}: {tuple(hrf_library.shape)}")
+        if saved.get("duration_convolved") and model_durations is not None:
+            model_durations = [0.0] * len(model_durations)
+            if verbose:
+                print(
+                    "  Library is duration-convolved: building the design's onsets as "
+                    "IMPULSES\n  (the duration is already inside the curves, not applied here)"
+                )
+    else:
+        hrf_library = get_hrf_library(
+            mode="library",
+            stim_duration=0.0,
+            microtime_dt=microtime_dt,
+            library_path=library_path,
+            device=device,
+        )
+        if verbose:
+            if library_path:
+                print(f"  Loaded custom HRF library from {library_path}")
+            else:
+                print(f"  {sidecar} not found: falling back to the stock HRF library")
+            print(f"  Using HRF library with {len(hrf_library)} HRFs")
+
+    if n_needed > len(hrf_library):
+        sys.exit(
+            f"ERROR: the HRF indices from -hrfopt_prefix {prefix} reach index "
+            f"{n_needed - 1}, but the library in hand has only {len(hrf_library)} "
+            f"curves.\n       They were selected from a different library; point "
+            f"-hrf_library at the one ffs_hrfopt used, or re-run ffs_hrfopt so "
+            f"{sidecar.name} sits beside the index map."
+        )
+    return hrf_library, model_durations
 
 
 def load_hrf_index_for_input(prefix: str, header, mask: np.ndarray | None = None) -> torch.Tensor:

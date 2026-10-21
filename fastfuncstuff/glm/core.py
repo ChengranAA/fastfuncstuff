@@ -586,14 +586,14 @@ def fit_glm(
 
     # Setup precision. MPS has no float64, so honour an explicit full-precision
     # request by running on CPU rather than silently downgrading to float32.
-    if use_double and device.type == "mps":
+    if use_double and _linalg_device(device) != device:
         warnings.warn(
             "use_double requested but MPS has no float64; running on CPU to honour "
             "the full-precision request. Pass -device cpu to silence this, or drop "
             "use_double to run float32 on MPS.",
             stacklevel=2,
         )
-        device = torch.device("cpu")
+        device = _linalg_device(device)
     dtype = torch.float64 if use_double else torch.float32
 
     # Handle single vs multiple runs

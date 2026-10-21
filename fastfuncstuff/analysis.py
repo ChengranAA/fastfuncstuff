@@ -1047,6 +1047,13 @@ def analyze_from_design_matrix(
         keep = torch.as_tensor(list(good_list), dtype=torch.long)
         if design.shape[0] == n_full:
             design = design[keep.to(design.device)]
+        if designs_by_hrf is not None:
+            # Each voxel is fit with its own HRF's design, so each one has to
+            # lose the same rows as the shared design.
+            designs_by_hrf = {
+                h: d[keep.to(d.device)] if d.shape[0] == n_full else d
+                for h, d in designs_by_hrf.items()
+            }
         if data.shape[1] == n_full:
             data = data[:, keep.to(data.device)]
         if dsort_tensor is not None and dsort_tensor.shape[-1] == n_full:

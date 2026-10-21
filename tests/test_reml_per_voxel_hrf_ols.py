@@ -23,7 +23,8 @@ def _hrf(t, k):
 
 
 @pytest.mark.parametrize("dsort", [False, True])
-def test_ols_only_uses_each_voxels_own_hrf(tmp_path, dsort):
+@pytest.mark.parametrize("censor", [False, True])
+def test_ols_only_uses_each_voxels_own_hrf(tmp_path, dsort, censor):
     """``dsort``: OLS + -dsort took a shared-design branch of its own that
     dropped the per-voxel HRF all over again."""
     tt = np.arange(320) * 0.1
@@ -61,6 +62,11 @@ def test_ols_only_uses_each_voxels_own_hrf(tmp_path, dsort):
             tmp_path / "ds.nii.gz",
         )
         extra = ["-dsort", "ds.nii.gz"]
+    if censor:
+        keep = np.ones(NT, dtype=int)
+        keep[[30, 31, 100, 170]] = 0
+        np.savetxt(tmp_path / "censor.1D", keep, fmt="%d")
+        extra += ["-censor", "censor.1D"]
     res = subprocess.run(  # noqa: S603
         [
             sys.executable,

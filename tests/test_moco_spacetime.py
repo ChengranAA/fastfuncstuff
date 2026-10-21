@@ -155,7 +155,13 @@ def test_reduces_stimulus_correlated_motion():
     # motion, so all of this is artifact).
     blind = float(np.sqrt((res_blind.params[:, :3] ** 2).sum(axis=1)).mean())
     st = float(np.sqrt((res_st.params[:, :3] ** 2).sum(axis=1)).mean())
-    assert blind > 0.1, f"test too weak; blind translation energy {blind}"
+    # Tripwire against a vacuous comparison, not a claim about moco: it only has
+    # to guarantee there IS a spurious signal to remove. Re-based 2026-10-21 from
+    # 0.1 to 0.05 -- the timing-blind estimator's artifact on this phantom has
+    # since dropped to 0.0750 (st 0.0581), so the old bound failed on moco having
+    # got BETTER. It went unnoticed because this test is marked slow and the
+    # suite was habitually run with -m "not slow".
+    assert blind > 0.05, f"test too weak; blind translation energy {blind}"
     assert st < 0.92 * blind, (
         f"space-time did not reduce stimulus-correlated motion: blind={blind:.4f} st={st:.4f}"
     )

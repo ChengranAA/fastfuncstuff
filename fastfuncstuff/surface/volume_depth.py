@@ -840,8 +840,12 @@ def export_roi_depth_volumes(
 
     edge_mm = [_mean_edge_mm(0.5 * (s.white + s.pial), s.faces) for s in surfaces]
     results = []
-    for roi in rois:
+    rois = list(rois)
+    for k, roi in enumerate(rois, 1):
         name = _file_token(roi.name)
+        # Where a bar would go: an .annot is 34 regions, each its own fill and
+        # distance search, and the line below carries the grid a bar could not.
+        count = f"[{k}/{len(rois)}] " if len(rois) > 1 else ""
         affine, shape = np.asarray(master_affine, np.float64), tuple(master_shape)
         if dxyz is not None:
             affine, shape = regrid(affine, shape, dxyz)
@@ -865,7 +869,7 @@ def export_roi_depth_volumes(
         if verbose:
             vox = np.linalg.norm(affine[:3, :3], axis=0)
             print(
-                f"{name}: {n_own:,} columns (+{n_grown:,} surround) onto "
+                f"{count}{name}: {n_own:,} columns (+{n_grown:,} surround) onto "
                 f"{shape[0]}x{shape[1]}x{shape[2]} at "
                 f"{' x '.join(f'{v:.3g}' for v in vox)} mm"
             )

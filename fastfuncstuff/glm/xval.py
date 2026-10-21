@@ -1781,10 +1781,6 @@ def compute_xval_r2(
             # Free intermediate tensors
             del train_data_batch, test_data_batch, predictions_batch, betas_fit
 
-        # Clear GPU cache once per split when streaming from CPU
-        if not data_on_gpu and device.type == "cuda":
-            torch.cuda.empty_cache()
-
         # Update count for these test timepoints (slow mode only)
         if not use_fast_r2:
             count_per_timepoint[test_tps] += 1.0
@@ -2158,9 +2154,9 @@ def single_trial_cv_helper(
 
                 del test_betas, test_sum, train_sum
 
+            # No empty_cache here: the next chunk reuses these same-sized blocks,
+            # and releasing them only makes the allocator re-request them.
             del betas_chunk, total_sum, total_sum_sq
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
         if is_sse:
             r2 = sse_accum

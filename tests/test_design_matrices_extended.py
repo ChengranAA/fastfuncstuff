@@ -320,6 +320,16 @@ class TestBuildGlmDesign:
         # FIR: n_conditions * n_lags
         assert design.shape[1] == 20
 
+    @pytest.mark.parametrize(("tr", "lags"), [(0.5, 64), (3.0, 11)])
+    def test_fir_default_lags_span_32s_at_any_tr(self, tr, lags):
+        # A fixed 30-lag default was 15 s at TR 0.5 and 90 s at TR 3.
+        onsets = torch.zeros(200, 2, device=DEVICE)
+        onsets[[10, 90], 0] = 1
+        onsets[[40, 130], 1] = 1
+        design = build_glm_design(onsets, mode="fir", tr=tr, device=DEVICE)
+        assert design.shape[1] == 2 * lags
+        assert (lags - 1) * tr < 32.0 <= lags * tr
+
     def test_onoff_mode(self, simple_onsets, hrf):
         design = build_glm_design(simple_onsets, hrf=hrf, mode="onoff", device=DEVICE)
         assert design.shape[0] == 50

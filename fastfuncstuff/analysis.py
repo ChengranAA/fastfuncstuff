@@ -258,7 +258,7 @@ def analyze_from_onsets(
             n_timepoints=n_timepoints,
             mode="fir",
             device=device,
-            **hrf_kwargs,
+            **{"tr": tr, **hrf_kwargs},
         )
 
     elif hrf_mode == "canonical":

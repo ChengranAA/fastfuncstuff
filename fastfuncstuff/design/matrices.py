@@ -5,6 +5,8 @@ Handles FIR, assumed HRF, and convolution operations
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -1352,12 +1354,23 @@ def convolve_design_hrf(
     return convolved
 
 
+FIR_WINDOW_S = 32.0
+
+
+def default_fir_lags(tr: float, window_s: float = FIR_WINDOW_S) -> int:
+    """FIR lags covering ``window_s`` seconds at this TR (at least one)."""
+    if not tr > 0:
+        raise ValueError(f"FIR lag count needs a positive TR, got {tr}")
+    # The epsilon keeps an exact multiple (32 s / 0.5 s) from rounding up a lag.
+    return max(1, math.ceil(window_s / tr - 1e-9))
+
+
 def build_glm_design(
     onsets: torch.Tensor | list[torch.Tensor],
     hrf: torch.Tensor | None = None,
     n_timepoints: int | list[int] | None = None,
     mode: str = "assumed",
-    n_fir_lags: int = 30,
+    n_fir_lags: int | None = None,
     tr: float = 1.0,
     single_trial: bool = False,
     device: torch.device | None = None,
@@ -1385,10 +1398,13 @@ def build_glm_design(
         - TENT lives in :func:`fastfuncstuff.design.builder.build_per_run_task_designs`,
           which keeps the onset times TENT needs
         - 'onoff': Simple boxcar (summed onsets)
-    n_fir_lags : int
-        Number of lags for FIR design (default: 30)
+    n_fir_lags : int, optional
+        Number of lags for FIR design. Default: enough TRs to span
+        :data:`FIR_WINDOW_S` (the 32 s HRF duration used everywhere else), so the
+        window is the same in seconds at any TR -- a fixed lag count is 15 s at
+        TR 0.5 (truncating the undershoot) and 90 s at TR 3.
     tr : float
-        Repetition time in seconds (default: 1.0)
+        Repetition time in seconds (default: 1.0); sets the default FIR lag count
     single_trial : bool
         If True, create single-trial design (one regressor per trial)
     device : torch.device, optional
@@ -1411,6 +1427,8 @@ def build_glm_design(
         n_timepoints = [o.shape[0] for o in onsets]
     elif isinstance(n_timepoints, int):
         n_timepoints = [n_timepoints] * len(onsets)
+
+    fir_lags = n_fir_lags if n_fir_lags is not None else default_fir_lags(tr)
 
     designs = []
 
@@ -1438,7 +1456,7 @@ def build_glm_design(
                 design = convolve_hrf(onset, hrf, n_tp, device=device)
 
             elif mode == "fir":
-                design = make_fir_design(onset, n_fir_lags, n_tp, device=device)
+                design = make_fir_design(onset, fir_lags, n_tp, device=device)
 
             elif mode in ("tent", "tentzero"):
                 # TENT needs onset TIMES; this function only has a TR-sampled

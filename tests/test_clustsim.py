@@ -413,9 +413,16 @@ def test_residual_null_table_holds_its_false_positive_rate_where_one_acf_cannot(
     mask = np.ones(shape, bool)
     mask[[0, -1]] = mask[:, [0, -1]] = mask[:, :, [0, -1]] = False
     e = _two_sided_field(rng, shape, mask, 300)
+    # batch pinned and BOTH simulators seeded, or this test is a lottery: the
+    # automatic batch size is read from FREE memory (so it moves with whatever
+    # else is on the box), and an unseeded ResidualNull drew from entropy --
+    # which is how a 0.0867 FPR got past the 0.085 bound on one parallel run
+    # while passing serially. A seed on simulate_cluster_null is NOT enough:
+    # it only reaches the simulator it constructs itself, and this call passes
+    # its own.
     kw = dict(n_iter=1000, pthr=(0.001,), athr=(0.05,), nns=(1,), sideds=("1-sided",),
-              n_jobs=4, verbose=False)  # fmt: skip
-    null_r = simulate_cluster_null(mask, vox, None, simulator=ResidualNull(mask, e), **kw)
+              n_jobs=4, batch=250, verbose=False)  # fmt: skip
+    null_r = simulate_cluster_null(mask, vox, None, simulator=ResidualNull(mask, e, seed=0), **kw)
     est = estimate_fwhmx_run(
         torch.as_tensor(e.astype(np.float32)), torch.as_tensor(mask), shape, vox,
         unif=True, unif_scale="sd", progress=False,

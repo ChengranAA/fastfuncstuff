@@ -1078,6 +1078,7 @@ def fit_pathfinder(
         "n_runs": n_runs,
         "n_cv_splits": len(cv_splits),
         "n_conditions": n_conditions,
+        "microtime_dt": microtime_dt,
         "hrf_usage_counts": hrf_counts.tolist(),
         "initial_xval_r2_mean": float(initial_xval_r2.mean().item()),
         "final_xval_r2_mean": float(xval_r2_best.mean().item()),
@@ -1212,6 +1213,23 @@ def save_pathfinder_results(
     hrf_index_path = f"{output_prefix}_hrf_index{nii_ext}"
     save_nifti(hrf_index_vol.astype(np.float32), output_path=hrf_index_path, affine=affine)
     output_files["hrf_index"] = hrf_index_path
+
+    # The library the index map numbers into, under the name every -hrf_opt /
+    # -hrfopt_prefix consumer looks for. Without it they cannot know which
+    # curves (or, under -hrf_mode pighs, which kind) the indices mean.
+    if results.hrf_library is not None:
+        hrf_lib_path = f"{output_prefix}_hrf_library.pt"
+        torch.save(
+            {
+                "hrf_library": results.hrf_library.cpu(),
+                "hrf_index": results.hrf_index.cpu(),
+                "metadata": results.metadata,
+                # Built with stim_duration=0: impulse responses.
+                "duration_convolved": False,
+            },
+            hrf_lib_path,
+        )
+        output_files["hrf_library"] = hrf_lib_path
 
     # 2. Best denoised xval R² (final, optimized)
     xval_r2_vol = to_volume(results.xval_r2_best.numpy())

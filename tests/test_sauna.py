@@ -568,6 +568,41 @@ def test_residual_map_saved(tmp_path):
     assert meta["outputs"]["residual"] is not None
 
 
+def test_llr_batch_size_does_not_change_result(tmp_path):
+    """The CUDA memory guard shrinks svd_batch_size when the working set
+    overflows; that must be a pure memory knob, invisible in the output."""
+    rng = np.random.RandomState(7)
+    magn = np.abs(rng.normal(size=(10, 9, 6, 19))).astype(np.float32) + 1.0
+    magn_file = tmp_path / "magn.nii.gz"
+    _write_nifti(magn_file, magn)
+
+    results = []
+    for batch in (512, 7):
+        cfg = SaunaConfig(
+            temporal_phase=0,
+            magnitude_only=True,
+            noise_volume_last=3,
+            kernel_size_pca=(3, 3, 3),
+            patch_overlap=2,
+            save_residual_map=True,
+            svd_batch_size=batch,
+            gfactor_smooth_fwhm=2.0,
+            verbose=False,
+        )
+        out = run_sauna(
+            str(magn_file), None, str(tmp_path / f"S_{batch}"), cfg, device=torch.device("cpu")
+        )
+        assert out.residual_file is not None
+        results.append(
+            (
+                nib.load(out.magnitude_file).get_fdata(dtype=np.float32),
+                nib.load(out.residual_file).get_fdata(dtype=np.float32),
+            )
+        )
+    np.testing.assert_allclose(results[0][0], results[1][0], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(results[0][1], results[1][1], rtol=1e-5, atol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # 3D Legendre basis
 # ---------------------------------------------------------------------------

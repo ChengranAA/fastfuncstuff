@@ -59,8 +59,8 @@ from fastfuncstuff.denoise.nordic import (
 )
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.memory import (
-    estimate_nordic_llr_memory,
-    get_available_memory,
+    nordic_llr_gpu_budget,
+    plan_nordic_llr_memory,
 )
 from fastfuncstuff.utils import get_device, linalg_device, to_linalg_f64
 
@@ -1292,17 +1292,22 @@ def run_sauna(
     # ------------------------------------------------------------------
     # 6. Main LLR denoising with optimal shrinkage
     # ------------------------------------------------------------------
+    # Same guard as nordic's LLR pass: offloading the input alone does not help
+    # when the per-batch working set is what overflows, so the batch shrinks too.
+    svd_batch_size = cfg.svd_batch_size
     if dev.type == "cuda":
-        mem_est = estimate_nordic_llr_memory(
+        avail = nordic_llr_gpu_budget(dev)
+        plan = plan_nordic_llr_memory(
             shape=KSP2.shape,
             kernel_size=kernel_pca,
             svd_batch_size=cfg.svd_batch_size,
             dtype_bytes=KSP2.element_size(),
+            avail_bytes=avail,
             return_recon=True,
         )
-        avail = get_available_memory(dev)
-        gpu_without_data = mem_est["total"] - mem_est["data"]
-        if mem_est["total"] > avail:
+        mem_est = plan["est"]
+        if plan["offload_data"]:
+            svd_batch_size = int(plan["svd_batch_size"])
             if cfg.verbose:
                 print(
                     f"  Memory guard: LLR needs ~{mem_est['total'] / 1024**3:.2f} GiB "
@@ -1310,8 +1315,13 @@ def run_sauna(
                 )
                 print(
                     f"  Offloading input ({mem_est['data'] / 1024**3:.2f} GiB) to CPU; "
-                    f"accumulators + working set = {gpu_without_data / 1024**3:.2f} GiB on GPU."
+                    f"reducing svd_batch_size {cfg.svd_batch_size} -> {svd_batch_size}."
                 )
+                if not plan["fits"]:
+                    print(
+                        "  WARNING: resident accumulators alone exceed the memory "
+                        "budget; running at minimum batch — may still OOM."
+                    )
             KSP2 = KSP2.cpu()
             torch.cuda.empty_cache()
 
@@ -1322,17 +1332,19 @@ def run_sauna(
         threshold_mode=threshold_mode,
         threshold_value=threshold_value,
         verbose=cfg.verbose,
-        svd_batch_size=cfg.svd_batch_size,
+        svd_batch_size=svd_batch_size,
         decomp_method=cfg.decomp_method,
         device=dev,
         noise_sigma=noise_sigma,
     )
 
     # Compute residual (complex difference in transformed space) before
-    # freeing the input.  Reuse KSP2 memory: residual = input - denoised.
+    # freeing the input.  On the input's device: an offloaded KSP2 must not be
+    # staged back onto the GPU beside denoised (the steps below are
+    # device-agnostic).
     residual: torch.Tensor | None = None
     if cfg.save_residual_map:
-        residual = KSP2.to(denoised.device) - denoised
+        residual = KSP2 - denoised.to(KSP2.device)
     del KSP2
     II = None  # noqa: F841
     if dev.type == "cuda":

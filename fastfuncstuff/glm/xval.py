@@ -17,7 +17,7 @@ import torch
 
 from fastfuncstuff._compile import compile_after_eager_time
 from fastfuncstuff.memory import estimate_chunk_size, get_available_memory
-from fastfuncstuff.utils import cpu_if_mps, factor_device
+from fastfuncstuff.utils import accum_dtype, cpu_if_mps, factor_device
 
 
 def compute_qr_projectors(
@@ -1323,11 +1323,12 @@ def compute_xval_r2(
         # Check if we can fit accumulators on GPU
         use_gpu_accumulators = False
         if data_on_gpu and device.type == "cuda":
-            free_mem = torch.cuda.get_device_properties(
-                device
-            ).total_memory - torch.cuda.memory_allocated(device)
-            # Need 2x for accumulators + 1x for R² temps + 30% headroom
-            needed_mem = data_size_bytes * 3.3
+            # Driver-reported free memory with MemoryConfig's safety factor -- the
+            # card's total minus our own allocations counted every other
+            # process's VRAM as free. 2x for accumulators + 1x for R² temps; the
+            # safety factor is the headroom.
+            free_mem = get_available_memory(device)
+            needed_mem = data_size_bytes * 3
             use_gpu_accumulators = free_mem > needed_mem
             if verbose:
                 free_gb = free_mem / 1e9
@@ -1339,10 +1340,8 @@ def compute_xval_r2(
                 else:
                     print(f"  Data on GPU but only {free_gb:.1f}GB free (need {needed_gb:.1f}GB)")
                     print("  Using CPU accumulators with GPU compute (hybrid mode)")
-        # TODO - here is another section of the code not using the memory modules that we have.
-        # This effective batch size, and hard coded values below mean we are thrashing a lot when we _might_ not need to .
-        # TODO - basically any memory check stuff should be in the main memory module, for that specific opeartion.
-        # I think xval already had one - does it include this stuff?
+        # The batch multiplier below is capped to free VRAM by
+        # _cap_batch_to_free_vram, which sizes one fold through the memory module.
         if use_gpu_accumulators:
             accumulator_device = device
             effective_batch_size = min(batch_size * 4, n_voxels)
@@ -1525,10 +1524,7 @@ def compute_xval_r2(
                 if use_fast_r2:
                     # float64 accumulation without materialising float64 copies
                     # (MPS has no float64, so reduce in float32 there).
-                    if test_data_batch.device.type == "mps":
-                        red_dtype = torch.float32
-                    else:
-                        red_dtype = torch.float64
+                    red_dtype = accum_dtype(test_data_batch.device)
                     residuals = test_data_batch - predictions_batch
                     ss_res_batch = (residuals * residuals).sum(dim=1, dtype=red_dtype)
                     sum_actual_batch = test_data_batch.sum(dim=1, dtype=red_dtype)
@@ -1743,7 +1739,7 @@ def compute_xval_r2(
                 # there we reduce in float32 on-device (SS_res is a difference, so
                 # no catastrophic cancellation) and promote to float64 only after
                 # moving onto the CPU float64 accumulators below.
-                if test_data_batch.device.type == "mps":
+                if accum_dtype(test_data_batch.device) != torch.float64:
                     residuals = test_data_batch - predictions_batch
                     ss_res_batch = (residuals**2).sum(dim=1)
                     sum_actual_batch = test_data_batch.sum(dim=1)

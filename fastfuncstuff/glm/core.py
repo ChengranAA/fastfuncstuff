@@ -1353,9 +1353,13 @@ def fit_glm_hrf_library(
     if verbose:
         print(f"  Using microtime: dt={microtime_dt}s ({bins_per_tr} bins/TR)")
 
-    # Fit GLM for each HRF
+    # Fit GLM for each HRF, keeping only the running best per voxel. Holding
+    # every candidate's full GLMResults (residuals and all) until the end cost
+    # n_hrfs times the memory of one fit for no gain.
     all_r2 = []
-    all_results = []
+    best_results = GLMResults()
+    best_betas: torch.Tensor | None = None
+    best_r2: torch.Tensor | None = None
 
     for hrf_idx in range(n_hrfs):
         if verbose:
@@ -1382,8 +1386,23 @@ def fit_glm_hrf_library(
         fit_kwargs["verbose"] = False  # Suppress inner GLM progress
 
         results = fit_glm(data, convolved_design, tr, **fit_kwargs)
+        assert results.betas is not None and results.r2 is not None
         all_r2.append(results.r2)
-        all_results.append(results)
+
+        # Compared in the fit's own dtype, so the winner is exactly argmax's.
+        r2, betas = results.r2, results.betas
+        if best_betas is None or best_r2 is None:
+            best_results.original_shape = results.original_shape
+            best_results.meanvol = results.meanvol
+            best_betas, best_r2 = betas, r2
+        else:
+            # Same winner as argmax over the stacked R²: the first maximum wins
+            # a tie, and a NaN, which argmax treats as the maximum, wins once
+            # and is never displaced.
+            better = ~torch.isnan(best_r2) & (torch.isnan(r2) | (r2 > best_r2))
+            best_betas = torch.where(better.unsqueeze(1), betas, best_betas)
+            best_r2 = torch.where(better, r2, best_r2)
+        del results, r2, betas
 
     # Stack R² values
     r2_all_hrfs = torch.stack(all_r2, dim=1)  # (n_voxels, n_hrfs)
@@ -1391,24 +1410,9 @@ def fit_glm_hrf_library(
     # Select best HRF per voxel
     hrf_index = torch.argmax(r2_all_hrfs, dim=1)  # (n_voxels,)
 
-    # Extract results for best HRF
-    best_results = GLMResults()
-    best_results.original_shape = all_results[0].original_shape
-
-    n_voxels = r2_all_hrfs.shape[0]
-    assert all_results[0].betas is not None  # populated by the completed fit_glm() call above
-    n_regressors = all_results[0].betas.shape[1]
-
-    # Select betas and R² for best HRF per voxel
-    best_results.betas = torch.zeros(n_voxels, n_regressors, device=device)
-    best_results.r2 = torch.zeros(n_voxels, device=device)
-
-    for voxel_idx in range(n_voxels):
-        best_hrf = hrf_index[voxel_idx].item()
-        best_results.betas[voxel_idx] = all_results[best_hrf].betas[voxel_idx]
-        best_results.r2[voxel_idx] = all_results[best_hrf].r2[voxel_idx]
-
-    best_results.meanvol = all_results[0].meanvol
+    assert best_betas is not None and best_r2 is not None
+    best_results.betas = best_betas.to(device=device, dtype=torch.get_default_dtype())
+    best_results.r2 = best_r2.to(device=device, dtype=torch.get_default_dtype())
 
     if verbose:
         print(f"Best HRF selection: mean R² = {best_results.r2.mean().item():.3f}")

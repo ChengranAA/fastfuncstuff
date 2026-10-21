@@ -742,3 +742,55 @@ class TestGLMContrasts:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_hrf_library_running_best_matches_per_voxel_gather(monkeypatch):
+    """fit_glm_hrf_library keeps a running best instead of every candidate's fit.
+
+    The winner must be exactly the old ``argmax`` + per-voxel gather's,
+    including its tie (first maximum) and NaN (argmax treats NaN as the
+    maximum) behaviour.
+    """
+    import fastfuncstuff.glm.core as core
+    from fastfuncstuff.glm.core import GLMResults, fit_glm_hrf_library
+
+    n_voxels, n_reg, n_hrfs = 9, 3, 4
+    gen = torch.Generator().manual_seed(3)
+    betas = [torch.randn(n_voxels, n_reg, generator=gen) for _ in range(n_hrfs)]
+    r2 = torch.rand(n_hrfs, n_voxels, generator=gen)
+    r2[:, 0] = 0.5  # four-way tie
+    r2[2, 1] = float("nan")  # NaN mid-way
+    r2[1, 2] = r2[3, 2] = float("nan")  # two NaNs: the first one wins
+    r2[0, 3] = float("nan")  # NaN first
+
+    fits = iter(range(n_hrfs))
+
+    def fake_fit_glm(*_args, **_kwargs):
+        k = next(fits)
+        res = GLMResults()
+        res.betas, res.r2 = betas[k].clone(), r2[k].clone()
+        res.meanvol = torch.ones(n_voxels)
+        return res
+
+    monkeypatch.setattr(core, "fit_glm", fake_fit_glm)
+    monkeypatch.setattr(core, "build_task_design", lambda *a, **k: torch.zeros(10, n_reg))
+
+    cpu = torch.device("cpu")
+    best, hrf_index, r2_all = fit_glm_hrf_library(
+        torch.zeros(n_voxels, 10),
+        torch.zeros(200, n_reg),
+        torch.zeros(n_hrfs, 20),
+        tr=2.0,
+        device=cpu,
+        verbose=False,
+    )
+
+    # The old path, verbatim in effect.
+    expected_index = torch.argmax(r2.T, dim=1)
+    expected_betas = torch.stack([betas[int(h)][v] for v, h in enumerate(expected_index)])
+    expected_r2 = torch.stack([r2[int(h), v] for v, h in enumerate(expected_index)])
+
+    assert torch.equal(hrf_index, expected_index)
+    assert torch.equal(best.betas, expected_betas)
+    torch.testing.assert_close(best.r2, expected_r2, equal_nan=True, rtol=0, atol=0)
+    assert torch.equal(r2_all.isnan(), r2.T.isnan())

@@ -138,7 +138,7 @@ def smooth_var_per_perm(
     var_pv: torch.Tensor,  # [P, V_in_mask], float32
     mask: np.ndarray,  # [X, Y, Z] bool
     sigma_vox: tuple[float, float, float],
-    perm_chunk: int = 256,
+    perm_chunk: int | None = None,
     device: str | torch.device = "cpu",
 ) -> torch.Tensor:
     """Mask-aware Gaussian smoothing of a per-perm variance matrix.
@@ -148,7 +148,8 @@ def smooth_var_per_perm(
     the same correction used by ``3dBlurInMask``.
 
     Streams in chunks of ``perm_chunk`` perms so peak memory stays
-    bounded regardless of P.
+    bounded regardless of P. ``None`` (the default) sizes the chunk from the
+    memory module, capped at 256 perms.
     """
     p, v_mask = var_pv.shape
     dev = torch.device(device) if not isinstance(device, torch.device) else device
@@ -160,6 +161,18 @@ def smooth_var_per_perm(
     # Pre-compute mask-smooth denominator once (1-channel, broadcast).
     mask_3d = torch.from_numpy(mask.astype(np.float32)).to(dev).unsqueeze(0)
     mask_smooth = gaussian3d_batched(mask_3d, sigma_vox).clamp_min(1e-10)  # [1, X, Y, Z]
+
+    if perm_chunk is None:
+        from fastfuncstuff.memory import estimate_chunk_size
+
+        # A perm holds ~6 full-grid float32 volumes at the peak (the scatter
+        # target, the blur's per-axis outputs, the normalised copy, the gather):
+        # the GLM model's (5*T + R)*4 bytes with T = R = grid size is 24 bytes a
+        # voxel. Per-perm results are independent, so the chunk never moves a bit.
+        perm_chunk = estimate_chunk_size(
+            p, n_total, n_total, dev, operation="glm", min_chunk_size=1, max_chunk_size=256
+        )
+    perm_chunk = max(1, int(perm_chunk))
 
     out = torch.empty_like(var_pv)
     for p0 in range(0, p, perm_chunk):

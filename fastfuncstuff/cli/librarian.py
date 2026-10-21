@@ -74,9 +74,12 @@ try:
         load_and_preprocess_runs,
         parse_input_files,
         parse_prefix,
+        polort_per_run,
+        polort_summary,
         preflight_check,
         resolve_event_filters,
         resolve_microtime_offset,
+        resolve_polort,
         run_lengths_from_starts,
         setup_device,
         spinner,
@@ -607,7 +610,10 @@ Notes:
         "-max-poly-degree",
         type=int,
         default=None,
-        help="Polynomial detrend degree (per run).  Auto if omitted.",
+        help=(
+            "Legendre drift order, the same for every run. Default: per run, "
+            "1 + floor(run_seconds / 150) for each run in its own block."
+        ),
     )
     proc_grp.add_argument(
         "-debug-design",
@@ -2124,15 +2130,9 @@ def main() -> None:
     from fastfuncstuff.design.builder import pack_for_shared_task_glm
 
     per_run_data = [data[:, run_starts_ext[r] : run_starts_ext[r + 1]] for r in range(n_runs)]
-    # Resolve polort: None (auto) → ~run_duration_min/2 per run.  fit_glm
-    # used to do this automatically when handed a per-run list; we
-    # replicate it here so the packed-design path matches.
-    if args.max_poly_degree is None:
-        run_duration_min = per_run_data[0].shape[1] * tr / 60.0 if per_run_data else 1.0
-        polort_resolved = max(0, round(run_duration_min / 2))
-        print(f"  Polort auto: {polort_resolved} (run duration ≈ {run_duration_min:.1f} min)")
-    else:
-        polort_resolved = int(args.max_poly_degree)
+    # -max-poly-degree N for every run, else each run's own 1 + floor(D / 150),
+    # the rule every other tool uses.
+    polort_resolved = resolve_polort(args.max_poly_degree, [d.shape[1] for d in per_run_data], tr)
 
     # External nuisance (motion, physio, GLMdenoise noise regressors).
     # These go into the per-run block-diagonal section alongside the
@@ -2159,12 +2159,17 @@ def main() -> None:
         n_extra = extra_per_run[0].shape[1]
         print(f"  External nuisance: {n_extra} regressor(s) per run, block-diagonal")
 
-    def _fit_packed(task_designs, run_data, labels, verbose=False):
-        """Pack + fit one shared-task GLM, returning (packed, results)."""
+    def _fit_packed(task_designs, run_data, labels, verbose=False, runs=None):
+        """Pack + fit one shared-task GLM, returning (packed, results).
+
+        ``runs`` names which runs ``run_data`` holds when it is a subset, so
+        each keeps its own drift degree.
+        """
+        degrees = polort_per_run(polort_resolved, n_runs)
         pk = pack_for_shared_task_glm(
             per_run_data=run_data,
             per_run_task_designs=task_designs,
-            polort=polort_resolved,
+            polort=degrees if runs is None else [degrees[r] for r in runs],
             task_column_labels=labels,
             extra_regressors_per_run=extra_per_run,
             device=torch.device("cpu"),
@@ -2286,7 +2291,9 @@ def main() -> None:
                 saved_extra = extra_per_run
                 if extra_per_run is not None:
                     extra_per_run = [extra_per_run[r] for r in subset]
-                _, sub_res = _fit_packed(sub_designs, sub_data, design_result.column_labels)
+                _, sub_res = _fit_packed(
+                    sub_designs, sub_data, design_result.column_labels, runs=subset
+                )
                 extra_per_run = saved_extra
                 b = sub_res.betas
                 if isinstance(b, torch.Tensor):
@@ -2430,7 +2437,7 @@ def main() -> None:
         "spline_knots": int(args.spline_knots) if args.fit_gamma == "spline" else None,
         "deconv_method": args.deconv_method,
         "refit_pcs": args.refit_pcs == "on",
-        "polort": int(polort_resolved),
+        "polort": (polort_resolved if isinstance(polort_resolved, list) else int(polort_resolved)),
         "n_external_nuisance_per_run": (
             int(extra_per_run[0].shape[1]) if extra_per_run is not None else 0
         ),
@@ -2644,7 +2651,7 @@ def main() -> None:
                 print(
                     f"    NSD refinement: refitting with {args.n_pcs} PC-basis "
                     f"regressors (shared across {len(per_run_data)} runs + "
-                    f"per-run polort={polort_resolved})"
+                    f"per-run polort={polort_summary(polort_resolved)})"
                 )
                 refit_weights_g = _compute_refit_weights(g, svd_pre.pcs)
 

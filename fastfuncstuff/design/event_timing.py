@@ -109,21 +109,25 @@ def design_gain(
     per_run_designs: list[torch.Tensor],
     n_basis_per_condition: list[int],
     n_events_per_condition: list[int],
-    polort: int = 2,
+    polort: int | list[int] = 2,
     knot_dt: float = float("nan"),
 ) -> DesignGain:
     """Per-knot and worst-direction noise gain of a task design.
 
     The design is projected against each run's Legendre drift (the part the
     GLM spends on baseline) before ``(X'X)^-1`` is formed, so the numbers are
-    what a fit with that ``polort`` actually gets.  Gains are scaled by
+    what a fit with that ``polort`` (one degree, or one per run) actually gets.  Gains are scaled by
     ``sqrt(n_events)``: an isolated, TR-locked FIR knot scores 1.
     """
+    from fastfuncstuff.design.polort import polort_per_run
+
     blocks = []
-    for design in per_run_designs:
+    for design, run_polort in zip(
+        per_run_designs, polort_per_run(polort, len(per_run_designs)), strict=True
+    ):
         x = design.detach().to("cpu", torch.float64).numpy()
-        if polort >= 0 and x.shape[0] > polort + 1:
-            q, _ = np.linalg.qr(legendre_polynomials(x.shape[0], polort))
+        if run_polort >= 0 and x.shape[0] > run_polort + 1:
+            q, _ = np.linalg.qr(legendre_polynomials(x.shape[0], run_polort))
             x = x - q @ (q.T @ x)
         blocks.append(x)
     x = np.concatenate(blocks, axis=0)
@@ -197,7 +201,7 @@ def check_event_timing(
     microtime_offset: float = 0.0,
     precision: float = 0.05,
     max_subdivision: int = 4,
-    polort: int = 2,
+    polort: int | list[int] = 2,
     condition_labels: list[str] | None = None,
 ) -> TimingReport:
     """Phase statistics plus noise gains for knots at TR, TR/2, ... TR/max_subdivision.
@@ -293,7 +297,7 @@ def assess_design(
     *,
     window_top: float,
     microtime_offset: float = 0.0,
-    polort: int = 2,
+    polort: int | list[int] = 2,
 ) -> DesignGain:
     """Noise gain of the design a tool is about to fit, vs rounding to plain FIR."""
     n_events = [int(sum(np.asarray(o).size for o in runs)) for runs in onsets]

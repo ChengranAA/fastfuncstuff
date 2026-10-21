@@ -214,10 +214,11 @@ def bold_header(path: str | Path) -> tuple[int, float]:
 
 
 def auto_polort(durations_sec: list[float]) -> int | list[int]:
-    """AFNI's rule: 1 + floor(run_seconds / 150). Scalar if every run agrees."""
-    import math
+    """Each run's own 1 + floor(run_seconds / 150). Scalar if every run agrees,
+    which keeps the spec file short; compile reads either form."""
+    from fastfuncstuff.design.polort import auto_polort as _auto_polort
 
-    per_run = [int(1 + math.floor(d / 150.0)) for d in durations_sec]
+    per_run = [_auto_polort(d) for d in durations_sec]
     return per_run[0] if len(set(per_run)) == 1 else per_run
 
 

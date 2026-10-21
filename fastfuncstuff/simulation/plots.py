@@ -1593,7 +1593,7 @@ def plot_design_matrix(
     task: np.ndarray,
     conditions: list[str],
     run_lengths: list[int],
-    poly_degree: int,
+    poly_degree: int | list[int],
     tr: float,
     path: str | Path | None = None,
     title: str | None = None,
@@ -1606,14 +1606,17 @@ def plot_design_matrix(
     """
     import matplotlib.pyplot as plt
 
+    from fastfuncstuff.design.polort import polort_per_run, polort_summary
+
     from .power import _nuisance
 
-    D = _nuisance(list(run_lengths), poly_degree).numpy()
+    degrees = polort_per_run(poly_degree, len(run_lengths))
+    D = _nuisance(list(run_lengths), degrees).numpy()
     X = np.concatenate([np.asarray(task, dtype=float), D], axis=1)
     lo, hi = X.min(axis=0), X.max(axis=0)
     Xs = (X - lo) / np.where(hi > lo, hi - lo, 1.0)
     labels = list(conditions) + [
-        f"run {r + 1} P{k}" for r in range(len(run_lengths)) for k in range(poly_degree + 1)
+        f"run {r + 1} P{k}" for r, p in enumerate(degrees) for k in range(p + 1)
     ]
     n_cols = X.shape[1]
     fig, ax = plt.subplots(figsize=(max(5.0, 0.32 * n_cols + 2.0), 7.5))
@@ -1630,7 +1633,7 @@ def plot_design_matrix(
     ax.set_ylabel("scan", color=INK2, fontsize=9)
     ax.set_title(
         title or f"Design matrix: {len(conditions)} task column(s), then drift\n(polort "
-        f"{poly_degree} per run); each column scaled to its range",
+        f"{polort_summary(poly_degree)} per run); each column scaled to its range",
         color=INK, fontsize=9.5, loc="left",
     )  # fmt: skip
     fig.tight_layout()

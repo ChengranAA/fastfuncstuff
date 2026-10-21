@@ -56,7 +56,6 @@ try:
         add_verbose_arg,
         apply_onset_rounding,
         apply_trim_to_timing,
-        auto_polort,
         bids_event_kwargs,
         blur_masked_data,
         build_nuisance_per_run,
@@ -64,7 +63,6 @@ try:
         collect_noise_comp_blocks,
         collect_nuisance_blocks,
         compute_run_lengths,
-        get_average_run_duration,
         load_and_preprocess_runs,
         microtime_offset_bins,
         parse_cv_strategy,
@@ -74,6 +72,7 @@ try:
         resolve_cv_design,
         resolve_microtime_dt,
         resolve_microtime_offset,
+        resolve_polort,
         run_lengths_from_starts,
         save_r2_ceiling_stack,
         setup_device,
@@ -441,7 +440,10 @@ Notes:
         "-polort",
         type=int,
         default=None,
-        help="Polynomial order for drift modeling (default: auto based on run length)",
+        help=(
+            "Legendre drift order, the same for every run. Default: per run, "
+            "1 + floor(run_seconds / 150) for each run in its own block."
+        ),
     )
     add_ortvec_arguments(proc_opts)
     add_noise_comps_arguments(proc_opts)
@@ -993,12 +995,9 @@ def main():
         # Their PCA projects out the same polynomials the fit will use, plus the
         # user blocks above; after that they are ordinary nuisance blocks, so both
         # the condition-level and the single-trial selection see them.
-        _polort = args.polort
-        if _polort is None:
-            _polort = auto_polort(
-                get_average_run_duration(compute_run_lengths(run_starts, n_timepoints), args.tr),
-                formula="afni",
-            )
+        _polort = resolve_polort(
+            args.polort, compute_run_lengths(run_starts, n_timepoints), args.tr, verbose=False
+        )
         nuisance_blocks = nuisance_blocks + collect_noise_comp_blocks(
             args,
             input_files,
@@ -1096,13 +1095,8 @@ def main():
     if cv_design == "single" or args.single_trials:
         run_lengths = compute_run_lengths(run_starts, n_timepoints)
 
-        # Auto-determine polort if not specified
-        if args.polort is None:
-            avg_run_duration = get_average_run_duration(run_lengths, args.tr)
-            polort = auto_polort(avg_run_duration, formula="afni")
-            print(f"  Auto-determined polort: {polort} (avg run duration: {avg_run_duration:.1f}s)")
-        else:
-            polort = args.polort
+        # -polort N for every run, else each run's own automatic degree.
+        polort = resolve_polort(args.polort, run_lengths, args.tr, verbose=args.polort is None)
 
         # Build nuisance per run using shared utility
         nuisance_per_run = build_nuisance_per_run(

@@ -41,14 +41,13 @@ from fastfuncstuff.cli_utils import (
     add_load_threads_arg,
     add_ortvec_arguments,
     add_verbose_arg,
-    auto_polort,
     build_nuisance_per_run,
     collect_nuisance_blocks,
     compute_run_lengths,
-    get_average_run_duration,
     load_and_preprocess_runs,
     parse_input_files,
     parse_prefix,
+    resolve_polort,
     setup_device,
 )
 from fastfuncstuff.denoise.sequential import extract_noise_pcs_per_run
@@ -586,8 +585,9 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Per-run Legendre polynomial degree; defaults to AFNI-style automatic "
-            "selection. Use -1 for no drift terms at all (analyzePRF's NaN case)"
+            "Legendre polynomial degree, the same for every run. Default: per run, "
+            "1 + floor(run_seconds / 150) for each run in its own block. Use -1 for "
+            "no drift terms at all (analyzePRF's NaN case)"
         ),
     )
     model.add_argument("-maxiter", type=int, default=50, help="Maximum CSS Gauss-Newton iterations")
@@ -1876,9 +1876,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"({degrees_per_pixel:.4f} deg/pixel, "
                 f"{args.screen_extent / 2:g} deg maximum eccentricity)"
             )
-    polort = args.polort
-    if polort is None:
-        polort = auto_polort(get_average_run_duration(run_lengths, loaded.tr))
+    # -polort N for every run, else each run's own automatic degree.
+    polort = resolve_polort(args.polort, run_lengths, loaded.tr, verbose=bool(args.verb))
     nuisance_blocks = collect_nuisance_blocks(
         args, loaded.run_starts, loaded.n_timepoints, verbose=args.verb > 1
     )

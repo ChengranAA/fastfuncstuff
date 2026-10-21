@@ -28,6 +28,7 @@ from fastfuncstuff.design.matrices import (
     make_fir_design,
     make_tent_design,
 )
+from fastfuncstuff.design.polort import n_polort_columns, polort_per_run
 from fastfuncstuff.unique import sorted_unique
 
 
@@ -844,7 +845,7 @@ def build_design_matrix(
     stim_labels: list[str],
     n_timepoints_per_run: list[int],
     tr: float,
-    polort: int = 3,
+    polort: int | list[int] = 3,
     hrf_models: str | list[str] | None = None,
     im_mode: bool | list[bool] | None = None,
     padortvec_files: list[tuple[str | Path, str, int]] | None = None,
@@ -873,8 +874,9 @@ def build_design_matrix(
         Number of timepoints in each run
     tr : float
         Repetition time in seconds
-    polort : int, default=3
-        Polynomial order for drift modeling (AFNI -polort)
+    polort : int or list of int, default=3
+        Polynomial order for drift modeling (AFNI -polort): one for every
+        run, or one per run (each run's block then has its own width)
         Set to -1 for no polynomials
     hrf_models : str or list of str, optional
         HRF model(s) with duration, e.g., 'SPMG1(5)', 'BLOCK(30)'
@@ -1043,7 +1045,8 @@ def build_design_matrix(
     run_starts = []
 
     # Count columns
-    n_polort_cols = (polort + 1) * n_runs if polort >= 0 else 0
+    polort_degrees = polort_per_run(polort, n_runs)
+    n_polort_cols = n_polort_columns(polort_degrees, n_runs)
     n_padortvec_cols = 0
     n_ortvec_cols = 0
     n_extra_cols = 0
@@ -1135,27 +1138,25 @@ def build_design_matrix(
     extra_indices = []
     regressor_labels = []
 
-    # 1. Add polynomial regressors (per-run)
-    if polort >= 0:
-        for run_idx in range(n_runs):
-            n_tp = n_timepoints_per_run[run_idx]
-            run_start = sum(n_timepoints_per_run[:run_idx])
-            run_end = run_start + n_tp
-            run_starts.append(run_start)
+    # 1. Add polynomial regressors (per-run, each run its own degree)
+    for run_idx in range(n_runs):
+        n_tp = n_timepoints_per_run[run_idx]
+        run_start = sum(n_timepoints_per_run[:run_idx])
+        run_end = run_start + n_tp
+        run_starts.append(run_start)
+        run_polort = polort_degrees[run_idx]
+        if run_polort < 0:
+            continue
 
-            # Generate polynomials for this run
-            polys = legendre_polynomials(n_tp, polort, normalize=False)
+        # Generate polynomials for this run
+        polys = legendre_polynomials(n_tp, run_polort, normalize=False)
 
-            # Insert into design matrix
-            for p in range(polort + 1):
-                design_matrix[run_start:run_end, col_idx] = polys[:, p]
-                polort_indices.append(col_idx)
-                regressor_labels.append(f"Run#{run_idx + 1}Pol#{p}")
-                col_idx += 1
-    else:
-        # No polynomials, still need run_starts
-        for run_idx in range(n_runs):
-            run_starts.append(sum(n_timepoints_per_run[:run_idx]))
+        # Insert into design matrix
+        for p in range(run_polort + 1):
+            design_matrix[run_start:run_end, col_idx] = polys[:, p]
+            polort_indices.append(col_idx)
+            regressor_labels.append(f"Run#{run_idx + 1}Pol#{p}")
+            col_idx += 1
 
     # 2a. Add padortvec regressors
     for padded in padortvec_data:
@@ -2348,7 +2349,7 @@ class PackedSharedTaskDesign:
     ----------
     data_concat : torch.Tensor, (n_voxels, sum n_tp_run)
         Row-concatenated per-run data.
-    design_concat : torch.Tensor, (sum n_tp_run, n_task_cols + n_runs * (polort+1))
+    design_concat : torch.Tensor, (sum n_tp_run, n_task_cols + sum_r (polort_r + 1))
         Shared task (row-stacked across runs) followed by
         block-diagonal polynomial nuisance.  Pass to ``fit_glm`` with
         ``max_poly_degree=-1`` to prevent double-adding polynomials.
@@ -2372,13 +2373,13 @@ class PackedSharedTaskDesign:
     n_task_cols: int
     column_labels: list[str]
     n_tp_per_run: list[int]
-    polort: int
+    polort: int | list[int]
 
 
 def pack_for_shared_task_glm(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],
-    polort: int,
+    polort: int | list[int],
     *,
     task_column_labels: list[str] | None = None,
     extra_regressors_per_run: list[torch.Tensor] | None = None,
@@ -2422,17 +2423,17 @@ def pack_for_shared_task_glm(
         Per-run task design (output of
         :func:`build_per_run_task_designs`).  All runs must have the
         same ``n_task`` (the task model is shared by definition).
-    polort : int
-        Polynomial nuisance degree.  ``-1`` disables.  ``0`` adds a
-        run-specific constant; ``4`` adds Legendre degrees 0–4 per
-        run (5 columns × n_runs total).
+    polort : int or list of int
+        Polynomial nuisance degree, one for every run or one per run.
+        ``-1`` disables.  ``0`` adds a run-specific constant; ``4`` adds
+        Legendre degrees 0–4 per run (5 columns × n_runs total).
     task_column_labels : list[str], optional
         Labels for the task columns.  Defaults to
         ``["task0", "task1", …]``.
     extra_regressors_per_run : list[torch.Tensor], optional
         Per-run external nuisance (e.g. motion, GLMdenoise PCs).  Each
-        tensor must have shape ``(n_tp_run, n_extra)`` with the same
-        ``n_extra`` across runs.  These are appended to each run's
+        tensor has shape ``(n_tp_run, n_extra_run)``; the width may differ
+        by run.  These are appended to each run's
         polynomial block in the block-diagonal section, so they
         remain run-specific (no shared external nuisance — that's the
         canonical convention).
@@ -2488,18 +2489,11 @@ def pack_for_shared_task_glm(
                 f"extra_regressors_per_run has {len(extra_regressors_per_run)} "
                 f"runs but data has {n_runs}."
             )
-        n_extra = (
-            extra_regressors_per_run[0].shape[1] if extra_regressors_per_run[0].ndim > 1 else 1
-        )
-        for r in range(1, n_runs):
-            x = extra_regressors_per_run[r]
-            n_e_r = x.shape[1] if x.ndim > 1 else 1
-            if n_e_r != n_extra:
-                raise ValueError(
-                    f"extra_regressors_per_run[{r}] has {n_e_r} columns; run 0 has {n_extra}."
-                )
+        # Widths may differ by run: whitened per-run polynomials arrive here as
+        # extras, and the automatic polort gives each run its own degree.
+        n_extra_per_run = [x.shape[1] if x.ndim > 1 else 1 for x in extra_regressors_per_run]
     else:
-        n_extra = 0
+        n_extra_per_run = [0] * n_runs
 
     if device is None:
         device = (
@@ -2515,10 +2509,11 @@ def pack_for_shared_task_glm(
     # --- Build block-diagonal nuisance (poly + optional extras) per run ---
     n_tp_per_run = [d.shape[1] for d in per_run_data]
     total_tp = sum(n_tp_per_run)
-    n_nuisance_per_run = (polort + 1 if polort >= 0 else 0) + n_extra
-    if n_nuisance_per_run > 0:
+    degrees = polort_per_run(polort, n_runs)
+    n_nuisance_total = n_polort_columns(degrees, n_runs) + sum(n_extra_per_run)
+    if n_nuisance_total > 0:
         nuisance_full = torch.zeros(
-            (total_tp, n_runs * n_nuisance_per_run),
+            (total_tp, n_nuisance_total),
             dtype=torch.float32,
             device=device,
         )
@@ -2526,8 +2521,8 @@ def pack_for_shared_task_glm(
         col_start = 0
         for r, n_tp in enumerate(n_tp_per_run):
             run_blocks: list[torch.Tensor] = []
-            if polort >= 0:
-                poly_np = legendre_polynomials(n_tp, polort)
+            if degrees[r] >= 0:
+                poly_np = legendre_polynomials(n_tp, degrees[r])
                 run_blocks.append(torch.from_numpy(poly_np).to(torch.float32).to(device))
             if extra_regressors_per_run is not None:
                 x = extra_regressors_per_run[r].to(device).to(torch.float32)
@@ -2555,10 +2550,9 @@ def pack_for_shared_task_glm(
             )
         labels = list(task_column_labels)
     for r in range(n_runs):
-        if polort >= 0:
-            for k in range(polort + 1):
-                labels.append(f"run{r + 1}_poly{k}")
-        for k in range(n_extra):
+        for k in range(degrees[r] + 1):
+            labels.append(f"run{r + 1}_poly{k}")
+        for k in range(n_extra_per_run[r]):
             labels.append(f"run{r + 1}_extra{k}")
 
     if drop_empty_nuisance and design_concat.shape[1] > n_task:

@@ -36,6 +36,16 @@ from fastfuncstuff.cli_help import (  # noqa: F401
     option_string_value,
     suggest,
 )
+from fastfuncstuff.design.polort import (  # noqa: F401 — re-exported, the CLIs' import site
+    auto_polort,
+    auto_polort_per_run,
+    max_polort,
+    n_polort_columns,
+    polort_column_labels,
+    polort_per_run,
+    polort_summary,
+    resolve_polort,
+)
 from fastfuncstuff.design.trim import TrimSpec, TrimTimingReport, shift_onsets_for_trim
 from fastfuncstuff.utils import suppress_io_progress
 
@@ -1423,51 +1433,13 @@ class DesignResult:
 
     task_design: torch.Tensor | None  # (n_timepoints, n_conditions) or None for per-HRF
     nuisance_per_run: list[torch.Tensor]  # Per-run nuisance blocks
-    polort: int
+    polort: int | list[int]
     condition_labels: list[str]
     n_timepoints: int
     n_runs: int
     task_indices: list[int] | None = None  # Indices of task regressors
     nuisance_indices: list[int] | None = None  # Indices of nuisance regressors
     ortvec_labels: list[str] | None = None  # Labels for ortvec regressors
-
-
-def auto_polort(
-    run_duration_sec: float,
-    formula: str = "afni",
-) -> int:
-    """
-    Auto-determine polynomial order from run duration.
-
-    Parameters
-    ----------
-    run_duration_sec : float
-        Duration of a single run in seconds
-    formula : str, default="afni"
-        Formula to use:
-        - "afni": polort = 1 + floor(duration / 150) (AFNI/GLMdenoise convention)
-        - "conservative": polort = max(1, round(duration / 120))
-
-    Returns
-    -------
-    int
-        Recommended polynomial order
-
-    Notes
-    -----
-    The AFNI formula (1 + floor(duration/150)) is the standard convention:
-    - 150s run → polort 2
-    - 300s run → polort 3
-    - 450s run → polort 4
-
-    This provides one polynomial coefficient per ~2.5 minutes of data.
-    """
-    if formula == "afni":
-        return int(1 + np.floor(run_duration_sec / 150.0))
-    elif formula == "conservative":
-        return max(1, int(round(run_duration_sec / 120.0)))
-    else:
-        raise ValueError(f"Unknown polort formula: {formula}")
 
 
 # ---------------------------------------------------------------------------
@@ -2553,7 +2525,7 @@ def assemble_per_run_nuisance(
     blocks: list[NuisanceBlock],
     run_starts: list[int],
     n_timepoints: int,
-    polort: int,
+    polort: int | Sequence[int],
     device: torch.device,
     noise_pcs: list[torch.Tensor] | None = None,
     verbose: bool = False,
@@ -2572,13 +2544,15 @@ def assemble_per_run_nuisance(
     per_run_t: list[torch.Tensor] = []
     per_run_names: list[list[str]] = []
 
+    degrees = polort_per_run(polort, n_runs)
     # Polynomials first (block-diagonal: each run's own columns).
     for run_idx in range(n_runs):
         end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
         run_length = end - run_starts[run_idx]
-        if polort >= 0:
-            poly = construct_polynomial_matrix(run_length, polort, device=device)
-            names = [f"r{run_idx + 1:02d}_poly{p}" for p in range(polort + 1)]
+        run_polort = degrees[run_idx]
+        if run_polort >= 0:
+            poly = construct_polynomial_matrix(run_length, run_polort, device=device)
+            names = [f"r{run_idx + 1:02d}_poly{p}" for p in range(run_polort + 1)]
         else:
             poly = torch.zeros((run_length, 0), device=device)
             names = []
@@ -2631,7 +2605,7 @@ def assemble_per_run_nuisance(
 def build_nuisance_per_run(
     run_starts: list[int],
     n_timepoints: int,
-    polort: int,
+    polort: int | Sequence[int],
     device: torch.device,
     ortvec_files: list[tuple[str, str]] | None = None,
     ortvec_data: torch.Tensor | None = None,
@@ -2652,8 +2626,9 @@ def build_nuisance_per_run(
         Starting timepoint for each run
     n_timepoints : int
         Total number of timepoints (all runs concatenated)
-    polort : int
-        Polynomial order for drift modeling (use -1 for no polynomials)
+    polort : int or sequence of int
+        Polynomial order for drift modeling (use -1 for no polynomials): one
+        degree for every run, or one per run (see ``resolve_polort``)
     device : torch.device
         Device to create tensors on
     ortvec_files : list of tuple, optional
@@ -2739,7 +2714,7 @@ def build_nuisance_per_run(
 def build_nuisance_block_diag(
     run_starts: list[int],
     n_timepoints: int,
-    polort: int,
+    polort: int | Sequence[int],
     device: torch.device,
     ortvec_files: list[tuple[str, str]] | None = None,
     blocks: list[NuisanceBlock] | None = None,
@@ -2758,8 +2733,9 @@ def build_nuisance_block_diag(
         Starting timepoint for each run
     n_timepoints : int
         Total number of timepoints (all runs concatenated)
-    polort : int
-        Polynomial order for drift modeling (use -1 for no polynomials)
+    polort : int or sequence of int
+        Polynomial order for drift modeling (use -1 for no polynomials): one
+        degree for every run, or one per run (see ``resolve_polort``)
     device : torch.device
         Device to create tensors on
     ortvec_files : list of tuple, optional
@@ -2809,11 +2785,11 @@ def build_nuisance_block_diag(
         for i in range(n_runs)
     ]
 
-    # Polynomial block-diag.
+    # Polynomial block-diag (one degree per run; the blocks may differ in width).
     poly_blocks = []
-    for run_len in run_lengths:
-        if polort >= 0:
-            poly_blocks.append(construct_polynomial_matrix(run_len, polort, device))
+    for run_len, run_polort in zip(run_lengths, polort_per_run(polort, n_runs), strict=True):
+        if run_polort >= 0:
+            poly_blocks.append(construct_polynomial_matrix(run_len, run_polort, device))
         else:
             poly_blocks.append(torch.zeros((run_len, 0), device=device))
     nuisance_design = torch.block_diag(*poly_blocks)

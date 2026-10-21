@@ -28,6 +28,7 @@ from fastfuncstuff.cli_utils import (
     add_verbose_arg,
     check_bids_event_args,
     resolve_event_filters,
+    resolve_polort,
     spinner,
 )
 from fastfuncstuff.io.headers import header_tr
@@ -428,7 +429,8 @@ def create_parser() -> argparse.ArgumentParser:
         default="A",
         metavar="N",
         help="Legendre drift order per run, removed from both series before the fit. "
-        "'A' (default) = AFNI's rule from run length; 1 = phaseprep; -1 none.",
+        "'A' (default) = per run, 1 + floor(run_seconds / 150) for each run; "
+        "1 = phaseprep; -1 none.",
     )
     proc.add_argument(
         "-tr",
@@ -502,7 +504,6 @@ def main(argv: list[str] | None = None) -> int:
     # ── Imports ──────────────────────────────────────────────────────────
     try:
         from fastfuncstuff.cli_utils import (
-            auto_polort,
             input_nifti_ext,
             parse_device_arg,
             parse_prefix,
@@ -701,12 +702,10 @@ def main(argv: list[str] | None = None) -> int:
     pha_list = list(phas.split(n_tp_per_run, dim=1))
 
     # ── Polort ───────────────────────────────────────────────────────────
+    # "A": each run's own 1 + floor(D / 150), not one degree for all runs.
     polort_str = str(args.polort).strip().upper()
     if polort_str == "A":
-        run_dur = min(n_tp_per_run) * tr
-        polort = auto_polort(run_dur, formula="afni")
-        if args.verb >= 1:
-            print(f"  Polort: A -> {polort} (run duration {run_dur:.1f}s)")
+        polort = resolve_polort(None, list(n_tp_per_run), tr, verbose=args.verb >= 1)
     else:
         polort = int(polort_str)
 

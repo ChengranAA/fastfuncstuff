@@ -954,20 +954,22 @@ def fit_shifted_hrf(
 
 
 def build_blockdiag_polys(
-    n_tp_per_run: list[int], polort: int, device: torch.device
+    n_tp_per_run: list[int], polort: int | list[int], device: torch.device
 ) -> Tensor | None:
     """Per-run Legendre drift in zero-padded block-diagonal columns.
 
     Follows [[Block-diagonal nuisance]]: each run gets its own polynomial
-    basis so drift is never shared across run boundaries.
+    basis so drift is never shared across run boundaries. ``polort`` is one
+    degree for every run or one per run (aligned with ``n_tp_per_run``).
     """
+    from fastfuncstuff.design.polort import max_polort, polort_per_run
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
-    if polort < 0:
+    if max_polort(polort) < 0:
         return None
     blocks = [
-        construct_polynomial_matrix(n, polort, device=device, dtype=torch.float64)
-        for n in n_tp_per_run
+        construct_polynomial_matrix(n, p, device=device, dtype=torch.float64)
+        for n, p in zip(n_tp_per_run, polort_per_run(polort, len(n_tp_per_run)), strict=True)
     ]
     total = sum(n_tp_per_run)
     ncol = sum(b.shape[1] for b in blocks)
@@ -1019,7 +1021,7 @@ def xval_shifted_hrf(
     hrf: np.ndarray,
     hrf_dt: float,
     tr: float,
-    polort: int,
+    polort: int | list[int],
     *,
     single_trials: bool,
     durations: list[float] | None = None,
@@ -1104,6 +1106,10 @@ def xval_shifted_hrf(
         raise ValueError(f"cross-validation needs >= 2 runs; got {n_runs}")
     n_cond = len(per_run_condition_onsets[0])
     n_voxels = per_run_data[0].shape[0]
+    from fastfuncstuff.design.polort import polort_per_run
+
+    # One drift degree per run, sliced per fold so train and test runs keep their own.
+    degrees = polort_per_run(polort, n_runs)
 
     folds = [list(range(i, min(i + leave_n_out, n_runs))) for i in range(0, n_runs, leave_n_out)]
     folds = [f for f in folds if f and len(f) < n_runs]
@@ -1139,7 +1145,7 @@ def xval_shifted_hrf(
             continue
 
         y_train = torch.cat([per_run_data[r] for r in train_runs], dim=1)
-        Z_train = build_blockdiag_polys(n_tp_train, polort, device)
+        Z_train = build_blockdiag_polys(n_tp_train, [degrees[r] for r in train_runs], device)
         if extra_regs_per_run is not None:
             Z_train = append_blockdiag_extras(
                 Z_train, [extra_regs_per_run[r] for r in train_runs], n_tp_train, device
@@ -1265,7 +1271,7 @@ def xval_shifted_hrf(
         for r in test_runs:
             n_tp_r = int(per_run_data[r].shape[1])
             test_onsets = [np.atleast_1d(per_run_condition_onsets[r][c]) for c in range(n_cond)]
-            Z_test = build_blockdiag_polys([n_tp_r], polort, device)
+            Z_test = build_blockdiag_polys([n_tp_r], [degrees[r]], device)
             if extra_regs_per_run is not None:
                 Z_test = append_blockdiag_extras(Z_test, [extra_regs_per_run[r]], [n_tp_r], device)
             y_test = per_run_data[r].to(device=device, dtype=torch.float64)

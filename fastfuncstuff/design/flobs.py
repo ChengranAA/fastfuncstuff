@@ -41,6 +41,12 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives, pighs_halfcos
+from fastfuncstuff.design.polort import (
+    max_polort,
+    n_polort_columns,
+    polort_per_run,
+    polort_summary,
+)
 from fastfuncstuff.utils import get_device, linalg_device, linalg_lstsq, warn_mps_cpu_fallback
 
 
@@ -1546,7 +1552,7 @@ def cv_basis_constrained_ridge(
     prior_mean: np.ndarray,
     prior_cov: np.ndarray,
     n_blocks: int,
-    polort: int,
+    polort: int | list[int],
     *,
     weight_grid: list[float] | None = None,
     include_ols: bool = True,
@@ -1663,15 +1669,19 @@ def cv_basis_constrained_ridge(
     # data and task design once, up front — after this the design is
     # polynomial-free and per-fold fits collapse to a clean ridge
     # solve on the task block.
-    if polort >= 0:
+    if max_polort(polort) >= 0:
         nuisance_per_run = [
-            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(device).float()
+            torch.from_numpy(
+                legendre_polynomials(n_tp_per_run[r], polort_per_run(polort, n_runs)[r])
+            )
+            .to(device)
+            .float()
             for r in range(n_runs)
         ]
         if verbose:
             print(
-                f"  CV: projecting out per-run polynomials (polort={polort}, "
-                f"{polort + 1} cols × {n_runs} runs)…"
+                f"  CV: projecting out per-run polynomials "
+                f"(polort={polort_summary(polort)}, {n_runs} runs)…"
             )
         data_clean, design_clean = project_out_nuisance_per_run(
             data=data_full,
@@ -1898,7 +1908,7 @@ def fit_basis_lss(
     basis_functions: np.ndarray,
     prior_mean: np.ndarray,
     prior_cov: np.ndarray,
-    polort: int,
+    polort: int | list[int],
     *,
     prior_weight: float | str = "auto",
     lambda_mode: str = "global",
@@ -2051,17 +2061,17 @@ def fit_basis_lss(
         [d.to(device).float() for d in per_run_designs],
         dim=0,
     )  # (total_tp, n_blocks*K)
-    if polort >= 0:
+    if max_polort(polort) >= 0:
         nuisance_per_run = [
-            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(
-                device=device, dtype=torch.float32
-            )
+            torch.from_numpy(
+                legendre_polynomials(n_tp_per_run[r], polort_per_run(polort, n_runs)[r])
+            ).to(device=device, dtype=torch.float32)
             for r in range(n_runs)
         ]
         if verbose:
             print(
                 f"  LSS: projecting out per-run polynomials "
-                f"(polort={polort}, {polort + 1} cols × {n_runs} runs)…"
+                f"(polort={polort_summary(polort)}, {n_runs} runs)…"
             )
         data_clean, design_clean = project_out_nuisance_per_run(
             data=data_full,
@@ -2381,7 +2391,7 @@ def fit_basis_fracridge(
     per_run_task_designs: list[torch.Tensor],
     n_blocks: int,
     n_basis: int,
-    polort: int,
+    polort: int | list[int],
     *,
     fracs: np.ndarray | None = None,
     leave_n_out: int = 1,
@@ -2443,15 +2453,19 @@ def fit_basis_fracridge(
     n_voxels = data_full.shape[0]
     design_full = torch.cat([t.to(device).float() for t in per_run_task_designs], dim=0)
 
-    if polort >= 0:
+    if max_polort(polort) >= 0:
         nuisance_per_run = [
-            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(device).float()
+            torch.from_numpy(
+                legendre_polynomials(n_tp_per_run[r], polort_per_run(polort, n_runs)[r])
+            )
+            .to(device)
+            .float()
             for r in range(n_runs)
         ]
         if verbose:
             print(
                 f"  fracridge: projecting out per-run polynomials "
-                f"(polort={polort}, {polort + 1} cols × {n_runs} runs)…"
+                f"(polort={polort_summary(polort)}, {n_runs} runs)…"
             )
         data_clean, design_clean = project_out_nuisance_per_run(
             data=data_full,
@@ -2735,7 +2749,7 @@ class ARMAWhitenCell:
 def estimate_arma11_per_voxel(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],
-    polort: int,
+    polort: int | list[int],
     *,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -2774,22 +2788,24 @@ def estimate_arma11_per_voxel(
     )  # (total_tp, n_task)
 
     # Build block-diagonal polynomial nuisance and concatenate.
-    if polort >= 0:
-        n_poly = polort + 1
+    if max_polort(polort) >= 0:
+        degrees = polort_per_run(polort, n_runs)
         Z_full = torch.zeros(
             total_tp,
-            n_runs * n_poly,
+            n_polort_columns(degrees, n_runs),
             device=device,
             dtype=torch.float32,
         )
+        col = 0
         for r in range(n_runs):
-            Z_r = torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(
+            Z_r = torch.from_numpy(legendre_polynomials(n_tp_per_run[r], degrees[r])).to(
                 device=device, dtype=torch.float32
             )
             Z_full[
                 run_starts[r] : run_starts[r] + n_tp_per_run[r],
-                r * n_poly : (r + 1) * n_poly,
+                col : col + Z_r.shape[1],
             ] = Z_r
+            col += Z_r.shape[1]
         X_full = torch.cat([design_task, Z_full], dim=1)
     else:
         X_full = design_task
@@ -2930,7 +2946,7 @@ def bin_and_whiten_arma11(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],
     arma_per_voxel: np.ndarray,
-    polort: int,
+    polort: int | list[int],
     *,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -2967,11 +2983,11 @@ def bin_and_whiten_arma11(
 
     # Pre-build per-run polynomials (un-whitened, on device) — shared
     # across cells; only the L_r⁻¹ application differs per cell.
-    if polort >= 0:
+    if max_polort(polort) >= 0:
         polys_raw_per_run = [
-            torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(
-                device=device, dtype=torch.float32
-            )
+            torch.from_numpy(
+                legendre_polynomials(n_tp_per_run[r], polort_per_run(polort, n_runs)[r])
+            ).to(device=device, dtype=torch.float32)
             for r in range(n_runs)
         ]
     else:
@@ -3353,7 +3369,7 @@ def compute_xval_r2_per_voxel(
     basis_mode: str,
     tr: float,
     n_tp_per_run: list[int],
-    polort: int,
+    polort: int | list[int],
     prior_mean: np.ndarray,
     prior_cov: np.ndarray,
     prior_weight: float | str,
@@ -3501,7 +3517,8 @@ def compute_xval_r2_per_voxel(
             packed_train = pack_for_shared_task_glm(
                 per_run_data=per_run_data_train,
                 per_run_task_designs=train_designs,
-                polort=polort,
+                # Fold-local: each train run keeps its own drift degree.
+                polort=[polort_per_run(polort, n_runs)[r] for r in train_runs],
                 device=device,
             )
             n_task_cols_train = packed_train.n_task_cols
@@ -3539,10 +3556,10 @@ def compute_xval_r2_per_voxel(
             # Project out polys per-run from BOTH data and design
             # so the prediction is comparable on the same residual
             # subspace the fit operates in.
-            if polort >= 0:
-                Z_r = torch.from_numpy(legendre_polynomials(n_tp_per_run[r], polort)).to(
-                    device=device, dtype=torch.float32
-                )
+            if max_polort(polort) >= 0:
+                Z_r = torch.from_numpy(
+                    legendre_polynomials(n_tp_per_run[r], polort_per_run(polort, n_runs)[r])
+                ).to(device=device, dtype=torch.float32)
                 Q_z, _ = torch.linalg.qr(Z_r)
                 test_data_proj = test_data - (test_data @ Q_z) @ Q_z.T
                 X_test_proj = X_test_cond - Q_z @ (Q_z.T @ X_test_cond)
@@ -3563,7 +3580,7 @@ def compute_xval_r2_per_voxel(
 def compute_per_voxel_residuals(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],
-    polort: int,
+    polort: int | list[int],
     *,
     task_betas: np.ndarray,
     nuisance_betas: np.ndarray | None,
@@ -3608,7 +3625,8 @@ def compute_per_voxel_residuals(
         device = get_device()
 
     n_runs = len(per_run_data)
-    n_poly = polort + 1 if polort >= 0 else 0
+    degrees = polort_per_run(polort, n_runs)
+    n_poly = n_polort_columns(degrees, n_runs)
     task_betas_t = torch.from_numpy(task_betas).to(device=device, dtype=torch.float32)
     nuis_betas_t = (
         torch.from_numpy(nuisance_betas).to(device=device, dtype=torch.float32)
@@ -3627,10 +3645,11 @@ def compute_per_voxel_residuals(
 
         # Nuisance prediction (run r's slice of the block-diag betas).
         if nuis_betas_t is not None and n_poly > 0:
-            Z_r = torch.from_numpy(legendre_polynomials(n_tp_r, polort)).to(
+            Z_r = torch.from_numpy(legendre_polynomials(n_tp_r, degrees[r])).to(
                 device=device, dtype=torch.float32
-            )  # (n_tp_r, n_poly)
-            nuis_beta_r = nuis_betas_t[:, r * n_poly : (r + 1) * n_poly]
+            )  # (n_tp_r, degrees[r] + 1)
+            col = sum(p + 1 for p in degrees[:r] if p >= 0)
+            nuis_beta_r = nuis_betas_t[:, col : col + Z_r.shape[1]]
             y_pred = y_pred + nuis_beta_r @ Z_r.T
 
         residuals.append(y_r - y_pred)
@@ -3641,7 +3660,7 @@ def compute_per_voxel_residuals(
 def estimate_and_apply_arma11_prewhitening(
     per_run_data: list[torch.Tensor],
     per_run_task_designs: list[torch.Tensor],
-    polort: int,
+    polort: int | list[int],
     *,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -3707,13 +3726,14 @@ def estimate_and_apply_arma11_prewhitening(
         print(f"  prewhiten: OLS pre-pass on {n_runs} runs to estimate ARMA(1,1)…")
 
     residual_mean_per_run: list[np.ndarray] = []
-    for y_r, X_task_r in zip(per_run_data, per_run_task_designs, strict=False):
+    degrees = polort_per_run(polort, n_runs)
+    for r, (y_r, X_task_r) in enumerate(zip(per_run_data, per_run_task_designs, strict=False)):
         y_dev = y_r.to(device).float()  # (n_voxels, n_tp_r)
         X_task_dev = X_task_r.to(device).float()  # (n_tp_r, n_task)
         n_tp_r = X_task_dev.shape[0]
 
-        if polort >= 0:
-            Z_r = torch.from_numpy(legendre_polynomials(n_tp_r, polort)).to(
+        if degrees[r] >= 0:
+            Z_r = torch.from_numpy(legendre_polynomials(n_tp_r, degrees[r])).to(
                 device=device, dtype=torch.float32
             )
             X_full = torch.cat([X_task_dev, Z_r], dim=1)

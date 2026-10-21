@@ -318,7 +318,7 @@ def phase_regress(
     task_removal: str = "none",
     onsets_per_condition: list[list] | None = None,
     nuisance_per_run: list[torch.Tensor] | None = None,
-    max_poly_degree: int = 3,
+    max_poly_degree: int | list[int] = 3,
     durations_per_condition: list[float] | None = None,
     phi: float | torch.Tensor | None = None,
     phi_method: str = "fft",
@@ -377,8 +377,9 @@ def phase_regress(
     nuisance_per_run : list of Tensor, optional
         Additional per-run nuisance regressors (e.g. motion parameters),
         each (n_timepoints, n_regressors).
-    max_poly_degree : int
-        Polynomial drift order for detrending.  Set to -1 to skip.
+    max_poly_degree : int or list of int
+        Polynomial drift order for detrending, one for every run or one per
+        run.  Set to -1 to skip.
     phi : float, Tensor, or None
         Fixed variance ratio for Deming regression.  If None, estimated
         automatically.
@@ -605,12 +606,14 @@ def phase_regress(
 
     # ── 2. Per-run polynomial + nuisance, and task, projection bases ─────
     from fastfuncstuff.design.builder import legendre_polynomials
+    from fastfuncstuff.design.polort import polort_per_run
 
+    degrees = polort_per_run(max_poly_degree, n_runs)
     poly_per_run: list[torch.Tensor] = []
     for run_idx, n_tp_run in enumerate(n_tp_per_run):
         parts = []
-        if max_poly_degree >= 0:
-            poly = legendre_polynomials(n_tp_run, max_poly_degree)
+        if degrees[run_idx] >= 0:
+            poly = legendre_polynomials(n_tp_run, degrees[run_idx])
             parts.append(torch.tensor(poly, dtype=torch.float32, device=device))
         if nuisance_per_run is not None and run_idx < len(nuisance_per_run):
             parts.append(nuisance_per_run[run_idx].to(device))
@@ -656,10 +659,10 @@ def phase_regress(
         task_per_run = [
             None
             if t is None
-            else design_fit_basis(t, max(max_poly_degree, 0), n_deriv=n_deriv, device=device).to(
+            else design_fit_basis(t, max(degrees[r], 0), n_deriv=n_deriv, device=device).to(
                 torch.float32
             )
-            for t in canon
+            for r, t in enumerate(canon)
         ]
     elif task_removal != "none":
         raise ValueError(

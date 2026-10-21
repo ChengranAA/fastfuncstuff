@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 import sys
 import tempfile
 from pathlib import Path
@@ -887,21 +886,17 @@ def _do_compile(args: argparse.Namespace) -> int:
         spec.meta.events_columns.trial_type,
     )
 
-    # polort: list form means per-run; build_design_matrix only supports a
-    # scalar today. Collapse with the max and warn.
+    # polort: a list is one degree per run, "auto" is each run's own
+    # 1 + floor(D / 150), an int is the same degree for every run.
+    from fastfuncstuff.design.polort import auto_polort_per_run
+
+    polort_spec: int | list[int]
     if isinstance(spec.meta.polort, list):
-        polort_scalar = max(spec.meta.polort)
-        print(
-            f"warn: per-run polort {spec.meta.polort} not yet supported by "
-            f"build_design_matrix; using max={polort_scalar}.",
-            file=sys.stderr,
-        )
+        polort_spec = [int(p) for p in spec.meta.polort]
     elif spec.meta.polort == "auto":
-        polort_scalar = max(
-            int(1 + math.floor(n * spec.meta.tr / 150.0)) for n in spec.meta.n_timepoints_per_run
-        )
+        polort_spec = auto_polort_per_run(spec.meta.n_timepoints_per_run, spec.meta.tr)
     else:
-        polort_scalar = int(spec.meta.polort)
+        polort_spec = int(spec.meta.polort)
 
     events_files = [Path(r.events) if r.events else None for r in spec.meta.runs]
     if any(ef is None for ef in events_files):
@@ -958,7 +953,7 @@ def _do_compile(args: argparse.Namespace) -> int:
         stim_labels=stim_labels,
         n_timepoints_per_run=spec.meta.n_timepoints_per_run,
         tr=spec.meta.tr,
-        polort=polort_scalar,
+        polort=polort_spec,
         hrf_models=hrf_models,
         im_mode=im_modes,
         padortvec_files=[(str(p), l, r) for p, l, r in padortvec_files] or None,

@@ -989,7 +989,7 @@ class TestHRFSelectionSubWorkflows:
         assert total_voxels == 20
 
     def test_auto_polort(self, device):
-        """polort=None should auto-compute polort from AFNI formula."""
+        """polort=None gives each run its own AFNI-formula degree."""
         data, onset_matrix, hrf_library, run_starts, _, tr = _build_hrf_test_inputs(
             n_runs=3, n_voxels=10
         )
@@ -1003,7 +1003,9 @@ class TestHRFSelectionSubWorkflows:
             verbose=False,
             device=device,
         )
-        assert results.hrf_metadata["polort"] >= 1
+        polort = results.hrf_metadata["polort"]
+        assert isinstance(polort, list) and len(polort) == 3
+        assert all(p >= 1 for p in polort)
 
 
 # ============================================================================

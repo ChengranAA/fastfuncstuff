@@ -79,19 +79,23 @@ try:
         append_nuisance_blocks,
         apply_onset_rounding,
         apply_trim_to_timing,
-        auto_polort,
         bids_event_kwargs,
         check_bids_event_args,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
+        max_polort,
+        n_polort_columns,
         parse_cv_strategy,
         parse_input_files,
         parse_prefix,
         parse_timing_spec,
+        polort_per_run,
+        polort_summary,
         pool_timing,
         preflight_check,
         print_cli_header,
         resolve_microtime_offset,
+        resolve_polort,
         run_lengths_from_starts,
         setup_device,
         spinner,
@@ -365,8 +369,11 @@ def parse_args():
         type=str,
         default="A",
         metavar="N",
-        help="Polynomial drift order for detrending. 'A' (default) = auto (AFNI formula: "
-        "1 + floor(run_duration / 150)). Integer N for fixed order. -1 for none.",
+        help="Polynomial drift order for detrending. 'A' (default) = auto, PER RUN: each "
+        "run gets 1 + floor(its_duration / 150) in its own block. NOTE: this deviates "
+        "from 3dDeconvolve, whose -polort A uses one degree from the longest run for "
+        "every run; equal-length runs give the same design either way. Integer N for "
+        "the same fixed order in every run. -1 for none.",
     )
 
     proc_opts.add_argument(
@@ -815,7 +822,7 @@ def _compute_loro_r2_matrix(
     candidate_tops: list[float],
     tr: float,
     n_conditions: int,
-    polort: int,
+    polort: int | list[int],
     device: torch.device,
     verbose: bool,
     max_voxels: int = 500_000,
@@ -872,10 +879,11 @@ def _compute_loro_r2_matrix(
     Q_per_run: list[torch.Tensor | None] = []
     data_clean: list[torch.Tensor] = []
 
+    degrees = polort_per_run(polort, len(n_tp_per_run))
     for run_idx, n_tp in enumerate(n_tp_per_run):
         data_r = data_xval[run_idx].to(device=device, dtype=torch.float32)
-        if polort >= 0:
-            poly_np = legendre_polynomials(n_tp, polort)
+        if degrees[run_idx] >= 0:
+            poly_np = legendre_polynomials(n_tp, degrees[run_idx])
             poly_r = torch.tensor(poly_np, dtype=torch.float32, device=device)
             Q, _ = torch.linalg.qr(poly_r)
             Q_per_run.append(Q)
@@ -923,7 +931,7 @@ def _xval_tent_top(
     candidate_tops: list[float],
     tr: float,
     n_conditions: int,
-    polort: int,
+    polort: int | list[int],
     device: torch.device,
     verbose: bool,
     microtime_offset: float = 0.0,
@@ -1277,13 +1285,11 @@ def main(argv: list[str] | None = None):
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # Resolve polort: "A" → AFNI auto formula based on run duration
+    # Resolve polort: "A" → each run's own 1 + floor(D / 150) (3dDeconvolve
+    # uses the longest run's degree for all; see -polort in -help).
     polort_str = str(args.polort).strip().upper()
     if polort_str == "A":
-        run_duration_sec = min(n_timepoints_per_run) * tr
-        args.polort = auto_polort(run_duration_sec, formula="afni")
-        if args.verb >= 1:
-            print(f"  Polort: A → {args.polort} (run duration {run_duration_sec:.1f}s)")
+        args.polort = resolve_polort(None, list(n_timepoints_per_run), tr, verbose=args.verb >= 1)
     else:
         try:
             args.polort = int(polort_str)
@@ -2176,7 +2182,7 @@ def main(argv: list[str] | None = None):
             tr,
             window_top=max(top for _, top in design_result.fir_window_s or [(0.0, tr)]),
             microtime_offset=microtime_offset,
-            polort=max(args.polort, 0),
+            polort=[max(p, 0) for p in polort_per_run(args.polort, n_runs)],
         )
         message = design_risk_message(risk, smooth_method is not None, "-tent-smooth")
         if message:
@@ -2303,13 +2309,15 @@ def main(argv: list[str] | None = None):
                     f"# FIR lags: {n_basis_per_condition_list[0]} (duration: {(n_basis_per_condition_list[0] - 1) * tr}s)\n"
                 )
 
-            if args.polort >= 0:
+            if max_polort(args.polort) >= 0:
+                _degrees = polort_per_run(args.polort, len(n_timepoints_per_run))
                 f.write("#\n")
                 f.write("# Polynomial drift (zero-padded per run):\n")
-                f.write(f"#   Order: {args.polort}\n")
-                f.write(f"#   Regressors per run: {args.polort + 1}\n")
+                f.write(f"#   Order: {polort_summary(args.polort)}\n")
+                f.write(f"#   Regressors per run: {[p + 1 for p in _degrees]}\n")
                 f.write(
-                    f"#   Total polynomial regressors: {len(n_timepoints_per_run) * (args.polort + 1)}\n"
+                    "#   Total polynomial regressors: "
+                    f"{n_polort_columns(_degrees, len(_degrees))}\n"
                 )
 
             if extra_regs_per_run is not None:
@@ -2432,7 +2440,7 @@ def main(argv: list[str] | None = None):
             f"  Data: ({n_vox_total}, {packed.design_concat.shape[0]}) "
             f"across {len(per_run_data)} runs"
         )
-        n_poly_total = ((args.polort + 1) if args.polort >= 0 else 0) * len(per_run_data)
+        n_poly_total = n_polort_columns(args.polort, len(per_run_data))
         print(
             f"  Design: {tuple(packed.design_concat.shape)}  "
             f"({packed.n_task_cols} task + {n_poly_cols} block-diagonal nuisance "

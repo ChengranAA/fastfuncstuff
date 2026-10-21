@@ -169,15 +169,18 @@ def test_fitbasis_index_map_round_trips_with_its_own_sidecar(tmp_path, monkeypat
 @pytest.mark.parametrize(
     ("run_starts", "n_tp", "expected"),
     [
-        ([0], 60, 1),  # a 1-minute run: AFNI gives 1, round(0.5) gave 0
-        ([0, 60], 460, 3),  # 60 s + 400 s: the longest run sets it (mean gave 2)
-        ([0, 300], 600, 3),  # equal 300 s runs
+        ([0], 60, [1]),  # a 1-minute run: AFNI gives 1, round(0.5) gave 0
+        ([0, 60], 460, [1, 3]),  # 60 s + 400 s: each run its own degree
+        ([0, 300], 600, [3, 3]),  # equal 300 s runs
     ],
 )
-def test_auto_polort_is_afnis_longest_run_rule(run_starts, n_tp, expected):
-    from fastfuncstuff.cli.fitbasis import _auto_polort_for_runs
+def test_auto_polort_is_per_run(run_starts, n_tp, expected):
+    from fastfuncstuff.cli_utils import compute_run_lengths, resolve_polort
 
-    assert _auto_polort_for_runs(run_starts, n_tp, 1.0)[0] == expected
+    lengths = compute_run_lengths(run_starts, n_tp)
+    assert resolve_polort(None, lengths, 1.0, verbose=False) == expected
+    # An explicit -polort stays one degree for every run.
+    assert resolve_polort(2, lengths, 1.0, verbose=False) == 2
 
 
 def test_shift_parametrization_writes_the_sidecar_too(tmp_path, monkeypatch, capsys):

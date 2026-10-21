@@ -15,6 +15,7 @@ For help:
 import argparse
 import contextlib
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -52,22 +53,22 @@ try:
         append_nuisance_blocks_to_design_info,
         apply_onset_rounding,
         apply_trim_to_timing,
-        auto_polort,
         build_nuisance_block_diag,
         build_nuisance_per_run,
         collect_noise_comp_blocks,
         collect_nuisance_blocks,
         compute_run_lengths,
-        get_average_run_duration,
         has_imaging_ext,
         microtime_offset_bins,
         parse_cv_strategy,
         parse_device_arg,
         parse_input_files,
         parse_prefix,  # noqa: F401 — TODO: apply parse_prefix to individual output flags
+        polort_column_labels,
         resolve_event_filters,
         resolve_microtime_dt,
         resolve_microtime_offset,
+        resolve_polort,
         trim_spec_from_args,
         xmat_nuisance_per_run,
     )
@@ -1150,7 +1151,10 @@ Examples:
         "-polort",
         type=int,
         default=None,
-        help="Polynomial order (default: auto based on run length)",
+        help=(
+            "Legendre drift order, the same for every run. Default: per run, "
+            "1 + floor(run_seconds / 150) for each run in its own block."
+        ),
     )
     add_ortvec_arguments(onset_group)
     add_noise_comps_arguments(onset_group)
@@ -1803,7 +1807,20 @@ def _report_loaded_design(design_info: dict, source: str) -> None:
         n_nuis = sum(1 for g in groups if g == 0)
         n_runs = len(run_starts)
         polort_note = ""
-        if n_runs and n_polort % n_runs == 0:
+        # Per-run widths can differ (automatic polort is per run), so read the
+        # degrees off the Run#kPol#j labels when they are there.
+        per_run_cols: dict[int, int] = {}
+        for lab in design_info.get("column_labels") or []:
+            m = re.fullmatch(r"Run#(\d+)Pol#\d+", str(lab))
+            if m:
+                per_run_cols[int(m.group(1))] = per_run_cols.get(int(m.group(1)), 0) + 1
+        if per_run_cols and sum(per_run_cols.values()) == n_polort:
+            degrees = [per_run_cols[k] - 1 for k in sorted(per_run_cols)]
+            if len(set(degrees)) == 1:
+                polort_note = f" (order {degrees[0]} per run × {len(degrees)} runs)"
+            else:
+                polort_note = f" (per-run orders {degrees})"
+        elif n_runs and n_polort % n_runs == 0:
             polort_note = f" (order {n_polort // n_runs - 1} per run × {n_runs} runs)"
         print(f"  Polort drift columns: {n_polort}{polort_note}")
         print(f"  Stim columns: {n_stim_cols}")
@@ -2783,15 +2800,8 @@ def main():
                     "first; use -allow_late_events to drop them and continue."
                 )
 
-        # Auto-determine polort if not specified
-        if args.polort is None:
-            run_lengths = compute_run_lengths(run_starts, n_timepoints)
-            avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
-            polort = auto_polort(avg_run_duration_sec, formula="afni")
-            print(f"  Auto polort: {polort} (based on {avg_run_duration_sec / 60:.1f} min avg run)")
-        else:
-            polort = args.polort
-            print(f"  Polort: {polort}")
+        # -polort N for every run, else each run's own automatic degree.
+        polort = resolve_polort(args.polort, compute_run_lengths(run_starts, n_timepoints), tr)
 
         # Per-voxel HRF: load assignments + library if -hrfopt_prefix set
         hrf_library_obj = None
@@ -3095,9 +3105,7 @@ def main():
 
         # Add nuisance labels
         _nuisance_label_offset = len(column_labels)
-        for run_idx in range(n_runs):
-            for p in range(polort + 1):
-                column_labels.append(f"Run#{run_idx + 1}Pol#{p}")
+        column_labels.extend(polort_column_labels(polort, n_runs))
 
         # Nuisance block labels (one entry per column; widest column count
         # per block when per-run widths differ).
@@ -3913,9 +3921,7 @@ def main():
 
         # Build nuisance labels: per-run poly + per-block column names.
         nuisance_labels_st: list[str] = []
-        for run_idx in range(n_runs):
-            for p in range(polort + 1):
-                nuisance_labels_st.append(f"r{run_idx + 1:02d}_poly{p}")
+        nuisance_labels_st.extend(polort_column_labels(polort, n_runs, style="short"))
         for block in nuisance_blocks_st:
             nuisance_labels_st.extend(block.get_column_names())
         # Pad if rounding/widening mismatch (shouldn't happen, but be safe).

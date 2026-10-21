@@ -63,12 +63,10 @@ try:
         add_verbose_arg,
         apply_onset_rounding,
         apply_trim_to_timing,
-        auto_polort,
         bids_event_kwargs,
         build_nuisance_per_run,
         check_bids_event_args,
         compute_run_lengths,
-        get_average_run_duration,
         load_and_preprocess_runs,
         load_hrf_index_for_input,
         load_hrfopt_library,
@@ -78,6 +76,7 @@ try:
         preflight_check,
         resolve_microtime_dt,
         resolve_microtime_offset,
+        resolve_polort,
         run_lengths_from_starts,
         save_4d_nifti,
         save_r2_ceiling_stack,
@@ -318,7 +317,10 @@ Notes:
         "-polort",
         type=int,
         default=None,
-        help="Polynomial order for drift modeling (default: auto based on run length)",
+        help=(
+            "Legendre drift order, the same for every run. Default: per run, "
+            "1 + floor(run_seconds / 150) for each run in its own block."
+        ),
     )
     proc_opts.add_argument(
         "-microtime_dt",
@@ -766,14 +768,10 @@ def main():
         print()
 
         # Build nuisance design (polynomials + noise PCs)
-        # Auto-determine polort if not specified
-        if args.polort is None:
-            run_lengths = compute_run_lengths(run_starts, n_timepoints)
-            avg_run_duration_sec = get_average_run_duration(run_lengths, args.tr)
-            polort = auto_polort(avg_run_duration_sec, formula="afni")
-            print(f"Auto polort: {polort} (based on {avg_run_duration_sec / 60:.1f} min avg run)")
-        else:
-            polort = args.polort
+        # -polort N for every run, else each run's own automatic degree.
+        polort = resolve_polort(
+            args.polort, compute_run_lengths(run_starts, n_timepoints), args.tr, indent=""
+        )
 
         # Build nuisance per run using shared utility
         nuisance_per_run = build_nuisance_per_run(
@@ -1193,7 +1191,12 @@ def main():
             condition_design=condition_design,
             fracs=fracs,
             nuisance=noise_pcs,
-            polort=args.polort,
+            # Resolved here, not left to the fitter, whose None means "no drift"
+            # whenever noise PCs are supplied — the beta-space path above
+            # always models drift, so this one should too.
+            polort=resolve_polort(
+                args.polort, compute_run_lengths(run_starts, n_timepoints), args.tr, indent=""
+            ),
             trial_labels=trial_labels,
             autoscale=args.autoscale,
             chunk_size=args.chunk_size if args.chunk_size > 0 else None,

@@ -552,7 +552,8 @@ def fit_glm(
         Repetition time in seconds
     max_poly_degree : int or list of int, optional
         Maximum polynomial degree for detrending each run
-        If None, auto-compute as round(duration_minutes/2)
+        If None, each run gets its own 1 + floor(run_seconds / 150)
+        (``design.polort.auto_polort_per_run``, the rule every tool uses)
     extra_regressors : torch.Tensor or list of torch.Tensor, optional
         Additional nuisance regressors (motion, GLMdenoise PCs, etc.)
         Shape: (n_timepoints, n_extra) or list per run
@@ -635,7 +636,9 @@ def fit_glm(
 
     # Handle polynomial detrending
     if max_poly_degree is None:
-        max_poly_degree = [round((d.shape[1] * tr / 60) / 2) for d in data_2d]
+        from fastfuncstuff.design.polort import auto_polort_per_run
+
+        max_poly_degree = auto_polort_per_run([d.shape[1] for d in data_2d], tr)
     elif isinstance(max_poly_degree, int):
         max_poly_degree = [max_poly_degree] * n_runs
 

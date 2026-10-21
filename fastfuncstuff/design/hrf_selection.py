@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
+from fastfuncstuff.glm.core import GLMResults, fit_glm
 from fastfuncstuff.glm.xval import (
     _cod_ratio,
     compute_xval_r2,
@@ -784,7 +784,7 @@ def fit_glm_hrf_library_with_xval(
     metric: str = "cod",
     microtime_dt: float = 0.1,
     microtime_onset: int = 0,
-    polort: int | None = None,
+    polort: int | list[int] | None = None,
     ortvec_files: list[tuple[str | Path, str]] | None = None,
     nuisance_blocks: list | None = None,
     extra_regressors: np.ndarray | torch.Tensor | None = None,
@@ -853,8 +853,9 @@ def fit_glm_hrf_library_with_xval(
     microtime_onset : int, default=0
         Which microtime bin within each TR to sample (0-indexed).
         0 = start of TR, bins_per_tr/2 = middle of TR.
-    polort : int, optional
-        Polynomial order for detrending (None = auto)
+    polort : int or list of int, optional
+        Polynomial order for detrending: one for every run, one per run, or
+        None for each run's automatic degree (``cli_utils.auto_polort_per_run``)
     ortvec_files : list of (filepath, label) tuples, optional
         Additional nuisance regressors to project out (like AFNI's -ortvec).
         Each file should contain already-concatenated regressors spanning
@@ -1100,19 +1101,15 @@ def fit_glm_hrf_library_with_xval(
     # Build per-run nuisance blocks using shared utility
     # =========================================================================
     from fastfuncstuff.cli_utils import (
-        auto_polort,
         build_nuisance_per_run,
         compute_run_lengths,
-        get_average_run_duration,
+        polort_per_run,
+        resolve_polort,
     )
 
-    # Auto-compute polort if not specified (AFNI formula)
+    # Each run's own automatic degree unless the caller fixed one.
     if polort is None:
-        run_lengths = compute_run_lengths(run_starts, n_timepoints)
-        avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
-        polort = auto_polort(avg_run_duration_sec, formula="afni")
-        if verbose:
-            print(f"  Auto polort: {polort} (AFNI formula, {avg_run_duration_sec:.0f}s avg run)")
+        polort = resolve_polort(None, compute_run_lengths(run_starts, n_timepoints), tr, verbose)
 
     # Convert extra_regressors to tensor for ortvec_data parameter
     ortvec_data = None
@@ -1149,8 +1146,11 @@ def fit_glm_hrf_library_with_xval(
         verbose=verbose,
     )
 
-    n_poly_cols = polort + 1
-    n_nuisance_cols_per_run = nuisance_blocks_per_run[0].shape[1]
+    # Per-run polort makes the per-run widths differ: plan on the widest.
+    poly_cols_per_run = [p + 1 if p >= 0 else 0 for p in polort_per_run(polort, n_runs)]
+    n_poly_cols = sum(poly_cols_per_run)
+    n_nuisance_cols_per_run = max(b.shape[1] for b in nuisance_blocks_per_run)
+    n_extra_nuisance = nuisance_blocks_per_run[0].shape[1] - poly_cols_per_run[0]
 
     if verbose:
         print(f"  Nuisance per run: {n_nuisance_cols_per_run} columns")
@@ -1379,8 +1379,8 @@ def fit_glm_hrf_library_with_xval(
 
         # Nuisance statistics
         print(
-            f"\nNuisance per run: {n_nuisance_cols_per_run} columns/run, "
-            f"{n_poly_cols} poly + {n_nuisance_cols_per_run - n_poly_cols} extra"
+            f"\nNuisance per run: up to {n_nuisance_cols_per_run} columns/run, "
+            f"poly {poly_cols_per_run} + {n_extra_nuisance} extra"
         )
         for ri, nb in enumerate(nuisance_blocks_per_run):
             print(f"  Run {ri}: shape={nb.shape}, col_norms={nb.norm(dim=0).tolist()}")
@@ -1749,7 +1749,7 @@ def fit_glm_hrf_library_with_xval(
         "microtime_onset": microtime_onset,
         "polort": polort,
         "n_poly_cols": n_poly_cols,
-        "n_extra_nuisance": n_nuisance_cols_per_run - n_poly_cols,
+        "n_extra_nuisance": n_extra_nuisance,
         "n_nuisance_total": nuisance_design.shape[1],
         "extra_nuisance_labels": extra_nuisance_labels,
         "n_voxels": n_voxels,
@@ -2395,7 +2395,7 @@ def _write_afni_xmat(
     condition_labels: list[str] | None,
     run_starts: list[int],
     tr: float,
-    polort: int | None = None,
+    polort: int | list[int] | None = None,
     extra_nuisance_labels: list[str] | None = None,
 ) -> None:
     """Write design matrix in AFNI xmat.1D format.
@@ -2414,8 +2414,8 @@ def _write_afni_xmat(
         Starting timepoint for each run
     tr : float
         Repetition time in seconds
-    polort : int, optional
-        Polynomial order (for generating meaningful poly labels per run)
+    polort : int or list of int, optional
+        Polynomial order, one for all runs or one per run (for poly labels)
     extra_nuisance_labels : list of str, optional
         Labels for extra nuisance regressors (e.g., ['motion_0', 'motion_1', ...])
     """
@@ -2434,11 +2434,9 @@ def _write_afni_xmat(
 
     # If polort is known, build per-run polynomial labels
     if polort is not None:
-        n_poly_per_run = polort + 1
-        n_poly_total = n_runs * n_poly_per_run
-        for r in range(n_runs):
-            for p in range(n_poly_per_run):
-                nuisance_labels.append(f"r{r + 1:02d}_poly{p}")
+        from fastfuncstuff.cli_utils import polort_column_labels
+
+        nuisance_labels.extend(polort_column_labels(polort, n_runs, style="short"))
     else:
         # Fall back to auto-detecting poly columns
         n_poly_total = n_nuisance - (len(extra_nuisance_labels) if extra_nuisance_labels else 0)
@@ -2997,22 +2995,24 @@ def save_hrf_selection_results(
             else:
                 run_starts_local = run_starts
 
-            # Build polynomial design for nuisance columns (block-diagonal for runs)
-            polort_val = results.hrf_metadata.get("polort")
-            if polort_val is None or not isinstance(polort_val, int):
-                polort_val = min(1 + int(n_timepoints * tr / 150), 3)
+            # Build polynomial design for nuisance columns (block-diagonal for runs).
+            # The fit's own degrees (an int, or one per run); old metadata
+            # without them falls back to each run's automatic degree.
+            from fastfuncstuff.cli_utils import (
+                auto_polort_per_run,
+                build_nuisance_block_diag,
+                compute_run_lengths,
+            )
 
-            # Build block-diagonal polynomial matrix
             n_runs = len(run_starts_local)
-            poly_blocks = []
-            for i in range(n_runs):
-                if i < n_runs - 1:
-                    run_len = run_starts_local[i + 1] - run_starts_local[i]
-                else:
-                    run_len = n_timepoints - run_starts_local[i]
-                poly_block = construct_polynomial_matrix(run_len, polort_val, onsets.device)
-                poly_blocks.append(poly_block)
-            poly_design = torch.block_diag(*poly_blocks)
+            polort_val = results.hrf_metadata.get("polort")
+            if polort_val is None or (isinstance(polort_val, list) and len(polort_val) != n_runs):
+                polort_val = auto_polort_per_run(
+                    compute_run_lengths(run_starts_local, n_timepoints), tr
+                )
+            poly_design = build_nuisance_block_diag(
+                run_starts_local, n_timepoints, polort_val, onsets.device
+            )
 
             # Create output directory for HRF designs
             hrf_designs_dir = Path(f"{output_prefix}_hrf_designs")

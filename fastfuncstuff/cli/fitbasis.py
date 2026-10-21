@@ -96,13 +96,16 @@ try:
         bids_event_kwargs,
         check_bids_event_args,
         collect_nuisance_blocks,
+        compute_run_lengths,
         load_and_preprocess_runs,
         microtime_offset_bins,
+        n_polort_columns,
         parse_input_files,
         parse_prefix,
         preflight_check,
         resolve_microtime_dt,
         resolve_microtime_offset,
+        resolve_polort,
         run_lengths_from_starts,
         setup_device,
         trim_spec_from_args,
@@ -936,7 +939,10 @@ def create_parser() -> argparse.ArgumentParser:
         "-polort",
         type=int,
         default=None,
-        help="Per-run polynomial drift order.  None → auto from run duration.",
+        help=(
+            "Legendre drift order, the same for every run. Default: per run, "
+            "1 + floor(run_seconds / 150) for each run in its own block."
+        ),
     )
     add_microtime_offset_arg(proc)
     add_device_arg(proc, default="auto")
@@ -1722,7 +1728,7 @@ def _select_hrf_per_voxel(
     n_timepoints: int,
     tr: float,
     dt: float,
-    polort: int,
+    polort: int | list[int],
     extra_regs_per_run: list[torch.Tensor] | None,
     select_mode: str,
     device: torch.device,
@@ -1903,21 +1909,6 @@ def _hrfopt_sidecar_for(index_path: str):
     return prefix, hrf_library_path(prefix)
 
 
-def _auto_polort_for_runs(run_starts: list[int], n_timepoints: int, tr: float) -> tuple[int, float]:
-    """AFNI's ``-polort A``: one degree, ``1 + floor(D / 150)`` for the LONGEST run.
-
-    The same formula as every other tool (``cli_utils.auto_polort``) and the
-    same run AFNI sizes it from (3dDeconvolve.c, "longest block").  The old
-    ``round(mean_minutes / 2)`` gave a 1-minute run no drift term at all and let
-    short runs drag down the degree a long one needs.
-    """
-    from fastfuncstuff.cli_utils import auto_polort
-
-    bounds = [*run_starts, n_timepoints]
-    longest_s = max(bounds[i + 1] - bounds[i] for i in range(len(run_starts))) * float(tr)
-    return auto_polort(longest_s, formula="afni"), longest_s
-
-
 def _import_hrfopt_shapes(
     index_path: str,
     *,
@@ -2040,7 +2031,7 @@ def _run_shift_mode(
     condition_labels: list[str],
     condition_durations: list[float],
     tr: float,
-    polort: int,
+    polort: int | list[int],
     volume_shape,
     mask,
     device: torch.device,
@@ -2485,7 +2476,7 @@ def _run_shift_mode(
         "single_trials": bool(args.single_trials),
         "n_blocks": len(block_onsets),
         "condition_labels": list(condition_labels),
-        "polort": int(polort),
+        "polort": polort if isinstance(polort, list) else int(polort),
         "blur_fwhm": args.do_blur,
         "r2_median_task_relative": float(np.median(fit.r2)),
         "r2_tau0_median": float(np.median(fit.r2_fixed)),
@@ -2769,11 +2760,10 @@ def main() -> int:
         print("  Prior: disabled (-reg none)")
 
     # ── Polort resolution ─────────────────────────────────────────
-    if args.polort is None:
-        polort_resolved, longest_s = _auto_polort_for_runs(list(run_starts), n_timepoints, tr)
-        print(f"  Polort auto: {polort_resolved} (longest run {longest_s:.0f} s)")
-    else:
-        polort_resolved = int(args.polort)
+    # -polort N for every run, else each run's own 1 + floor(D / 150).
+    polort_resolved = resolve_polort(
+        args.polort, compute_run_lengths(list(run_starts), n_timepoints), tr
+    )
 
     # ── Build per-run task design (one block per CONDITION OR per TRIAL) ─
     # build_pc_basis_design_per_run handles convolving onsets with each
@@ -3387,8 +3377,7 @@ def main() -> int:
         # also shares its whitened task design and polynomial nuisance;
         # only the data (and the subset of voxels) differs.
         n_voxels_total = sum(c.voxel_indices.size for c in arma_cells)
-        n_poly_per_run = (polort_resolved + 1) if polort_resolved >= 0 else 0
-        n_total_cols = n_task_cols + n_runs * n_poly_per_run
+        n_total_cols = n_task_cols + n_polort_columns(polort_resolved, n_runs)
 
         # Per-voxel diagnostics gathered across cells.  These are kept
         # at the top-level scope so the VB loop below can pass them
@@ -4609,7 +4598,7 @@ def main() -> int:
         "n_conditions": int(n_conditions),
         "n_blocks_fit": int(n_blocks),
         "condition_labels": list(condition_labels),
-        "polort": int(polort_resolved),
+        "polort": (polort_resolved if isinstance(polort_resolved, list) else int(polort_resolved)),
         "prior_mean": prior_m.tolist(),
         "prior_cov_diag": np.diag(prior_C).tolist(),
         "sigma2_mean": float(fit.sigma2_mean),

@@ -965,7 +965,7 @@ def fit_ridge_single_trial(
     condition_design: torch.Tensor,
     fracs: np.ndarray | None = None,
     nuisance: torch.Tensor | list[torch.Tensor] | None = None,
-    polort: int | None = None,
+    polort: int | list[int] | None = None,
     cv_splits: list[tuple[list[int], list[int]]] | None = None,
     trial_labels: list[str] | None = None,
     trial_run_ids: torch.Tensor | None = None,
@@ -1005,9 +1005,10 @@ def fit_ridge_single_trial(
         Nuisance regressors per run (e.g., motion, noise PCs).
         Per-run format: list of (n_timepoints_run, n_nuisance)
         If None and polort is None, Legendre polynomials are added automatically.
-    polort : int, optional
-        Polynomial order for drift modeling. If None, auto-determined.
-        Set to -1 to disable polynomial drift.
+    polort : int or list of int, optional
+        Polynomial order for drift modeling: one for every run or one per run.
+        If None (and no ``nuisance``), each run gets its own automatic degree
+        (``cli_utils.auto_polort_per_run``). Set to -1 to disable polynomial drift.
     cv_splits : list of tuples, optional
         Cross-validation splits as (train_runs, test_runs).
         Default: leave-one-run-out
@@ -1092,12 +1093,11 @@ def fit_ridge_single_trial(
     # Calculate run lengths (needed for nuisance splitting regardless of polort)
     run_lengths = np.diff(run_starts + [n_timepoints])
 
-    # Auto-determine polort if needed
+    from fastfuncstuff.cli_utils import auto_polort_per_run, polort_per_run, polort_summary
+
+    # Auto-determine polort if needed: each run its own degree.
     if polort is None and nuisance is None:
-        # Calculate median run length using pattern from xval.py
-        median_run_length = int(np.median(run_lengths))
-        run_duration = median_run_length * tr
-        polort = int(np.floor(1 + run_duration / 150.0))
+        polort = auto_polort_per_run(run_lengths.tolist(), tr)
 
     # Build nuisance regressors per run
     # Following GLMsingle: combine [polynomials, extra_regressors] like combinedmatrix
@@ -1105,10 +1105,10 @@ def fit_ridge_single_trial(
 
     # First, build polynomial regressors if needed
     poly_per_run = []
-    if polort is not None and polort >= 0:
-        for run_idx in range(n_runs):
+    if polort is not None:
+        for run_idx, run_polort in enumerate(polort_per_run(polort, n_runs)):
             run_length = run_lengths[run_idx]
-            poly = construct_polynomial_matrix(run_length, polort, device=device)
+            poly = construct_polynomial_matrix(int(run_length), run_polort, device=device)
             poly_per_run.append(poly)
 
     # Second, get user-provided nuisance (e.g., noise PCs, motion, etc.)
@@ -1151,7 +1151,7 @@ def fit_ridge_single_trial(
         print(f"  Trials: {n_trials}")
         nuisance_desc = []
         if n_polys > 0:
-            nuisance_desc.append(f"{n_polys} polys (polort={polort})")
+            nuisance_desc.append(f"{n_polys} polys (polort={polort_summary(polort)})")
         if n_extra > 0:
             nuisance_desc.append(f"{n_extra} extra")
         if nuisance_desc:

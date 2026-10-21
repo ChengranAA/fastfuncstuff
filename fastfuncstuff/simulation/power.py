@@ -49,11 +49,17 @@ def _two_tailed_power(crit: float, dof: float, nc: float | np.ndarray) -> Any:
     return float(out) if np.ndim(out) == 0 else out
 
 
-def _nuisance(run_lengths: list[int], poly_degree: int) -> torch.Tensor:
+def _nuisance(run_lengths: list[int], poly_degree: int | list[int]) -> torch.Tensor:
+    """Block-diagonal Legendre drift; ``poly_degree`` is one degree or one per run."""
+    from fastfuncstuff.design.polort import polort_per_run
     from fastfuncstuff.glm.core import construct_polynomial_matrix
 
     cpu = torch.device("cpu")
-    blocks = [construct_polynomial_matrix(n, poly_degree, cpu, torch.float64) for n in run_lengths]
+    degrees = polort_per_run(poly_degree, len(run_lengths))
+    blocks = [
+        construct_polynomial_matrix(n, p, cpu, torch.float64)
+        for n, p in zip(run_lengths, degrees, strict=True)
+    ]
     return torch.block_diag(*blocks)
 
 
@@ -169,13 +175,13 @@ def _glm_setup(
     run_lengths: list[int],
     tr: float,
     contrasts: dict[str, list[float] | np.ndarray],
-    poly_degree: int | None,
+    poly_degree: int | list[int] | None,
     true_design: torch.Tensor | np.ndarray | None,
     beta_pattern: list[float] | np.ndarray | None,
     beta_offset: list[float] | np.ndarray | float,
 ) -> dict[str, Any]:
     """The fitted GLM and the planted signal's deterministic parts, shared by both engines."""
-    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.polort import auto_polort_per_run
 
     X_task = torch.as_tensor(design, dtype=torch.float64)
     n_t, n_cond = X_task.shape
@@ -189,7 +195,7 @@ def _glm_setup(
         pattern = torch.as_tensor(beta_pattern, dtype=torch.float64)
     offset = torch.as_tensor(beta_offset, dtype=torch.float64).expand(n_cond).clone()
     if poly_degree is None:
-        poly_degree = auto_polort(max(run_lengths) * tr)
+        poly_degree = auto_polort_per_run(run_lengths, tr)
 
     X = torch.cat([X_task, _nuisance(run_lengths, poly_degree)], dim=1)
     n_p = X.shape[1]
@@ -225,7 +231,7 @@ def analytic_power(
     noise: list[dict[str, Any]],
     beta_pattern: list[float] | np.ndarray | None = None,
     beta_offset: list[float] | np.ndarray | float = 0.0,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     alpha: float = 0.001,
     true_design: torch.Tensor | np.ndarray | None = None,
     baseline: float = 100.0,
@@ -263,7 +269,7 @@ def simulate_design_power(
     noise: list[dict[str, Any]],
     beta_pattern: list[float] | np.ndarray | None = None,
     n_reps: int = 500,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     beta_offset: list[float] | np.ndarray | float = 0.0,
     alpha: float = 0.001,
     true_design: torch.Tensor | np.ndarray | None = None,
@@ -500,7 +506,7 @@ def scan_time_sweep(
     hrf: str = "spmg1",
     alpha: float = 0.001,
     target: float = 0.8,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     seed: int = 0,
     progress: bool = True,
 ) -> dict[str, Any]:
@@ -582,7 +588,7 @@ class RealizationScorer:
         hrf: str = "spmg1",
         alpha: float = 0.001,
         target: float = 0.8,
-        poly_degree: int | None = None,
+        poly_degree: int | list[int] | None = None,
         mean_response: float = 1.0,
         trial_sd: float = 0.5,
     ):
@@ -618,7 +624,7 @@ class RealizationScorer:
         apart to be told apart (:func:`shape_steps`, mean over conditions;
         one past the maximum where never), at mean_response x pattern.
         """
-        from fastfuncstuff.cli_utils import auto_polort
+        from fastfuncstuff.design.polort import auto_polort_per_run
 
         from .core import build_task_design
 
@@ -630,7 +636,7 @@ class RealizationScorer:
         pdeg = (
             self.poly_degree
             if self.poly_degree is not None
-            else auto_polort(max(lengths) * self.tr)
+            else auto_polort_per_run(lengths, self.tr)
         )
         X = torch.cat([X_task, _nuisance(lengths, pdeg)], dim=1)
         if int(torch.linalg.matrix_rank(X)) < X.shape[1]:
@@ -810,7 +816,7 @@ def design_quality(
     noise: list[dict[str, Any]],
     alpha: float = 0.001,
     target: float = 0.8,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
 ) -> dict[str, Any]:
     """How estimable each condition and each pairwise difference is, before any simulation.
 
@@ -831,12 +837,12 @@ def design_quality(
       Positively correlated regressors make their *difference* costly: the
       fit can tell that something happened, not which.
     """
-    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.polort import auto_polort_per_run
 
     X_task = torch.as_tensor(design, dtype=torch.float64)
     n_t, n_cond = X_task.shape
     if poly_degree is None:
-        poly_degree = auto_polort(max(run_lengths) * tr)
+        poly_degree = auto_polort_per_run(run_lengths, tr)
     D = _nuisance(run_lengths, poly_degree)
     X = torch.cat([X_task, D], dim=1)
     n_p = X.shape[1]
@@ -920,7 +926,7 @@ def realizations_design_quality(
     hrf: str = "spmg1",
     alpha: float = 0.001,
     target: float = 0.8,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     single_trial_designs: int = 20,
     mean_response: float = 1.0,
     trial_sd: float = 0.5,
@@ -993,7 +999,7 @@ def estimation_quality(
     tr: float,
     noise: list[dict[str, Any]],
     window: float = 16.0,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     hrf: str = "spmg1",
 ) -> dict[str, Any]:
     """How well the design estimates each condition's response *shape* (FIR), not its size.
@@ -1016,13 +1022,13 @@ def estimation_quality(
                       xi, a point on Liu et al. (2001)'s trade-off plane
         'fir_lags'  : bins per condition
     """
-    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.polort import auto_polort_per_run
 
     from .metrics import compute_detection_power, compute_estimation_efficiency
 
     lengths = list(realization.run_lengths)
     if poly_degree is None:
-        poly_degree = auto_polort(max(lengths) * tr)
+        poly_degree = auto_polort_per_run(lengths, tr)
     k = max(1, int(round(window / tr)))
     on = fir_onsets(realization, tr)
     n_t, n_cond = on.shape
@@ -1139,7 +1145,7 @@ def single_trial_quality(
     tr: float,
     noise: list[dict[str, Any]],
     hrf: str = "spmg1",
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     mean_response: float = 1.0,
     trial_sd: float = 0.5,
 ) -> dict[str, Any]:
@@ -1171,13 +1177,13 @@ def single_trial_quality(
     (per condition), 'leakage' (per condition; noise-free), and
     'reliability' {label: {'lss', 'lsa', 'ridge', 'ridge_frac'}}.
     """
-    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.polort import auto_polort_per_run
 
     from .core import default_microtime_dt, hrfs_from_spec
 
     lengths = list(realization.run_lengths)
     if poly_degree is None:
-        poly_degree = auto_polort(max(lengths) * tr)
+        poly_degree = auto_polort_per_run(lengths, tr)
     dt = default_microtime_dt(tr)
     bases = hrfs_from_spec(hrf, dt, torch.device("cpu"))[0][1]
     Xt, cond = trial_regressors(realization, tr, bases, dt)
@@ -1325,7 +1331,7 @@ def tent_estimate(
     true_hrf: str = "spmg1",
     window: float | None = None,
     spacing: float = 2.0,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     seed: int = 0,
     tail: float = 20.0,
 ) -> dict[str, Any]:
@@ -1347,8 +1353,8 @@ def tent_estimate(
     the estimate from that voxel and its SE under the noise ARMA (what a fresh
     voxel would scatter by).
     """
-    from fastfuncstuff.cli_utils import auto_polort
     from fastfuncstuff.design.matrices import make_tent_design
+    from fastfuncstuff.design.polort import auto_polort_per_run
 
     from .core import build_task_design, default_microtime_dt, hrfs_from_spec
 
@@ -1356,7 +1362,7 @@ def tent_estimate(
     lengths = list(realization.run_lengths)
     n_cond = len(realization.conditions)
     if poly_degree is None:
-        poly_degree = auto_polort(max(lengths) * tr)
+        poly_degree = auto_polort_per_run(lengths, tr)
     windows = [
         float(window)
         if window is not None
@@ -1425,7 +1431,7 @@ def single_trial_example(
     mean_response: float = 1.0,
     trial_sd: float = 0.5,
     hrf: str = "spmg1",
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     seed: int = 0,
     sd_grid: tuple[float, ...] = (0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0),
 ) -> dict[str, Any]:
@@ -1439,13 +1445,13 @@ def single_trial_example(
     'expected' {method: r at trial_sd}, 'ridge_frac', 'sd_grid', 'curve'
     {method: r per sd}.
     """
-    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.polort import auto_polort_per_run
 
     from .core import default_microtime_dt, hrfs_from_spec
 
     lengths = list(realization.run_lengths)
     if poly_degree is None:
-        poly_degree = auto_polort(max(lengths) * tr)
+        poly_degree = auto_polort_per_run(lengths, tr)
     label = str(noise.get("label", "noise"))
     kw = {k: v for k, v in noise.items() if k != "label"}
     dt = default_microtime_dt(tr)
@@ -1503,7 +1509,7 @@ def t_example(
     beta_pattern: list[float] | np.ndarray | None = None,
     hrf: str = "spmg1",
     alpha: float = 0.001,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     n_reps: int = 2000,
     seed: int = 0,
     estimator: str = "ols",
@@ -1568,7 +1574,7 @@ def design_spectrum(
     contrasts: dict[str, list[float] | np.ndarray],
     noise: dict[str, Any],
     hrf: str = "spmg1",
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
 ) -> dict[str, Any]:
     """Where each contrast's information sits in frequency, against the noise and the drift.
 
@@ -1582,14 +1588,14 @@ def design_spectrum(
     relative}, 'noise_psd', 'removed', 'drift_share' {contrast: fraction of
     its power the drift removes}.
     """
-    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.polort import auto_polort_per_run, polort_per_run
 
     from .core import build_task_design, default_microtime_dt, hrfs_from_spec
 
     cpu = torch.device("cpu")
     n = int(realization.run_lengths[0])
     if poly_degree is None:
-        poly_degree = auto_polort(max(realization.run_lengths) * tr)
+        poly_degree = auto_polort_per_run(realization.run_lengths, tr)
     dt = default_microtime_dt(tr)
     bases = hrfs_from_spec(hrf, dt, cpu)[0][1]
     X = build_task_design(
@@ -1598,7 +1604,9 @@ def design_spectrum(
     ).double()[:n].numpy()  # fmt: skip
     freq = np.fft.rfftfreq(n, d=tr)
     t = np.arange(n) * tr
-    Q, _ = np.linalg.qr(_nuisance([n], poly_degree).numpy())
+    Q, _ = np.linalg.qr(
+        _nuisance([n], polort_per_run(poly_degree, len(realization.run_lengths))[:1]).numpy()
+    )
     removed = np.empty(len(freq))
     for k, f in enumerate(freq):
         wave = np.stack([np.cos(2 * np.pi * f * t), np.sin(2 * np.pi * f * t)], axis=1)
@@ -1636,7 +1644,7 @@ def shape_steps(
     amplitudes: list[float] | np.ndarray,
     alpha: float = 0.001,
     target: float = 0.8,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     max_step: int = 12,
 ) -> dict[str, Any]:
     """How far apart two response shapes must be for this design to tell them apart.
@@ -1659,14 +1667,14 @@ def shape_steps(
     """
     from scipy import stats as st
 
-    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.polort import auto_polort_per_run
 
     from .core import build_task_design, default_microtime_dt, hrfs_from_spec
 
     cpu = torch.device("cpu")
     lengths = list(realization.run_lengths)
     if poly_degree is None:
-        poly_degree = auto_polort(max(lengths) * tr)
+        poly_degree = auto_polort_per_run(lengths, tr)
     dt = default_microtime_dt(tr)
     lib = hrfs_from_spec("lib:all", dt, cpu)
     Xs = torch.stack(
@@ -1813,7 +1821,7 @@ def hrf_robustness(
     shared: float = 0.0,
     alpha: float = 0.001,
     target: float = 0.8,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     responses: list[float] | np.ndarray | None = None,
 ) -> dict[str, Any]:
     """What each contrast costs when the true HRF is each of the 20 library shapes.
@@ -1835,14 +1843,14 @@ def hrf_robustness(
     no mismatch, only what that shape does to this design -- a fast HRF
     passes more of a rapid design's high frequencies than a slow one).
     """
-    from fastfuncstuff.cli_utils import auto_polort
+    from fastfuncstuff.design.polort import auto_polort_per_run
 
     from .core import build_task_design, default_microtime_dt, hrfs_from_spec
 
     cpu = torch.device("cpu")
     lengths = list(realization.run_lengths)
     if poly_degree is None:
-        poly_degree = auto_polort(max(lengths) * tr)
+        poly_degree = auto_polort_per_run(lengths, tr)
     dt = default_microtime_dt(tr)
 
     def design(spec: str) -> torch.Tensor:
@@ -1977,7 +1985,7 @@ def _auto_grids(
     noise: list[dict[str, Any]],
     pattern: np.ndarray,
     offset: np.ndarray,
-    poly_degree: int | None,
+    poly_degree: int | list[int] | None,
     alpha: float,
     auto: AutoSweep,
 ) -> dict[str, list[float]]:
@@ -2018,7 +2026,7 @@ def simulate_realizations_power(
     n_reps: int = 500,
     alpha: float = 0.001,
     true_delay: float = 0.0,
-    poly_degree: int | None = None,
+    poly_degree: int | list[int] | None = None,
     device: torch.device | None = None,
     seed: int = 0,
     progress: bool = True,

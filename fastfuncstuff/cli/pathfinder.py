@@ -57,14 +57,14 @@ try:
         add_device_arg,
         add_ortvec_arguments,
         add_verbose_arg,
-        auto_polort,
+        build_nuisance_per_run,
         collect_nuisance_blocks,
         compute_run_lengths,
-        get_average_run_duration,
         parse_cv_strategy,
         parse_input_files,
         parse_prefix,
         resolve_microtime_dt,
+        resolve_polort,
         setup_device,
         spinner,
     )
@@ -76,7 +76,7 @@ try:
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
     from fastfuncstuff.design.matrices import build_task_design
-    from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
+    from fastfuncstuff.glm.core import GLMResults, fit_glm
     from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
     from fastfuncstuff.glm.xval import (
         _cod_ratio,
@@ -346,7 +346,10 @@ Notes:
         "-polort",
         type=int,
         default=None,
-        help="Polynomial order for drift modeling (default: auto)",
+        help=(
+            "Legendre drift order, the same for every run. Default: per run, "
+            "1 + floor(run_seconds / 150) for each run in its own block."
+        ),
     )
     add_ortvec_arguments(proc_opts)
     proc_opts.add_argument(
@@ -1526,20 +1529,9 @@ def main():
     print()
     print("Building nuisance regressors...")
 
-    if args.polort is None:
-        run_lengths = compute_run_lengths(run_starts, n_timepoints)
-        avg_run_duration_sec = get_average_run_duration(run_lengths, args.tr)
-        polort = auto_polort(avg_run_duration_sec, formula="afni")
-    else:
-        polort = args.polort
-
-    nuisance_per_run = []
-    for run_idx in range(n_runs):
-        start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        run_length = end_tp - start_tp
-        poly_block = construct_polynomial_matrix(run_length, polort, device)
-        nuisance_per_run.append(poly_block)
+    # -polort N for every run, else each run's own automatic degree.
+    polort = resolve_polort(args.polort, compute_run_lengths(run_starts, n_timepoints), args.tr)
+    nuisance_per_run = build_nuisance_per_run(run_starts, n_timepoints, polort, device)
 
     # Add user nuisance blocks (-ortvec / -ortvec_run / -ortvec_glob).
     user_blocks = collect_nuisance_blocks(args, run_starts, n_timepoints, verbose=True)
@@ -1560,7 +1552,7 @@ def main():
             )
             nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], run_nuisance], dim=1)
 
-    print(f"  Nuisance per run: {nuisance_per_run[0].shape[1]} columns (polort={polort})")
+    print(f"  Nuisance per run: {[m.shape[1] for m in nuisance_per_run]} columns")
 
     # Generate HRF library
     print()

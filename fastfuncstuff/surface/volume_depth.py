@@ -256,7 +256,13 @@ def volume_quantile_depth(
 
 
 def column_smooth_rounds(n_samples: int, n_columns: int, column_voxels: float) -> int:
-    """Rounds of 1-ring pooling for a column to hold ~``column_voxels`` samples."""
+    """Rounds of 1-ring pooling for a column to hold ~``column_voxels`` samples.
+
+    No samples pools once, not the 500-round maximum that "0 per column" asks for:
+    there is nothing to pool, and the rounds are paid for whether or not there is.
+    """
+    if int(n_samples) == 0:
+        return 1
     return _rounds_for(n_samples / max(int(n_columns), 1), column_voxels)
 
 
@@ -498,6 +504,12 @@ def cortical_depth_volumes(
         rounds = column_rounds
         if columns is not None:
             keep_t = torch.as_tensor(np.asarray(columns[h], bool), device=device)[owner_v]
+            if not bool(keep_t.any()):
+                # None of this hemisphere is in the region -- the other one's crop
+                # reaches across the midline. Nothing here survives, so measure nothing.
+                flat_owner[np.asarray(idx_t.cpu())] = -2
+                log(f"{s.name}: no column of the region on this grid")
+                continue
             if rounds is None:
                 # Pool as a whole-hemisphere run would. The surround exists so the
                 # region's own columns are complete, but the surround's outermost

@@ -85,6 +85,33 @@ def test_restriction_keeps_exactly_what_the_full_run_computed():
     assert not np.isin(part.border_idx, full.gm_idx[~keep]).any()
 
 
+def test_a_hemisphere_the_region_misses_is_dropped_unmeasured():
+    """A hemisphere with no column of the region costs nothing but its fill.
+
+    Its voxels are all dropped, and "0 voxels per column" would otherwise ask the
+    equivolume CDF for its 500-round maximum over a whole hemisphere.
+    """
+    import time
+
+    from fastfuncstuff.surface.volume_depth import RibbonSurfaces
+
+    s, v, affine, shape = shell(step=0.5)
+    # A second hemisphere on the same grid, clear of the first (the shells must not
+    # intersect, or one's white surface turns the other's GM into WM), which the
+    # region will not touch. The grid is widened along x to hold both.
+    off = np.array([19.0, 0.0, 0.0])
+    other = RibbonSurfaces("rh", s.white + off, s.pial + off, s.faces)
+    shape = (shape[0] + int(2 * off[0]), shape[1], shape[2])
+    empty = np.zeros(len(s.white), bool)
+    t0 = time.time()
+    out = cortical_depth_volumes(
+        [s, other], affine, shape, device=CPU, columns=[cap(v, 0.8), empty]
+    )
+    assert [h for h, _ in out.smooth_rounds] == [0], out.smooth_rounds
+    assert out.n_gm > 0 and all(r < 500 for _, r in out.smooth_rounds)
+    assert time.time() - t0 < 60
+
+
 def test_a_partial_depth_volume_roi_becomes_whole_columns(tmp_path):
     """A blob covering only the outer half of the ribbon gives full-depth columns."""
     from fastfuncstuff.io.afni import load_nifti, save_nifti

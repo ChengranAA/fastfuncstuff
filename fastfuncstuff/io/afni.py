@@ -2359,9 +2359,13 @@ def load_fmri_data(
     >>> data = load_fmri_data('func.nii.gz', 'mask.nii.gz')
     >>> print(f"Shape: {data.shape}")  # (n_timepoints, n_voxels)
     """
-    # Load fMRI data
+    # Read at the output precision, never get_fdata()'s float64 default: that is
+    # twice the whole 4-D file again before a single voxel is masked. nibabel
+    # applies the scl_slope/inter scaling in float64 either way and only then casts,
+    # so a float32 read is bit-identical to the old float64-then-cast route.
+    read_dtype = np.float64 if np.dtype(dtype) == np.float64 else np.float32
     fmri_img = load_nifti(fmri_file)
-    fmri_data = fmri_img.get_fdata()
+    fmri_data = fmri_img.get_fdata(dtype=read_dtype)
 
     if fmri_data.ndim != 4:
         raise ValueError(f"fMRI data must be 4D, got {fmri_data.ndim}D")
@@ -2379,16 +2383,30 @@ def load_fmri_data(
             f"Spatial dimensions mismatch: fMRI {fmri_data.shape[:3]} vs mask {mask_data.shape}"
         )
 
-    # Create boolean mask
-    mask_bool = mask_data > 0
-    n_voxels = mask_bool.sum()
+    # Gather the in-mask voxels straight out of the file layout, a block of
+    # volumes at a time: (t, voxels in file order) is a free view of nibabel's
+    # F-ordered array, so each block is one take over the mask instead of a
+    # per-timepoint boolean index (the loader's _voxel_major_masked_numpy, but
+    # landing time-major as this function's callers expect).
     n_timepoints = fmri_data.shape[3]
+    file_idx = _file_order_index((mask_data > 0).reshape(-1), fmri_data.shape[:3])
+    by_time = fmri_data.T.reshape(n_timepoints, -1)
+    data = np.empty((n_timepoints, file_idx.size), dtype=dtype)
+    n_cpu, _ = resolve_cpu_threads()
+    n_threads = max(1, min(_MAX_INNER_THREADS, n_cpu))
+    n_blocks = max(1, min(n_timepoints, 4 * n_threads))
+    bounds = np.linspace(0, n_timepoints, n_blocks + 1).astype(int)
 
-    # Extract masked data
-    data = np.zeros((n_timepoints, n_voxels), dtype=dtype)
-    for t in range(n_timepoints):
-        data[t] = fmri_data[..., t][mask_bool]
+    def _gather(k: int) -> None:
+        lo, hi = bounds[k], bounds[k + 1]
+        data[lo:hi] = np.take(by_time[lo:hi], file_idx, axis=1)
 
+    if n_threads <= 1:
+        for k in range(n_blocks):
+            _gather(k)
+    else:
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            list(pool.map(_gather, range(n_blocks)))
     return data
 
 

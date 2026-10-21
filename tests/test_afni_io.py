@@ -1073,3 +1073,46 @@ def test_afni_stats_bucket_keeps_labels_and_stat_types_through_a_warp(tmp_path):
     assert read_brick_stataux(w) == {0: (4, (6.0, 1826.0)), 2: (3, (1826.0,))}
     one = np.asarray(load_nifti(f"{out}[2]").dataobj).squeeze()
     np.testing.assert_array_equal(one, np.asarray(w.dataobj)[..., 2])
+
+
+def _load_fmri_data_reference(fmri_file, mask_file, dtype=np.float32):
+    """The pre-streaming load_fmri_data: float64 get_fdata, one boolean index per volume."""
+    fmri = nib.load(str(fmri_file)).get_fdata()
+    mask = nib.load(str(mask_file)).get_fdata() > 0
+    out = np.zeros((fmri.shape[3], int(mask.sum())), dtype=dtype)
+    for t in range(fmri.shape[3]):
+        out[t] = fmri[..., t][mask]
+    return out
+
+
+@pytest.mark.parametrize("stored", ["float32", "int16_scaled"])
+def test_load_fmri_data_matches_the_float64_reference(tmp_path, stored):
+    """The float32 block gather must be bit-identical to the old float64 route.
+
+    Covers a scaled int16 file too: nibabel applies scl_slope/inter in float64
+    whatever the requested dtype, so reading at float32 must not move a bit.
+    """
+    from fastfuncstuff.io.afni import load_fmri_data
+
+    rng = np.random.default_rng(0)
+    shape = (7, 6, 5, 23)
+    affine = np.diag([2.0, 2.0, 2.5, 1.0])
+    values = rng.normal(100.0, 15.0, size=shape)
+    if stored == "float32":
+        img = nib.Nifti1Image(values.astype(np.float32), affine)
+    else:
+        img = nib.Nifti1Image(np.round(values * 10).astype(np.int16), affine)
+        img.header.set_slope_inter(0.1037, -3.3)
+    fmri_file = tmp_path / "func.nii.gz"
+    nib.save(img, str(fmri_file))
+    mask = rng.random(shape[:3]) > 0.4
+    mask_file = tmp_path / "mask.nii.gz"
+    nib.save(nib.Nifti1Image(mask.astype(np.uint8), affine), str(mask_file))
+
+    expected = _load_fmri_data_reference(fmri_file, mask_file)
+    got = load_fmri_data(fmri_file, mask_file)
+
+    assert got.dtype == np.float32
+    assert got.shape == (shape[3], int(mask.sum()))
+    assert got.flags["C_CONTIGUOUS"]
+    np.testing.assert_array_equal(got, expected)

@@ -34,15 +34,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-# Import for memory-aware chunking
-try:
-    from fastfuncstuff.memory import estimate_chunk_size
-except ImportError:
-    # Fallback if memory module not available
-    estimate_chunk_size = None
-
 # Import for R² metric computation
 from fastfuncstuff.glm.xval import compute_r2_metric
+from fastfuncstuff.memory import estimate_chunk_size
 from fastfuncstuff.utils import cpu_if_mps
 
 
@@ -1170,28 +1164,20 @@ def fit_ridge_single_trial(
 
     # Determine chunk size (memory-aware if not specified)
     if chunk_size is None:
-        if estimate_chunk_size is not None:
-            # Determine n_regressors based on design type
-            if per_voxel_design:
-                # For per-voxel designs, use max trials across voxels
-                n_regressors = n_trials
-            else:
-                n_regressors = design_matrix.shape[1]
-
-            chunk_size = estimate_chunk_size(
-                n_voxels=n_voxels,
-                n_timepoints=n_timepoints,
-                n_regressors=n_regressors,
-                device=device,
-                operation="ridge",
-            )
-            if verbose:
-                print(f"  Auto-determined chunk size: {chunk_size:,} voxels")
-        else:
-            # Fallback to conservative default
-            chunk_size = 10000
-            if verbose:
-                print(f"  Using default chunk size: {chunk_size:,} voxels")
+        # Per-voxel designs: size for the max trials across voxels.
+        n_regressors = n_trials if per_voxel_design else design_matrix.shape[1]
+        # "ridge_cv", not "ridge": each chunk holds a full-length prediction
+        # timeseries per fraction until every fold has landed in it.
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=n_regressors,
+            device=device,
+            operation="ridge_cv",
+            n_fractions=n_fracs,
+        )
+        if verbose:
+            print(f"  Auto-determined chunk size: {chunk_size:,} voxels")
 
     # Process in chunks
     n_chunks = (n_voxels + chunk_size - 1) // chunk_size

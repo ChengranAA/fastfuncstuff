@@ -188,7 +188,9 @@ def heldout_prediction_r2(
             device=device,
             store_device=train_data.device,
         )
-        scored = _solve_and_score(moments, target, all_runs, device)
+        scored = _solve_and_score(
+            moments, target, all_runs, device, _score_chunk_size(target, device)
+        )
         if target.voxel_mask is None:
             r2 = scored
         else:
@@ -248,12 +250,32 @@ def _prepare_test_targets(
     return [_one(test_data, test_design, None)]
 
 
+def _score_chunk_size(target: _TestTarget, device: torch.device) -> int:
+    """Voxels per prediction chunk when scoring *target*.
+
+    Planned once per target, not per fit: the learning curve scores hundreds of
+    run subsets against the same target, so the planner must not run (or flush
+    the cache) inside that loop.
+    """
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    n_vox, n_test_tp = target.data_proj.shape
+    return estimate_chunk_size(
+        n_voxels=int(n_vox),
+        n_timepoints=int(n_test_tp),
+        n_regressors=int(target.design_proj.shape[1]),
+        device=device,
+        operation="glm",
+        empty_cache=False,
+    )
+
+
 def _solve_and_score(
     moments: RunMoments,
     target: _TestTarget,
     runs: list[int],
     device: torch.device,
-    chunk_size: int = 20000,
+    chunk_size: int,
 ) -> torch.Tensor:
     """Betas from the summed moments of *runs*, scored against the held-out side."""
     from fastfuncstuff.glm.xval import compute_r2_metric
@@ -469,11 +491,12 @@ def heldout_learning_curve(
                 store_device=store_device,
             )
             progress.update(n_train_runs)
+            chunk_size = _score_chunk_size(target, device)
 
             for k_idx, k in enumerate(subset_sizes):
                 scored = torch.stack(
                     [
-                        _solve_and_score(moments, target, list(runs), device)
+                        _solve_and_score(moments, target, list(runs), device, chunk_size)
                         for runs in subsets_by_k[k]
                     ],
                     dim=0,

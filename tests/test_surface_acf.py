@@ -48,6 +48,7 @@ def test_acf_of_smoothed_noise_is_the_kernels_own(sheet):
     np.testing.assert_allclose(got, truth, atol=0.04)
 
 
+@pytest.mark.slow  # 13s
 def test_mixed_noise_carries_the_requested_tail(sheet):
     v, f = sheet
     acf = ACF(0.5, 2.5, 6.0)
@@ -99,6 +100,7 @@ def test_cluster_areas_by_sidedness():
     assert bi == pytest.approx(max(area[pos].sum(), area[neg].sum()))
 
 
+@pytest.mark.slow  # 11s
 def test_clustsim_table_is_its_own_null_quantile_and_is_cached(tmp_path):
     v, f = _sheet(61, 1.0)
     acf = ACF(0.6, 2.0, 4.0)

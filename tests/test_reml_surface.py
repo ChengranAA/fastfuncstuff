@@ -140,6 +140,7 @@ def test_do_blur_on_a_surface_is_heat_smoothing_on_the_datas_own_mesh(tmp_path, 
     np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.slow  # 11s
 def test_surface_chain_blur_to_acf_and_clustsim(tmp_path, monkeypatch):
     # The localizer chain on a surface: blur TO a smoothness, fit, measure the residual
     # ACF, and attach SurfClustSim area tables to the bucket.

@@ -377,6 +377,7 @@ def _make_textured(nz=24, ny=40, nx=40, readout=0.5):
     return true, field, readout
 
 
+@pytest.mark.slow  # 16s
 def test_motion_estimation_reconciles_moved_pair():
     # Blip-down acquired after a small rigid head move dominated by a THROUGH-PLANE (z)
     # translation, which a phase-encode (y) field physically cannot represent -- so unlike

@@ -197,6 +197,7 @@ def test_uniform_drive_gives_sloped_bold_that_deveining_flattens():
     assert spread < 0.15, f"deveined profile should be flat for uniform drive, spread={spread:.3f}"
 
 
+@pytest.mark.slow  # 28s
 def test_drainage_shift_is_basis_referenced_at_every_k():
     """Bug of record: the contamination metric was wrong twice, the same way.
 

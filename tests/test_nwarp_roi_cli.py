@@ -152,6 +152,7 @@ def _psf_table(path, k):
     return m
 
 
+@pytest.mark.slow  # 22s
 def test_the_depth_psf_through_an_identity_chain_is_the_grid_one(world):
     """With no transform the native EPI grid is the master grid, so the matrix nwarp
     computes from exact chain coordinates must equal the one computed for data on that
@@ -175,6 +176,7 @@ def test_the_depth_psf_through_an_identity_chain_is_the_grid_one(world):
     assert (np.diag(got) > 0.4).all()
 
 
+@pytest.mark.slow  # 14s
 def test_several_depth_counts_read_the_data_once_and_write_a_set_per_count(world):
     """-depths 3 5: one pass over the data, PREFIX.K3.roi.* and PREFIX.K5.roi.*; each
     count's profile is the analytic shell means (so the shared tiling serves both) and the

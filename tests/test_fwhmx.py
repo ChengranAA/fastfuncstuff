@@ -119,6 +119,7 @@ def _find_3dfwhmx():
     return None
 
 
+@pytest.mark.slow  # 16s
 @pytest.mark.parametrize("sigma,vox", [(2.0, 1.0), (1.5, 2.0)])
 def test_parity_with_3dfwhmx_acf(sigma, vox):
     afni = _find_3dfwhmx()

@@ -58,6 +58,7 @@ def test_noise_sd_inverts_the_precision_not_the_variance():
     assert sd[1] < sd[0] < sd[2]
 
 
+@pytest.mark.slow  # 21s
 def test_simulated_data_is_the_prediction_plus_noise(params, inputs):
     y, clean = simulate_laminar_data(SPEC, params, inputs, N_SCANS, noise_sd=0.0, generator=None)
     assert torch.allclose(y, clean), "zero noise must return the prediction exactly"

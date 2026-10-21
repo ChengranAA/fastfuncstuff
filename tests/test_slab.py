@@ -67,6 +67,7 @@ def test_a_cell_across_a_boundary_splits_its_volume():
     assert (np.bincount(cell, minlength=len(cells)) > 1).any()
 
 
+@pytest.mark.slow  # 14s
 def test_a_patch_holds_every_cell_its_columns_own():
     surf, v, f = _sphere(slide=0.08)
     cap = np.flatnonzero(v[:, 2] > 0.6)
@@ -123,6 +124,7 @@ def test_equivolume_cells_beat_equidistant_on_bok_truth_with_pial_slide():
     assert err_equivol < 0.25 * err_equidist, (err_equivol, err_equidist)
 
 
+@pytest.mark.slow  # 27s
 def test_thicker_sheets_reach_the_tiling_and_the_estimate_is_exact():
     """The read budget relaxes only the sheet thickness; that must change the cells
     actually made, not just the estimate of them."""
@@ -138,6 +140,7 @@ def test_thicker_sheets_reach_the_tiling_and_the_estimate_is_exact():
     assert thick < thin
 
 
+@pytest.mark.slow  # 17s
 def test_float32_vertices_do_not_change_the_tiling():
     surf, v, f = _sphere()
     s32 = RibbonSurfaces("lh", surf.white.astype(np.float32), surf.pial.astype(np.float32), f)

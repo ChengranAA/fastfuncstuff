@@ -217,6 +217,7 @@ def test_recovers_per_frame_pe_shift(known_shift_series):
     assert np.abs(est + shifts).max() < 0.3
 
 
+@pytest.mark.slow  # 15s
 def test_single_echo_lanczos_correction_2d_slicewise(known_shift_series):
     """Single-echo, single-PE (2-D slicewise) correction is a 1-D shift along one axis, so
     lanczos routes through the windowed-sinc gather (not grid_sample). It must recover the
@@ -243,6 +244,7 @@ def test_single_echo_lanczos_correction_2d_slicewise(known_shift_series):
     assert not np.allclose(c_lin, c_lan, atol=1e-4)
 
 
+@pytest.mark.slow  # 18s
 def test_lanczos_generalizes_to_slice_stack_rank3():
     """The resampler is rank-generic (batch dim 0): a (B,H,W) slice stack shifts along its
     W axis exactly like the 4-D path, so the 2-D correction can reuse it."""

@@ -58,6 +58,7 @@ def _means(roi_set, data):
     return roi_set.collapse(sel, device=CPU).numpy()
 
 
+@pytest.mark.slow  # 10s
 @pytest.mark.parametrize("method", ["equidistant", "equivolume"])
 def test_bins_land_on_the_analytic_shells(sphere, tmp_path, method):
     surf, affine, shape, data, v = sphere
@@ -79,6 +80,7 @@ def test_bins_land_on_the_analytic_shells(sphere, tmp_path, method):
     np.testing.assert_allclose(vol, want_vol, rtol=0.005)
 
 
+@pytest.mark.slow  # 20s
 def test_the_two_methods_differ_where_they_should(sphere, tmp_path):
     surf, affine, shape, data, v = sphere
     label = _all_label(tmp_path, len(v))
@@ -185,6 +187,7 @@ def test_label_coordinates_pick_and_check_the_hemisphere(tmp_path):
         )
 
 
+@pytest.mark.slow  # 22s
 def test_the_sampling_matrix_predicts_what_the_depth_read_measures(sphere, tmp_path):
     """A voxel integrates the depths inside it; the ROI read then interpolates and
     averages. The sampling matrix claims to be that whole path for a depth profile

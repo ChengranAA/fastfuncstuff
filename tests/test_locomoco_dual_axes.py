@@ -927,6 +927,7 @@ def test_echo_count_sweep_interecho_and_scaled(tmp_path, n_echo):
     assert len(inter.per_echo) == n_echo and inter.alpha.shape == (n_echo,)
 
 
+@pytest.mark.slow  # 11s
 @pytest.mark.parametrize("n_echo", [2, 3, 5])
 def test_echo_count_sweep_qwarp(tmp_path, n_echo):
     """qwarp polish over 2..N echoes, single axis and dual."""

@@ -94,6 +94,7 @@ def _shell_mean(a, b):
     return 0.75 * (b**4 - a**4) / (b**3 - a**3)
 
 
+@pytest.mark.slow  # 10s
 def test_ribbon_reads_land_on_the_analytic_shells_in_passes(sphere_world):
     surf, path, ident, label, n_v = sphere_world
     opts = DepthOptions(n_depths=3, dxyz=1.0)
@@ -110,6 +111,7 @@ def test_ribbon_reads_land_on_the_analytic_shells_in_passes(sphere_world):
     np.testing.assert_allclose(one.sizes, 4 / 3 * np.pi * np.diff(e**3), rtol=0.01)
 
 
+@pytest.mark.slow  # 22s
 def test_two_rois_in_passes_equal_one_pass(sphere_world, tmp_path):
     surf, path, ident, label, n_v = sphere_world
     v, _ = icosphere(4)

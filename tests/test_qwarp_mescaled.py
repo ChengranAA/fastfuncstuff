@@ -70,6 +70,7 @@ def _corr(a: torch.Tensor, b: torch.Tensor, m: torch.Tensor) -> float:
     "cost,optimizer",
     [("ncc", "gn"), ("ncc", "adam"), pytest.param("lpa", "adam", marks=pytest.mark.gpu)],
 )
+@pytest.mark.slow  # 12s
 def test_single_echo_recovers_field_and_improves_alignment(cost, optimizer):
     nz, ny, nx = 10, 24, 24
     base = _smooth_volume(nz, ny, nx, seed=0)

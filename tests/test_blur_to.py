@@ -109,6 +109,7 @@ def test_a_detrended_master_mistakes_the_task_for_smoothness_and_residuals_do_no
     assert k_detr < 0.9 * k_resid
 
 
+@pytest.mark.slow  # 35s
 def test_forty_time_points_pin_the_kernel(sheet):
     # The default -blur_to_columns: across seeds, the kernel 40 points choose stays
     # within a few percent of the one all 400 choose.
@@ -255,6 +256,7 @@ def test_volume_blur_to_lands_on_the_target_on_the_whole_data():
     assert none is None and start > 2.0
 
 
+@pytest.mark.slow  # 18s
 def test_reml_volume_blur_to_reaches_the_target_in_the_fit_residuals(tmp_path, monkeypatch, capsys):
     import nibabel as nib
 
@@ -349,6 +351,7 @@ def test_local_blur_to_evens_out_a_volume_that_is_rough_on_one_side():
     np.testing.assert_allclose(ad(held)[out], held[out], rtol=1e-6)
 
 
+@pytest.mark.slow  # 12s
 def test_surface_local_blur_to_evens_out_a_sheet_that_is_rough_on_one_side(sheet):
     from fastfuncstuff.surface.acf import blur_to_fwhm, blur_to_fwhm_local, local_surface_fwhm
 
@@ -380,6 +383,7 @@ def test_surface_local_blur_to_evens_out_a_sheet_that_is_rough_on_one_side(sheet
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.slow  # 12s
 def test_volume_blur_to_tsnr_blurs_noisy_white_noise_not_clean_or_structured():
     import torch
 

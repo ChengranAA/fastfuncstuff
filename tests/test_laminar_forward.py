@@ -186,6 +186,7 @@ def test_laminar_bold_increases_toward_surface():
     assert y[:, 0].min() < -0.05
 
 
+@pytest.mark.slow  # 17s
 def test_batched_matches_looped():
     """Batch-first is the whole design; it must be numerically identical."""
     spec = _driver_spec(3, 7)

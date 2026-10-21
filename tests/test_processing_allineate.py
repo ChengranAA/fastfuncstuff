@@ -1886,6 +1886,7 @@ class TestMovie:
         inner = expected > 0.05
         torch.testing.assert_close(final[inner], expected[inner], atol=2e-3, rtol=2e-3)
 
+    @pytest.mark.slow  # 11s
     def test_no_recorder_leaves_the_search_untouched(self):
         base, source = self._pair()
         m_plain, _ = allineate(base, source, config=self._cfg())

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from fastfuncstuff.processing.presurf import (
@@ -70,6 +71,7 @@ def test_clean_mask_opening_cuts_bridge_without_prior():
     assert not cleaned[eye].any() and cleaned[brain].all()
 
 
+@pytest.mark.slow  # 22s
 def test_util_presurf_cli_end_to_end(tmp_path):
     """Smoke: the whole CLI on a phantom, into a not-yet-existing prefix directory."""
     import nibabel as nib
@@ -110,6 +112,7 @@ def test_util_presurf_cli_end_to_end(tmp_path):
         assert (tmp_path / "out" / f"sub_{name}.nii.gz").exists(), name
 
 
+@pytest.mark.slow  # 27s
 def test_util_presurf_cli_denoise_reg(tmp_path):
     """-denoise reg: joint INV1/INV2 denoising feeds both segmentations."""
     import nibabel as nib

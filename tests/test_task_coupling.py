@@ -1911,6 +1911,7 @@ def _locomoco_run(tmp_path, stem, *extra):
     return rc
 
 
+@pytest.mark.slow  # 19s
 def test_component_scan_runs_with_task_qc_and_changes_no_field(capsys, tmp_path):
     """-task_qc scores the field's INDEPENDENT components without touching it.
 
@@ -1933,12 +1934,14 @@ def test_component_scan_runs_with_task_qc_and_changes_no_field(capsys, tmp_path)
     assert not (tmp_path / "scan_locomoco_rejected.1D").exists()
 
 
+@pytest.mark.slow  # 19s
 def test_task_comps_off_skips_the_scan(capsys, tmp_path):
     stem = str(tmp_path / "off")
     _locomoco_run(tmp_path, stem, "-task_qc", "-task_comps", "off")
     assert "WARP TASK SCAN" not in capsys.readouterr().out
 
 
+@pytest.mark.slow  # 21s
 def test_detask_ica_does_not_decompose_twice(capsys, tmp_path):
     """The acting mode runs the same decomposition, so the scan must stand down."""
     stem = str(tmp_path / "act")

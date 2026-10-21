@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import nibabel as nib
 import numpy as np
+import pytest
 
 from fastfuncstuff.cli.allineate import main
 from fastfuncstuff.processing.affine import load_matrix_1D, read_aff12_rows
@@ -121,6 +122,7 @@ def _slab_pair(tmp_path):
     return base_aff, true_aff, true_aff
 
 
+@pytest.mark.slow  # 22s
 def test_the_header_placement_is_always_a_candidate(tmp_path):
     """Bug of record (ds003427): a posterior MP2RAGE slab against an oblique EPI
     slab, same session, headers within 4 mm. cmass moved the source several cm and

@@ -76,6 +76,7 @@ def _check_depth_table(path, n):
     return header, rows
 
 
+@pytest.mark.slow  # 23s
 def test_reml_fits_each_depth_and_orders_them(brain):
     tmp = brain
     res = subprocess.run(  # noqa: S603
@@ -148,6 +149,7 @@ def test_depth_flag_help_renders():
     assert "-depth_smooth" in text and "-depth_interp" in text
 
 
+@pytest.mark.slow  # 24s
 def test_several_depth_counts_are_one_fit_with_a_k_column(brain):
     """-depths 3 5: one load, one fit, every (K, depth) a row; K is a table column and
     each count's depth profile is ordered like its single-count run."""
@@ -185,6 +187,7 @@ def test_several_depth_counts_are_one_fit_with_a_k_column(brain):
     assert len(psf) == 3 * 3 + 5 * 5
 
 
+@pytest.mark.slow  # 24s
 def test_deconvolve_takes_several_depth_counts_too(brain, monkeypatch):
     from fastfuncstuff.cli import deconvolve
 

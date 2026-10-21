@@ -296,6 +296,7 @@ def _sim(prefix, *extra):
     assert main(base + list(extra)) == 0
 
 
+@pytest.mark.slow  # 12s
 def test_compare_summarises_each_design_over_its_realizations(tmp_path, capsys):
     _sim(tmp_path / "a", "-scan_time", "200", "-ndesigns", "3", "-no_plots")
     _sim(tmp_path / "b", "-scan_time", "200", "-ndesigns", "2", "-no_plots")
@@ -369,6 +370,7 @@ def test_compare_needs_matching_names(tmp_path, capsys):
     )
 
 
+@pytest.mark.slow  # 29s
 def test_hrf_figure_written_only_under_mismatch(tmp_path):
     _sim(tmp_path / "same", "-ndesigns", "1")
     assert not (tmp_path / "same_hrf.png").exists()
@@ -453,6 +455,7 @@ def test_summary_reports_design_quality(tmp_path, capsys):
     assert "hardest to tell apart" not in out
 
 
+@pytest.mark.slow  # 63s
 def test_scan_times_sweep_writes_its_table_and_figure(tmp_path, capsys):
     blocks = ["-block", "E1", "30", "1", "-block", "E2", "30", "1", "-isi", "10"]
     base = ["-tr", "1", "-nruns", "2", "-scan_time", "330", *blocks, "-tsnr", "60",
@@ -497,6 +500,7 @@ def test_isi_list_names_a_pool_any_spec_can_use():
     assert str(spec.isi) == "even:GAP-1" and spec.units[0].items[0].off.kind == "choice"
 
 
+@pytest.mark.slow  # 28s
 def test_responses_report_power_at_the_given_experiment(tmp_path, capsys):
     base = ["-tr", "1", "-nruns", "1", "-trial", "A", "0.5", "12", "-trial", "B", "0.5", "12",
             "-isi", "exp:4,2,10", "-post_fix", "15", "-contrast", "A", "-contrast", "A-B",
@@ -525,6 +529,7 @@ def test_target_reaches_the_summary_and_mismatch_false_positives_are_split(tmp_p
     assert "condition contrasts; differences below" in out
 
 
+@pytest.mark.slow  # 16s
 def test_rank_by_picks_best_and_worst_by_a_goal(tmp_path):
     _sim(tmp_path / "r", "-ndesigns", "3", "-rank_by", "shape")
     assert (tmp_path / "r_designs.png").stat().st_size > 10_000

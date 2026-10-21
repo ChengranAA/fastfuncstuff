@@ -131,6 +131,7 @@ class TestOptiwarpFoldGuard:
         assert guarded.min_jacobian == pytest.approx(plain.min_jacobian, rel=1e-9)
         assert guarded.levels[0].damped_iters == 0
 
+    @pytest.mark.slow  # 12s
     def test_guard_opens_up_a_setting_that_was_illegal(self, pair):
         """The point of the whole exercise: low regularization used to be
         unusable because it folded, not because it fit badly."""
@@ -163,6 +164,7 @@ class TestFormwarpFoldGuard:
         )
         return formwarp(fixed, moving, config=cfg, device=CPU)
 
+    @pytest.mark.slow  # 13s
     def test_guard_is_a_no_op_at_default_regularization(self, pair):
         a = self._syn(pair)
         b = self._syn(pair, fold_guard=0.0, fold_aware_best=False)

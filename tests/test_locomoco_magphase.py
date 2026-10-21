@@ -386,6 +386,7 @@ def test_two_axis_result_is_a_dual_locomoco_result():
     assert torch.allclose(comps[1], flow.u_field)
 
 
+@pytest.mark.slow  # 18s
 def test_cli_two_axis_with_phase_writes_both_components(tmp_path):
     """-pe_dir (in-plane) + -pe_dir2 (partition) + -phase now runs: per echo both flow
     components are written, the partition one TE-scaled, plus the corrected phase."""

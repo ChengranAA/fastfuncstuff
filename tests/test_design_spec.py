@@ -503,6 +503,7 @@ def test_compile_refuses_to_overwrite_xmat(tmp_path):
     assert xmat.read_text() == "this is stale content\n"
 
 
+@pytest.mark.slow  # 12s
 def test_reml_spec_rebuilds_its_own_xmat_but_still_guards_a_named_one(tmp_path):
     """`ffs_reml -spec` re-run after a TOML edit must not abort on the stale xmat.
 

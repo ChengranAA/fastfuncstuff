@@ -40,6 +40,7 @@ def _table(path):
     return rows[0], rows[1:]
 
 
+@pytest.mark.slow  # 55s
 def test_the_cli_writes_the_four_tables(reference, tmp_path):
     o, a, b, kern = reference
     prefix = str(tmp_path / "quick")

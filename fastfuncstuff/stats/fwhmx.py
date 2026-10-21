@@ -327,12 +327,12 @@ def estimate_fwhmx_run(
     n_time = int(resid_2d.shape[1])
 
     # Timepoint chunk sized to fit a handful of float32 working volumes (vol,
-    # demeaned copy, transient products). Diagnostics run AFTER the fit, so on
-    # CUDA size against the driver's real free memory (mem_get_info), not
-    # total-reserved -- other resident tensors would otherwise be ignored and
-    # OOM the chunk. ~6 planes/timepoint covers the working copies.
+    # demeaned copy, transient products). Diagnostics run AFTER the fit -- a
+    # stage boundary -- so the flush in get_available_memory is wanted here; it
+    # sizes against the driver's free figure, so tensors still resident from the
+    # fit are accounted for. ~6 planes/timepoint covers the working copies.
     plane_bytes = s0 * s1 * s2 * 4
-    avail = _free_bytes(device)
+    avail = get_available_memory(device)
     tchunk = max(1, min(n_time, int(avail // max(1, plane_bytes * 6))))
 
     # First pass over chunks: classic FWHM (Forman) to fix the ACF radius.
@@ -430,23 +430,6 @@ def estimate_fwhmx_run(
         n_subbricks=n_bricks,
         acf_fwhm_axes=axes_fwhm,
     )
-
-
-def _free_bytes(device: torch.device) -> int:
-    """Usable bytes for chunking, halved for the caching allocator's overhead.
-
-    On CUDA use the driver's real free figure (``mem_get_info``) so tensors from
-    the preceding fit -- or another process -- are accounted for; fall back to
-    the Memory module elsewhere.
-    """
-    if device.type == "cuda":
-        try:
-            torch.cuda.empty_cache()
-            free, _total = torch.cuda.mem_get_info(device)
-            return int(free * 0.5)
-        except Exception:
-            pass
-    return get_available_memory(device)
 
 
 def _scatter(chunk: Tensor, mask: Tensor, shape: tuple[int, int, int, int], device) -> Tensor:

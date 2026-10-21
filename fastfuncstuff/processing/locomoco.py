@@ -969,12 +969,14 @@ def _phase_slope_dense(
     # complex tensors; at dense settings that is still GiBs for a long series.
     # Process the frame batch in chunks sized to fit — the per-patch estimate is
     # independent across frames, so this is exact.
+    from ..memory import get_available_memory
+
     per_frame = kmax * max(h, w) * max(lh, lw) * 48  # ~3 complex working tensors
-    if device.type == "cuda":
-        free_b, _ = torch.cuda.mem_get_info(device)
-        budget = int(0.4 * free_b)
-    else:
-        budget = 2 * 1024**3
+    # Called once per warping iteration, so no cache flush. Off CUDA the 2 GiB
+    # cap keeps the host working set modest; the chunking is exact either way.
+    budget = get_available_memory(device, safety_factor=0.4, empty_cache=False)
+    if device.type != "cuda":
+        budget = min(budget, 2 * 1024**3)
     chunk = max(1, min(b, budget // max(1, per_frame)))
 
     out = torch.empty(b, h, w, device=device, dtype=dtype)
@@ -7907,7 +7909,7 @@ def warp_project_out(components, bad_timecourses, device=None):
         # per-voxel mean next to a small displacement), so the planner must budget 8
         # bytes per element or it under-sizes by exactly 2x.
         chunk = estimate_chunk_size(
-            n_vox, n_t, q.shape[1] + 4, dev, operation="glm", use_double=True
+            n_vox, n_t, q.shape[1] + 4, dev, operation="glm", use_double=True, empty_cache=False
         )
         for start in range(0, n_vox, chunk):
             y = flat[start : start + chunk].to(device=dev, dtype=torch.float64).T  # (T, c)

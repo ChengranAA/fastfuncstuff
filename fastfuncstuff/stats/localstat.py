@@ -738,7 +738,11 @@ def local_acf(
             # The batched LM fit holds ~14 live (chunk, K) float64 temporaries;
             # chunk voxels so that footprint stays within the memory budget.
             bytes_per_voxel = n_bins * 8 * 16
-            fit_chunk = int(get_available_memory(device) // max(1, bytes_per_voxel))
+            # Sized per slab (the slab's own tensors are live), so no flush:
+            # a cache flush here is a device sync per z-slab.
+            fit_chunk = int(
+                get_available_memory(device, empty_cache=False) // max(1, bytes_per_voxel)
+            )
             fit_chunk = max(4096, min(fit_chunk, idx.numel()))
             for c0 in range(0, idx.numel(), fit_chunk):
                 cidx = idx[c0 : c0 + fit_chunk]

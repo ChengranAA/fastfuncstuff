@@ -1516,6 +1516,7 @@ def estimate_chunk_size(
     n_runs: int = 1,
     n_splits: int = 1,
     verbose: bool = False,
+    empty_cache: bool = True,
 ) -> int:
     """
     Estimate optimal chunk size for memory-efficient processing.
@@ -1545,6 +1546,10 @@ def estimate_chunk_size(
         If True, account for float64 (2x memory)
     verbose : bool, default=False
         Print chunk size estimation details
+    empty_cache : bool, default=True
+        Passed to :func:`get_available_memory`. Pass False when planning
+        inside a loop: a flush there is a device sync per iteration and hands
+        back blocks the caching allocator is about to reuse anyway.
 
     Returns
     -------
@@ -1660,7 +1665,7 @@ def estimate_chunk_size(
         bytes_per_voxel = int(bytes_per_voxel * config.double_precision_multiplier)
 
     # Get available memory (uses config defaults if safety_factor is None)
-    available_bytes = get_available_memory(device, safety_factor)
+    available_bytes = get_available_memory(device, safety_factor, empty_cache=empty_cache)
 
     # Estimate chunk size based on memory
     if bytes_per_voxel > 0:

@@ -42,17 +42,24 @@ def _interp_dtype(device: torch.device) -> torch.dtype:
 def _row_chunk(n_rows: int, nt: int, device: torch.device) -> int:
     """Time series per chunk for the detrend -> shift -> retrend chain on ``device``.
 
-    Local per-row model (not a memory.py planner): about sixteen float64 copies of
-    a row are live at the peak -- the float32 input and its float64 promotion, the
-    detrended pair, the zero-padded FFT buffer, the complex spectrum and its
-    phase-rotated product, the inverse, and the retrend. Planned once per shift
-    group, so no cache flush.
+    The per-row model is :func:`fastfuncstuff.memory.bytes_per_row_slicetime`.
+    Bounds are 1..n_rows rather than the config's voxel-chunk defaults: a row is
+    a whole time series, and one chunk covering the group is the common case.
+    Planned once per shift group, so no cache flush.
     """
-    from fastfuncstuff.memory import get_available_memory
+    from fastfuncstuff.memory import estimate_chunk_size
 
-    bytes_per_row = 16 * 8 * max(1, nt)
-    avail = get_available_memory(device, empty_cache=False)
-    return max(1, min(n_rows, int(avail // bytes_per_row)))
+    n = max(1, n_rows)
+    return estimate_chunk_size(
+        n_voxels=n,
+        n_timepoints=nt,
+        n_regressors=0,
+        device=device,
+        operation="slicetime",
+        min_chunk_size=1,
+        max_chunk_size=n,
+        empty_cache=False,
+    )
 
 
 # ---------------------------------------------------------------------------

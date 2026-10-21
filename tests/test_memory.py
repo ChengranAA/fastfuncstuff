@@ -750,6 +750,17 @@ class TestGlmPlannerHelpers:
         with patch("fastfuncstuff.memory.get_available_memory", return_value=bpv * 10):
             assert check_cuda_memory_before_batch(20000, 200, 10, cpu) == 100
 
+    def test_slicetime_row_chunk_matches_its_old_local_model(self):
+        """_row_chunk moved onto the planner; sizes must not move with it."""
+        from fastfuncstuff.processing.slicetime import _row_chunk
+
+        cpu = torch.device("cpu")
+        nt = 300
+        for avail, n_rows in [(16 * 8 * nt * 5000, 20000), (10**12, 3000), (10, 20000)]:
+            old = max(1, min(n_rows, int(avail // (16 * 8 * nt))))
+            with patch("fastfuncstuff.memory.get_available_memory", return_value=avail):
+                assert _row_chunk(n_rows, nt, cpu) == old
+
     def test_arma_gls_glts_add_covariance(self):
         from fastfuncstuff.memory import bytes_per_voxel_arma_gls
 

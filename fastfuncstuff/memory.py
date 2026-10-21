@@ -831,6 +831,20 @@ def bytes_per_voxel_ridge_cv(
     return base + n_fractions * per_frac * 4
 
 
+def bytes_per_row_slicetime(n_timepoints: int) -> int:
+    """Memory per time series for ``processing.slicetime``'s shift chain.
+
+    About sixteen float64 copies of a row are live at the peak of the
+    detrend -> shift -> retrend chain: the float32 input and its float64
+    promotion, the detrended pair, the zero-padded FFT buffer, the complex
+    spectrum and its phase-rotated product, the inverse, and the retrend.
+
+    Already in float64 bytes -- the chain promotes internally whatever the
+    input dtype -- so plan with ``use_double=False``.
+    """
+    return 16 * 8 * max(1, n_timepoints)
+
+
 _MOCO_RESAMPLE_NTAPS = {"wsinc5": 11, "heptic": 8, "quintic": 6, "cubic": 4, "linear": 1}
 
 
@@ -1714,6 +1728,8 @@ def estimate_chunk_size(
         )
     elif operation == "ridge_cv":
         bytes_per_voxel = bytes_per_voxel_ridge_cv(n_timepoints, n_regressors, n_fractions)
+    elif operation == "slicetime":
+        bytes_per_voxel = bytes_per_row_slicetime(n_timepoints)
     elif operation == "lss":
         bytes_per_voxel = bytes_per_voxel_lss(
             n_timepoints,

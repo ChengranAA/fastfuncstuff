@@ -173,12 +173,28 @@ def _surface_rois(path: str, surfaces, notes: list[str]) -> list[_Roi]:
     ]
 
 
-def _volume_rois(path: str, surfaces, notes: list[str]) -> list[_Roi]:
-    """A volume ROI, mapped to the columns whose midthickness point lies inside it.
+#: Depth fractions (white 0 to pial 1) a volume ROI is read at to claim a column.
+#: One midthickness read is the depth-sampling default -- a column is in an ROI if
+#: the ROI is there at mid-depth. The spread is for ``ffs_util_surf2layers``, where
+#: the ROI is usually a thresholded statistic that only reaches part of the ribbon.
+CLAIM_MID = (0.5,)
+CLAIM_ANY = (0.1, 0.25, 0.4, 0.55, 0.7, 0.85)
+
+
+def _volume_rois(
+    path: str, surfaces, notes: list[str], claim: tuple[float, ...] = CLAIM_MID
+) -> list[_Roi]:
+    """A volume ROI, mapped to the columns whose ribbon lies inside it.
 
     Read on the ROI file's own grid (any resolution, in register with the surfaces),
     nearest voxel: a 3-D integer map gives one ROI per label, a 4-D stack one per
     volume (any value above zero is in).
+
+    ``claim`` are the depth fractions (white 0 to pial 1) read along each column; the
+    column joins if the ROI is there at *any* of them. With one fraction this is a
+    point test -- the usual midthickness rule -- and with several it is the rule for
+    an ROI that need not span the depth, such as a thresholded statistic that peaks
+    near the pial surface and falls below threshold at the white matter.
     """
     from fastfuncstuff.io.afni import load_nifti
     from fastfuncstuff.io.labels import label_table
@@ -190,19 +206,28 @@ def _volume_rois(path: str, surfaces, notes: list[str]) -> list[_Roi]:
     if arr.ndim not in (3, 4):
         raise ValueError(f"{path}: ROI files must be 3-D or 4-D, got {arr.ndim}-D")
     inv = np.linalg.inv(np.asarray(img.affine, np.float64))
-    sampled = []  # per surface: (V,) or (V, n) values at midthickness
+    fracs = np.asarray(claim, np.float64)
+    sampled = []  # per surface: (V, len(claim)) or (V, len(claim), n) values on the column
     for s in surfaces:
-        mid = 0.5 * (np.asarray(s.white, np.float64) + np.asarray(s.pial, np.float64))
-        ijk = np.rint(mid @ inv[:3, :3].T + inv[:3, 3]).astype(np.int64)
-        inside = np.all((ijk >= 0) & (ijk < np.asarray(arr.shape[:3])), axis=1)
-        vals = np.zeros((len(mid), *arr.shape[3:]), arr.dtype)
-        vals[inside] = arr[ijk[inside, 0], ijk[inside, 1], ijk[inside, 2]]
+        w = np.asarray(s.white, np.float64)
+        p = np.asarray(s.pial, np.float64)
+        vals = np.zeros((len(w), fracs.size, *arr.shape[3:]), arr.dtype)
+        for d, frac in enumerate(fracs):
+            pts = w + frac * (p - w)
+            ijk = np.rint(pts @ inv[:3, :3].T + inv[:3, 3]).astype(np.int64)
+            inside = np.all((ijk >= 0) & (ijk < np.asarray(arr.shape[:3])), axis=1)
+            vals[inside, d] = arr[ijk[inside, 0], ijk[inside, 1], ijk[inside, 2]]
         sampled.append(vals)
-    notes.append(f"{Path(path).name}: volume ROI, each column joins by its midthickness point")
+    where = (
+        "its midthickness point"
+        if fracs.size == 1
+        else f"any of {fracs.size} points along it (depth {fracs.min():g}-{fracs.max():g})"
+    )
+    notes.append(f"{Path(path).name}: volume ROI, each column joins by {where}")
     if arr.ndim == 4:
         return [
             _Roi(j + 1, f"{_stem(path)}_{j + 1}" if arr.shape[3] > 1 else _stem(path),
-                 {i: v[:, j] > 0 for i, v in enumerate(sampled)})
+                 {i: (v[:, :, j] > 0).any(1) for i, v in enumerate(sampled)})
             for j in range(arr.shape[3])
         ]  # fmt: skip
     if not np.array_equal(arr, np.round(arr)):
@@ -214,20 +239,24 @@ def _volume_rois(path: str, surfaces, notes: list[str]) -> list[_Roi]:
         _Roi(
             lab,
             _stem(path) if one else (table[lab].name if lab in table else f"{_stem(path)}_{lab}"),
-            {i: v == lab for i, v in enumerate(sampled)},
+            {i: (v == lab).any(1) for i, v in enumerate(sampled)},
         )
         for lab in labels
     ]
 
 
-def _read_rois(paths: list[str], surfaces, notes: list[str]) -> list[_Roi]:
+def _read_rois(
+    paths: list[str], surfaces, notes: list[str], claim: tuple[float, ...] = CLAIM_MID
+) -> list[_Roi]:
     from fastfuncstuff.io.gifti import is_gifti
 
     rois: list[_Roi] = []
     for f in paths:
         plain = f.split("[")[0]
-        on_surface = plain.lower().endswith((".label", ".annot")) or is_gifti(plain)
-        rois += (_surface_rois if on_surface else _volume_rois)(plain, surfaces, notes)
+        if plain.lower().endswith((".label", ".annot")) or is_gifti(plain):
+            rois += _surface_rois(plain, surfaces, notes)
+        else:
+            rois += _volume_rois(plain, surfaces, notes, claim)
     if len(paths) > 1:  # labels repeat across files; the table needs distinct ids
         for k, r in enumerate(rois):
             r.rid = k + 1
@@ -377,10 +406,20 @@ def _check_options(opts: DepthOptions) -> None:
         raise ValueError(f"read interpolation must be one of {READ_KERNELS}, not {opts.interp!r}")
 
 
-def read_depth_rois(files: list[str], surfaces, notes: list[str]) -> list[_Roi]:
-    """The ROIs of ``files`` that cover any vertex of ``surfaces``."""
+def read_depth_rois(
+    files: list[str], surfaces, notes: list[str], claim: tuple[float, ...] = CLAIM_MID
+) -> list[_Roi]:
+    """The ROIs of ``files`` that cover any vertex of ``surfaces``.
+
+    One ROI per label, per 4-D volume or per ``.annot`` region, each holding the
+    cortical columns it covers (``members``: surface index -> vertex mask). The one
+    reading of ``-atlas`` / ``-rois`` against a ribbon, shared by the depth sampling
+    and by ``ffs_util_surf2layers``'s ``-roi``; ``claim`` is :func:`_volume_rois`'s.
+    """
     rois = [
-        r for r in _read_rois(files, surfaces, notes) if any(m.any() for m in r.members.values())
+        r
+        for r in _read_rois(files, surfaces, notes, claim)
+        if any(m.any() for m in r.members.values())
     ]
     if not rois:
         raise ValueError("no ROI covers any vertex of the surfaces given")

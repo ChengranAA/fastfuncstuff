@@ -294,8 +294,45 @@ def geodesic_reach(
     return near[inside], d[inside]
 
 
+def dilate_patch(
+    vertices: np.ndarray, topo: MeshTopology, mask: np.ndarray, radius_mm: float
+) -> np.ndarray:
+    """``mask`` grown to every vertex within ``radius_mm`` of it along the mesh."""
+    mask = np.asarray(mask, bool)
+    seeds = np.flatnonzero(mask)
+    if seeds.size == 0 or radius_mm <= 0:
+        return mask.copy()
+    ids, _ = geodesic_reach(vertices, topo, seeds, float(radius_mm))
+    out = mask.copy()
+    out[ids] = True
+    return out
+
+
+def close_patch(
+    vertices: np.ndarray, topo: MeshTopology, mask: np.ndarray, radius_mm: float
+) -> np.ndarray:
+    """``mask`` with holes and notches narrower than ``2 * radius_mm`` filled.
+
+    A morphological closing along the mesh -- dilate, then erode by the same
+    radius -- which is what turns a thresholded blob into a patch: the voxels
+    that fell below threshold inside a region come back, and the region's
+    outline does not move. A plain dilation would do the first by also doing
+    the second.
+    """
+    mask = np.asarray(mask, bool)
+    if radius_mm <= 0 or not mask.any():
+        return mask.copy()
+    grown = dilate_patch(vertices, topo, mask, radius_mm)
+    if grown.all():
+        return grown
+    # Erosion of the dilation: what the complement's own dilation cannot reach.
+    return (grown & ~dilate_patch(vertices, topo, ~grown, radius_mm)) | mask
+
+
 __all__ = [
     "MeshTopology",
+    "close_patch",
+    "dilate_patch",
     "even_spacing",
     "face_normals",
     "geodesic_ball",

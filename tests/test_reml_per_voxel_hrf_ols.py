@@ -149,3 +149,53 @@ def test_voxels_without_an_hrf_assignment_take_the_middle_curve(tmp_path, extra)
     )
     assert res.returncode == 0, res.stdout[-2500:] + res.stderr[-1500:]
     assert "middle curve (index 1)" in res.stdout
+
+
+def test_xval_r2_scores_each_voxel_with_its_own_hrf(tmp_path):
+    """-xval_r2 scored every voxel against design_info["matrix"], one
+    representative HRF's design, although the fit (and ffs_reml's own advice
+    under -beta_cv) was per-voxel."""
+    tt = np.arange(320) * 0.1
+    lib = np.stack([_hrf(tt, 3.0), _hrf(tt, 9.0)])
+    lib /= lib.max(1, keepdims=True)
+    torch.save(
+        {"hrf_library": torch.tensor(lib, dtype=torch.float32)}, tmp_path / "lib_hrf_library.pt"
+    )
+    idx = (np.indices(SHAPE).sum(0) % 2) + 1
+    nib.save(
+        nib.Nifti1Image(idx.astype(np.float32), np.diag([3, 3, 3, 1])),
+        tmp_path / "lib_hrf_index.nii.gz",
+    )
+    nt = 120
+    onsets = np.arange(6, nt - 25, 9.3)
+    x = np.zeros(nt * 10)
+    for o in onsets:
+        x[int(round(o * 10)) : int(round(o * 10)) + 10] = 1
+    resp = np.stack([np.convolve(x, h)[: len(x)][::10][:nt] for h in lib])
+    rng = np.random.default_rng(3)
+    for r in range(3):
+        data = 100 + 3 * resp[idx - 1] + rng.normal(0, 0.5, (*SHAPE, nt))
+        nib.save(
+            nib.Nifti1Image(data.astype(np.float32), np.diag([3, 3, 3, 1])),
+            tmp_path / f"run{r}.nii.gz",
+        )
+    (tmp_path / "ev.tsv").write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t1\ta\n" for o in onsets)
+    )
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.reml", "-input"]
+        + [f"run{r}.nii.gz" for r in range(3)]
+        + ["-events"]
+        + ["ev.tsv"] * 3
+        + ["-TR", "1", "-device", "cpu", "-hrfopt_prefix", "lib", "-Rbuck", "r"]
+        + ["-xval_r2", "-noise_ceiling", "loro"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
+    )
+    assert res.returncode == 0, res.stdout[-2500:] + res.stderr[-1500:]
+    r2 = np.asanyarray(nib.load(tmp_path / "r_xval_r2.nii.gz").dataobj)
+    r2 = r2[..., 0] if r2.ndim == 4 else r2
+    fast, slow = np.median(r2[idx == 1]), np.median(r2[idx == 2])
+    assert min(fast, slow) > 0.8 * max(fast, slow), (fast, slow)

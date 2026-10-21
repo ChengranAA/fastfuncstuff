@@ -1227,7 +1227,15 @@ def _resolve_xval_prefix(args) -> str:
 
 
 def _run_condition_xval(
-    args, results, design_info, fmri_data, device, geometry=None, write=True
+    args,
+    results,
+    design_info,
+    fmri_data,
+    device,
+    geometry=None,
+    write=True,
+    designs_by_hrf=None,
+    hrf_indices=None,
 ) -> list:
     """Held-out R2 on the condition design, plus its ceiling, written as maps.
 
@@ -1235,6 +1243,10 @@ def _run_condition_xval(
     already computed by the time it runs, and it writes its own outputs.
     Returns the ``[(map, label), ...]`` layers (empty when skipped); ROI mode
     passes ``write=False`` and puts them in its table instead.
+
+    With ``designs_by_hrf`` + ``hrf_indices`` (``-hrfopt_prefix``) each voxel is
+    scored, and its ceiling estimated, against its own HRF's design: the fit
+    was, and ``design_info["matrix"]`` is only one representative of them.
     """
     import torch as _torch
 
@@ -1273,6 +1285,26 @@ def _run_condition_xval(
     stim_indices = list(design_info["stim_indices"])
     nuisance_indices = list(design_info["nuisance_indices"])
 
+    # (voxel mask, design) pairs; one pair covering every voxel unless per-HRF.
+    groups: list = [(None, design)]
+    if designs_by_hrf is not None and hrf_indices is not None:
+        idx = _torch.as_tensor(np.asarray(hrf_indices)).reshape(-1).long()
+        if voxel_mask is not None and idx.numel() != data.shape[0]:
+            idx = idx[_torch.as_tensor(np.asarray(voxel_mask)).reshape(-1).bool()]
+        if idx.numel() != data.shape[0]:
+            print("  ⚠️  -xval_r2: per-voxel HRF indices do not match the fitted units; skipped.")
+            return []
+        groups = []
+        for h in _torch.unique(idx).tolist():
+            # Censored the same way as the data below.
+            _, group_design, _, _ = censor_xval_inputs(
+                data[:0],
+                np.asarray(designs_by_hrf[h].detach().cpu(), dtype=np.float32),
+                run_starts,
+                design_info.get("good_list"),
+            )
+            groups.append((idx == h, group_design))
+
     # Score only the TRs the fit kept, as the fit did: a censored motion spike
     # in a held-out run would otherwise dominate its residual. tau carries the
     # true time gaps into the ARMA whitening across each censored hole.
@@ -1288,20 +1320,30 @@ def _run_condition_xval(
     print()
     print(f"📈 Cross-validated R² on the condition design ({len(cv_splits)} folds)")
 
-    xval = compute_xval_r2_arma(
-        data=data,
-        design_matrix=design,
-        run_starts=run_starts,
-        stim_indices=stim_indices,
-        nuisance_indices=nuisance_indices,
-        cv_splits=cv_splits,
-        arma_params=arma_params.detach().cpu(),
-        device=device,
-        verbose=args.verb >= 1,
-        tau=tau,
-    )
-    xval_r2 = xval["r2"]
-    assert isinstance(xval_r2, _torch.Tensor)
+    arma_cpu = arma_params.detach().cpu()
+    xval_r2 = None
+    for group_mask, group_design in groups:
+        sel = slice(None) if group_mask is None else group_mask
+        xval = compute_xval_r2_arma(
+            data=data[sel],
+            design_matrix=group_design,
+            run_starts=run_starts,
+            stim_indices=stim_indices,
+            nuisance_indices=nuisance_indices,
+            cv_splits=cv_splits,
+            arma_params=arma_cpu[sel],
+            device=device,
+            verbose=args.verb >= 1,
+            tau=tau,
+        )
+        group_r2 = xval["r2"]
+        assert isinstance(group_r2, _torch.Tensor)
+        if xval_r2 is None:
+            xval_r2 = _torch.full(
+                (data.shape[0],), float("nan"), dtype=group_r2.dtype, device=group_r2.device
+            )
+        xval_r2[sel] = group_r2
+    assert xval_r2 is not None
     finite = xval_r2[_torch.isfinite(xval_r2)]
     if finite.numel():
         print(
@@ -1318,17 +1360,31 @@ def _run_condition_xval(
     ceiling_layers: list = []
 
     if args.noise_ceiling in ("auto", "loro"):
-        from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
+        from fastfuncstuff.stats.noise_ceiling import (
+            loro_two_half_ceiling,
+            merge_voxel_group_ceilings,
+        )
 
-        ceiling = loro_two_half_ceiling(
-            data=data,
-            design_matrix=design,
-            run_starts=run_starts,
-            stim_indices=stim_indices,
-            nuisance_indices=nuisance_indices,
-            cv_splits=cv_splits,  # same folds: that is what makes them comparable
-            device=device,
-            verbose=False,
+        per_group = [
+            (
+                _torch.ones(data.shape[0], dtype=_torch.bool) if group_mask is None else group_mask,
+                loro_two_half_ceiling(
+                    data=data if group_mask is None else data[group_mask],
+                    design_matrix=group_design,
+                    run_starts=run_starts,
+                    stim_indices=stim_indices,
+                    nuisance_indices=nuisance_indices,
+                    cv_splits=cv_splits,  # same folds: that is what makes them comparable
+                    device=device,
+                    verbose=False,
+                ),
+            )
+            for group_mask, group_design in groups
+        ]
+        ceiling = (
+            per_group[0][1]
+            if len(per_group) == 1
+            else merge_voxel_group_ceilings(per_group, n_voxels=data.shape[0])
         )
         print(f"  Noise ceiling: {ceiling.summarize(ceiling.explainable_r2(xval_r2))}")
         for note in ceiling.notes:
@@ -4149,6 +4205,8 @@ def main():
                 device,
                 geometry=preproc_cached_metadata or cache_metadata or {},
                 write=roi_set is None,
+                designs_by_hrf=locals().get("full_designs_by_hrf"),
+                hrf_indices=locals().get("hrf_indices_obj"),
             )
 
         # ── Missing-data bookkeeping ─────────────────────────────────────────

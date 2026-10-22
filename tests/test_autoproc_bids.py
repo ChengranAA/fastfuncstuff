@@ -148,6 +148,46 @@ def test_time_based_fmap_assignment(tmp_path: Path):
     assert set(fmaps["skilled-run2"]) == {("skilled", "03"), ("rest", "01")}
 
 
+def test_each_tasks_fmaps_split_its_runs_by_time(tmp_path: Path):
+    """MindsEye shape: run-tagged fieldmaps for two tasks, one before each block,
+    plus a bare task-primary duplicate of primary's first one (same second). Each
+    run takes its own task's latest-preceding fieldmap. Bug of record: the bare
+    duplicate claimed all six primary runs, which stopped the time assignment, so
+    primary 4-6 took a 35-min-old field and floc took none of its own."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    runs = {
+        ("primary", "01"): "09:28:00",
+        ("primary", "02"): "09:37:00",
+        ("floc", "01"): "09:55:00",
+        ("primary", "03"): "10:04:00",
+        ("floc", "02"): "10:31:00",
+    }
+    for (task, run), t in runs.items():
+        _touch(
+            ses / "func" / f"sub-01_ses-01_task-{task}_run-{run}_part-mag_bold.nii.gz",
+            {"RepetitionTime": 1.5, "PhaseEncodingDirection": "j-", "AcquisitionTime": t},
+        )
+    fm = {"PhaseEncodingDirection": "j", "TotalReadoutTime": 0.05}
+    for name, t in (
+        ("task-primary_dir-PA_run-01", "09:27:07"),
+        ("task-primary_dir-PA", "09:27:07"),  # the duplicate
+        ("task-floc_dir-PA_run-01", "09:54:00"),
+        ("task-primary_dir-PA_run-02", "10:02:00"),
+        ("task-floc_dir-PA_run-02", "10:29:00"),
+    ):
+        _touch(
+            ses / "fmap" / f"sub-01_ses-01_{name}_part-mag_sbref.nii.gz",
+            {**fm, "AcquisitionTime": t},
+        )
+    fmaps = {f.fmap_id: f.intended_runs for f in scan_subject(tmp_path, "01").sessions[0].fmaps}
+    assert fmaps == {
+        "primary-run01": [("primary", "01"), ("primary", "02")],
+        "floc-run01": [("floc", "01")],
+        "primary-run02": [("primary", "03")],
+        "floc-run02": [("floc", "02")],
+    }
+
+
 def test_opposite_pe_fmaps_merge_into_one_paired_group(tmp_path: Path):
     """fmap/ holding BOTH polarities of the same acquisition (dir-AP + dir-PA) is
     ONE self-contained fieldmap: the pair corrects itself, so the group carries its

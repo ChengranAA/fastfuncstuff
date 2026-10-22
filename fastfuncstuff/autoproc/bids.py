@@ -299,6 +299,10 @@ class FmapGroup:
     # run polarity (b0 only — a measured field serves either polarity, but the
     # warp it produces does not). None means "take it from the run".
     pe_override: str | None = None
+    # The BIDS task entity a task-tagged fieldmap carries, and whether its runs came
+    # from IntendedFor (authoritative) rather than from matching that task.
+    task: str | None = None
+    intended_explicit: bool = False
 
     @property
     def run_ids(self) -> list[str]:
@@ -604,6 +608,7 @@ def _scan_pepolar_fmaps(
     """
     # tag -> dir (or "" when absent) -> form -> (path, sidecar)
     candidates: dict[str, dict[str, dict[str, tuple[Path, dict]]]] = {}
+    task_of: dict[str, str | None] = {}
     for nf in sorted(fmap_dir.glob("*.nii*")):
         if not _NIFTI_RE.search(nf.name):
             continue
@@ -617,6 +622,7 @@ def _scan_pepolar_fmaps(
         # the key or they'd collapse into one.
         task, run, d = ents.get("task"), ents.get("run"), ents.get("dir")
         tag = (task or "") + (f"-run{run}" if run else "")
+        task_of[tag] = task
         # Form within the group: acq refines the plain suffix ONLY when it names a
         # form (acq-bold/acq-sbref), so the SBRef form wins the preference below
         # even for conventional epi fmaps. `acq` is otherwise a free-text protocol
@@ -641,6 +647,7 @@ def _scan_pepolar_fmaps(
             fwd_nf, fwd_js = picks[fwd_dir]
             rev_nf, _ = picks[rev_dir]
             gid = tag.lstrip("-") or f"{fwd_dir}-{rev_dir}"
+            runs, explicit = _resolve_intended(fwd_js, task_of[tag], bold_runs)
             groups.append(
                 FmapGroup(
                     session=bold_runs[0].session if bold_runs else None,
@@ -648,7 +655,9 @@ def _scan_pepolar_fmaps(
                     reverse_path=rev_nf,
                     json=fwd_js,
                     forward_path=fwd_nf,
-                    intended_runs=_resolve_intended(fwd_js, gid, bold_runs),
+                    intended_runs=runs,
+                    task=task_of[tag],
+                    intended_explicit=explicit,
                 )
             )
             continue
@@ -656,13 +665,16 @@ def _scan_pepolar_fmaps(
             # Unpaired: the dir carries real information (which polarity this is),
             # so it goes back into the id — unless a task already names the group.
             gid = tag if tag and not tag.startswith("-") else f"{d or 'x'}{tag}"
+            runs, explicit = _resolve_intended(js, task_of[tag], bold_runs)
             groups.append(
                 FmapGroup(
                     session=bold_runs[0].session if bold_runs else None,
                     fmap_id=gid,
                     reverse_path=nf,
                     json=js,
-                    intended_runs=_resolve_intended(js, gid, bold_runs),
+                    intended_runs=runs,
+                    task=task_of[tag],
+                    intended_explicit=explicit,
                 )
             )
 
@@ -680,9 +692,19 @@ def _finalize_groups(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> list[
     present = {(r.task, r.run) for r in bold_runs}
     for g in groups:
         g.intended_runs = [p for p in g.intended_runs if p in present]
+    groups = _split_task_claims(groups, bold_runs)
     served = [g for g in groups if g.intended_runs]
     if served:
-        return served
+        # A run no fieldmap claimed (a task with none of its own: SKILLED's rest)
+        # takes the time-nearest of the task-matched ones, as the time fallback
+        # gave it before task claims existed. IntendedFor groups stay as declared;
+        # a run they leave out inherits the reference group in plan.py, as before.
+        claimed = {p for g in groups for p in g.intended_runs}
+        loose = [r for r in bold_runs if (r.task, r.run) not in claimed]
+        matched = [g for g in groups if g.task and not g.intended_explicit]
+        if loose and matched:
+            _assign_by_time(matched, loose, reset=False)
+        return [g for g in groups if g.intended_runs]
     # No explicit assignment (no IntendedFor, not task-tagged). Assign by
     # AcquisitionTime when available (conventional multi-fmap sessions), else the
     # single-geometry fallback.
@@ -870,7 +892,61 @@ def pair_undetermined(session: Session) -> list[str]:
     return sorted(lab for lab in labels if _OPPOSITE_DIRS.get(lab.split("-")[0].lower()) in bare)
 
 
-def _assign_by_time(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> bool:
+def _split_task_claims(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> list[FmapGroup]:
+    """Divide a task's runs among that task's fieldmaps by acquisition time.
+
+    Task-matching gives every fieldmap of a task every run of it. A task usually
+    has one fieldmap per block (MindsEye: task-floc_..._run-01 before floc run 1,
+    _run-02 before run 2), so each run takes the latest of them acquired at or
+    before it — the same rule :func:`_assign_by_time` applies to untagged ones —
+    else the nearest. Bug of record: task-match used the group's TAG
+    (``floc-run01``), so run-tagged task fieldmaps matched nothing, and a bare
+    ``task-primary`` duplicate then claimed every primary run, which stopped the
+    time assignment from ever running: runs 4-6 took a fieldmap 35 min old and
+    floc took none of its own.
+
+    Two task-matched fieldmaps of one task acquired in the same second are one
+    acquisition converted twice; the run-tagged one is kept. IntendedFor claims
+    are left exactly as declared.
+    """
+    kept: list[FmapGroup] = []
+    seen: dict[tuple[str, float], int] = {}
+    for g in groups:
+        if g.intended_explicit or not g.task or g.acq_time is None:
+            kept.append(g)
+            continue
+        key = (g.task, round(g.acq_time))
+        if key in seen:
+            if kept[seen[key]].fmap_id == g.task and g.fmap_id != g.task:
+                kept[seen[key]] = g
+            continue
+        seen[key] = len(kept)
+        kept.append(g)
+
+    run_time = {(r.task, r.run): r.acq_time for r in bold_runs}
+    claims: dict[tuple[str, str], list[FmapGroup]] = {}
+    for g in kept:
+        if not g.intended_explicit:
+            for p in g.intended_runs:
+                claims.setdefault(p, []).append(g)
+    for p, gs in claims.items():
+        timed = [g for g in gs if g.acq_time is not None]
+        rt = run_time.get(p)
+        if len(gs) < 2 or rt is None or not timed:
+            continue
+        before = [g for g in timed if (g.acq_time or 0.0) <= rt]
+        win = (
+            max(before, key=lambda g: g.acq_time or 0.0)
+            if before
+            else min(timed, key=lambda g: abs((g.acq_time or 0.0) - rt))
+        )
+        for g in gs:
+            if g is not win:
+                g.intended_runs = [q for q in g.intended_runs if q != p]
+    return kept
+
+
+def _assign_by_time(groups: list[FmapGroup], bold_runs: list[BoldRun], reset: bool = True) -> bool:
     """Assign each run to a fieldmap by AcquisitionTime, in place. Returns True if
     the time data was sufficient to assign anything.
 
@@ -881,8 +957,9 @@ def _assign_by_time(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> bool:
     timed = [(g, g.acq_time) for g in groups if g.acq_time is not None]
     if not timed or all(r.acq_time is None for r in bold_runs):
         return False
-    for g in groups:
-        g.intended_runs = []
+    if reset:
+        for g in groups:
+            g.intended_runs = []
     assigned = False
     for r in bold_runs:
         rt = r.acq_time
@@ -899,14 +976,18 @@ def _assign_by_time(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> bool:
     return assigned
 
 
-def _resolve_intended(fmap_json: dict, tag: str, bold_runs: list[BoldRun]) -> list[tuple[str, str]]:
+def _resolve_intended(
+    fmap_json: dict, task: str | None, bold_runs: list[BoldRun]
+) -> tuple[list[tuple[str, str]], bool]:
     """Which BOLD runs does this fmap correct, as ``(task, run)`` pairs (run
-    numbers repeat across tasks, so the pair is the unique run identity).
+    numbers repeat across tasks, so the pair is the unique run identity), and
+    whether that came from ``IntendedFor``.
 
-    ``IntendedFor`` when present; else task-match (the fmap tag equals a task
-    name). No blanket "serves everything" here — that fallback is applied in
-    ``_scan_fmaps`` only when a single candidate survives. quirk: ``IntendedFor``
-    is present on only *some* fmaps in some datasets.
+    ``IntendedFor`` when present; else task-match on the fmap's ``task`` entity —
+    every run of that task, which :func:`_split_task_claims` then divides among the
+    task's fieldmaps by acquisition time. No blanket "serves everything" here —
+    that fallback is applied in ``_scan_fmaps`` only when a single candidate
+    survives. quirk: ``IntendedFor`` is present on only *some* fmaps in some datasets.
     """
     intended = fmap_json.get("IntendedFor")
     if intended:
@@ -922,15 +1003,16 @@ def _resolve_intended(fmap_json: dict, tag: str, bold_runs: list[BoldRun]) -> li
             ra = re.search(r"acq-([A-Za-z0-9]+)", e)
             rr = re.search(r"run-([A-Za-z0-9]+)", e)
             if rr:
-                task = rt.group(1) if rt else ""
+                etask = rt.group(1) if rt else ""
                 # A task split by acquisition (see _scan_session) answers to its unit.
-                if ra and task not in units and task_unit(task, ra.group(1)) in units:
-                    task = task_unit(task, ra.group(1))
-                pairs.append((task, rr.group(1)))
+                if ra and etask not in units and task_unit(etask, ra.group(1)) in units:
+                    etask = task_unit(etask, ra.group(1))
+                pairs.append((etask, rr.group(1)))
         if pairs:
-            return pairs
-    # fmap tag names a task → that task's runs.
-    return [(r.task, r.run) for r in bold_runs if r.task == tag]
+            return pairs, True
+    if not task:
+        return [], False
+    return [(r.task, r.run) for r in bold_runs if r.task == task], False
 
 
 def _scan_anats(sdir: Path) -> list[Path]:

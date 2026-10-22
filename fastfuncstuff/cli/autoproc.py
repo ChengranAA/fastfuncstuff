@@ -29,6 +29,7 @@ from fastfuncstuff.autoproc.bids import (
     scan_subject,
 )
 from fastfuncstuff.autoproc.emit import write_script
+from fastfuncstuff.autoproc.family import family_dir
 from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
@@ -2104,10 +2105,17 @@ def _report_families(plan) -> None:
                 " they share one correction and one output grid.",
                 file=sys.stderr,
             )
-    if len(fams) > 1:
+    if plan.family_plans:
         print(
-            "  NOTE: families are not processed separately yet — one anat_nl and one"
-            " output voxel size serve them all.",
+            "  Each family runs as its own pipeline in "
+            + ", ".join(f"{family_dir(f)}/" for f in fams)
+            + "; they meet only at the anat.",
+            file=sys.stderr,
+        )
+    elif len(fams) > 1:
+        print(
+            "  NOTE: no anat for the families to meet at — they run as ONE pipeline at"
+            " the first run's voxel size.",
             file=sys.stderr,
         )
 
@@ -2788,7 +2796,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # The GLM's model is a file, not a command line: write it beside the script's
     # outputs so it can be reviewed (and edited) before anything runs.
-    spec_rows = write_design_specs(plan, args.bids_dir, work_dir)
+    if plan.family_plans:
+        spec_rows = [
+            row
+            for fam, sub in plan.family_plans
+            for row in write_design_specs(sub, args.bids_dir, str(Path(work_dir) / family_dir(fam)))
+        ]
+    else:
+        spec_rows = write_design_specs(plan, args.bids_dir, work_dir)
 
     tag = f" [{args.recipe}]" if args.recipe else ""
     print(f"wrote {out_path}{tag}  ({len(plan.runs)} run(s), ref session {plan.ref_session})")

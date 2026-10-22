@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from fastfuncstuff.autoproc import config
-from fastfuncstuff.autoproc.bids import BoldRun, FmapGroup, Subject
+from fastfuncstuff.autoproc.bids import BoldRun, FmapGroup, Session, Subject
 from fastfuncstuff.autoproc.family import Family, detect_families
 
 
@@ -412,6 +412,10 @@ class Plan:
     ref_session: str | None
     multi_session: bool
     families: list[Family] = field(default_factory=list)
+    # With more than one family: each family's own plan, built from only its runs.
+    # The script runs each in its own folder (family.family_dir), so every family
+    # gets its own grandmean, anat alignment, anat_nl, output grid and mask.
+    family_plans: list[tuple[Family, Plan]] = field(default_factory=list)
 
     @property
     def use_sbref(self) -> bool:
@@ -867,6 +871,14 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
     for pr in runs:
         pr.family = label_of[(pr.bold.session, pr.bold.task, pr.bold.run)]
 
+    family_plans: list[tuple[Family, Plan]] = []
+    # Separate families meet only at the anat. Without one they would land in
+    # unrelated EPI spaces, so they stay one pipeline, linked by cross-fmap alignment.
+    if len(families) > 1 and opt.go_to_anat:
+        for fam in families:
+            sub = family_subject(subject, fam)
+            family_plans.append((fam, build_plan(sub, _family_options(sub, opt))))
+
     return Plan(
         subject=subject.subject,
         options=opt,
@@ -874,4 +886,35 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
         ref_session=ref_session,
         multi_session=multi_session,
         families=families,
+        family_plans=family_plans,
     )
+
+
+def family_subject(subject: Subject, fam: Family) -> Subject:
+    """``subject`` cut down to one family's runs and the fieldmaps that serve them.
+
+    A fieldmap is kept when it claims any of the family's runs, so one serving two
+    families is estimated in both (same inputs, same field). Sessions the family
+    never appears in are dropped, which also makes its reference session the first
+    one it has.
+    """
+    members = set(fam.members)
+    sessions: list[Session] = []
+    for sess in subject.sessions:
+        bold = [b for b in sess.bold_runs if (b.session, b.task, b.run) in members]
+        if not bold:
+            continue
+        keys = {(b.task, b.run) for b in bold}
+        fmaps = [fg for fg in sess.fmaps if keys & set(fg.intended_runs)]
+        sessions.append(replace(sess, bold_runs=bold, fmaps=fmaps))
+    return Subject(subject.subject, sessions)
+
+
+def _family_options(sub: Subject, opt: Options) -> Options:
+    """-ref_ses names a session for the whole subject; a family that was not
+    acquired there takes its own first session instead of failing the plan."""
+    try:
+        _resolve_ref_session(sub, opt)
+    except ValueError:
+        return replace(opt, ref_ses=None)
+    return opt

@@ -60,6 +60,11 @@ class Family:
         return list(dict.fromkeys(t for _s, t, _r in self.members))
 
 
+def family_dir(fam: Family) -> str:
+    """The folder a family's pipeline runs in (multi-family scripts only)."""
+    return f"fam-{fam.label}"
+
+
 def _grid(path: Path) -> tuple[tuple[float, float, float], tuple[int, int, int]] | None:
     """(voxel size, matrix) from the header alone. nibabel reads .nii/.nii.gz
     lazily; anything it cannot open (missing file, .nii.zst) is unknown rather

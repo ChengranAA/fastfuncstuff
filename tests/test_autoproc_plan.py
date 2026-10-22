@@ -1641,7 +1641,9 @@ def test_b0_fmap_splits_per_pe_polarity():
             )
         ],
     )
-    plan = build_plan(subj, Options())
+    # No anat: opposite polarities are two acquisition families, which with an anat
+    # would run in separate folders (test_autoproc_family); here they stay one pipeline.
+    plan = build_plan(subj, Options(go_to_anat=False))
     ids = {pr.bold.run: pr.fmap.fmap_id for pr in plan.runs}
     assert ids["1"] != ids["2"]
     s = write_script(plan, "wd", bids_root="/bids")

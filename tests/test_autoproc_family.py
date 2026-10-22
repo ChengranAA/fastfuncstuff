@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
 
-from fastfuncstuff.autoproc.bids import BoldRun, Session, Subject
+from fastfuncstuff.autoproc.bids import BoldRun, FmapGroup, Session, Subject
 from fastfuncstuff.autoproc.emit import write_script
 from fastfuncstuff.autoproc.family import detect_families
 from fastfuncstuff.autoproc.plan import Options, build_plan
@@ -107,3 +108,66 @@ def test_plan_labels_runs_and_header_names_families_only_when_several(tmp_path):
     one = [_bold(tmp_path, "floc", "1"), _bold(tmp_path, "floc", "2")]
     plan = build_plan(Subject("X", [Session("01", one)]), Options())
     assert "acq families" not in write_script(plan, "wd", bids_root="/bids")
+
+
+def _two_family_subject(tmp: Path, prim_ses="01") -> Subject:
+    """floc at 2 mm PE j-, prim at 1.2 mm PE i, each with its own fieldmap."""
+    floc = _bold(tmp, "floc", "1", vox=2.0, pe="j-")
+    prim = _bold(tmp, "prim", "1", vox=1.2, pe="i", ses=prim_ses)
+    f1 = FmapGroup("01", "floc", tmp / "floc_rev.nii.gz", {}, [("floc", "1")])
+    f2 = FmapGroup(prim_ses, "prim", tmp / "prim_rev.nii.gz", {}, [("prim", "1")])
+    anat = tmp / "T1w.nii.gz"
+    if prim_ses == "01":
+        return Subject("X", [Session("01", [floc, prim], [f1, f2], anat=anat)])
+    return Subject(
+        "X", [Session("01", [floc], [f1], anat=anat), Session(prim_ses, [prim], [f2], anat=anat)]
+    )
+
+
+def test_each_family_plans_alone_with_only_its_own_fieldmaps(tmp_path):
+    opt = Options(go_to_anat=True, anat_nonlin=True)
+    plan = build_plan(_two_family_subject(tmp_path), opt)
+    assert [fam.label for fam, _ in plan.family_plans] == ["floc", "prim"]
+    for fam, sub in plan.family_plans:
+        assert [pr.bold.task for pr in sub.runs] == fam.tasks
+        (pr,) = sub.runs
+        # Each family is its own reference: no cross-family xfmap link, and the
+        # anat_nl it carries is the one estimated on its own data.
+        assert pr.is_ref_fmap and pr.fmap.fmap_id == fam.label
+        assert not any(t.startswith("xfmap") for t in pr.warp_chain)
+        assert "anat_nl" in pr.warp_chain
+    # The whole-subject plan still links them, which is what the families replace.
+    assert any(t.startswith("xfmap") for t in plan.runs[1].warp_chain)
+
+
+def test_multi_family_script_runs_each_family_in_its_own_folder(tmp_path):
+    opt = Options(go_to_anat=True, anat_nonlin=True)
+    script = write_script(build_plan(_two_family_subject(tmp_path), opt), "wd", bids_root="/bids")
+    sh = tmp_path / "proc.sh"
+    sh.write_text(script)
+    res = subprocess.run(["bash", "-n", str(sh)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+
+    _, floc, prim = script.split("\n# family ")
+    assert '(\nmkdir -p "fam-floc" && cd "fam-floc"' in floc
+    assert '(\nmkdir -p "fam-prim" && cd "fam-prim"' in prim
+    # Its own PE axis for the nonlinear anat correction, its own voxel size for the
+    # output grid (read from its own first run).
+    assert "-pe_axis y" in floc and "-pe_axis x" in prim
+    assert "_task-floc_" in floc.split("FINAL_DXYZ=")[1].splitlines()[0]
+    assert "_task-prim_" in prim.split("FINAL_DXYZ=")[1].splitlines()[0]
+    assert "task-prim" not in floc and "task-floc" not in prim
+
+
+def test_ref_ses_a_family_lacks_falls_back_to_its_own_first_session(tmp_path):
+    subj = _two_family_subject(tmp_path, prim_ses="02")
+    plan = build_plan(subj, Options(ref_ses="01"))
+    assert [sub.ref_session for _, sub in plan.family_plans] == ["01", "02"]
+
+
+def test_without_an_anat_families_stay_one_pipeline(tmp_path):
+    # Split families meet only at the anat; with none they would never be aligned.
+    plan = build_plan(_two_family_subject(tmp_path), Options(go_to_anat=False))
+    assert len(plan.families) == 2 and not plan.family_plans
+    script = write_script(plan, "wd", bids_root="/bids")
+    assert "fam-" not in script and "ONE pipeline" in script

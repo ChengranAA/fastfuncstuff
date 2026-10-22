@@ -21,6 +21,7 @@ from pathlib import Path
 
 from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import find_events
+from fastfuncstuff.autoproc.family import Family, family_dir
 from fastfuncstuff.autoproc.naming import STAGE_NUMBERS, NameKey, coord, stem
 from fastfuncstuff.autoproc.plan import (
     Plan,
@@ -1202,10 +1203,17 @@ def _family_header_note(plan: Plan) -> str:
         lines.append(
             f"\n#     {fam.label}: {fam.signature.describe()}; {len(fam.members)} run(s){how}"
         )
-    lines.append(
-        "\n#     Processed as ONE: a single anat_nl (first run's PE axis) and one output"
-        "\n#     voxel size (first run's) serve every family."
-    )
+    if plan.family_plans:
+        lines.append(
+            "\n#     Each family runs as its own complete pipeline in fam-<label>/: its own"
+            "\n#     grandmean, anat alignment, anat_nl on its own PE axis, output grid at"
+            "\n#     its own voxel size, mask and GLM. They meet only at the anat."
+        )
+    else:
+        lines.append(
+            "\n#     No anat for them to meet at, so they run as ONE pipeline, linked by"
+            "\n#     cross-fieldmap alignment, at the first run's voxel size."
+        )
     return "".join(lines)
 
 
@@ -1286,9 +1294,9 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 #   image lanes       : {len(_lanes(plan))}{_lane_header_note(plan)}
 #   ref image         : {
         opt.ref_image or "grandmean"
-    } (session representative for xses; -ref_image){_fmap_inherit_note(plan)}{
-        _family_header_note(plan)
-    }{_qc_header_note(plan)}
+    } (session representative for xses; -ref_image){
+        "" if plan.family_plans else _fmap_inherit_note(plan)
+    }{_family_header_note(plan)}{_qc_header_note(plan)}
 # ============================================================================={
         _invocation_note(invocation)
     }
@@ -5218,8 +5226,38 @@ def write_script(
 
     ``invocation`` is the ffs_autoproc command line that produced this script; it
     is written into the header, commented out."""
+    if plan.family_plans:
+        sections = [
+            _family_section(fam, sub, bids_root, script_stem) for fam, sub in plan.family_plans
+        ]
+        return "\n".join([_header(plan, out_dir, invocation), *sections]).rstrip() + "\n"
+    return _pipeline_body(plan, bids_root, script_stem, _header(plan, out_dir, invocation))
+
+
+def _family_section(fam: Family, sub: Plan, bids_root: str | None, script_stem: str) -> str:
+    """One family's whole pipeline, in its own folder and its own subshell.
+
+    The subshell is what lets each family reuse every name the single-family
+    script uses — the data-table arrays, MASTER, FINAL_DXYZ — without one family's
+    values leaking into the next; the folder does the same for filenames. The skip
+    toggles are set once in the header and inherited. ``set -e`` carries in too, so
+    a failure inside a family still stops the script.
+    """
+    d = family_dir(fam)
+    banner = (
+        "\n# " + "#" * 77 + f"\n# family {fam.label}: {fam.signature.describe()}"
+        f"\n#   {len(sub.runs)} run(s), task {', '.join(fam.tasks)}  →  {d}/"
+        f"\n#   reference session : {sub.ref_session}"
+        f"\n#   sbref lane        : {sub.use_sbref}{_fmap_inherit_note(sub)}"
+        "\n# " + "#" * 77
+    )
+    body = _pipeline_body(sub, bids_root, script_stem, None)
+    return f'{banner}\n(\nmkdir -p "{d}" && cd "{d}"\n{body})'
+
+
+def _pipeline_body(plan: Plan, bids_root: str | None, script_stem: str, header: str | None) -> str:
     parts = [
-        _header(plan, out_dir, invocation),
+        header,
         _data_arrays(plan, bids_root),
         _preflight(plan, bids_root),
         _qc_helper(plan, script_stem),

@@ -433,6 +433,9 @@ class Plan:
     # On a child family's plan linked to the root: the root family and its plan,
     # whose corrected anchor xfam aligns this family's onto.
     xfam_root: tuple[Family, Plan] | None = None
+    # On a family's plan: its anat-only prep (strip, autobox, TPM, MNI link) is
+    # built once in the parent folder and linked in, not redone here.
+    shared_anat: bool = False
 
     @property
     def use_sbref(self) -> bool:
@@ -908,6 +911,7 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
             sub = family_subject(subject, fam)
             fopt = replace(_family_options(sub, opt), xfam_link=fam.link == "xfam")
             fplan = build_plan(sub, fopt)
+            fplan.shared_anat = not opt.has_grand_ref
             if fam is root:
                 root_plan = fplan
             elif fam.link == "xfam" and root is not None and root_plan is not None:

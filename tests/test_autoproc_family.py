@@ -262,3 +262,37 @@ def test_family_ref_and_link_overrides(tmp_path):
     plan = build_plan(_slab_subject(tmp_path), Options(go_to_anat=True, family_ref="anat"))
     assert {f.link for f in plan.families} == {"anat"}
     assert all(sub.xfam_root is None for _, sub in plan.family_plans)
+
+
+def test_anat_prep_and_mni_run_once_and_are_linked_into_each_family(tmp_path):
+    opt = Options(
+        go_to_anat=True,
+        anat_nonlin=True,
+        anat_tpm=True,
+        anat_skull=True,
+        anat_path=str(tmp_path / "T1w.nii.gz"),
+        spm_tpm="/TPM.nii",
+        do_mni=True,
+        mni_template="/MNI.nii.gz",
+    )
+    script = write_script(build_plan(_slab_subject(tmp_path), opt), "wd", bids_root="/bids")
+    sh = tmp_path / "proc.sh"
+    sh.write_text(script)
+    assert subprocess.run(["bash", "-n", str(sh)], capture_output=True).returncode == 0
+    head, *families = script.split("\n# family ")
+    shared = head.split("shared: anat prep")[1]
+    # Once, in the parent folder: strip, autobox, subject TPM, MNI affine + warp.
+    # (The calls, not the names: the preflight lists every tool, and every CHAIN
+    # names the MNI matrix.)
+    for step in (
+        'mri_synthstrip -i "',
+        '-prefix "stage09.anat_autobox.nii.gz"',
+        '-prefix "tpm_work/anatseg"',
+        '-1Dmatrix_save "stage09.mni.aff12.1D"',
+    ):
+        assert step in shared and all(step not in fam for fam in families), step
+    for fam in families:
+        assert 'ln -sfn "$f" .' in fam
+        # Each family still aligns its own EPI and pushes its own anchor into MNI.
+        assert '-1Dmatrix_save "stage09.anat.aff12.1D"' in fam
+        assert "_al_mni" in fam

@@ -2881,6 +2881,90 @@ if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.xref.aff12.1D" ]; then
 """
 
 
+_SHARED_ANAT_NOTE = (
+    "# Anat prep (strip, autobox, subject TPM, MNI link) is shared by every family:\n"
+    "# built once in the parent folder and linked in here (see the shared section)."
+)
+
+
+def _anat_prep_blocks(opt) -> tuple[list[str], str]:
+    """The anat-only preparation before the autobox — presurf, the T1w average,
+    the skull strip — and the image ``$ANAT`` ends up naming. EPI-free, so a
+    multi-family script runs it once for every family (:func:`_shared_anat_section`)."""
+    blocks: list[str] = []
+    anat_ph = (
+        opt.anat_path or "${FFS_ANAT:?set FFS_ANAT to the T1w to align to (SUMA brain.nii.gz)}"
+    )
+    if opt.presurf:
+        blocks.append(_presurf_block(opt))
+    inputs = _anat_inputs(opt, anat_ph)
+    anat_ph = inputs[0]
+    if opt.anat_extra:
+        blocks.append(_anat_average_block(anat_ph, inputs[1:]))
+        anat_ph = _anat_avg()
+    if opt.anat_skull:
+        blocks.append(_skullstrip_block(opt, anat_ph))
+        anat_ph = _anat_brain()
+    return blocks, anat_ph
+
+
+def _anat_box_block() -> str:
+    box = _anat_box()
+    boxing = _ffs(
+        "ffs_util_autobox",
+        ['-input "$ANAT"', "-npad 3", f'-prefix "{box}"', '-device "$DEVICE"'],
+    )
+    return f'[ -f "{box}" ] || \\\n{boxing}'
+
+
+def _tpm_block(opt) -> str:
+    """The subject-TPM build ffs_segment's EPI fit reads, if this run makes one."""
+    if not (opt.anat_nonlin and opt.anat_nonlin_method != "register"):
+        return ""
+    if opt.fs_tpm:
+        return _fs_tpm_block(opt)
+    if opt.anat_tpm:
+        return _anat_tpm_block(opt)
+    return ""
+
+
+def _shared_anat_section(plan: Plan) -> str:
+    """Multi-family: the anat-only work every family would otherwise redo — prep,
+    autobox, subject TPM, the anat→MNI link — run once in the parent folder.
+
+    Each family folder links these in (:func:`_link_shared_anat`) and its stage09
+    leaves them out rather than relying on their exists-guards: under skip_anat=0 a
+    family would otherwise re-estimate the MNI link through the symlink, after an
+    earlier family had already been resampled with the old one."""
+    opt = plan.options
+    if not (plan.family_plans and _own_anat(opt)):
+        return ""
+    prep, anat_ph = _anat_prep_blocks(opt)
+    parts = [
+        "",
+        "# ============================ shared: anat prep (all families) ==============",
+        "echo '== shared anat prep =='",
+        *prep,
+        f'ANAT="{anat_ph}"',
+        _anat_box_block(),
+        _tpm_block(opt),
+        _mni_estimate(plan),
+    ]
+    return "\n".join(p for p in parts if p) + "\n"
+
+
+def _link_shared_anat(plan: Plan) -> str:
+    """Link the parent folder's shared anat outputs into a family folder."""
+    if not plan.shared_anat:
+        return ""
+    return (
+        "# The shared anat prep, built once in the parent folder.\n"
+        "for f in ../stage09.* ../presurf_work ../tpm_work; do\n"
+        '  if [ -e "$f" ]; then ln -sfn "$f" .; fi\n'
+        "done\n"
+    )
+
+
 def _stage_anat(plan: Plan) -> str:
     opt = plan.options
     if not opt.go_to_anat:
@@ -2909,26 +2993,14 @@ def _stage_anat(plan: Plan) -> str:
         out.append(f"# anat matrix borrowed from {gr}/stage09.anat.aff12.1D (not recomputed).")
         seg_mats = f"{gr}/stage09.anat.aff12.1D stage09.xref.aff12.1D"
     else:
-        anat_ph = (
-            opt.anat_path or "${FFS_ANAT:?set FFS_ANAT to the T1w to align to (SUMA brain.nii.gz)}"
-        )
-        if opt.presurf:
-            out.append(_presurf_block(opt))
-        inputs = _anat_inputs(opt, anat_ph)
-        anat_ph = inputs[0]
-        if opt.anat_extra:
-            out.append(_anat_average_block(anat_ph, inputs[1:]))
-            anat_ph = _anat_avg()
-        if opt.anat_skull:
-            out.append(_skullstrip_block(opt, anat_ph))
-            anat_ph = _anat_brain()
+        prep, anat_ph = _anat_prep_blocks(opt)
+        if plan.shared_anat:
+            out.append(_SHARED_ANAT_NOTE)
+        else:
+            out.extend(prep)
         src = _anat_source_image(plan)
         mode = effective_anat_source(plan)
         box = _anat_box()
-        boxing = _ffs(
-            "ffs_util_autobox",
-            ['-input "$ANAT"', "-npad 3", f'-prefix "{box}"', '-device "$DEVICE"'],
-        )
         lin = _ffs(
             "ffs_allineate",
             [
@@ -2953,7 +3025,7 @@ def _stage_anat(plan: Plan) -> str:
             "# keeps the base's own origin — so on an oblique anat this crop is NOT a\n"
             "# free lunch: anything reading the matrix against the uncropped anat must\n"
             "# be told the crop was the base, or it slips by a fixed shift.\n"
-            f'[ -f "{box}" ] || \\\n{boxing}\n'
+            f"{'' if plan.shared_anat else _anat_box_block() + chr(10)}"
             'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.anat.aff12.1D" ]; then\n'
             "  # cross-modal rigid lpc: base=anat → matrix maps anat→EPI (chain head).\n"
             f"  # source = -anat_source {mode} (all choices share the reference-fmap grid).\n"
@@ -2967,10 +3039,9 @@ def _stage_anat(plan: Plan) -> str:
     elif opt.anat_nonlin:
         # Optionally build the subject TPM first: from FreeSurfer (SUMA), so no SPM
         # TPM is needed ahead of time, else from the anat's own segmentation.
-        if opt.fs_tpm:
-            out.append(_fs_tpm_block(opt))
-        elif opt.anat_tpm:
-            out.append(_anat_tpm_block(opt))
+        if not plan.shared_anat:
+            out.append(_tpm_block(opt))
+        if opt.anat_tpm and not opt.fs_tpm:
             # The head is the image those priors were fitted to, so it is the
             # anat-in-EPI QC source that costs nothing extra to ask for.
             tpm_src_path = tpm_src_path or _anat_prestrip(opt)
@@ -3100,6 +3171,27 @@ def _stage_mni(plan: Plan) -> str:
             "\n# ============================ stage09b: MNI (borrowed) =====================\n"
             f"# anat→MNI warp borrowed from {gr}/stage09.mni* (not recomputed).\n"
         )
+    return "\n".join(
+        [
+            "",
+            "# ============================ stage09b: anat → MNI =========================",
+            "# The last link in every run's chain, estimated here and applied once, at the",
+            "# very end of stage10's single resample. Only the anat is warped in this",
+            "# stage; the data never makes a second trip through an interpolator.",
+            "echo '== stage09b: anat → MNI =='",
+            _SHARED_ANAT_NOTE if plan.shared_anat else _mni_estimate(plan),
+            _mni_anchor_call(plan),
+            _qc_mni(plan),
+        ]
+    )
+
+
+def _mni_estimate(plan: Plan) -> str:
+    """The anat → MNI affine + warp. Estimated on the anat alone, so a multi-family
+    script runs it once and every family reaches MNI through the same warp."""
+    opt = plan.options
+    if not (opt.do_mni and opt.go_to_anat and not opt.grand_reference):
+        return ""
     # Sub-brick 0 of AFNI's SSW template is the skull-off volume; a plain template
     # has one volume and [0] is still it. Quoted whole: the selector's brackets are
     # a glob to the shell and belong to the tool.
@@ -3134,12 +3226,6 @@ def _stage_mni(plan: Plan) -> str:
     warp = _mni_files(opt, "_nl_WARP.nii.gz")[0]
     return "\n".join(
         [
-            "",
-            "# ============================ stage09b: anat → MNI =========================",
-            "# The last link in every run's chain, estimated here and applied once, at the",
-            "# very end of stage10's single resample. Only the anat is warped in this",
-            "# stage; the data never makes a second trip through an interpolator.",
-            "echo '== stage09b: anat → MNI =='",
             f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{stem(NameKey("mni"))}.aff12.1D" ]; then',
             "  # base = the template's skull-off volume, source = the stripped anat.",
             f"{lin}",
@@ -3147,8 +3233,6 @@ def _stage_mni(plan: Plan) -> str:
             f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{warp}" ]; then',
             f"{nl}",
             "fi",
-            _mni_anchor_call(plan),
-            _qc_mni(plan),
         ]
     )
 
@@ -5304,7 +5388,13 @@ def write_script(
         sections = [
             _family_section(fam, sub, bids_root, script_stem) for fam, sub in plan.family_plans
         ]
-        return "\n".join([_header(plan, out_dir, invocation), *sections]).rstrip() + "\n"
+        shared = _shared_anat_section(plan)
+        return (
+            "\n".join(
+                p for p in [_header(plan, out_dir, invocation), shared, *sections] if p
+            ).rstrip()
+            + "\n"
+        )
     return _pipeline_body(plan, bids_root, script_stem, _header(plan, out_dir, invocation))
 
 
@@ -5327,7 +5417,7 @@ def _family_section(fam: Family, sub: Plan, bids_root: str | None, script_stem: 
         "\n# " + "#" * 77
     )
     body = _pipeline_body(sub, bids_root, script_stem, None)
-    return f'{banner}\n(\nmkdir -p "{d}" && cd "{d}"\n{body})'
+    return f'{banner}\n(\nmkdir -p "{d}" && cd "{d}"\n{_link_shared_anat(sub)}{body})'
 
 
 def _family_link_note(fam: Family) -> str:

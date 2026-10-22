@@ -999,3 +999,46 @@ def test_split_inv_parses_the_afni_form():
     assert split_inv("a.aff12.1D") == ("a.aff12.1D", False)
     with pytest.raises(ValueError, match="malformed"):
         split_inv("INV(a.aff12.1D")
+
+
+def test_inv_pulls_back_onto_an_oblique_source_grid_without_a_frame_slip(tmp_path):
+    """EPI (oblique slab) -> anat grid through M, then back onto the EPI grid
+    through INV(M). The forward leg has the matrix's base as output; the return leg
+    has its SOURCE as output, which no chain did before INV(). On oblique grids with
+    different origins a cardinal-frame mistake there is a fixed mm shift
+    (project_aff12_base_grid), so the round trip must land on the original voxels."""
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.processing.nwarpforge import nwarpforge
+
+    cpu = torch.device("cpu")
+    n = 32
+    zz, yy, xx = np.meshgrid(*(np.arange(n, dtype=np.float32),) * 3, indexing="ij")
+    epi = (100 + 40 * np.sin(xx / 4.0) + 30 * np.cos(yy / 5.0) + 20 * np.sin(zz / 3.0)).transpose(
+        2, 1, 0
+    )
+    b = np.deg2rad(15.0)
+    epi_aff = np.eye(4)
+    epi_aff[:3, :3] = 2.0 * np.array(
+        [[1, 0, 0], [0, np.cos(b), -np.sin(b)], [0, np.sin(b), np.cos(b)]]
+    )
+    epi_aff[:3, 3] = [-30.0, -20.0, -25.0]
+    ep = tmp_path / "epi.nii.gz"
+    nib.save(nib.Nifti1Image(epi, epi_aff), ep)
+    anat_aff = np.diag([1.0, 1.0, 1.0, 1.0])
+    anat_aff[:3, 3] = [-45.0, -50.0, -45.0]
+    ap = tmp_path / "anat_grid.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((90, 100, 90), np.float32), anat_aff), ap)
+    m = str(_rigid_aff12(tmp_path))
+
+    fwd = tmp_path / "fwd.nii.gz"
+    nwarpforge(str(ep), [m], str(fwd), master_path=str(ap), interp="linear",
+               device=cpu, verb=0, auto_pad=False)  # fmt: skip
+    back = tmp_path / "back.nii.gz"
+    nwarpforge(str(fwd), [f"INV({m})"], str(back), master_path=str(ep), interp="linear",
+               device=cpu, verb=0, auto_pad=False)  # fmt: skip
+    got = np.asarray(nib.load(back).dataobj)
+    inner = (slice(6, -6),) * 3
+    # Measured: median 0.19 / p99 0.60 (two linear resamples); with the return grid's
+    # header slipped 1 mm (half an EPI voxel), median 3.6 / p99 5.3.
+    err = np.abs(got[inner] - epi[inner])
+    assert np.median(err) < 0.5 and np.percentile(err, 99) < 2.0, (np.median(err), err.max())

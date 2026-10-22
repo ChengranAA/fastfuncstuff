@@ -163,6 +163,13 @@ class ImagePane(QtWidgets.QWidget):
         #: Left-drag keeps picking. Off for a cell that re-centres on the
         #: crosshair, where each pick would move the ground under the drag.
         self.drag_picks = True
+        #: Drag picks are paced to frames; see _queue_pick.
+        self._pending_pick: tuple[int, int] | None = None
+        self._frame_due = False
+        self._frame_guard = QtCore.QTimer(self)
+        self._frame_guard.setSingleShot(True)
+        self._frame_guard.setInterval(50)
+        self._frame_guard.timeout.connect(self._frame_shown)
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -360,6 +367,7 @@ class ImagePane(QtWidgets.QWidget):
             if self._toast and self._toast_alpha > 0:
                 self._paint_toast(p)
             p.end()
+            self._frame_shown()
             return
 
         rect = self._target_rect()
@@ -421,6 +429,7 @@ class ImagePane(QtWidgets.QWidget):
         if self._toast and self._toast_alpha > 0:
             self._paint_toast(p)
         p.end()
+        self._frame_shown()
 
     #: How long a toast stays fully visible, then how long it fades, ms.
     TOAST_HOLD = 3000
@@ -693,6 +702,8 @@ class ImagePane(QtWidgets.QWidget):
 
     # -- input ---------------------------------------------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        self._pending_pick = None  # a press supersedes a drag's last place
+        self._frame_due = False
         if self.painting and self._paint_press(event):
             return
         if event.button() == QtCore.Qt.MouseButton.RightButton:
@@ -809,9 +820,42 @@ class ImagePane(QtWidgets.QWidget):
             return
         idx = self._to_indices(event.position())
         if idx is not None and self.drag_picks:
-            self.picked.emit(*idx)
+            self._queue_pick(idx)
+
+    def _queue_pick(self, idx: tuple[int, int]) -> None:
+        """Pick where a drag is now, at most once per frame this pane shows.
+
+        A mouse reports faster than a pick can be drawn, and every move run on
+        its own redrew every window for a place that was never shown -- a
+        fifth of a drag's work, and each one pushed the next frame back. Only
+        the newest place matters to a drag, so it waits for the last pick's
+        frame. Paced by the paint rather than by a zero timer: those are
+        posted events, which Qt serves ahead of the repaint, and a drag paced
+        that way showed 35 frames a second instead of 55.
+        """
+        self._pending_pick = idx
+        if not self._frame_due:
+            self._flush_pick()
+
+    def _flush_pick(self) -> None:
+        idx, self._pending_pick = self._pending_pick, None
+        if idx is None:
+            return
+        self._frame_due = True
+        # A pick that changes nothing paints nothing; the drag must not wait on it.
+        self._frame_guard.start()
+        self.picked.emit(*idx)
+
+    def _frame_shown(self) -> None:
+        if not self._frame_due:
+            return
+        self._frame_due = False
+        self._frame_guard.stop()
+        if self._pending_pick is not None:
+            QtCore.QTimer.singleShot(0, self, self._flush_pick)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        self._flush_pick()  # the drag ends where the button came up
         if self._paint_drag:
             self._paint_drag = False
             self.paint_released.emit()

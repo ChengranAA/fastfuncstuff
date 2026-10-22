@@ -46,6 +46,40 @@ def _drag(widget, button, mods, start, end):
     send(QtCore.QEvent.Type.MouseButtonRelease, end, none)
 
 
+def test_a_drag_picks_once_per_frame_and_ends_where_released(pane):
+    """A mouse reports faster than a pick draws; each extra pick redrew every
+    window for a place never shown. The newest place waits for the frame."""
+    import torch
+
+    from fastfuncstuff.viewer.compose import PaneImage
+
+    p, got = pane
+    p.set_pane(PaneImage(torch.zeros(20, 20, 4, dtype=torch.uint8), Plane.AXIAL, 0))
+    p.show()
+    QtWidgets.QApplication.processEvents()
+
+    def send(kind, pos, button, buttons):
+        ev = QtGui.QMouseEvent(
+            kind, QtCore.QPointF(*pos), QtCore.QPointF(*pos), button, buttons, M.NoModifier
+        )
+        QtWidgets.QApplication.sendEvent(p, ev)
+
+    def move(pos):
+        send(QtCore.QEvent.Type.MouseMove, pos, B.NoButton, B.LeftButton)
+
+    send(QtCore.QEvent.Type.MouseButtonPress, (10, 10), B.LeftButton, B.LeftButton)
+    move((50, 50))
+    move((100, 100))
+    move((150, 150))
+    assert got["picked"] == [(1, 1), (5, 5)], "the press, then the first move; the rest wait"
+    p.repaint()  # the frame for (5, 5) is shown
+    QtWidgets.QApplication.processEvents()
+    assert got["picked"][-1] == (15, 15), "the newest place, not the one in between"
+    move((60, 60))
+    send(QtCore.QEvent.Type.MouseButtonRelease, (60, 60), B.LeftButton, B.NoButton)
+    assert got["picked"][-1] == (6, 6), "the drag ends where the button came up"
+
+
 def test_right_drag_up_zooms_in_and_does_not_pan(pane):
     p, got = pane
     _drag(p, B.RightButton, M.NoModifier, (100, 120), (100, 60))

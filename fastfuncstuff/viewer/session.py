@@ -514,7 +514,11 @@ class ViewerSession:
 
     # -- dispatch ------------------------------------------------------
     def _on_command(self, cmd: Command, dirty: Aspect) -> None:
-        if dirty & (Aspect.TIME | Aspect.LAYERS):
+        # Not on TIME: a time-linked layer's cache key already carries the
+        # index, and dropping everything re-uploaded the static underlay on
+        # every volume step -- 45 ms of a 110 ms step on a 1 mm anatomy.
+        # Anything that rewrites a layer's voxels invalidates that key itself.
+        if dirty & Aspect.LAYERS:
             self.invalidate()
         elif isinstance(cmd, SetVolume):
             self.invalidate(cmd.key)

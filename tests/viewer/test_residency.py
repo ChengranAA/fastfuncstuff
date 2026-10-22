@@ -425,6 +425,22 @@ def test_compositing_stays_on_a_device_that_tolerates_two_threads(kind):
         session.close()
 
 
+def test_a_volume_step_keeps_a_static_layer_cached(session, dataset, tmp_path):
+    """Every step used to drop the underlay too, re-uploading a 1 mm anatomy
+    that had not changed: 45 ms of a 110 ms step while a key was held."""
+    path, data = dataset
+    anat = tmp_path / "anat.nii.gz"
+    nib.save(nib.Nifti1Image(data[..., 0].copy(), np.diag([3.0, 3.0, 4.0, 1.0])), str(anat))
+    base = session.load(anat)
+    run = session.load(path)
+    session.store.ensure_ram(run)
+    before = session.display_volume(base)
+    session.do(SetIndex(5))
+    assert session.display_volume(base) is before
+    # The time-linked layer still moves with the step.
+    assert float(session.display_volume(run)[0, 0, 0]) == pytest.approx(500.0)
+
+
 def test_a_displayed_sub_brick_lands_on_the_display_device(session, dataset):
     path, _ = dataset
     key = session.load(path)

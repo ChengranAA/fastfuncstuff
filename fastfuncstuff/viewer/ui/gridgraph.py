@@ -26,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
+import shiboken6
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.commands import Command
@@ -89,6 +90,37 @@ def _decimate(values: np.ndarray, width: float) -> tuple[np.ndarray, np.ndarray]
         return np.arange(n), values
     idx = np.linspace(0, n - 1, budget).astype(np.intp)
     return idx, values[idx]
+
+
+def _polygon(xy: np.ndarray) -> QtGui.QPolygonF:
+    """A QPolygonF of ``(N, 2)`` points, written through its buffer.
+
+    A QPointF per point, built in Python, was a third of a graph's paint;
+    a QPointF is two doubles, so the polygon's storage is an ``(N, 2)`` array.
+    """
+    xy = np.asarray(xy, np.float64).reshape(-1, 2)
+    poly = QtGui.QPolygonF()
+    poly.resize(len(xy))
+    if len(xy):
+        # (address, size, writeable); the stub knows only the one-argument form.
+        buf = shiboken6.VoidPtr(poly.data(), xy.nbytes, True)  # ty: ignore[too-many-positional-arguments]
+        np.frombuffer(buf, np.float64).reshape(-1, 2)[:] = xy
+    return poly
+
+
+def _same_cells(a: list[Cell], b: list[Cell]) -> bool:
+    """Whether two grids would paint the same traces (the cursor aside)."""
+    if len(a) != len(b):
+        return False
+    for x, y in zip(a, b, strict=True):
+        if (x.ijk, x.is_centre, x.tint) != (y.ijk, y.is_centre, y.tint) or len(x.traces) != len(
+            y.traces
+        ):
+            return False
+        for (ia, va), (ib, vb) in zip(x.traces, y.traces, strict=True):
+            if ia != ib or not np.array_equal(va, vb, equal_nan=True):
+                return False
+    return True
 
 
 @dataclass
@@ -212,6 +244,11 @@ class GridGraph(QtWidgets.QWidget):
         self._tinting = False
         self._colors: dict[str, QtGui.QColor] = {}
         self._time: set[str] = set()
+        #: Everything but the time cursor, which is all a volume step moves.
+        #: Repainting the traces for it was most of a held arrow key's frame.
+        self._static: QtGui.QPixmap | None = None
+        self._static_key: tuple = ()
+        self._static_version = 0
         self.setMinimumSize(60, 48)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
@@ -225,11 +262,19 @@ class GridGraph(QtWidgets.QWidget):
         colors: dict[str, QtGui.QColor] | None = None,
         time_keys: set[str] | None = None,
     ) -> None:
+        same = (
+            n == self._n
+            and _same_cells(cells, self._cells)
+            and (colors is None or colors == self._colors)
+            and (time_keys is None or time_keys == self._time)
+        )
         self._cells, self._n, self._index = cells, n, index
         if colors is not None:
             self._colors = colors
         if time_keys is not None:
             self._time = time_keys
+        if not same:
+            self._static_version += 1
         self.update()
 
     def _time_trace(self, cell: Cell) -> np.ndarray | None:
@@ -315,17 +360,30 @@ class GridGraph(QtWidgets.QWidget):
             p.end()
             return
 
-        n = self._n
-        pad = 3
-        cw = (self.width() - pad * (n + 1)) / n
-        ch = (self.height() - pad * (n + 1)) / n
-        shared = self._bounds(self._cells) if self._shared_scale else None
-        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-
-        for idx, cell in enumerate(self._cells):
-            r, c = divmod(idx, n)
-            rect = QtCore.QRectF(pad + c * (cw + pad), pad + r * (ch + pad), cw, ch)
-            self._paint_cell(p, rect, cell, shared)
+        rects = self._cell_rects()
+        dpr = self.devicePixelRatioF()
+        key = (
+            self.size(),
+            dpr,
+            c,
+            self._static_version,
+            self._shared_scale,
+            self._tinting,
+        )
+        if self._static is None or key != self._static_key:
+            static = QtGui.QPixmap(self.size() * dpr)
+            static.setDevicePixelRatio(dpr)
+            static.fill(QtCore.Qt.GlobalColor.transparent)
+            sp = QtGui.QPainter(static)
+            sp.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+            shared = self._bounds(self._cells) if self._shared_scale else None
+            for rect, cell in zip(rects, self._cells, strict=False):
+                self._paint_cell(sp, rect, cell, shared)
+            sp.end()
+            self._static, self._static_key = static, key
+        p.drawPixmap(0, 0, self._static)
+        for rect, cell in zip(rects, self._cells, strict=False):
+            self._paint_cursor(p, rect, cell)
         p.end()
 
     def _paint_cell(
@@ -361,13 +419,10 @@ class GridGraph(QtWidgets.QWidget):
         # course is Hz beside TR -- so scaling both to the longest would squash
         # the shorter one into a fraction of the cell and imply a shared x that
         # does not exist.
-        cursor_len = 0
-
         for si, (ident, values) in indexed:
             lo, hi = bounds.get(ident, (0.0, 1.0))
             span = hi - lo or 1.0
             nt = values.size
-            cursor_len = max(cursor_len, nt)
             # Decimate to the width of the cell. At a 16x16 grid a cell is
             # about thirty pixels wide, and drawing four hundred points into
             # thirty pixels costs the whole paint and shows nothing -- the
@@ -377,26 +432,19 @@ class GridGraph(QtWidgets.QWidget):
             # Python it was most of a repaint once a mode added a few traces.
             px = inner.left() + xs.astype(np.float64) * (inner.width() / max(nt - 1, 1))
             py = inner.bottom() - (np.asarray(ys, np.float64) - lo) * (inner.height() / span)
-            poly = QtGui.QPolygonF(
-                [QtCore.QPointF(x, y) for x, y in zip(px.tolist(), py.tolist(), strict=True)]
-            )
+            points = np.stack([px, py], axis=1)
             colour = self._colors.get(ident) or QtGui.QColor.fromRgbF(*c.series[si % len(c.series)])
             pen = QtGui.QPen(colour)
             pen.setWidthF(1.6 if cell.is_centre else 1.0)
             p.setPen(pen)
-            p.drawPolyline(poly)
-
-        # The time cursor belongs to a time-domain trace; a spectrum has no
-        # "current time point", and with every time course ticked off there is
-        # no cursor to draw.
-        timeline = self._time_trace(cell)
-        first_len = 0 if timeline is None else timeline.size
-        if 0 <= self._index < first_len:
-            x = inner.left() + (self._index / max(first_len - 1, 1)) * inner.width()
-            cursor = QtGui.QColor(c.warn)
-            cursor.setAlpha(170)
-            p.setPen(QtGui.QPen(cursor))
-            p.drawLine(QtCore.QPointF(x, inner.top()), QtCore.QPointF(x, inner.bottom()))
+            if cell.is_centre:
+                # Stroked as separate segments: a wider-than-1 pen sends a
+                # polyline through Qt's stroker, which outlines a noisy trace
+                # as one self-crossing path -- 28 ms for 300 points, against
+                # 1.7 here. At 1.6 px the missing joins are invisible.
+                p.drawLines(_polygon(np.stack([points[:-1], points[1:]], axis=1)))
+            else:
+                p.drawPolyline(_polygon(points))
 
         if self._n <= 3:
             p.setPen(QtGui.QColor(c.dim))
@@ -405,6 +453,20 @@ class GridGraph(QtWidgets.QWidget):
             p.setFont(f)
             i, j, k = cell.ijk
             p.drawText(QtCore.QPointF(rect.left() + 4, rect.top() + 11), f"{i} {j} {k}")
+
+    def _paint_cursor(self, p: QtGui.QPainter, rect: QtCore.QRectF, cell: Cell) -> None:
+        # The time cursor belongs to a time-domain trace; a spectrum has no
+        # "current time point", and with every time course ticked off there is
+        # no cursor to draw.
+        timeline = self._time_trace(cell)
+        first_len = 0 if timeline is None else timeline.size
+        if 0 <= self._index < first_len:
+            inner = rect.adjusted(2, 2, -2, -2)
+            x = inner.left() + (self._index / max(first_len - 1, 1)) * inner.width()
+            cursor = QtGui.QColor(theme.palette().warn)
+            cursor.setAlpha(170)
+            p.setPen(QtGui.QPen(cursor))
+            p.drawLine(QtCore.QPointF(x, inner.top()), QtCore.QPointF(x, inner.bottom()))
 
 
 class GraphWindow(QtWidgets.QWidget):

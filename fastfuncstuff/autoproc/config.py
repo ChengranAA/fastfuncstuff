@@ -54,6 +54,11 @@ DEFAULT_OPTS: dict[str, str] = {
     # cross-family linear: a child acquisition family's corrected anchor onto the
     # root family's, both in anat space — same contrast, so lpa, not the anat's lpc.
     "xfam": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
+    # cross-family nonlinear (-xfam_nonlin): the child's corrected grandmean onto the
+    # root's corrected anchor pulled back onto the child's grid, PE axis only (the
+    # emitter adds the -no?dis flags). Same-contrast, so the cross-run settings.
+    "xfam_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
+    "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # cross-session linear/nonlinear (session grandmean → ref session).
     "xses": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
     "xses_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
@@ -122,7 +127,7 @@ DEFAULT_OPTS: dict[str, str] = {
 # these same backends, and a name that means one thing to the tuner and another
 # to the pipeline is how a tuned setting ends up applied to the wrong engine.
 # ---------------------------------------------------------------------------
-NL_STAGE_KEYS: tuple[str, ...] = ("xrun_nl", "xfmap_nl", "xses_nl", "anat_nl")
+NL_STAGE_KEYS: tuple[str, ...] = ("xrun_nl", "xfmap_nl", "xses_nl", "anat_nl", "xfam_nl")
 DEFAULT_NL_BACKEND = "formwarp"
 
 

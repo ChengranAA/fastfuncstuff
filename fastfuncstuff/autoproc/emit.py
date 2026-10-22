@@ -345,6 +345,8 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt, echo: int | None = None) 
         return _anat_lin_files(opt)
     if tok == "xfam_lin":
         return [_xfam_matrix()]
+    if tok == "xfam_nl":
+        return [stem(NameKey("xfam")) + f"_nl_WARP{fmt}"]
     if tok == "xref_nl":
         return [stem(NameKey("xref")) + f"_nl_WARP{fmt}"]
     if tok == "xref_lin":
@@ -3710,7 +3712,7 @@ def _final_master(plan: Plan) -> str:
     if opt.do_mni:
         return _al_mni(plan)
     if plan.xfam_root is not None:
-        return _xfam_image()
+        return _xfam_nl_anchor() if plan.options.xfam_nonlin else _xfam_image()
     return _anat_anchor(plan)
 
 
@@ -3771,11 +3773,141 @@ def _stage_xfam(plan: Plan) -> str:
                 )
             ],
         )
-    return (
+    out = (
         f"# ---- stage09: align to the root family ({fam.label}) ----\n"
         "# This family's corrected anchor onto the root family's, both in anat space.\n"
         f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{_xfam_matrix()}" ]; then\n{call}\nfi\n{qc}'
     )
+    return out + _stage_xfam_nl(plan, base)
+
+
+def _xfam_nl_anchor() -> str:
+    """The child's anchor in anat space through its WHOLE head of chain, the
+    cross-family warp included — what the output grid is cut from under
+    -xfam_nonlin (allineate's stage09.xfam_lin stops at the rigid link)."""
+    return stem(NameKey("xfam")) + "_nl_al_anat.nii$FMT"
+
+
+def _stage_xfam_nl(plan: Plan, root_anchor: str) -> str:
+    """-xfam_nonlin: warp this family onto the root along its own PE axis.
+
+    Not on the anat grid: there both anchors have been through anat_lin, and this
+    family's PE axis is a diagonal. So the root's corrected anchor is pulled BACK
+    onto this family's EPI grid through the inverse of the two rigid links
+    (INV(anat_lin) acts first on the output coordinate, then INV(xfam)), and fitted
+    there against this family's own grandmean through its anat_nl — two images on
+    one grid whose PE axis is a grid axis, so -no?dis on the other two is exact.
+    The warp lands between anat_lin and anat_nl, in the frame anat_nl acts in.
+
+    Where the root has no data the pulled-back image is zero, and the backends'
+    default coverage handling drops it from the cost, so only the shared slab
+    drives the fit; outside it the field is left to the regularisation.
+    """
+    if plan.xfam_root is None or not plan.options.xfam_nonlin or not plan.runs:
+        return ""
+    opt = plan.options
+    pr = plan.runs[0]
+    own = _anat_source_image(plan)
+    anat_mats = _anat_lin_files(opt)
+    pull = " ".join([*(f"INV({m})" for m in anat_mats), f"INV({_xfam_matrix()})"])
+    root_in_epi = stem(NameKey("xfam")) + "_root_in_epi.nii$FMT"
+    parts = [
+        "# ---- stage09: cross-family warp, PE axis only (-xfam_nonlin) ----",
+        "# The root's corrected anchor, pulled back onto this family's EPI grid.",
+        f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{root_in_epi}" ]; then',
+        _ffs(
+            "ffs_nwarp",
+            [
+                f'-source "{root_anchor}"',
+                f'-nwarp "{pull}"',
+                f'-master "{own}"',
+                *_split_flags(config.DEFAULT_OPTS["nwarp"]),
+                f'-prefix "{root_in_epi}"',
+                '-device "$DEVICE"',
+            ],
+        ),
+        "fi",
+    ]
+    corrected = own
+    if "anat_nl" in pr.warp_chain:
+        corrected = stem(NameKey("xfam")) + "_own_in_epi.nii$FMT"
+        parts += [
+            "# ...and this family's own grandmean through its anat_nl, on the same grid.",
+            f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{corrected}" ]; then',
+            _ffs(
+                "ffs_nwarp",
+                [
+                    f'-source "{own}"',
+                    f'-nwarp "{" ".join(chain_files(pr, ".nii$FMT", opt, tokens=["anat_nl"]))}"',
+                    f'-master "{own}"',
+                    *_split_flags(config.DEFAULT_OPTS["nwarp"]),
+                    f'-prefix "{corrected}"',
+                    '-device "$DEVICE"',
+                ],
+            ),
+            "fi",
+        ]
+    pe = _pe_axis(plan)
+    frozen = [f"-no{a.upper()}dis" for a in "xyz" if a != pe]
+    warp = chain_files(pr, ".nii$FMT", opt, tokens=["xfam_nl"])[0]
+    parts += [
+        f"# PE axis ({pe}) only: {' '.join(frozen)}",
+        f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{warp}" ]; then',
+        _ffs(
+            _nl_tool(opt, "xfam_nl"),
+            [
+                f'-base "{root_in_epi}"',
+                f'-source "{corrected}"',
+                f'-prefix "{stem(NameKey("xfam"))}_nl.nii$FMT"',
+                "-save_warp",
+                f'-warp_prefix "{stem(NameKey("xfam"))}_nl"',
+                *frozen,
+                *_split_flags(config.DEFAULT_OPTS["xfam_nl"]),
+                '-device "$DEVICE"',
+            ],
+        ),
+        "fi",
+    ]
+    # The anchor through the whole head, so the output grid and mask are cut from
+    # the shape the data lands in.
+    head = [
+        t for t in pr.warp_chain[: pr.warp_chain.index("xfam_nl") + 1] if not t.startswith("mni_")
+    ]
+    if "anat_nl" in pr.warp_chain:
+        head.append("anat_nl")
+    anchor = _xfam_nl_anchor()
+    parts += [
+        f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{anchor}" ]; then',
+        _ffs(
+            "ffs_nwarp",
+            [
+                f'-source "{own}"',
+                f'-nwarp "{" ".join(chain_files(pr, ".nii$FMT", opt, tokens=head))}"',
+                f'-master "{_anat_box()}"',
+                *_split_flags(config.DEFAULT_OPTS["nwarp"]),
+                f'-prefix "{anchor}"',
+                '-device "$DEVICE"',
+            ],
+        ),
+        "fi",
+    ]
+    if _qc_on(plan):
+        parts.append(
+            _qc_block(
+                "cross-family warp",
+                [
+                    _qc_call(
+                        _qc_stem("xfam", role="nl"),
+                        [
+                            (root_in_epi, "root_in_epi"),
+                            (corrected, "own"),
+                            (f"{stem(NameKey('xfam'))}_nl.nii$FMT", "own_xfam_nl"),
+                        ],
+                    )
+                ],
+            )
+        )
+    return "\n" + "\n".join(p for p in parts if p) + "\n"
 
 
 def _final_anat(plan: Plan) -> str:

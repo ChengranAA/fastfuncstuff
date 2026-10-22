@@ -84,6 +84,9 @@ class Options:
     family_links: dict[str, str] = field(default_factory=dict)
     # -xfam_min_overlap: least fraction of a child's FoV the root must cover.
     xfam_min_overlap: float = 0.5
+    # -xfam_nonlin: after the rigid cross-family link, a warp along the child's own
+    # PE axis onto the root, fitted in the child's EPI frame.
+    xfam_nonlin: bool = False
     # Set by build_plan on a child family's own plan, never by the user: its chain
     # carries xfam_lin, the rigid link onto the root family's corrected anchor.
     xfam_link: bool = False
@@ -243,6 +246,7 @@ class Options:
     xfmap_nl_backend: str = config.DEFAULT_NL_BACKEND
     xses_nl_backend: str = config.DEFAULT_NL_BACKEND
     anat_nl_backend: str = config.DEFAULT_NL_BACKEND
+    xfam_nl_backend: str = config.DEFAULT_NL_BACKEND
     # -anat_nonlin by ffs_segment (TPM-driven) or by registering the anat anchor
     # to the anat along the PE axis with the anat_nl backend.
     anat_nonlin_method: str = "segment"
@@ -367,6 +371,11 @@ _CHAIN_ORDER = (
     "anat_lin",
     "xref_nl",
     "xref_lin",
+    # -xfam_nonlin: the child's PE-axis refinement onto the root. Fitted in the
+    # child's EPI frame, the one anat_lin lands in and anat_nl acts in, so it sits
+    # between the two — along the same axis as anat_nl, never on the anat grid,
+    # where that axis is a diagonal.
+    "xfam_nl",
     # anat_nl is estimated on the grandmean (reference-session space), so the
     # data must already be there when it acts — i.e. AFTER xses, which in this
     # leftmost-acts-first order means it is listed BEFORE the xses tokens.
@@ -760,6 +769,7 @@ def build_warp_chain(pr: PlanRun, opt: Options, multi_session: bool) -> list[str
         "mni_nl": opt.go_to_anat and opt.do_mni,
         "anat_lin": opt.go_to_anat,
         "xfam_lin": opt.go_to_anat and opt.xfam_link,
+        "xfam_nl": opt.go_to_anat and opt.xfam_link and opt.xfam_nonlin,
         # xref: align this data's grandmean to the external reference's grandmean.
         "xref_lin": opt.go_to_anat and grand_ref,
         "xref_nl": opt.go_to_anat and grand_ref and opt.grand_reference_nonlin,

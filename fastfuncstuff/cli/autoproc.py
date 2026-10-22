@@ -814,6 +814,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="nonlinear cross-fmap-group refinement",
     )
     g.add_argument(
+        "-xfam_nonlin",
+        "-xfam-nonlin",
+        action="store_const",
+        const=True,
+        default=None,
+        help="after the rigid link of a family to the root family, also warp it onto "
+        "the root along its OWN phase-encode axis. Fitted in the family's EPI frame "
+        "(the root's corrected anchor pulled back onto the family's grid), where PE is "
+        "a grid axis, and acting beside the family's own anat_nl. Only where the two "
+        "slabs overlap drives it; outside, the warp is left to its regularisation. "
+        "Off by default: it trusts the root's correction over this family's own.",
+    )
+    g.add_argument(
         "-xses_nonlin",
         "-xses-nonlin",
         action="store_const",
@@ -844,6 +857,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("xfmap", "cross-fmap-group"),
         ("xses", "cross-session"),
         ("anat", "EPI-to-anat (-anat_nonlin_method register)"),
+        ("xfam", "cross-family (-xfam_nonlin)"),
     ):
         suggest(
             g.add_argument(
@@ -2744,6 +2758,7 @@ def main(argv: list[str] | None = None) -> int:
         locomoco_detask=args.locomoco_detask,
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),
+        xfam_nonlin=eff(args.xfam_nonlin, "xfam_nonlin"),
         xses_nonlin=eff(args.xses_nonlin, "xses_nonlin"),
         xrun_nonlin_in_source=eff(args.xrun_nonlin_in_source, "xrun_nonlin_in_source"),
         xfmap_nonlin_in_source=eff(args.xfmap_nonlin_in_source, "xfmap_nonlin_in_source"),

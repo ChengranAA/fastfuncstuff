@@ -296,3 +296,30 @@ def test_anat_prep_and_mni_run_once_and_are_linked_into_each_family(tmp_path):
         # Each family still aligns its own EPI and pushes its own anchor into MNI.
         assert '-1Dmatrix_save "stage09.anat.aff12.1D"' in fam
         assert "_al_mni" in fam
+
+
+def test_xfam_nonlin_fits_on_the_childs_own_grid_along_its_pe_axis(tmp_path):
+    opt = Options(go_to_anat=True, anat_nonlin=True, xfam_nonlin=True)
+    plan = build_plan(_slab_subject(tmp_path), opt)
+    (_, root), (_, child) = plan.family_plans
+    toks = child.runs[0].warp_chain
+    # Between anat_lin and anat_nl: the frame anat_nl acts in, not the anat grid.
+    i = toks.index("anat_lin")
+    assert toks[i : i + 3] == ["anat_lin", "xfam_nl", "anat_nl"]
+    assert toks[i - 1] == "xfam_lin" and "xfam_nl" not in root.runs[0].warp_chain
+
+    script = write_script(plan, "wd", bids_root="/bids")
+    sh = tmp_path / "proc.sh"
+    sh.write_text(script)
+    assert subprocess.run(["bash", "-n", str(sh)], capture_output=True).returncode == 0
+    floc = script.split("\n# family ")[2]
+    # The root's anchor comes back through INV(anat_lin) then INV(xfam)...
+    assert '-nwarp "INV(stage09.anat.aff12.1D) INV(stage09.xfam.aff12.1D)"' in floc
+    # ...and the fit holds the two non-PE axes still (floc is PE j-, so y moves).
+    fit = floc.split('-warp_prefix "stage09.xfam_nl"')[1].split("-device")[0]
+    assert "-noXdis" in fit and "-noZdis" in fit and "-noYdis" not in fit
+    # The output grid is cut from the anchor through the whole head, warp included.
+    assert '-nwarp "stage09.xfam.aff12.1D stage09.anat.aff12.1D stage09.xfam_nl_WARP' in floc
+    assert 'MASTER="${FFS_MASTER:-stage09.xfam_nl_al_anat.nii$FMT}"' in floc
+    # The family's own anchor still excludes both cross-family links.
+    assert '-nwarp "stage09.anat.aff12.1D stage09.nlanat_invwarp.nii$FMT"' in floc

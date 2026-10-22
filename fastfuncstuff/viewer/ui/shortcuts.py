@@ -11,6 +11,7 @@ that has focus -- a graph window's keys are not the main window's.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -107,15 +108,73 @@ class _StepKeys(QtCore.QObject):
         return False
 
 
+class _StaleRepeats(QtCore.QObject):
+    """Drop key auto-repeats that waited in the queue, so a held key never runs ahead.
+
+    A held key repeats every ~33 ms whatever the viewer is doing. When a step
+    takes longer than that, the repeats queue up behind it and are then all
+    run back to back with no paint between them: the picture freezes, jumps,
+    and keeps going after the key is let go. A repeat that sat in the queue
+    is one the person has already pressed past, so it is dropped, and a held
+    key steps exactly as fast as the viewer can draw.
+
+    Queue delay is the event's own timestamp against the local clock, with the
+    clocks' offset taken as the smallest gap seen -- the delivery that waited
+    least. Only repeats are judged; a fresh press always lands.
+    """
+
+    #: A repeat older than this when it arrives is stale. Under one repeat
+    #: interval, so a viewer that keeps up loses nothing.
+    STALE_MS = 20.0
+    #: A gap this far off is a clock that restarted, not a queue; re-anchor.
+    RESYNC_MS = 2000.0
+
+    def __init__(self, parent: QtCore.QObject | None = None, clock=None) -> None:
+        super().__init__(parent)
+        self._clock = clock or (lambda: time.monotonic() * 1000.0)
+        self._offset: float | None = None
+        #: One verdict per physical event: it is filtered again as a
+        #: ShortcutOverride, a KeyPress, and on every parent it propagates to.
+        self._last: tuple[int, int, bool] = (-1, -1, False)
+
+    def stale(self, event: QtGui.QKeyEvent) -> bool:
+        ts = int(event.timestamp())
+        if ts <= 0:  # synthetic (scripts, tests): no clock to judge by
+            return False
+        if self._last[:2] == (ts, event.key()):
+            return self._last[2]
+        gap = self._clock() - ts
+        if self._offset is None or gap < self._offset or gap - self._offset > self.RESYNC_MS:
+            self._offset = gap
+        drop = event.isAutoRepeat() and gap - self._offset > self.STALE_MS
+        self._last = (ts, event.key(), drop)
+        return drop
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt)
+        kind = event.type()
+        if kind not in (QtCore.QEvent.Type.ShortcutOverride, QtCore.QEvent.Type.KeyPress):
+            return False
+        if not self.stale(event):
+            return False
+        if kind == QtCore.QEvent.Type.ShortcutOverride:
+            # Accepted, the shortcut map stands aside; the KeyPress that
+            # follows is then swallowed below.
+            event.accept()
+        return True
+
+
 _step_keys: _StepKeys | None = None
+_stale_repeats: _StaleRepeats | None = None
 
 
 def _keep_step_keys() -> None:
-    global _step_keys
+    global _step_keys, _stale_repeats
     app = QtWidgets.QApplication.instance()
     if app is not None and _step_keys is None:
         _step_keys = _StepKeys(app)
         app.installEventFilter(_step_keys)
+        _stale_repeats = _StaleRepeats(app)
+        app.installEventFilter(_stale_repeats)
 
 
 def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:

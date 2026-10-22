@@ -1104,6 +1104,31 @@ def _rescue_null_threshold(
     return float(torch.quantile(stat, 1.0 - alpha).item())
 
 
+def _magnitude_phase_to_host(
+    denoised: torch.Tensor,
+    want_phase: bool,
+    chunk_z: int = 8,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """``|denoised|`` (and its angle) as float32 host arrays, zeroing non-finite voxels.
+
+    Chunked over z: the whole-volume ``isfinite`` mask and ``abs``/``angle`` results
+    each needed a full 4-D allocation next to ``denoised``, and on a shared card the
+    first of them was the OOM after the LLR pass had already finished.
+    """
+    nz = denoised.shape[2]
+    magn = np.empty(tuple(denoised.shape), dtype=np.float32)
+    phase = np.empty(tuple(denoised.shape), dtype=np.float32) if want_phase else None
+    for z0 in range(0, nz, chunk_z):
+        z1 = min(nz, z0 + chunk_z)
+        blk = denoised[:, :, z0:z1]
+        blk[~torch.isfinite(blk)] = 0
+        magn[:, :, z0:z1] = torch.abs(blk).cpu().numpy()
+        if phase is not None:
+            phase[:, :, z0:z1] = torch.angle(blk).cpu().numpy()
+        del blk
+    return magn, phase
+
+
 def _magnitude_loss(
     denoised: torch.Tensor,
     residual: torch.Tensor,
@@ -2005,12 +2030,6 @@ def _finalize_echo(
     if residual is not None:
         residual *= absolute_scale
 
-    # Clean nan in-place
-    nan_mask = ~torch.isfinite(denoised)
-    if nan_mask.any():
-        denoised[nan_mask] = 0
-    del nan_mask
-
     # ------------------------------------------------------------------
     # 9. Write outputs
     # ------------------------------------------------------------------
@@ -2027,15 +2046,10 @@ def _finalize_echo(
         magn_path = out_dir / f"{out_prefix.name}{ext}"
         phase_path = out_dir / f"{out_prefix.name}.part-phase{ext}" if phase_in_used else None
 
-    # Compute magnitude (and phase) on GPU, move to CPU, then free GPU
-    # to avoid holding denoised + abs + angle all at once.
-    magn_np_out = torch.abs(denoised).cpu().numpy().astype(np.float32)
+    magn_np_out, phase_out_np = _magnitude_phase_to_host(denoised, phase_path is not None)
     task_loss_np: np.ndarray | None = None
     if cfg.save_task_loss and residual is not None:
         task_loss_np = _magnitude_loss(denoised, residual, magn_np_out)
-    phase_out_np: np.ndarray | None = None
-    if phase_path is not None:
-        phase_out_np = torch.angle(denoised).cpu().numpy().astype(np.float32)
     del denoised
     if dev.type == "cuda":
         torch.cuda.empty_cache()
@@ -2219,6 +2233,9 @@ def _llr_main_pass(
     (denoised, stats, residual, mean_removed). Consumes prepped.ksp2."""
     KSP2 = prepped.ksp2
     assert KSP2 is not None
+    # Drop the dataclass's reference now: while it lives, the offload below copies
+    # the input to the host but frees nothing on the device.
+    prepped.ksp2 = None
     kernel_pca = prepped.kernel_pca
 
     # Memory check: if data + accumulators + working set exceeds available GPU
@@ -2290,7 +2307,6 @@ def _llr_main_pass(
         # residual that lives on a different device than denoised.
         residual = KSP2 - denoised.to(KSP2.device)
     del KSP2
-    prepped.ksp2 = None
     if dev.type == "cuda":
         torch.cuda.empty_cache()
 

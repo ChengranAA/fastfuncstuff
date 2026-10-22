@@ -1374,3 +1374,24 @@ def test_task_rescue_needs_the_scan_it_acts_on(tmp_path):
                 "off",
             ]
         )
+
+
+def test_magnitude_phase_to_host_matches_whole_volume():
+    from fastfuncstuff.denoise.nordic import _magnitude_phase_to_host
+
+    g = torch.Generator().manual_seed(0)
+    x = torch.complex(torch.randn(5, 4, 11, 6, generator=g), torch.randn(5, 4, 11, 6, generator=g))
+    x[1, 2, 9, 3] = complex(float("nan"), 0.0)
+    x[0, 0, 0, 0] = complex(float("inf"), 1.0)
+    ref = x.clone()
+    ref[~torch.isfinite(ref)] = 0
+
+    magn, phase = _magnitude_phase_to_host(x, want_phase=True, chunk_z=4)
+    # angle() on a strided slab vs the contiguous whole differs by 1 ULP (measured 1.2e-7).
+    np.testing.assert_allclose(magn, torch.abs(ref).numpy(), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(phase, torch.angle(ref).numpy(), rtol=1e-6, atol=1e-6)
+    assert torch.isfinite(x).all()  # zeroed in place, as the save path relies on
+
+    magn_only, none = _magnitude_phase_to_host(ref, want_phase=False)
+    assert none is None
+    np.testing.assert_array_equal(magn_only, magn)

@@ -1,4 +1,4 @@
-"""-ortvec* regressors reach both ffs_ridge fit paths."""
+"""End-to-end ffs_ridge CLI fits: -ortvec* nuisance and -ridge_fracs edge cases."""
 
 import sys
 
@@ -9,7 +9,7 @@ import pytest
 from fastfuncstuff.cli.ridge import main
 
 
-def _fit(tmp_path, monkeypatch, single_trials, ortvec):
+def _fit(tmp_path, monkeypatch, single_trials, ortvec, fracs=("0.1", "1", "0.9")):
     rng = np.random.default_rng(5)
     n_t = 40
     vols = []
@@ -29,7 +29,7 @@ def _fit(tmp_path, monkeypatch, single_trials, ortvec):
     onset.write_text("4 20 36 52\n4 20 36 52\n")
     prefix = str(tmp_path / ("with" if ortvec else "without"))
     argv = ["ffs_ridge", "-input", *vols, "-onsets", str(onset), "-durations", "1"]
-    argv += ["-device", "cpu", "-polort", "1", "-prefix", prefix, "-ridge_fracs", "0.1", "1", "0.9"]
+    argv += ["-device", "cpu", "-polort", "1", "-prefix", prefix, "-ridge_fracs", *fracs]
     if single_trials:
         argv.append("-single_trials")
     if ortvec:
@@ -45,3 +45,10 @@ def test_ortvec_glob_projected_out(tmp_path, monkeypatch, single_trials):
     without = _fit(tmp_path, monkeypatch, single_trials, ortvec=False)
     with_ortvec = _fit(tmp_path, monkeypatch, single_trials, ortvec=True)
     assert with_ortvec < 0.05 * without
+
+
+def test_single_fraction_single_trials(tmp_path, monkeypatch):
+    # The no-repeats warning tells users to pass one fraction; the selection
+    # used to drop the last (OLS) column regardless and crash on an empty slice.
+    betas = _fit(tmp_path, monkeypatch, True, ortvec=False, fracs=("0.5", "0.5", "1"))
+    assert np.isfinite(betas)

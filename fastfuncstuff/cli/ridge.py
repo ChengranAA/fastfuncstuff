@@ -812,6 +812,9 @@ def main():
 
         per_voxel_design = design_matrix.ndim == 3
         _hib = metric_higher_is_better(args.metric)
+        # The last fraction is the OLS reference and stays out of the selection —
+        # unless it is the only one, which is what the no-repeats warning advises.
+        n_selectable = max(len(fracs) - 1, 1)
 
         def _vec_design_for(hrf_kernel=None):
             """Stim vector columns convolved with one HRF (None = the design's)."""
@@ -972,9 +975,9 @@ def main():
                 # For SSE (GLMsingle "badness"), minimize; for R² metrics, maximize
                 _hib = metric_higher_is_better(args.metric)
                 if _hib:
-                    chunk_xval, chunk_best_idx = chunk_r2_frac[:, :-1].max(dim=1)
+                    chunk_xval, chunk_best_idx = chunk_r2_frac[:, :n_selectable].max(dim=1)
                 else:
-                    chunk_xval, chunk_best_idx = chunk_r2_frac[:, :-1].min(dim=1)
+                    chunk_xval, chunk_best_idx = chunk_r2_frac[:, :n_selectable].min(dim=1)
                 xval_r2[c0:c1] = chunk_xval.cpu()
                 r2_by_frac[c0:c1] = chunk_r2_frac.cpu()
                 optimal_fracs[c0:c1] = fracs_t[chunk_best_idx.cpu()]
@@ -1153,9 +1156,9 @@ def main():
                     # Use r2_chunk directly — avoids reading back from r2_by_frac
                     # SSE: minimize; R² metrics: maximize
                     if _hib:
-                        chunk_r2, chunk_best_idx = r2_chunk[:, :-1].max(dim=1)
+                        chunk_r2, chunk_best_idx = r2_chunk[:, :n_selectable].max(dim=1)
                     else:
-                        chunk_r2, chunk_best_idx = r2_chunk[:, :-1].min(dim=1)
+                        chunk_r2, chunk_best_idx = r2_chunk[:, :n_selectable].min(dim=1)
                     xval_r2[chunk_voxel_idx_dev] = chunk_r2
                     optimal_fracs[chunk_voxel_idx_dev] = fracs_dev[chunk_best_idx]
 

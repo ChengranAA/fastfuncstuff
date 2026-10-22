@@ -52,3 +52,10 @@ def test_single_fraction_single_trials(tmp_path, monkeypatch):
     # used to drop the last (OLS) column regardless and crash on an empty slice.
     betas = _fit(tmp_path, monkeypatch, True, ortvec=False, fracs=("0.5", "0.5", "1"))
     assert np.isfinite(betas)
+
+
+def test_single_trials_writes_temporal_similarity(tmp_path, monkeypatch):
+    _fit(tmp_path, monkeypatch, True, ortvec=False)
+    assert (tmp_path / "without_temporal_similarity.png").stat().st_size > 0
+    header = (tmp_path / "without_temporal_similarity.tsv").read_text().splitlines()[0]
+    assert header.startswith("trials_apart\tOLS (frac 1)\tridge (")

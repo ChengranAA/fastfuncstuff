@@ -262,6 +262,17 @@ Notes:
         help="Z-score betas per run before CV using OLS normalization stats "
         "(GLMsingle default). Only applies with -single_trials.",
     )
+    ridge_opts.add_argument(
+        "-temporal_similarity_voxels",
+        type=int,
+        default=2000,
+        metavar="N",
+        help="Write {prefix}_temporal_similarity.png/.tsv: trial-by-trial correlation of\n"
+        "beta maps in presentation order, OLS vs the final ridge betas (GLMsingle\n"
+        "Fig. 5), plus correlation by trials-apart. Uses the N voxels with the best\n"
+        "beta-space CV score averaged over OLS and the chosen fraction, so neither\n"
+        "version picks its own voxels. 0 disables. Only applies with -single_trials.",
+    )
     add_noise_ceiling_args(
         ridge_opts,
         stage_note="ffs_ridge scores in beta space, so 'auto' resolves to "
@@ -815,6 +826,11 @@ def main():
         # The last fraction is the OLS reference and stays out of the selection —
         # unless it is the only one, which is what the no-repeats warning advises.
         n_selectable = max(len(fracs) - 1, 1)
+        similarity_tracker = None
+        if args.temporal_similarity_voxels > 0 and n_basis == 1:
+            from fastfuncstuff.glm.temporal_similarity import TopVoxelTracker
+
+            similarity_tracker = TopVoxelTracker(args.temporal_similarity_voxels, _hib)
 
         def _vec_design_for(hrf_kernel=None):
             """Stim vector columns convolved with one HRF (None = the design's)."""
@@ -980,6 +996,12 @@ def main():
                     chunk_xval, chunk_best_idx = chunk_r2_frac[:, :n_selectable].min(dim=1)
                 xval_r2[c0:c1] = chunk_xval.cpu()
                 r2_by_frac[c0:c1] = chunk_r2_frac.cpu()
+                if similarity_tracker is not None:
+                    similarity_tracker.add(
+                        (chunk_r2_frac[:, -1] + chunk_xval) / 2,
+                        torch.arange(c0, c1),
+                        chunk_betas_all[-1],
+                    )
                 optimal_fracs[c0:c1] = fracs_t[chunk_best_idx.cpu()]
 
                 # Extract final betas at optimal fraction for this chunk
@@ -1161,6 +1183,12 @@ def main():
                         chunk_r2, chunk_best_idx = r2_chunk[:, :n_selectable].min(dim=1)
                     xval_r2[chunk_voxel_idx_dev] = chunk_r2
                     optimal_fracs[chunk_voxel_idx_dev] = fracs_dev[chunk_best_idx]
+                    if similarity_tracker is not None:
+                        similarity_tracker.add(
+                            (r2_chunk[:, -1] + chunk_r2) / 2,
+                            chunk_voxel_idx,
+                            all_chunk_betas[-1],
+                        )
 
                     # Extract final betas at optimal fraction
                     chunk_voxel_range = torch.arange(chunk_size_actual, device=device)
@@ -1308,6 +1336,46 @@ def main():
             header=nifti_header,
         )
         print(f"  {args.prefix}_optimal_frac{_nii_ext}")
+        if similarity_tracker is not None and similarity_tracker.ols is not None:
+            from fastfuncstuff.glm.outputs import extract_onset_times_from_design
+            from fastfuncstuff.glm.temporal_similarity import (
+                plot_temporal_similarity,
+                temporal_similarity,
+                write_temporal_similarity_tsv,
+            )
+
+            _design_2d = design_matrix if design_matrix.ndim == 2 else design_matrix[0]
+            _onsets = extract_onset_times_from_design(
+                _design_2d[:, :n_trial_cols].cpu().numpy(), list(range(n_trial_cols))
+            )
+            _order = np.lexsort((_onsets, trial_run_ids.cpu().numpy()))
+            _idx = similarity_tracker.index
+            _runs = trial_run_ids.cpu().numpy()
+            _sel_fracs = optimal_fracs.cpu()[_idx]
+            _ridge_name = (
+                f"ridge ({args.metric}-selected, median frac {float(_sel_fracs.median()):.2f})"
+            )
+            _sim = {
+                f"OLS (frac {fracs[-1]:g})": temporal_similarity(
+                    similarity_tracker.ols.numpy(), _runs, _order
+                ),
+                _ridge_name: temporal_similarity(
+                    final_betas[_idx.to(final_betas.device)].cpu().numpy(), _runs, _order
+                ),
+            }
+            write_temporal_similarity_tsv(f"{args.prefix}_temporal_similarity.tsv", _sim)
+            plot_temporal_similarity(
+                f"{args.prefix}_temporal_similarity.png",
+                _sim,
+                f"{len(_idx):,} voxels with the best beta-space CV {args.metric} "
+                "(mean of OLS and chosen fraction)",
+            )
+            print(f"  {args.prefix}_temporal_similarity.png / .tsv")
+            for _name, _r in _sim.items():
+                print(
+                    f"    {_name}: 1 apart {_r.lag_mean[0]:+.3f}, 2 apart {_r.lag_mean[1]:+.3f}, "
+                    f"between runs {_r.between_run_mean:+.3f}"
+                )
         save_4d_nifti(
             r2_by_frac,
             f"{args.prefix}_{cv_metric_token}_by_frac{_nii_ext}",

@@ -15,12 +15,14 @@ merge acquisitions that differ — the report says so when it does.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     import nibabel as nib
+    import numpy as np
 
 from fastfuncstuff.autoproc.bids import BoldRun
 
@@ -54,6 +56,14 @@ class Family:
     forced: bool = False
     # A forced family whose members do not all share ``signature``.
     mixed: bool = False
+    # How this family reaches the anat (set by link_families): "root" for the
+    # reference family, "xfam" for one aligned to the root's corrected anchor, "anat"
+    # for one aligned to the anat on its own.
+    link: str | None = None
+    link_reason: str = ""
+    # (fraction of this family's FoV the root covers, overlap extent in mm along
+    # this family's slab normal), from the headers; None when unknown or the root.
+    overlap: tuple[float, float] | None = None
 
     @property
     def tasks(self) -> list[str]:
@@ -164,3 +174,143 @@ def _owned(fam: Family, order: list[Family], value) -> str | None:
         return None
     others = {value(m) for f in order if f is not fam for m in f.members}
     return None if name in others else name
+
+
+# -family_ref modes; anything else names a family by label.
+ROOT_MODES = ("highest_res", "lowest_res", "coverage", "least_distorted", "anat")
+# A thinner overlap than this along the child's slab normal cannot pin rotation: a
+# sliver pivots about itself, and the error grows across the rest of the slab.
+MIN_OVERLAP_EXTENT_MM = 20.0
+
+
+def _geometry(path: Path) -> tuple[np.ndarray, tuple[int, int, int], tuple[float, ...]] | None:
+    """(sform/qform affine, matrix, voxel size) from the header alone, or None."""
+    try:
+        import nibabel as nib
+        import numpy as np
+
+        img = nib.load(str(path))
+        hdr = cast("nib.Nifti1Header", img.header)
+        aff = np.asarray(cast("nib.Nifti1Image", img).affine, dtype=float)
+        shape = tuple(int(n) for n in hdr.get_data_shape()[:3])
+        zooms = tuple(float(z) for z in hdr.get_zooms()[:3])
+    except Exception:
+        return None
+    if aff.shape != (4, 4) or len(shape) != 3 or len(zooms) != 3:
+        return None
+    return aff, (shape[0], shape[1], shape[2]), zooms
+
+
+def overlap(child: Path, root: Path, samples: int = 24) -> tuple[float, float] | None:
+    """How much of ``child``'s field of view ``root`` also covers, from headers.
+
+    Returns (fraction of the child's FoV inside the root's, extent in mm of that
+    overlap along the child's thinnest FoV axis — its slab normal). Sampled on a
+    lattice of ~``samples`` points per axis through the child's voxel centres, mapped
+    through both affines, so oblique and differently-tilted slabs are handled. Both
+    headers are in scanner space; across sessions that ignores head movement between
+    them, which is fine for a link/no-link decision.
+    """
+    import numpy as np
+
+    gc, gr = _geometry(child), _geometry(root)
+    if gc is None or gr is None:
+        return None
+    (ac, sc, zc), (ar, sr, _) = gc, gr
+    axes = [np.linspace(0, n - 1, min(n, samples)) for n in sc]
+    ijk = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+    world = ijk @ ac[:3, :3].T + ac[:3, 3]
+    rijk = (world - ar[:3, 3]) @ np.linalg.inv(ar[:3, :3]).T
+    inside = np.all((rijk >= -0.5) & (rijk <= np.asarray(sr) - 0.5), axis=1)
+    if not inside.any():
+        return 0.0, 0.0
+    normal = int(np.argmin([n * z for n, z in zip(sc, zc, strict=True)]))
+    k = ijk[inside, normal]
+    step = (sc[normal] - 1) / max(len(axes[normal]) - 1, 1)
+    extent = (k.max() - k.min() + step) * zc[normal]
+    return float(inside.mean()), float(extent)
+
+
+def _rank(fam: Family, mode: str, geom) -> float:
+    """Smaller is better for the root under ``mode``; inf when unknowable."""
+    if geom is None:
+        return math.inf
+    _aff, shape, zooms = geom
+    if mode == "highest_res":
+        return math.prod(zooms)
+    if mode == "lowest_res":
+        return -math.prod(zooms)
+    if mode == "coverage":
+        return -math.prod(n * z for n, z in zip(shape, zooms, strict=True))
+    # least_distorted: the residual shift in mm scales with readout time times the
+    # voxel size along PE (displacement in voxels is field x readout).
+    sig = fam.signature
+    axis = {"i": 0, "j": 1, "k": 2}.get((sig.pe_dir or "")[:1])
+    if sig.readout_s is None or axis is None:
+        return math.inf
+    return sig.readout_s * zooms[axis]
+
+
+def link_families(
+    families: list[Family],
+    rep: dict[str, Path],
+    mode: str = "highest_res",
+    forced: dict[str, str] | None = None,
+    min_overlap: float = 0.5,
+) -> Family | None:
+    """Pick the root family and decide, per child, how it reaches the anat.
+
+    ``rep`` maps each label to one run's image (headers only). A child links to
+    the root ("xfam") when the root covers at least ``min_overlap`` of its FoV over
+    at least MIN_OVERLAP_EXTENT_MM along its slab normal; otherwise, or when the
+    overlap cannot be read, it is aligned to the anat on its own ("anat"), which
+    is the best available when the two slabs share too little brain. ``forced``
+    ({label: "root"|"anat"}) overrides the decision for named children. Returns
+    the root, or None under ``mode == "anat"`` (every family on its own).
+    """
+    forced = forced or {}
+    if len(families) < 2:
+        return None
+    if mode == "anat":
+        for fam in families:
+            fam.link, fam.link_reason = "anat", "-family_ref anat"
+        return None
+    by_label = {f.label: f for f in families}
+    if mode not in by_label and mode not in ROOT_MODES:
+        raise ValueError(
+            f"-family_ref {mode!r}: not a mode ({', '.join(ROOT_MODES)}) or a family "
+            f"label ({', '.join(by_label)})."
+        )
+    for label in forced:
+        if label not in by_label:
+            raise ValueError(
+                f"-family_link {label!r}: no such family (have {', '.join(by_label)})."
+            )
+    if mode in by_label:
+        root = by_label[mode]
+    else:
+        geoms = {f.label: _geometry(rep[f.label]) for f in families}
+        root = min(families, key=lambda f: _rank(f, mode, geoms[f.label]))
+    root.link, root.link_reason = "root", f"-family_ref {mode}"
+    for fam in families:
+        if fam is root:
+            continue
+        fam.overlap = overlap(rep[fam.label], rep[root.label])
+        want = forced.get(fam.label)
+        if want is not None:
+            fam.link = "xfam" if want == "root" else "anat"
+            fam.link_reason = f"-family_link {fam.label} {want}"
+        elif fam.overlap is None:
+            fam.link, fam.link_reason = "anat", "overlap with the root unknown (header unread)"
+        elif fam.overlap[0] < min_overlap or fam.overlap[1] < MIN_OVERLAP_EXTENT_MM:
+            fam.link = "anat"
+            fam.link_reason = (
+                f"root covers {fam.overlap[0]:.0%} of its FoV over {fam.overlap[1]:.0f} mm "
+                f"(needs {min_overlap:.0%} and {MIN_OVERLAP_EXTENT_MM:.0f} mm)"
+            )
+        else:
+            fam.link = "xfam"
+            fam.link_reason = (
+                f"root covers {fam.overlap[0]:.0%} of its FoV over {fam.overlap[1]:.0f} mm"
+            )
+    return root

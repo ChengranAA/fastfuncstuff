@@ -51,6 +51,9 @@ DEFAULT_OPTS: dict[str, str] = {
     "xfmap": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
     "xfmap_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
+    # cross-family linear: a child acquisition family's corrected anchor onto the
+    # root family's, both in anat space — same contrast, so lpa, not the anat's lpc.
+    "xfam": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
     # cross-session linear/nonlinear (session grandmean → ref session).
     "xses": "-rigid -cost lpa -source_automask -autoweight -smallrange -final wsinc5",
     "xses_nl": "-metric lpa -cc_radius 4 -update_var 2 -final_interp wsinc5 "

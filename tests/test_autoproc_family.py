@@ -14,9 +14,22 @@ from fastfuncstuff.autoproc.family import detect_families
 from fastfuncstuff.autoproc.plan import Options, build_plan
 
 
-def _bold(tmp: Path, task, run, vox=2.0, shape=(8, 8, 6), pe="j-", readout=0.04, ses="01", acq=""):
+def _bold(
+    tmp: Path,
+    task,
+    run,
+    vox=2.0,
+    shape=(8, 8, 6),
+    pe="j-",
+    readout=0.04,
+    ses="01",
+    acq="",
+    origin=(0.0, 0.0, 0.0),
+):
     path = tmp / f"sub-X_ses-{ses}_task-{task}_acq-{acq}_run-{run}_bold.nii.gz"
-    img = nib.Nifti1Image(np.zeros((*shape, 3), np.float32), np.diag([vox, vox, vox, 1]))
+    aff = np.diag([vox, vox, vox, 1.0])
+    aff[:3, 3] = origin
+    img = nib.Nifti1Image(np.zeros((*shape, 1), np.uint8), aff)
     img.header.set_zooms((vox, vox, vox, 2.0))
     nib.save(img, path)
     return BoldRun(
@@ -127,7 +140,8 @@ def _two_family_subject(tmp: Path, prim_ses="01") -> Subject:
 def test_each_family_plans_alone_with_only_its_own_fieldmaps(tmp_path):
     opt = Options(go_to_anat=True, anat_nonlin=True)
     plan = build_plan(_two_family_subject(tmp_path), opt)
-    assert [fam.label for fam, _ in plan.family_plans] == ["floc", "prim"]
+    # The higher-res family is the root, and its folder runs first.
+    assert [fam.label for fam, _ in plan.family_plans] == ["prim", "floc"]
     for fam, sub in plan.family_plans:
         assert [pr.bold.task for pr in sub.runs] == fam.tasks
         (pr,) = sub.runs
@@ -148,7 +162,7 @@ def test_multi_family_script_runs_each_family_in_its_own_folder(tmp_path):
     res = subprocess.run(["bash", "-n", str(sh)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
 
-    _, floc, prim = script.split("\n# family ")
+    _, prim, floc = script.split("\n# family ")
     assert '(\nmkdir -p "fam-floc" && cd "fam-floc"' in floc
     assert '(\nmkdir -p "fam-prim" && cd "fam-prim"' in prim
     # Its own PE axis for the nonlinear anat correction, its own voxel size for the
@@ -162,7 +176,10 @@ def test_multi_family_script_runs_each_family_in_its_own_folder(tmp_path):
 def test_ref_ses_a_family_lacks_falls_back_to_its_own_first_session(tmp_path):
     subj = _two_family_subject(tmp_path, prim_ses="02")
     plan = build_plan(subj, Options(ref_ses="01"))
-    assert [sub.ref_session for _, sub in plan.family_plans] == ["01", "02"]
+    assert {f.label: sub.ref_session for f, sub in plan.family_plans} == {
+        "floc": "01",
+        "prim": "02",
+    }
 
 
 def test_without_an_anat_families_stay_one_pipeline(tmp_path):
@@ -171,3 +188,77 @@ def test_without_an_anat_families_stay_one_pipeline(tmp_path):
     assert len(plan.families) == 2 and not plan.family_plans
     script = write_script(plan, "wd", bids_root="/bids")
     assert "fam-" not in script and "ONE pipeline" in script
+
+
+def _slab_subject(tmp: Path, prim_z0: float = 20.0) -> Subject:
+    """Realistic slabs: floc 2 mm 96x96x40 (80 mm thick) from z=0, prim 1.2 mm
+    160x160x50 (60 mm thick) starting at ``prim_z0`` — inside floc by default."""
+    floc = _bold(tmp, "floc", "1", vox=2.0, shape=(96, 96, 40), readout=0.06)
+    prim = _bold(
+        tmp, "prim", "1", vox=1.2, shape=(160, 160, 50), readout=0.08, origin=(0, 0, prim_z0)
+    )
+    f1 = FmapGroup("01", "floc", tmp / "floc_rev.nii.gz", {}, [("floc", "1")])
+    f2 = FmapGroup("01", "prim", tmp / "prim_rev.nii.gz", {}, [("prim", "1")])
+    return Subject("X", [Session("01", [floc, prim], [f1, f2], anat=tmp / "T1w.nii.gz")])
+
+
+def test_overlap_reads_fraction_and_slab_extent_from_headers(tmp_path):
+    from fastfuncstuff.autoproc.family import overlap
+
+    subj = _slab_subject(tmp_path)
+    floc, prim = (b.mag_path for b in subj.sessions[0].bold_runs)
+    frac, extent = overlap(prim, floc)  # prim lies wholly inside floc
+    assert frac == 1.0 and abs(extent - 60) < 2
+    frac, extent = overlap(floc, prim)  # floc is 80 mm thick; prim covers 60 of it
+    assert 0.7 < frac < 0.8 and abs(extent - 60) < 3
+
+
+def test_child_links_to_the_root_through_its_corrected_anchor(tmp_path):
+    opt = Options(go_to_anat=True, anat_nonlin=True)
+    plan = build_plan(_slab_subject(tmp_path), opt)
+    links = {f.label: f.link for f in plan.families}
+    assert links == {"prim": "root", "floc": "xfam"}
+    (root_fam, root), (child_fam, child) = plan.family_plans
+    assert root_fam.label == "prim" and child.xfam_root is not None
+    # The child's chain gains the rigid link above its own anat_lin, keeping its
+    # own anat_nl; the root's does not.
+    toks = child.runs[0].warp_chain
+    assert toks.index("xfam_lin") + 1 == toks.index("anat_lin") and "anat_nl" in toks
+    assert "xfam_lin" not in root.runs[0].warp_chain
+
+    script = write_script(plan, "wd", bids_root="/bids")
+    sh = tmp_path / "proc.sh"
+    sh.write_text(script)
+    assert subprocess.run(["bash", "-n", str(sh)], capture_output=True).returncode == 0
+    _, prim, floc = script.split("\n# family ")
+    # Base = the root folder's corrected anchor; source = this family's own.
+    assert '-base "../fam-prim/stage09.' in floc and "_al_anat_nl.nii$FMT" in floc
+    assert "stage09.xfam.aff12.1D" in floc and "stage09.xfam" not in prim
+    # The child's own anchor is built WITHOUT the link it is the source of...
+    assert '-nwarp "stage09.anat.aff12.1D stage09.nlanat_invwarp.nii$FMT"' in floc
+    # ...every run's chain leads with it...
+    assert 'CHAIN[01:floc:1]="stage09.xfam.aff12.1D stage09.anat.aff12.1D ' in floc
+    # ...and the output grid is cut from the anchor WITH it.
+    assert 'MASTER="${FFS_MASTER:-stage09.xfam_lin.nii$FMT}"' in floc
+
+
+def test_thin_overlap_falls_back_to_the_anat(tmp_path):
+    # prim starts at z=70 of floc's 80 mm: 10 mm of shared slab cannot pin rotation.
+    plan = build_plan(_slab_subject(tmp_path, prim_z0=70.0), Options(go_to_anat=True))
+    fam = {f.label: f for f in plan.families}["floc"]
+    assert fam.link == "anat" and "20 mm" in fam.link_reason
+    assert all(sub.xfam_root is None for _, sub in plan.family_plans)
+
+
+def test_family_ref_and_link_overrides(tmp_path):
+    subj = _slab_subject(tmp_path, prim_z0=70.0)
+    plan = build_plan(subj, Options(go_to_anat=True, family_ref="floc"))
+    assert {f.label: f.link for f in plan.families}["floc"] == "root"
+    plan = build_plan(
+        _slab_subject(tmp_path, prim_z0=70.0),
+        Options(go_to_anat=True, family_links={"floc": "root"}),
+    )
+    assert {f.label: f.link for f in plan.families}["floc"] == "xfam"
+    plan = build_plan(_slab_subject(tmp_path), Options(go_to_anat=True, family_ref="anat"))
+    assert {f.link for f in plan.families} == {"anat"}
+    assert all(sub.xfam_root is None for _, sub in plan.family_plans)

@@ -31,7 +31,7 @@ from dataclasses import dataclass, field, replace
 
 from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import BoldRun, FmapGroup, Session, Subject
-from fastfuncstuff.autoproc.family import Family, detect_families
+from fastfuncstuff.autoproc.family import Family, detect_families, link_families
 
 
 @dataclass
@@ -77,6 +77,16 @@ class Options:
     # {task: label} from -family: these tasks form the named family whatever their
     # acquisition signatures say (see family.detect_families).
     family_overrides: dict[str, str] = field(default_factory=dict)
+    # -family_ref: which family the others align to (a family.ROOT_MODES mode or a
+    # label); "anat" aligns every family to the anat on its own.
+    family_ref: str = "highest_res"
+    # -family_link LABEL root|anat: per-child override of the overlap decision.
+    family_links: dict[str, str] = field(default_factory=dict)
+    # -xfam_min_overlap: least fraction of a child's FoV the root must cover.
+    xfam_min_overlap: float = 0.5
+    # Set by build_plan on a child family's own plan, never by the user: its chain
+    # carries xfam_lin, the rigid link onto the root family's corrected anchor.
+    xfam_link: bool = False
     # ffs_nordic -task_rescue MODE, verbatim. Off by default for the same reason
     # locomoco_detask is: the stage00 -task_qc diagnostic MEASURES how much of the task
     # went out with the noise, and this ACTS on it. Read the report first.
@@ -350,6 +360,10 @@ _CHAIN_ORDER = (
     # "affine then warp" level: the warp was estimated FROM the affine result.
     "mni_nl",
     "mni_lin",
+    # A child family's rigid link onto the root family's corrected anchor. Both
+    # anchors are in anat space, so it acts on the output coordinate before this
+    # family's own anat_lin does — and below MNI, which is estimated on the anat.
+    "xfam_lin",
     "anat_lin",
     "xref_nl",
     "xref_lin",
@@ -416,6 +430,9 @@ class Plan:
     # The script runs each in its own folder (family.family_dir), so every family
     # gets its own grandmean, anat alignment, anat_nl, output grid and mask.
     family_plans: list[tuple[Family, Plan]] = field(default_factory=list)
+    # On a child family's plan linked to the root: the root family and its plan,
+    # whose corrected anchor xfam aligns this family's onto.
+    xfam_root: tuple[Family, Plan] | None = None
 
     @property
     def use_sbref(self) -> bool:
@@ -739,6 +756,7 @@ def build_warp_chain(pr: PlanRun, opt: Options, multi_session: bool) -> list[str
         "mni_lin": opt.go_to_anat and opt.do_mni,
         "mni_nl": opt.go_to_anat and opt.do_mni,
         "anat_lin": opt.go_to_anat,
+        "xfam_lin": opt.go_to_anat and opt.xfam_link,
         # xref: align this data's grandmean to the external reference's grandmean.
         "xref_lin": opt.go_to_anat and grand_ref,
         "xref_nl": opt.go_to_anat and grand_ref and opt.grand_reference_nonlin,
@@ -875,9 +893,26 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
     # Separate families meet only at the anat. Without one they would land in
     # unrelated EPI spaces, so they stay one pipeline, linked by cross-fmap alignment.
     if len(families) > 1 and opt.go_to_anat:
-        for fam in families:
+        rep = {
+            fam.label: next(pr.bold.mag_path for pr in runs if pr.family == fam.label)
+            for fam in families
+        }
+        # A borrowed anat link (-grand_reference / -ref_file) already puts every
+        # family on the one external reference; there is no root of our own to use.
+        mode = "anat" if opt.has_grand_ref else opt.family_ref
+        root = link_families(families, rep, mode, opt.family_links, opt.xfam_min_overlap)
+        # The root runs first: its children read its corrected anchor.
+        order = [root, *(f for f in families if f is not root)] if root else families
+        root_plan: Plan | None = None
+        for fam in order:
             sub = family_subject(subject, fam)
-            family_plans.append((fam, build_plan(sub, _family_options(sub, opt))))
+            fopt = replace(_family_options(sub, opt), xfam_link=fam.link == "xfam")
+            fplan = build_plan(sub, fopt)
+            if fam is root:
+                root_plan = fplan
+            elif fam.link == "xfam" and root is not None and root_plan is not None:
+                fplan.xfam_root = (root, root_plan)
+            family_plans.append((fam, fplan))
 
     return Plan(
         subject=subject.subject,

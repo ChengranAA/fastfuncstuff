@@ -28,6 +28,7 @@ STAGE_TOOL: dict[str, str] = {
     "blip": "blipflip",
     "b0fmap": "util_b0fmap",
     "xrun": "allineate",
+    "xfam": "allineate",
     # The nonlinear stages' engine is a runtime choice; this is only the default
     # (see cli/autoproc.py, which passes the resolved one).
     "xrun_nl": "formwarp",

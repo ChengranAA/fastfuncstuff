@@ -462,6 +462,38 @@ def build_parser() -> argparse.ArgumentParser:
         "for more tasks.",
     )
     g.add_argument(
+        "-family_ref",
+        default=None,
+        metavar="MODE|LABEL",
+        help="with several acquisition families, the one the others align to (the "
+        "root): highest_res (default: the low-res family moves toward the sharper "
+        "target), lowest_res, coverage (largest field of view), least_distorted "
+        "(smallest readout time x PE voxel size), a family LABEL, or anat (no root: "
+        "every family aligns to the anat on its own). A child links to the root "
+        "only when their slabs overlap enough (-xfam_min_overlap); otherwise it "
+        "too aligns to the anat on its own.",
+    )
+    g.add_argument(
+        "-family_link",
+        action="append",
+        nargs=2,
+        default=None,
+        metavar=("LABEL", "root|anat"),
+        help="override the overlap decision for one family: root = align it to the "
+        "root family whatever the overlap; anat = align it to the anat on its own. "
+        "Repeat for more families.",
+    )
+    g.add_argument(
+        "-xfam_min_overlap",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="least fraction of a family's field of view the root must also cover "
+        "(from the headers) for the two to be aligned to each other directly "
+        "(default 0.5). The overlap must also span 20 mm along the family's slab "
+        "normal: a thinner shared sliver cannot pin rotation.",
+    )
+    g.add_argument(
         "-phase_proc",
         "-phase-proc",
         action="store_true",
@@ -2085,6 +2117,16 @@ def _resolve_family_overrides(args) -> dict[str, str]:
     return out
 
 
+def _resolve_family_links(args) -> dict[str, str]:
+    """``{label: root|anat}`` from repeated ``-family_link LABEL MODE``."""
+    out: dict[str, str] = {}
+    for label, mode in args.family_link or []:
+        if mode not in ("root", "anat"):
+            raise SystemExit(f"ffs_autoproc: -family_link {label} {mode!r}: MODE is root or anat.")
+        out[label] = mode
+    return out
+
+
 def _report_families(plan) -> None:
     """Print the acquisition families — always, since a wrong grouping is cheap to
     see here and expensive to find in the outputs."""
@@ -2099,6 +2141,9 @@ def _report_families(plan) -> None:
             f"task {', '.join(fam.tasks)}{how}",
             file=sys.stderr,
         )
+        if fam.link:
+            to = {"root": "ROOT", "xfam": "→ root (rigid EPI-EPI)", "anat": "→ anat on its own"}
+            print(f"    {to[fam.link]}: {fam.link_reason}", file=sys.stderr)
         if fam.mixed:
             print(
                 f"    NOTE: -family put runs with different acquisitions in '{fam.label}';"
@@ -2109,7 +2154,7 @@ def _report_families(plan) -> None:
         print(
             "  Each family runs as its own pipeline in "
             + ", ".join(f"{family_dir(f)}/" for f in fams)
-            + "; they meet only at the anat.",
+            + ".",
             file=sys.stderr,
         )
     elif len(fams) > 1:
@@ -2654,6 +2699,9 @@ def main(argv: list[str] | None = None) -> int:
         noise_vols=args.noise_vols,
         cut_task_vols=_resolve_cut_task_vols(args),
         family_overrides=_resolve_family_overrides(args),
+        family_ref=args.family_ref or "highest_res",
+        family_links=_resolve_family_links(args),
+        xfam_min_overlap=(0.5 if args.xfam_min_overlap is None else args.xfam_min_overlap),
         slicetiming_method=_resolve_slicetiming(args, rget, subject),
         tzero=float(args.tzero if args.tzero is not None else rget("tzero", 0.0)),
         slicetiming_file=args.slicetiming,
@@ -2776,7 +2824,11 @@ def main(argv: list[str] | None = None) -> int:
         print("nothing written.", file=sys.stderr)
         return 1
 
-    plan = build_plan(subject, opt)
+    try:
+        plan = build_plan(subject, opt)
+    except ValueError as exc:
+        print(f"ffs_autoproc: {exc}\nnothing written.", file=sys.stderr)
+        return 1
     _report_families(plan)
 
     # Absolute so OUT is pinned to where the user ran ffs_autoproc — moving the

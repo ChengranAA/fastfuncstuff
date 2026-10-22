@@ -343,6 +343,8 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt, echo: int | None = None) 
         return _mni_files(opt, ".aff12.1D")
     if tok == "anat_lin":
         return _anat_lin_files(opt)
+    if tok == "xfam_lin":
+        return [_xfam_matrix()]
     if tok == "xref_nl":
         return [stem(NameKey("xref")) + f"_nl_WARP{fmt}"]
     if tok == "xref_lin":
@@ -1203,11 +1205,15 @@ def _family_header_note(plan: Plan) -> str:
         lines.append(
             f"\n#     {fam.label}: {fam.signature.describe()}; {len(fam.members)} run(s){how}"
         )
+        if fam.link:
+            lines.append(f"\n#       reaches the anat {_family_link_note(fam)}")
     if plan.family_plans:
         lines.append(
             "\n#     Each family runs as its own complete pipeline in fam-<label>/: its own"
             "\n#     grandmean, anat alignment, anat_nl on its own PE axis, output grid at"
-            "\n#     its own voxel size, mask and GLM. They meet only at the anat."
+            "\n#     its own voxel size, mask and GLM. A family linked to the root then has"
+            "\n#     its corrected anchor aligned to the root's (stage09 xfam), so the root's"
+            "\n#     anat placement is shared; the root's folder runs first."
         )
     else:
         lines.append(
@@ -2999,6 +3005,7 @@ def _stage_anat(plan: Plan) -> str:
             f"{seg}\nfi"
         )
         out.append(_anat_nl_anchor_call(plan))
+    out.append(_stage_xfam(plan))
     out.append(_qc_anat(plan))
     out.append(_stage_mni(plan))
     return "\n".join(p for p in out if p) + "\n"
@@ -3549,8 +3556,9 @@ def _anat_head_chain(plan: Plan) -> list[str]:
         return []
     # ...but NOT the -do_mni pair above it: this image is the anchor in ANAT
     # space (it is mastered on the anat), and stage09b's own anchor is the one
-    # that goes on to MNI.
-    head = [t for t in toks[: toks.index("anat_nl") + 1] if not t.startswith("mni_")]
+    # that goes on to MNI. Nor xfam_lin: it is estimated FROM this anchor, and its
+    # own output (stage09.xfam_lin) is the anchor with that link applied.
+    head = [t for t in toks[: toks.index("anat_nl") + 1] if not t.startswith(("mni_", "xfam_"))]
     return chain_files(pr, ".nii$FMT", plan.options, tokens=head)
 
 
@@ -3617,7 +3625,73 @@ def _final_master(plan: Plan) -> str:
         )
     if opt.do_mni:
         return _al_mni(plan)
-    return _al_anat_nl(plan) if opt.anat_nonlin else _al_anat(plan)
+    if plan.xfam_root is not None:
+        return _xfam_image()
+    return _anat_anchor(plan)
+
+
+def _anat_anchor(plan: Plan) -> str:
+    """This family's EPI anchor in anat space, in the state its data lands in
+    below any cross-family link: through anat_nl when there is one."""
+    return _al_anat_nl(plan) if plan.options.anat_nonlin else _al_anat(plan)
+
+
+def _xfam_matrix() -> str:
+    return stem(NameKey("xfam")) + ".aff12.1D"
+
+
+def _xfam_image() -> str:
+    """The child's anchor after xfam_lin, on the root anchor's grid (allineate's
+    own output) — the image this family's output grid and mask are cut from."""
+    return stem(NameKey("xfam")) + "_lin.nii$FMT"
+
+
+def _stage_xfam(plan: Plan) -> str:
+    """Align this family's corrected anchor to the root family's (stage09).
+
+    Both anchors are EPI contrast in anat space, each already through its own
+    family's anat_lin and anat_nl, so this is a same-contrast rigid fit (lpa) that
+    pins the two families to each other far more tightly than two separate
+    cross-modal fits to the anat can. Its matrix goes at the head of every run's
+    chain (xfam_lin), so the root's anat placement is the one both families share.
+    -source_automask keeps the child's out-of-slab zeros out of the cost, so only
+    the brain the two slabs share drives it.
+    """
+    if plan.xfam_root is None:
+        return ""
+    fam, root_plan = plan.xfam_root
+    base = f"../{family_dir(fam)}/{_anat_anchor(root_plan)}"
+    call = _ffs(
+        "ffs_allineate",
+        [
+            f'-base "{base}"',
+            f'-source "{_anat_anchor(plan)}"',
+            f'-prefix "{_xfam_image()}"',
+            f'-1Dmatrix_save "{_xfam_matrix()}"',
+            *_split_flags(config.DEFAULT_OPTS["xfam"]),
+            '-device "$DEVICE"',
+        ],
+    )
+    qc = ""
+    if _qc_on(plan):
+        qc = _qc_block(
+            "cross-family",
+            [
+                _qc_call(
+                    _qc_stem("xfam"),
+                    [
+                        (base, f"root_{fam.label}"),
+                        (_anat_anchor(plan), "anchor_own"),
+                        (_xfam_image(), "anchor_xfam"),
+                    ],
+                )
+            ],
+        )
+    return (
+        f"# ---- stage09: align to the root family ({fam.label}) ----\n"
+        "# This family's corrected anchor onto the root family's, both in anat space.\n"
+        f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{_xfam_matrix()}" ]; then\n{call}\nfi\n{qc}'
+    )
 
 
 def _final_anat(plan: Plan) -> str:
@@ -5249,10 +5323,19 @@ def _family_section(fam: Family, sub: Plan, bids_root: str | None, script_stem: 
         f"\n#   {len(sub.runs)} run(s), task {', '.join(fam.tasks)}  →  {d}/"
         f"\n#   reference session : {sub.ref_session}"
         f"\n#   sbref lane        : {sub.use_sbref}{_fmap_inherit_note(sub)}"
+        f"\n#   reaches the anat  : {_family_link_note(fam)}"
         "\n# " + "#" * 77
     )
     body = _pipeline_body(sub, bids_root, script_stem, None)
     return f'{banner}\n(\nmkdir -p "{d}" && cd "{d}"\n{body})'
+
+
+def _family_link_note(fam: Family) -> str:
+    if fam.link == "root":
+        return f"ROOT — the other families align to it ({fam.link_reason})"
+    if fam.link == "xfam":
+        return f"via the root family, rigid EPI-EPI in anat space ({fam.link_reason})"
+    return f"on its own, cross-modal to the anat ({fam.link_reason or 'no root'})"
 
 
 def _pipeline_body(plan: Plan, bids_root: str | None, script_stem: str, header: str | None) -> str:

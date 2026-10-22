@@ -90,6 +90,7 @@ STAGE_NUMBERS: dict[str, int] = {
     "grandmean": 8,
     "xref": 9,  # align this data's grandmean to an external -grand_reference
     "anat": 9,
+    "xfam": 9,  # a child family's corrected anchor → the root family's
     "anat_avg": 9,  # the aligned T1w repeats + their mean
     "mni": 9,  # -do_mni: the anat → MNI template link (stage09b)
     "anat_mni": 9,

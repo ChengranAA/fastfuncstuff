@@ -57,15 +57,18 @@ try:
         add_load_threads_arg,
         add_microtime_offset_arg,
         add_noise_ceiling_args,
+        add_ortvec_arguments,
         add_paired_surface_args,
         add_round_onsets_arguments,
         add_trim_args,
         add_verbose_arg,
         apply_onset_rounding,
         apply_trim_to_timing,
+        assemble_per_run_nuisance,
         bids_event_kwargs,
         build_nuisance_per_run,
         check_bids_event_args,
+        collect_nuisance_blocks,
         compute_run_lengths,
         load_and_preprocess_runs,
         load_hrf_index_for_input,
@@ -292,6 +295,7 @@ Notes:
 
     # Processing options
     proc_opts = parser.add_argument_group("Processing Options")
+    add_ortvec_arguments(proc_opts)
     add_stim_vec_arguments(proc_opts)
     proc_opts.add_argument(
         "-stim_vec_ridge",
@@ -653,6 +657,22 @@ def main():
             noise_pc_file = f"{args.denoise}_noise_pcs.xmat.1D"
             noise_pcs = load_noise_pcs(noise_pc_file, run_starts, n_timepoints)
             print(f"  Loaded {noise_pcs[0].shape[1]} noise PCs per run")
+
+    # -ortvec* blocks join the noise PCs as per-run extra nuisance, so both fit
+    # paths (beta-space and timeseries CV) carry them without separate plumbing.
+    nuisance_blocks = collect_nuisance_blocks(
+        args, run_starts, n_timepoints, verbose=(args.verb >= 1), trim=trim
+    )
+    if nuisance_blocks:
+        noise_pcs = assemble_per_run_nuisance(
+            blocks=nuisance_blocks,
+            run_starts=run_starts,
+            n_timepoints=n_timepoints,
+            polort=-1,
+            device=torch.device("cpu"),
+            noise_pcs=noise_pcs,
+            verbose=(args.verb >= 1),
+        ).per_run
 
     # Create single-trial design matrix
     print()

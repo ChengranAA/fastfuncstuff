@@ -1192,6 +1192,23 @@ def _fmap_inherit_note(plan: Plan) -> str:
     )
 
 
+def _family_header_note(plan: Plan) -> str:
+    """The acquisition families, when there is more than one to tell apart."""
+    if len(plan.families) < 2:
+        return ""
+    lines = [f"\n#   acq families      : {len(plan.families)}"]
+    for fam in plan.families:
+        how = " (-family, MIXED acquisitions)" if fam.mixed else " (-family)" if fam.forced else ""
+        lines.append(
+            f"\n#     {fam.label}: {fam.signature.describe()}; {len(fam.members)} run(s){how}"
+        )
+    lines.append(
+        "\n#     Processed as ONE: a single anat_nl (first run's PE axis) and one output"
+        "\n#     voxel size (first run's) serve every family."
+    )
+    return "".join(lines)
+
+
 def _qc_header_note(plan: Plan) -> str:
     """Point the reader at the QC stacks and say what they are for."""
     if not _qc_on(plan):
@@ -1269,7 +1286,9 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 #   image lanes       : {len(_lanes(plan))}{_lane_header_note(plan)}
 #   ref image         : {
         opt.ref_image or "grandmean"
-    } (session representative for xses; -ref_image){_fmap_inherit_note(plan)}{_qc_header_note(plan)}
+    } (session representative for xses; -ref_image){_fmap_inherit_note(plan)}{
+        _family_header_note(plan)
+    }{_qc_header_note(plan)}
 # ============================================================================={
         _invocation_note(invocation)
     }

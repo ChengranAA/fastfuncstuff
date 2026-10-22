@@ -449,6 +449,18 @@ def build_parser() -> argparse.ArgumentParser:
         "MATLAB NORDIC does without noise scans.",
     )
     g.add_argument(
+        "-family",
+        action="append",
+        nargs=2,
+        default=None,
+        metavar=("TASK", "LABEL"),
+        help="put every run of TASK in the acquisition family LABEL. Families are "
+        "detected from voxel size, matrix, PE direction, readout time and echo count, "
+        "and that detection is printed; use this when it groups wrongly. Tasks given "
+        "the same LABEL become one family even if their acquisitions differ. Repeat "
+        "for more tasks.",
+    )
+    g.add_argument(
         "-phase_proc",
         "-phase-proc",
         action="store_true",
@@ -1771,6 +1783,12 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                     f"{flag} names task '{task}', which is not in this subject/scope "
                     f"({', '.join(sorted(all_tasks)) or 'none'}) — it does nothing."
                 )
+    for task in sorted(opt.family_overrides):
+        if task not in all_tasks:
+            warnings.append(
+                f"-family names task '{task}', which is not in this subject/scope "
+                f"({', '.join(sorted(all_tasks)) or 'none'}) — it does nothing."
+            )
     for task in sorted(opt.cut_task_vols):
         if task not in all_tasks:
             warnings.append(
@@ -2049,6 +2067,43 @@ def _resolve_cut_task_vols(args) -> dict[str, int]:
             raise SystemExit(f"ffs_autoproc: -cut_task_vols {task} {n}: N must be positive.")
         out[task[len("task-") :] if task.startswith("task-") else task] = n_keep
     return out
+
+
+def _resolve_family_overrides(args) -> dict[str, str]:
+    """``{task: label}`` from repeated ``-family TASK LABEL``; a task named twice
+    keeps the last."""
+    out: dict[str, str] = {}
+    for task, label in args.family or []:
+        out[task[len("task-") :] if task.startswith("task-") else task] = label
+    return out
+
+
+def _report_families(plan) -> None:
+    """Print the acquisition families — always, since a wrong grouping is cheap to
+    see here and expensive to find in the outputs."""
+    fams = plan.families
+    if not fams:
+        return
+    print(f"== acquisition families: {len(fams)} ==", file=sys.stderr)
+    for fam in fams:
+        how = "  [-family]" if fam.forced else ""
+        print(
+            f"  {fam.label}: {fam.signature.describe()}  —  {len(fam.members)} run(s), "
+            f"task {', '.join(fam.tasks)}{how}",
+            file=sys.stderr,
+        )
+        if fam.mixed:
+            print(
+                f"    NOTE: -family put runs with different acquisitions in '{fam.label}';"
+                " they share one correction and one output grid.",
+                file=sys.stderr,
+            )
+    if len(fams) > 1:
+        print(
+            "  NOTE: families are not processed separately yet — one anat_nl and one"
+            " output voxel size serve them all.",
+            file=sys.stderr,
+        )
 
 
 def _resolve_event_cols(
@@ -2584,6 +2639,7 @@ def main(argv: list[str] | None = None) -> int:
         acq_3d=acq_3d,
         noise_vols=args.noise_vols,
         cut_task_vols=_resolve_cut_task_vols(args),
+        family_overrides=_resolve_family_overrides(args),
         slicetiming_method=_resolve_slicetiming(args, rget, subject),
         tzero=float(args.tzero if args.tzero is not None else rget("tzero", 0.0)),
         slicetiming_file=args.slicetiming,
@@ -2707,6 +2763,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     plan = build_plan(subject, opt)
+    _report_families(plan)
 
     # Absolute so OUT is pinned to where the user ran ffs_autoproc — moving the
     # script and running it elsewhere still writes outputs to the intended dir.

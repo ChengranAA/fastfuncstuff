@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 
 from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import BoldRun, FmapGroup, Subject
+from fastfuncstuff.autoproc.family import Family, detect_families
 
 
 @dataclass
@@ -73,6 +74,9 @@ class Options:
     # run_noise_vols): a run that needs cutting was usually stopped early, before
     # the noise scans were acquired.
     cut_task_vols: dict[str, int] = field(default_factory=dict)
+    # {task: label} from -family: these tasks form the named family whatever their
+    # acquisition signatures say (see family.detect_families).
+    family_overrides: dict[str, str] = field(default_factory=dict)
     # ffs_nordic -task_rescue MODE, verbatim. Off by default for the same reason
     # locomoco_detask is: the stage00 -task_qc diagnostic MEASURES how much of the task
     # went out with the noise, and this ACTS on it. Read the report first.
@@ -396,6 +400,8 @@ class PlanRun:
     # base IS that SBRef — which is what puts it in the run's post-moco space
     # with no transform of its own (see ``run_average_chain``).
     use_sbref: bool = False
+    # Label of this run's acquisition family (see family.py).
+    family: str | None = None
 
 
 @dataclass
@@ -405,6 +411,7 @@ class Plan:
     runs: list[PlanRun]
     ref_session: str | None
     multi_session: bool
+    families: list[Family] = field(default_factory=list)
 
     @property
     def use_sbref(self) -> bool:
@@ -855,10 +862,16 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
             pr.warp_chain = build_warp_chain(pr, opt, multi_session)
             runs.append(pr)
 
+    families = detect_families([pr.bold for pr in runs], opt.family_overrides)
+    label_of = {m: fam.label for fam in families for m in fam.members}
+    for pr in runs:
+        pr.family = label_of[(pr.bold.session, pr.bold.task, pr.bold.run)]
+
     return Plan(
         subject=subject.subject,
         options=opt,
         runs=runs,
         ref_session=ref_session,
         multi_session=multi_session,
+        families=families,
     )

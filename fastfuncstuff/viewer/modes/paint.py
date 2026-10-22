@@ -220,6 +220,12 @@ class PaintMode(Mode):
         centres = stroke_centres(stroke["last"], mm, stroke["radius"])
         stroke["last"] = np.asarray(mm, dtype=np.float64)
         stroke["points"].extend(centres)
+        if len(centres):
+            c = np.atleast_2d(centres)
+            lo, hi = c.min(0), c.max(0)
+            if "lo" in stroke:
+                lo, hi = np.minimum(lo, stroke["lo"]), np.maximum(hi, stroke["hi"])
+            stroke["lo"], stroke["hi"] = lo, hi
         changed = self.session.painter.apply(
             stroke["key"],
             stroke["value"],
@@ -260,6 +266,24 @@ class PaintMode(Mode):
     @property
     def painting(self) -> bool:
         return self._stroke is not None
+
+    def stroke_bounds_mm(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """A mm box holding every voxel the open stroke can have changed.
+
+        Padded by the brush and two of the layer's voxels: a brush reaches
+        whole voxels whose centres lie up to one voxel past its radius, and
+        each voxel has extent beyond its centre. Generous is right -- it only
+        decides which windows may skip a redraw mid-stroke.
+        """
+        stroke = self._stroke
+        if stroke is None or "lo" not in stroke or self.session is None:
+            return None
+        layer = self.session.state.layers.find(stroke["key"])
+        if layer is None:
+            return None
+        vox = float(np.sqrt((np.asarray(layer.affine)[:3, :3] ** 2).sum(0)).max())
+        pad = stroke["radius"] + 2.0 * vox
+        return stroke["lo"] - pad, stroke["hi"] + pad
 
     def _name_label(self, key: str) -> None:
         """Give the current label the typed name, if one was typed."""

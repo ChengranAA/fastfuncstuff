@@ -279,14 +279,20 @@ class WindowManager(QtCore.QObject):
         # pure move is held: a threshold, an edit, a new layer draws at once, and
         # takes whatever a scroll left waiting with it.
         moving = bool(dirty) and not (dirty & ~NAVIGATION)
-        scrolling = moving and (time.monotonic() - self._last_move) * 1000.0 < SETTLE_MS
+        # A paint stroke's dabs are held like a scroll's moves, and a slice
+        # the stroke cannot reach keeps its picture: of three image windows,
+        # usually only the one being painted changes until the stroke ends,
+        # which draws everything.
+        stroke = self._stroke_bounds() if dirty == Aspect.SLICES else None
+        holding = moving or stroke is not None
+        scrolling = holding and (time.monotonic() - self._last_move) * 1000.0 < SETTLE_MS
         for win in list(self.windows.values()):
             if isinstance(win, ImageWindow):
-                if images:
+                if images and not (stroke is not None and win.misses(*stroke)):
                     self._timed(win, win.follow if moving else win.redraw)
             elif isinstance(win, SurfaceWindow):
                 if surfaces:
-                    self._heavy(win, dirty, moving, scrolling)
+                    self._heavy(win, dirty, holding, scrolling)
             elif isinstance(win, ChediWindow):
                 # The crosshair (to follow), an edit or a USE (SLICES), what
                 # it samples (LAYERS, TIME, COLORMAP: the range), and its own
@@ -299,17 +305,17 @@ class WindowManager(QtCore.QObject):
                     | Aspect.COLORMAP
                     | Aspect.VIEWPORTS
                 ):
-                    self._heavy(win, dirty, moving, scrolling)
+                    self._heavy(win, dirty, holding, scrolling)
             elif isinstance(win, DepthWindow):
                 # The clicked spot (CROSSHAIR), the volume shown (TIME), what
                 # is loaded (LAYERS) and an edit moving white/pial (SLICES).
                 if dirty & (Aspect.CROSSHAIR | Aspect.TIME | Aspect.LAYERS | Aspect.SLICES):
-                    self._heavy(win, dirty, moving, scrolling)
+                    self._heavy(win, dirty, holding, scrolling)
             elif isinstance(win, ProfileWindow):
                 # The crosshair (to follow), an edit (SLICES: re-sample what
                 # moved), and the anatomy it reads (LAYERS, TIME).
                 if dirty & (Aspect.CROSSHAIR | Aspect.SLICES | Aspect.LAYERS | Aspect.TIME):
-                    self._heavy(win, dirty, moving, scrolling)
+                    self._heavy(win, dirty, holding, scrolling)
             elif graphs:
                 # A threshold or a colour map reaches a graph only through its
                 # tint; an untinted one has nothing new to draw (4 ms a tick of
@@ -321,11 +327,18 @@ class WindowManager(QtCore.QObject):
                 # A carpet's refresh only moves its time cursor; the picture
                 # itself is seconds of work and is rebuilt deliberately.
                 win.refresh()
-        if moving:
+        if holding:
             # Stamped after the draws, not before: the notches queued while a
             # slow CHEDI drew arrive "late" by its draw time, and measured from
             # before it every one of them read as a click and drew again.
             self._last_move = time.monotonic()
+
+    def _stroke_bounds(self):
+        """The open paint stroke's reach in mm, or ``None`` outside one."""
+        from fastfuncstuff.viewer.modes.paint import PaintMode
+
+        mode = self.session.mode
+        return mode.stroke_bounds_mm() if isinstance(mode, PaintMode) else None
 
     def _heavy(self, win, dirty: Aspect, moving: bool, scrolling: bool) -> None:
         """Refresh a 3-D / CHEDI / depth / profile window now, or hold it after a move."""

@@ -221,6 +221,50 @@ def test_left_drag_paints_right_drag_erases_ctrl_wheel_sizes(tmp_path):
         app.processEvents()
 
 
+def test_a_stroke_redraws_once_a_pass_and_only_the_slices_it_can_reach(tmp_path, monkeypatch):
+    """Every dab redrew all three windows, each on its own, whether or not
+    the stroke could appear in them; the stroke's end still redraws them all."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import SetIJK, SetUnderlay
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    path = tmp_path / "anat.nii.gz"
+    nib.save(nib.Nifti1Image(np.ones(SHAPE, np.float32), np.diag([2.0, 2.0, 2.0, 1.0])), str(path))
+    s = ViewerSession(device=CPU)
+    win = ViewerWindow(s)
+    try:
+        win.refresh(s.do(SetUnderlay(str(path))))
+        win.show()
+        win.refresh(s.do(SetIJK(2, 2, 10)))  # coronal and sagittal slices far from the stroke
+        win._switch_mode("paint")
+        app.processEvents()
+        windows = {vp.plane: win.manager.windows[vp.id] for vp in s.state.viewports.images}
+        counts = dict.fromkeys(windows, 0)
+        for plane, w in windows.items():
+
+            def counted(orig=w.redraw, plane=plane):
+                counts[plane] += 1
+                orig()
+
+            monkeypatch.setattr(w, "redraw", counted)
+        image = windows[Plane.AXIAL]
+        image._paint_press(15.0, 15.0, False)
+        app.processEvents()
+        counts.update(dict.fromkeys(counts, 0))
+        for col in (16.0, 17.0, 18.0):
+            image._paint_drag(15.0, col)
+        app.processEvents()
+        assert counts == {Plane.AXIAL: 1, Plane.CORONAL: 0, Plane.SAGITTAL: 0}
+        image._paint_release()
+        assert counts[Plane.CORONAL] == counts[Plane.SAGITTAL] == 1
+    finally:
+        win.close()
+        s.close()
+        app.processEvents()
+
+
 def test_label_counts_track_painting_erasing_and_undo(session):
     key = _stroke(session, [(10, 10, 8), (20, 10, 8)])
     session.do(SetModeParam("value", "2"))

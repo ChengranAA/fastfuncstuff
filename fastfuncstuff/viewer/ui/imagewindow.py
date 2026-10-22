@@ -228,6 +228,8 @@ class ImageWindow(QtWidgets.QWidget):
         self._nudge_timer.setInterval(self.NUDGE_REPEAT_MS)
         self._nudge_timer.timeout.connect(self._nudge_again)
         self._nudge_at: tuple[float, float] | None = None
+        #: What a stroke has painted since the windows last redrew (an Aspect).
+        self._paint_dirty = 0
 
         bar.addStretch(1)
         self.slice_label = QtWidgets.QLabel("")
@@ -1044,6 +1046,24 @@ class ImageWindow(QtWidgets.QWidget):
         else:
             self.redraw_crosshair()
 
+    def misses(self, lo: np.ndarray, hi: np.ndarray) -> bool:
+        """Whether the slice on screen lies wholly outside the mm box ``lo``..``hi``.
+
+        False whenever that is not simple to know -- a tilted, strip or tiled
+        window draws more than the one slice -- since the cost of a wrong
+        False is one redraw and of a wrong True a stale picture.
+        """
+        vp = self._viewport()
+        grid = self.session.state.grid
+        drawn = self.pane.position
+        if vp is None or grid is None or drawn is None or vp.strip or vp.tiles or self._tilted():
+            return False
+        fixed = plane_layout(grid.affine, vp.plane).fixed
+        corners = np.array(np.meshgrid(*zip(lo, hi, strict=True), indexing="ij")).reshape(3, -1)
+        inv = np.linalg.inv(grid.affine)
+        along = (inv[:3, :3] @ corners + inv[:3, 3:])[fixed]
+        return drawn < along.min() - 1.0 or drawn > along.max() + 1.0
+
     def redraw(self) -> None:
         vp = self._viewport()
         if vp is None:
@@ -1323,12 +1343,23 @@ class ImageWindow(QtWidgets.QWidget):
             return
         dirty = mode.extend(mm)
         if dirty:
-            self.painted.emit(int(dirty))
+            # Every point is painted; the redraw waits for the event loop to
+            # drain, so a fast stroke draws once for all the moves it queued
+            # instead of once per move with no frame shown between.
+            if not self._paint_dirty:
+                QtCore.QTimer.singleShot(0, self, self._flush_paint)
+            self._paint_dirty |= int(dirty)
+
+    def _flush_paint(self) -> None:
+        dirty, self._paint_dirty = self._paint_dirty, 0
+        if dirty:
+            self.painted.emit(dirty)
 
     def _paint_release(self) -> None:
         mode = self._paint_mode()
         if mode is not None:
-            self.painted.emit(int(mode.end()))
+            self._paint_dirty |= int(mode.end())
+        self._flush_paint()
 
     def _paint_resize(self, step: int) -> None:
         from fastfuncstuff.viewer.modes.paint import RADIUS_MAX, RADIUS_MIN

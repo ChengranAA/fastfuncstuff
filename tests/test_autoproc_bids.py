@@ -188,6 +188,39 @@ def test_each_tasks_fmaps_split_its_runs_by_time(tmp_path: Path):
     }
 
 
+def test_time_assignment_never_crosses_acquisitions(tmp_path: Path):
+    """MindsEye ME191678 SM shape: untagged fieldmaps, two acquisitions interleaved.
+    primary 4-6 come after floc's fieldmap, but it is floc's readout and grid, so
+    they keep primary's own (older) one. Bug of record: by time alone, primary 4-6
+    were corrected with floc's field."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    runs = {
+        ("primary", "01"): ("15:30:00", 0.082),
+        ("floc", "01"): ("15:59:00", 0.064),
+        ("primary", "04"): ("16:07:00", 0.082),
+    }
+    for (task, run), (t, ro) in runs.items():
+        _touch(
+            ses / "func" / f"sub-01_ses-01_task-{task}_run-{run}_part-mag_bold.nii.gz",
+            {
+                "RepetitionTime": 1.5,
+                "PhaseEncodingDirection": "j-",
+                "AcquisitionTime": t,
+                "TotalReadoutTime": ro,
+            },
+        )
+    for frun, t, ro in (("01", "15:28:00", 0.082), ("02", "15:57:00", 0.064)):
+        _touch(
+            ses / "fmap" / f"sub-01_ses-01_acq-sbref_dir-PA_run-{frun}_epi.nii.gz",
+            {"PhaseEncodingDirection": "j", "TotalReadoutTime": ro, "AcquisitionTime": t},
+        )
+    fmaps = {f.fmap_id: f.intended_runs for f in scan_subject(tmp_path, "01").sessions[0].fmaps}
+    assert {k: set(v) for k, v in fmaps.items()} == {
+        "PA-run01": {("primary", "01"), ("primary", "04")},
+        "PA-run02": {("floc", "01")},
+    }
+
+
 def test_opposite_pe_fmaps_merge_into_one_paired_group(tmp_path: Path):
     """fmap/ holding BOTH polarities of the same acquisition (dir-AP + dir-PA) is
     ONE self-contained fieldmap: the pair corrects itself, so the group carries its

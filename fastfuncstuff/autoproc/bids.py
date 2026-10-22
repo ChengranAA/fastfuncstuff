@@ -16,6 +16,7 @@ T1w. Everything is returned as plain dataclasses; reference/warp logic lives in
 
 from __future__ import annotations
 
+import functools
 import json
 import re
 from dataclasses import dataclass, field
@@ -690,8 +691,12 @@ def _finalize_groups(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> list[
     # when only -task primary was scanned) AND is immune to run-number collisions
     # across tasks (rest/run-01 vs skilled/run-01) — no task_tags bookkeeping.
     present = {(r.task, r.run) for r in bold_runs}
+    run_of = {(r.task, r.run): r for r in bold_runs}
     for g in groups:
         g.intended_runs = [p for p in g.intended_runs if p in present]
+        # An inferred claim never crosses acquisitions; a declared one stands.
+        if not g.intended_explicit:
+            g.intended_runs = [p for p in g.intended_runs if _same_acquisition(g, run_of[p])]
     groups = _split_task_claims(groups, bold_runs)
     served = [g for g in groups if g.intended_runs]
     if served:
@@ -711,9 +716,35 @@ def _finalize_groups(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> list[
     if groups and bold_runs and _assign_by_time(groups, bold_runs):
         return [g for g in groups if g.intended_runs]
     if len(groups) == 1 and bold_runs:
-        groups[0].intended_runs = [(r.task, r.run) for r in bold_runs]
-        return groups
+        groups[0].intended_runs = [
+            (r.task, r.run) for r in bold_runs if _same_acquisition(groups[0], r)
+        ]
+        return [g for g in groups if g.intended_runs]
     return served
+
+
+@functools.cache
+def _header_grid(path: str):
+    from fastfuncstuff.autoproc.family import _grid
+
+    return _grid(Path(path))
+
+
+def _same_acquisition(g: FmapGroup, r: BoldRun) -> bool:
+    """Whether a reverse-PE fieldmap was acquired with this run's protocol: same
+    readout time and same voxel grid. Its field is the distortion of THAT
+    readout on THAT grid, so a run of another acquisition cannot use it however
+    close in time it was — sessions interleave acquisitions, and fieldmaps with
+    them (MindsEye ME191678: one untagged fieldmap was serving floc and primary).
+    Unknown on either side is permissive, as everywhere in the scan. A GRE field
+    is measured in Hz and is rebuilt on each run's own grid, so it serves any."""
+    if g.is_b0:
+        return True
+    ro_f, ro_r = g.readout, r.json.get("TotalReadoutTime")
+    if ro_f is not None and ro_r is not None and abs(ro_f - float(ro_r)) > 1e-4 * max(ro_f, 1e-9):
+        return False
+    gf, gr = _header_grid(str(g.reverse_path)), _header_grid(str(r.mag_path))
+    return gf is None or gr is None or gf == gr
 
 
 # The three BIDS GRE fieldmap forms, by suffix. All three end up as one Hz field
@@ -965,11 +996,14 @@ def _assign_by_time(groups: list[FmapGroup], bold_runs: list[BoldRun], reset: bo
         rt = r.acq_time
         if rt is None:
             continue
-        preceding = [(g, t) for g, t in timed if t <= rt]
+        mine = [(g, t) for g, t in timed if _same_acquisition(g, r)]
+        if not mine:
+            continue
+        preceding = [(g, t) for g, t in mine if t <= rt]
         g = (
             max(preceding, key=lambda gt: gt[1])[0]
             if preceding
-            else min(timed, key=lambda gt: abs(gt[1] - rt))[0]
+            else min(mine, key=lambda gt: abs(gt[1] - rt))[0]
         )
         g.intended_runs.append((r.task, r.run))
         assigned = True

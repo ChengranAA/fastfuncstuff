@@ -24,6 +24,7 @@ from fastfuncstuff.autoproc.bids import find_events
 from fastfuncstuff.autoproc.family import Family, family_dir
 from fastfuncstuff.autoproc.naming import STAGE_NUMBERS, NameKey, coord, stem
 from fastfuncstuff.autoproc.plan import (
+    ABOVE_GRANDMEAN,
     Plan,
     PlanRun,
     effective_anat_source,
@@ -2617,9 +2618,7 @@ def _stage_grandmean(plan: Plan, script_stem: str) -> str:
 # undistorted echoes, so its lane images are already undistorted -- the warp again
 # would correct them twice), and everything ABOVE grandmean space (which is by
 # definition estimated from the grandmean, so it cannot act before it).
-_GRANDMEAN_DROP = frozenset(
-    {"moco", "locomoco", "medic", "mni_lin", "mni_nl", "anat_lin", "anat_nl", "xref_lin", "xref_nl"}
-)
+_GRANDMEAN_DROP = frozenset({"moco", "locomoco", "medic"}) | ABOVE_GRANDMEAN
 
 
 def _grandmean_tokens(pr: PlanRun) -> list[str]:

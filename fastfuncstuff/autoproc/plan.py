@@ -394,6 +394,13 @@ _CHAIN_ORDER = (
 )
 
 
+# Every link at or above anat_nl acts in anat (or reference) space and is estimated
+# FROM the grandmean, so none of it can act on the way TO the grandmean. Derived
+# from the order, not listed, so a new head link cannot be left out (bug of record:
+# xfam_lin/xfam_nl reached stage08's gmrun chain before stage09 had made them).
+ABOVE_GRANDMEAN: frozenset[str] = frozenset(_CHAIN_ORDER[: _CHAIN_ORDER.index("anat_nl") + 1])
+
+
 @dataclass
 class PlanRun:
     bold: BoldRun

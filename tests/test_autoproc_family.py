@@ -323,3 +323,30 @@ def test_xfam_nonlin_fits_on_the_childs_own_grid_along_its_pe_axis(tmp_path):
     assert 'MASTER="${FFS_MASTER:-stage09.xfam_nl_al_anat.nii$FMT}"' in floc
     # The family's own anchor still excludes both cross-family links.
     assert '-nwarp "stage09.anat.aff12.1D stage09.nlanat_invwarp.nii$FMT"' in floc
+
+
+def test_cross_family_links_stay_out_of_the_grandmean_chain(tmp_path):
+    # Bug of record: stage08's gmrun chain carried xfam_lin/xfam_nl, which stage09
+    # makes from that very grandmean, so the script died on a missing matrix.
+    from fastfuncstuff.autoproc.emit import _grandmean_tokens, _needs_gmrun
+
+    opt = Options(go_to_anat=True, anat_nonlin=True, xfam_nonlin=True)
+    plan = build_plan(_slab_subject(tmp_path), opt)
+    (_, _), (_, child) = plan.family_plans
+    toks = _grandmean_tokens(child.runs[0])
+    assert not any(t.startswith(("xfam", "anat", "mni", "xref")) for t in toks), toks
+    # The stray links are also what made a single-session run look as if it needed
+    # its own gmrun resample at all.
+    assert not _needs_gmrun(child.runs[0])
+
+
+def test_every_family_cuts_its_own_warpmaster_and_mask(tmp_path):
+    opt = Options(go_to_anat=True, anat_nonlin=True, xfam_nonlin=True)
+    script = write_script(build_plan(_slab_subject(tmp_path), opt), "wd", bids_root="/bids")
+    _, prim, floc = script.split("\n# family ")
+    for fam, anchor in ((prim, "grandmean_al_anat_nl"), (floc, "xfam_nl_al_anat")):
+        # Its own anchor (so its own FoV), its own voxel size, its own mask.
+        assert f'MASTER="${{FFS_MASTER:-stage09.{anchor}.nii$FMT}}"' in fam
+        assert "stage10.warpmaster.nii$FMT" in fam and "mask_epi.nii$FMT" in fam
+    assert "_task-prim_" in prim.split("FINAL_DXYZ=")[1].splitlines()[0]
+    assert "_task-floc_" in floc.split("FINAL_DXYZ=")[1].splitlines()[0]

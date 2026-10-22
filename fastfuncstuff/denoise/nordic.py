@@ -37,6 +37,7 @@ from fastfuncstuff.cli_utils import spinner
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.memory import (
     estimate_chunk_size,
+    nordic_fits_on_gpu,
     nordic_llr_gpu_budget,
     plan_nordic_llr_memory,
 )
@@ -297,6 +298,14 @@ def _compute_dd_phase(
     Each slab: (nx, ny, z_batch * nt) → single batched fft2.
     """
     nx, ny, nz, nt = data.shape
+    # A second full complex series next to ``data`` was the OOM on a shared card;
+    # when it does not fit, build it on the host -- callers move it there anyway.
+    slab_bytes = nx * ny * min(z_batch, nz) * nt * data.element_size()
+    out_device = (
+        data.device
+        if nordic_fits_on_gpu(data.device, data.numel() * data.element_size() + 3 * slab_bytes)
+        else torch.device("cpu")
+    )
     win_x = torch.tensor(
         tukey(nx, alpha=1.0, sym=True),
         dtype=torch.float32,
@@ -310,7 +319,7 @@ def _compute_dd_phase(
     # win2d shape: (nx, ny, 1) — broadcasts over batch dim
     win2d = (win_x[:, None] * win_y[None, :]).unsqueeze(-1)
 
-    dd = torch.empty_like(data)
+    dd = torch.empty_like(data, device=out_device)
     for z0 in range(0, nz, z_batch):
         z1 = min(z0 + z_batch, nz)
         n_slices = z1 - z0
@@ -318,9 +327,11 @@ def _compute_dd_phase(
         sl = data[:, :, z0:z1, :].reshape(nx, ny, n_slices * nt)
         k = torch.fft.fftshift(torch.fft.fft2(sl, dim=(0, 1)), dim=(0, 1))
         k *= win2d
-        dd[:, :, z0:z1, :] = torch.fft.ifft2(
-            torch.fft.ifftshift(k, dim=(0, 1)), dim=(0, 1)
-        ).reshape(nx, ny, n_slices, nt)
+        dd[:, :, z0:z1, :] = (
+            torch.fft.ifft2(torch.fft.ifftshift(k, dim=(0, 1)), dim=(0, 1))
+            .reshape(nx, ny, n_slices, nt)
+            .to(out_device)
+        )
         del k
     return dd
 

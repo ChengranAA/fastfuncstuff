@@ -1263,12 +1263,27 @@ def nordic_llr_gpu_budget(device: torch.device) -> int:
         return get_available_memory(device)
     try:
         torch.cuda.empty_cache()
-        reserved = torch.cuda.memory_reserved(device)
-        total = torch.cuda.get_device_properties(device).total_memory
-        free = total - reserved
+        # The itemized estimate counts the input volume we already hold, so the
+        # budget is everything except what OTHER processes hold: driver-free plus
+        # our own reservation. ``total - reserved`` used to stand in for this and
+        # handed a co-tenant's VRAM to the plan (same bug as get_available_memory's).
+        driver_free, _total = torch.cuda.mem_get_info(device)
+        reserved, _allocated = _reserved_and_allocated(device)
+        free = driver_free + reserved
     except Exception:
         return get_available_memory(device)
     return _nordic_budget_from_free(free)
+
+
+def nordic_fits_on_gpu(device: torch.device, n_bytes: int) -> bool:
+    """Whether ``n_bytes`` more can be allocated on ``device`` under the NORDIC policy.
+
+    For whole-volume temporaries outside the LLR pass (e.g. the dd_phase low-pass),
+    which are otherwise unplanned and sit next to the resident input volume.
+    """
+    if device.type != "cuda":
+        return True
+    return n_bytes <= _nordic_budget_from_free(get_available_memory(device, safety_factor=1.0))
 
 
 def dyn_chunk_estimator(

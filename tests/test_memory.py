@@ -776,3 +776,33 @@ class TestGlmPlannerHelpers:
         large = bytes_per_voxel_ridge_cv(300, 20, n_fractions=21)
         assert large - small >= 20 * 2 * 300 * 4
         assert large > bytes_per_voxel_ridge(300, 20, n_fractions=21)
+
+
+class TestNordicBudgetSharedCard:
+    """The NORDIC budget must not spend VRAM that another process holds."""
+
+    GiB = 1024**3
+
+    def _patch_card(self, monkeypatch, *, total, driver_free, reserved):
+        monkeypatch.delenv("FFS_GPU_SAFETY_FACTOR", raising=False)
+        monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (driver_free, total))
+        monkeypatch.setattr(
+            memory_module, "_reserved_and_allocated", lambda device: (reserved, reserved)
+        )
+
+    def test_cotenant_memory_is_excluded(self, monkeypatch):
+        # bug-of-record: 15.5 GiB card, 6 GiB ours, 2.3 GiB another job's. The old
+        # `total - reserved` budgeted the 2.3 GiB too, and the prep stage OOM'd.
+        total, ours, theirs = int(15.5 * self.GiB), 6 * self.GiB, int(2.3 * self.GiB)
+        self._patch_card(monkeypatch, total=total, driver_free=total - ours - theirs, reserved=ours)
+        budget = memory_module.nordic_llr_gpu_budget(torch.device("cuda"))
+        assert budget == _nordic_budget_from_free(total - theirs)
+
+    def test_fits_on_gpu_counts_only_free_memory(self, monkeypatch):
+        total = 16 * self.GiB
+        self._patch_card(monkeypatch, total=total, driver_free=8 * self.GiB, reserved=6 * self.GiB)
+        dev = torch.device("cuda")
+        assert memory_module.nordic_fits_on_gpu(dev, 5 * self.GiB)
+        assert not memory_module.nordic_fits_on_gpu(dev, 7 * self.GiB)
+        assert memory_module.nordic_fits_on_gpu(torch.device("cpu"), 10**15)

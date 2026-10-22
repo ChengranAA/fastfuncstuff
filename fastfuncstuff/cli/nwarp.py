@@ -121,7 +121,8 @@ Examples:
         "-nwarp",
         default=None,
         help="Warp chain (quoted, space-separated). E.g., 'warp1.nii matrix.1D warp2.nii' "
-        "[required unless -batch]",
+        "[required unless -batch]. INV(matrix.aff12.1D) applies a matrix backwards, as "
+        "in AFNI (matrices only: for a warp, give the inverse warp its registration saved).",
     )
     io_group.add_argument(
         "-chain_base",

@@ -939,3 +939,63 @@ def test_nwarpforge_composes_at_full_fp32_even_after_a_solver_enabled_tf32(tmp_p
         assert torch.get_float32_matmul_precision() == "high"
     finally:
         torch.set_float32_matmul_precision(before)
+
+
+def _rigid_aff12(tmp_path):
+    """A 7° rotation + shift as an .aff12.1D, written straight in DICOM mm."""
+    from fastfuncstuff.processing.affine import save_matrix_1D
+
+    a = np.deg2rad(7.0)
+    m = np.eye(4)
+    m[:3, :3] = [[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]]
+    m[:3, 3] = [3.0, -2.0, 1.5]
+    p = tmp_path / "m.aff12.1D"
+    save_matrix_1D(torch.from_numpy(m).float(), p)
+    return p
+
+
+def test_inv_matrix_is_the_exact_inverse_on_an_oblique_grid(tmp_path):
+    # The grid conversion is a similarity, so inverting in mm first must agree with
+    # inverting the converted voxel matrix -- on an oblique output grid too.
+    from fastfuncstuff.processing.nwarpforge import load_affine_1D
+
+    p = _rigid_aff12(tmp_path)
+    b = np.deg2rad(12.0)
+    out_aff = np.eye(4)
+    out_aff[:3, :3] = 1.5 * np.array(
+        [[1, 0, 0], [0, np.cos(b), -np.sin(b)], [0, np.sin(b), np.cos(b)]]
+    )
+    out_aff[:3, 3] = [-30.0, 20.0, -10.0]
+    fwd = load_affine_1D(p, out_aff).matrices[0].double()
+    inv = load_affine_1D(p, out_aff, inverse=True).matrices[0].double()
+    assert torch.allclose(fwd @ inv, torch.eye(4, dtype=torch.float64), atol=1e-5)
+
+
+def test_chain_through_a_matrix_and_its_inv_returns_the_source(tmp_path):
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.processing.nwarpforge import nwarpforge
+
+    n = 24
+    zz, yy, xx = np.meshgrid(*(np.arange(n, dtype=np.float32),) * 3, indexing="ij")
+    src = (100 + 50 * np.sin(xx / 3.0) + 20 * np.cos(yy / 4.0)).transpose(2, 1, 0)
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    aff[:3, 3] = -24.0
+    sp = tmp_path / "src.nii.gz"
+    nib.save(nib.Nifti1Image(src, aff), sp)
+    m = str(_rigid_aff12(tmp_path))
+    out = tmp_path / "o.nii.gz"
+    nwarpforge(str(sp), [m, f"INV({m})"], str(out), master_path=str(sp), interp="linear",
+               device=torch.device("cpu"), verb=0, auto_pad=False)  # fmt: skip
+    got = np.asarray(nib.load(out).dataobj)
+    # Interior only: the round trip is the identity, so no edge resampling either.
+    inner = (slice(2, -2),) * 3
+    np.testing.assert_allclose(got[inner], src[inner], rtol=1e-4, atol=1e-2)
+
+
+def test_split_inv_parses_the_afni_form():
+    from fastfuncstuff.processing.nwarpforge import split_inv
+
+    assert split_inv("INV(a.aff12.1D)") == ("a.aff12.1D", True)
+    assert split_inv("a.aff12.1D") == ("a.aff12.1D", False)
+    with pytest.raises(ValueError, match="malformed"):
+        split_inv("INV(a.aff12.1D")

@@ -339,6 +339,7 @@ def load_affine_1D(
     output_affine: np.ndarray,
     device: torch.device | None = None,
     debug: bool = False,
+    inverse: bool = False,
 ) -> AffineTransform:
     """Load AFNI .aff12.1D matrix file (single or multi-row).
 
@@ -390,6 +391,11 @@ def load_affine_1D(
             for j in range(4):
                 matrices[t, i, j] = float(mats_12[t, i * 4 + j])
         matrices[t, 3, 3] = 1.0
+    if inverse:
+        # In mm, before the grid conversion below: that conversion is a similarity
+        # (C^-1 F M F C), so this is exactly the inverse on any output grid. float64
+        # so a near-identity matrix does not come back with float32 noise doubled.
+        matrices = torch.linalg.inv(matrices.double()).float()
 
     if debug:
         m = matrices[0].cpu().numpy()
@@ -644,6 +650,21 @@ def split_vscale(spec: str) -> tuple[str, tuple[float, float, float] | None]:
     except ValueError as exc:
         raise ValueError(f"malformed {spec!r}: expected VSCALE:si,sj,sk:warp") from exc
     return path, (si, sj, sk)
+
+
+INV_PREFIX = "INV("
+
+
+def split_inv(spec: str) -> tuple[str, bool]:
+    """``INV(mat.aff12.1D)`` -> ``("mat.aff12.1D", True)``; else ``(spec, False)``.
+
+    AFNI's chain syntax for applying a transform backwards. Matrices only: an
+    inverse warp has to be computed (and is usually saved alongside the warp)."""
+    if not spec.startswith(INV_PREFIX):
+        return spec, False
+    if not spec.endswith(")"):
+        raise ValueError(f"malformed {spec!r}: expected INV(file)")
+    return spec[len(INV_PREFIX) : -1], True
 
 
 def apply_vscale(xform, scales: tuple[float, float, float]) -> None:
@@ -1529,7 +1550,7 @@ def _first_nonlinear_warp_grid(
     import glob as _glob
 
     for spec in nwarp_specs:
-        s = split_vscale(spec)[0]
+        s = split_inv(split_vscale(spec)[0])[0]
         if any(c in s for c in "*?[") and not Path(s).exists():
             matches = sorted(_glob.glob(s))
             if not matches:
@@ -2300,6 +2321,7 @@ def nwarpforge(
 
     for _i_spec, spec in enumerate(nwarp_specs):
         spec, vscale = split_vscale(spec)
+        spec, inverse = split_inv(spec)
         # A glob token (e.g. 'warp_*.nii.gz') expands, sorted, to one warp per
         # frame -> a single time-varying slot in the chain. A pattern matching
         # exactly one file falls through to normal single-warp handling.
@@ -2326,10 +2348,17 @@ def nwarpforge(
         kind = identify_transform_type(spec)
         if kind == "affine" and vscale is not None:
             raise ValueError(f"VSCALE: scales a warp's displacement; {spec} is an affine")
+        if inverse and kind != "affine":
+            raise ValueError(
+                f"INV({spec}): only matrices can be inverted in a chain; use the "
+                "inverse warp the registration saved (e.g. _invwarp / _WARPINV)."
+            )
 
         if kind == "affine":
             with progress_context(f"Loading affine {spec}"):
-                xform = load_affine_1D(spec, affine_for_matrices, device=device, debug=debug)
+                xform = load_affine_1D(
+                    spec, affine_for_matrices, device=device, debug=debug, inverse=inverse
+                )
             transforms.append(xform)
             max_time_points = max(max_time_points, xform.matrices.shape[0])
             if debug:

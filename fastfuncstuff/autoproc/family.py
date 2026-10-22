@@ -100,9 +100,10 @@ def _key(bold: BoldRun) -> tuple[str | None, str, str]:
 def detect_families(runs: list[BoldRun], overrides: dict[str, str] | None = None) -> list[Family]:
     """Group ``runs`` into families, in order of first appearance.
 
-    An automatic family is labelled with its task when it holds exactly one task
-    that no other family shares (the common case: one task per acquisition),
-    else ``famN``. Labels never collide with a ``-family`` label.
+    An automatic family is labelled, in order of preference, with its task, its
+    ``acq-`` value, or ``famN`` — a task or acq only when the family owns it
+    outright (see :func:`_owned`). The label names the family's output folder, so
+    it must be unique; it never collides with a ``-family`` label.
     """
     overrides = overrides or {}
     sigs = {_key(b): signature(b) for b in runs}
@@ -126,18 +127,16 @@ def detect_families(runs: list[BoldRun], overrides: dict[str, str] | None = None
                 order.append(fam)
         fam.members.append(_key(b))
 
-    families_of_task: dict[str, int] = {}
-    for fam in order:
-        for t in fam.tasks:
-            families_of_task[t] = families_of_task.get(t, 0) + 1
+    acq_of = {_key(b): b.acq for b in runs}
     taken = set(by_label)
     n = 0
     for fam in order:
         if fam.forced:
             continue
-        tasks = fam.tasks
-        if len(tasks) == 1 and families_of_task[tasks[0]] == 1 and tasks[0] not in taken:
-            fam.label = tasks[0]
+        for name in (_owned(fam, order, lambda m: m[1]), _owned(fam, order, acq_of.get)):
+            if name and name not in taken:
+                fam.label = name
+                break
         else:
             n += 1
             while f"fam{n}" in taken:
@@ -145,3 +144,18 @@ def detect_families(runs: list[BoldRun], overrides: dict[str, str] | None = None
             fam.label = f"fam{n}"
         taken.add(fam.label)
     return order
+
+
+def _owned(fam: Family, order: list[Family], value) -> str | None:
+    """The one ``value`` every member of ``fam`` shares and no other family's
+    member has — a name that identifies this family and nothing else — or None.
+    Tasks and acquisitions need not line up with families (one task acquired two
+    ways, two tasks acquired one way), so a name is only taken when it is exact."""
+    mine = {value(m) for m in fam.members}
+    if len(mine) != 1:
+        return None
+    (name,) = mine
+    if not name:
+        return None
+    others = {value(m) for f in order if f is not fam for m in f.members}
+    return None if name in others else name

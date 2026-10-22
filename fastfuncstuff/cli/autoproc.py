@@ -2074,6 +2074,12 @@ def _resolve_family_overrides(args) -> dict[str, str]:
     keeps the last."""
     out: dict[str, str] = {}
     for task, label in args.family or []:
+        # The label names the family's output folder (fam-<label>).
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", label):
+            raise SystemExit(
+                f"ffs_autoproc: -family {task} {label!r}: LABEL must be letters, digits, "
+                "'-' or '_' (it becomes the folder fam-LABEL)."
+            )
         out[task[len("task-") :] if task.startswith("task-") else task] = label
     return out
 

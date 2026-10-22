@@ -195,6 +195,7 @@ class BoldRun:
     phase_path: Path | None = None
     sbref_path: Path | None = None  # magnitude SBRef, if present
     fmap_id: str | None = None  # assigned in plan.py
+    acq: str = ""  # BIDS ``acq-`` entity as-found; "" if absent
     # Multi-echo (BIDS ``echo-`` entity): every echo, in echo order, with its TE in ms
     # from its own sidecar. Empty for single-echo data. ``mag_path`` / ``phase_path``
     # / ``sbref_path`` above are echo 1's, so a stage that only needs one image (moco
@@ -528,6 +529,7 @@ def _scan_session(
             json=load_sidecar(mag, bids_root),
             phase_path=phase,
             sbref_path=sbref,
+            acq=acq,
         )
         if len(echoes) >= 2:
             run_obj.echo_mags = [e["mag"] for e in echoes]

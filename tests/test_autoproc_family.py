@@ -13,8 +13,8 @@ from fastfuncstuff.autoproc.family import detect_families
 from fastfuncstuff.autoproc.plan import Options, build_plan
 
 
-def _bold(tmp: Path, task, run, vox=2.0, shape=(8, 8, 6), pe="j-", readout=0.04, ses="01"):
-    path = tmp / f"sub-X_ses-{ses}_task-{task}_run-{run}_bold.nii.gz"
+def _bold(tmp: Path, task, run, vox=2.0, shape=(8, 8, 6), pe="j-", readout=0.04, ses="01", acq=""):
+    path = tmp / f"sub-X_ses-{ses}_task-{task}_acq-{acq}_run-{run}_bold.nii.gz"
     img = nib.Nifti1Image(np.zeros((*shape, 3), np.float32), np.diag([vox, vox, vox, 1]))
     img.header.set_zooms((vox, vox, vox, 2.0))
     nib.save(img, path)
@@ -25,6 +25,7 @@ def _bold(tmp: Path, task, run, vox=2.0, shape=(8, 8, 6), pe="j-", readout=0.04,
         run=run,
         mag_path=path,
         json={"RepetitionTime": 2.0, "PhaseEncodingDirection": pe, "TotalReadoutTime": readout},
+        acq=acq,
     )
 
 
@@ -45,6 +46,26 @@ def test_identical_acquisition_across_tasks_is_one_family(tmp_path):
     runs = [_bold(tmp_path, "floc", "1"), _bold(tmp_path, "prim", "1")]
     fams = detect_families(runs)
     assert len(fams) == 1 and fams[0].label == "fam1"
+
+
+def test_acq_names_a_family_its_tasks_cannot(tmp_path):
+    # Two tasks share the high-res acquisition, so neither task names that family;
+    # its acq does. The other family owns its task outright and takes that.
+    runs = [
+        _bold(tmp_path, "floc", "1", vox=1.2, acq="hires"),
+        _bold(tmp_path, "prim", "1", vox=1.2, acq="hires"),
+        _bold(tmp_path, "rest", "1", vox=2.0, acq="lores"),
+    ]
+    assert [f.label for f in detect_families(runs)] == ["hires", "rest"]
+
+
+def test_shared_task_and_acq_fall_back_to_numbers(tmp_path):
+    # One task, one acq label, two resolutions: nothing names either family.
+    runs = [
+        _bold(tmp_path, "a", "1", vox=2.0, acq="x"),
+        _bold(tmp_path, "a", "2", vox=1.2, acq="x"),
+    ]
+    assert [f.label for f in detect_families(runs)] == ["fam1", "fam2"]
 
 
 def test_polarity_alone_splits_a_family(tmp_path):

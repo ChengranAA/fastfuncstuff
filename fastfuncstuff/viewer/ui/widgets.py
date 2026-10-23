@@ -10,6 +10,8 @@ from collections.abc import Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from fastfuncstuff.viewer.ui import theme
+
 
 class RowSizedList(QtWidgets.QListWidget):
     """A list as tall as what is in it, capped, scrolling past the cap.
@@ -103,11 +105,15 @@ class ValueColumnDelegate(QtWidgets.QStyledItemDelegate):
         )
         style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
         selected = bool(opt.state & QtWidgets.QStyle.StateFlag.State_Selected)
-        role = (
-            QtGui.QPalette.ColorRole.HighlightedText if selected else QtGui.QPalette.ColorRole.Text
-        )
         painter.save()
-        painter.setPen(opt.palette.color(role))
+        # Selected: the theme's text, not the QPalette's HighlightedText -- the
+        # stylesheet never sets that role, so it stays the system's white and
+        # vanishes on the light theme's pale selection fill.
+        painter.setPen(
+            QtGui.QColor(theme.palette().text)
+            if selected
+            else opt.palette.color(QtGui.QPalette.ColorRole.Text)
+        )
         painter.setFont(opt.font)
         shown = metrics.elidedText(value, QtCore.Qt.TextElideMode.ElideRight, room)
         painter.drawText(

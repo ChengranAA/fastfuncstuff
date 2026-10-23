@@ -188,3 +188,40 @@ def test_thermal_phi_uses_the_donor_brightness_under_spr():
     c = res.phi[~borrowed] / m_bar[~borrowed] ** 2
     want = c.median() * m_bar[donor[borrowed]] ** 2
     assert torch.allclose(res.phi[borrowed], want, rtol=1e-3)
+
+
+def test_shrink_reliability_passes_a_big_noisy_phase_vein_that_slope_throttles():
+    """A strong vein whose phase regressor is noisy (A^2/phi ~ 10, as in MindsEye
+    fam-floc 2026-10-23): Deming's A is right, but -shrink slope applies s*A with
+    s = 1/(1+A^2/phi) ~ 0.1, so the vein survives. -shrink reliability keeps a slope
+    that is many jackknife SEs from zero, and drops pure-noise slopes instead of
+    letting them explode."""
+    from fastfuncstuff.phasereg.core import phase_regress
+
+    g = torch.Generator().manual_seed(5)
+    n_tp, n_v, n_u = 380, 60, 400
+    t = torch.arange(n_tp, dtype=torch.float32) * 2.0
+    f = 0.005 + 0.075 * torch.rand(n_v, 6, 1, generator=g)
+    ph0 = 6.283 * torch.rand(n_v, 6, 1, generator=g)
+    truth = 0.05 * torch.sin(6.283 * f * t + ph0).sum(1)
+    pha_c = truth + 0.15 * torch.randn(n_v, n_tp, generator=g)  # phase noise ~ signal
+    mag_c = 1000 - 400 * truth + 5 * torch.randn(n_v, n_tp, generator=g)
+    pha_u = 0.15 * torch.randn(n_u, n_tp, generator=g)
+    mag_u = 1000 + 5 * torch.randn(n_u, n_tp, generator=g)
+    mag, pha = torch.cat([mag_c, mag_u]), torch.cat([pha_c, pha_u])
+    kw = dict(keep_drift=True, max_poly_degree=0, device="cpu", phi=25.0 / 0.0225)
+    slope = phase_regress(mag, pha, 2.0, shrink_mode="slope", **kw)
+    rel = phase_regress(mag, pha, 2.0, shrink_mode="reliability", **kw)
+
+    def left(res):  # share of the true vein signal still in the output
+        resid = res.magnitude_corrected[:n_v] - 1000
+        vein = -400 * truth
+        return float(((resid * vein).sum(1) / (vein * vein).sum(1)).median())
+
+    assert float(slope.slope[:n_v].median() / -400) > 0.8  # Deming finds the slope...
+    assert left(slope) > 0.7  # ...and -shrink slope leaves most of the vein in
+    assert left(rel) < 0.2
+    assert float(rel.shrink[:n_v].median()) > 0.8
+    noisier = rel.magnitude_corrected[n_v:].std(dim=1) / mag_u.std(dim=1)
+    assert float((rel.shrink[n_v:] == 0).float().mean()) > 0.8
+    assert float(noisier.median()) < 1.01 and float(noisier.max()) < 3.0

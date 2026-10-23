@@ -80,6 +80,7 @@ runs go in; -concat_output gives one file. 3D maps are one per fit.)
       the fit is chasing phase noise (check upstream phase processing first).
   prefix_slope     (3D)  A, magnitude units per radian. Read it with phi.
   prefix_phi       (3D)  Var(magnitude noise)/Var(phase noise) used by Deming.
+  [-shrink reliability] prefix_shrink (3D): share of the slope applied.
   prefix_r2        (3D)  ODR R^2, for phaseprep parity only. It saturates at
       0.5-0.8 brain-wide in raw-unit data, so it does not show where the
       correction acted; use macro_std (or -r2_mode naive).
@@ -93,7 +94,8 @@ IF VEINS SURVIVE, read prefix_slope at the vein:
   * Slope ~0: the voxel's own phase carries nothing (phase cancels within a
     voxel-sized vein, or the vessel is near the magic angle). Use -spr.
   * Slope huge (1e3-1e5): an ill-conditioned fit to phase noise. The default
-    -shrink slope damps it to ~0 (no correction); -shrink odr collapses the
+    -shrink slope damps it to ~0 (no correction; it also throttles real big
+    slopes: s*A <= sqrt(phi)/2, try -shrink reliability); -shrink odr collapses the
     voxel to its mean, which looks like suppression but is not; -shrink none
     adds it as noise. -spr gives it a real regressor.
   * Slopes small everywhere: phase noise dominates the regressor. Run
@@ -168,7 +170,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     reg.add_argument(
         "-shrink",
-        choices=["slope", "odr", "none"],
+        choices=["slope", "odr", "none", "reliability"],
         default="slope",
         help="ODR's factor s = 1/(1+A^2/phi): ~1 for a believable slope, ~0 for an "
         "ill-conditioned fit to phase noise. 'slope' (default): subtract s*A*phase, "
@@ -178,7 +180,20 @@ def create_parser() -> argparse.ArgumentParser:
         "'odr': phaseprep/Stanley's output, the residual scaled by s, which "
         "flattens every voxel with an unreliable slope (~73%% of the response "
         "removed, veins and tissue alike, on ds003427). 'none': the full A*phase; "
-        "explodes where magnitude and phase barely couple.",
+        "explodes where magnitude and phase barely couple. 'reliability' "
+        "(experimental): subtract r*A*phase, r = max(0, 1 - z^2*V/A^2) with V the "
+        "slope's jackknife variance (-reliability_z). 'slope' can never apply more "
+        "than sqrt(phi)/2 however large A is, so it throttles the biggest veins "
+        "hardest; here a well-determined slope passes almost whole and one within "
+        "z SEs of zero is dropped. Writes prefix_shrink, the factor applied.",
+    )
+    reg.add_argument(
+        "-reliability_z",
+        type=float,
+        default=2.0,
+        metavar="Z",
+        help="-shrink reliability: SEs a slope must clear before any of it is applied. "
+        "A slope at t = 3 / 5 / 10 keeps 0.56 / 0.84 / 0.96 of itself at Z=2.",
     )
     reg.add_argument(
         "-phi",
@@ -871,6 +886,7 @@ def main(argv: list[str] | None = None) -> int:
         phase_global_order=args.phase_global_order,
         keep_drift=args.keep_drift,
         shrink_mode=args.shrink,
+        reliability_z=args.reliability_z,
         vein_mask=args.vein_mask,
         vein_fdr_q=args.vein_fdr,
         spr=args.spr,
@@ -965,6 +981,11 @@ def main(argv: list[str] | None = None) -> int:
             fname = f"{args.prefix}_r2_naive{nii_ext}"
             save_nifti(_to_volume(result.r2_naive.numpy()), fname, reference_img=ref_img_path)
             outputs["r2_naive"] = fname
+
+        if args.shrink == "reliability" and result.shrink is not None:
+            fname = f"{args.prefix}_shrink{nii_ext}"
+            save_nifti(_to_volume(result.shrink.numpy()), fname, reference_img=ref_img_path)
+            outputs["shrink"] = fname
 
         fname = f"{args.prefix}_phi{nii_ext}"
         save_nifti(_to_volume(result.phi.numpy()), fname, reference_img=ref_img_path)

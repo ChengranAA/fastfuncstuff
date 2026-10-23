@@ -42,6 +42,8 @@ for GPU acceleration.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
+
 import torch
 
 
@@ -77,9 +79,22 @@ def deming_regression(
     syy = (y_c * y_c).sum(dim=0)
     sxy = (x_c * y_c).sum(dim=0)
 
+    slope = deming_slope_from_moments(sxx, syy, sxy, phi)
+    intercept = y_bar - slope * x_bar
+
+    return slope, intercept
+
+
+def deming_slope_from_moments(
+    sxx: torch.Tensor,
+    syy: torch.Tensor,
+    sxy: torch.Tensor,
+    phi: torch.Tensor | float = 1.0,
+) -> torch.Tensor:
+    """Deming slope from centred second moments (see :func:`deming_regression`)."""
     if not isinstance(phi, torch.Tensor):
-        phi = torch.tensor(phi, dtype=x.dtype, device=x.device)
-    phi = phi.broadcast_to(sxx.shape)
+        phi = torch.tensor(phi, dtype=sxx.dtype, device=sxx.device)
+    phi = phi.to(sxx.dtype).broadcast_to(sxx.shape)
 
     # Closed-form Deming slope (Wikipedia / scipy.odr convention):
     # With delta = phi = Var(eps_y) / Var(eps_x),
@@ -105,15 +120,67 @@ def deming_regression(
     denominator = torch.where(pos, 2.0 * sxy, sqrt_disc - diff)
 
     # Guard against a zero denominator (no correlation -> slope = 0)
-    slope = torch.where(
+    return torch.where(
         denominator.abs() > 1e-30,
         numerator / denominator,
         torch.zeros_like(numerator),
     )
 
-    intercept = y_bar - slope * x_bar
 
-    return slope, intercept
+def jackknife_variance(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    stats: Sequence[Callable[..., torch.Tensor]],
+    n_blocks: int = 10,
+) -> list[torch.Tensor]:
+    """Delete-a-block jackknife variances of moment-based statistics, per voxel.
+
+    Each ``stat(sxx, syy, sxy, n)`` (centred moments over ``n`` time points) is
+    re-run on every leave-one-block-out set of moments: e.g. the slope rule
+    actually applied (Deming, a capped Deming, OLS), or the covariance
+    ``sxy / n``. Blocks are contiguous in time so that autocorrelated noise
+    stays inside a block instead of looking like independent evidence.
+
+    The jackknife is a linearisation: it is sound for the covariance, but a
+    Deming slope is a ratio whose denominator can sit near zero, where every
+    leave-one-out slope is huge with one sign and the variance comes out small.
+    Judge a slope's support with the covariance's variance as well.
+
+    x, y : (n_timepoints, n_voxels). Returns one (n_voxels,) tensor per stat.
+    """
+    n_tp = x.shape[0]
+    n_blocks = max(2, min(n_blocks, n_tp // 2))
+    edges = torch.linspace(0, n_tp, n_blocks + 1).round().long().tolist()
+    # Centre on the full mean first so the block sums carry no large offset;
+    # the leave-one-out moments are then differences of modest numbers, taken
+    # in float64.
+    x_c = x - x.mean(dim=0)
+    y_c = y - y.mean(dim=0)
+    parts = []
+    for a, b in zip(edges[:-1], edges[1:], strict=True):
+        xb, yb = x_c[a:b], y_c[a:b]
+        parts.append(
+            torch.stack(
+                [
+                    torch.full_like(xb[0], float(b - a)),
+                    xb.sum(0),
+                    yb.sum(0),
+                    (xb * xb).sum(0),
+                    (yb * yb).sum(0),
+                    (xb * yb).sum(0),
+                ]
+            )
+        )
+    blocks = torch.stack(parts).double()  # (n_blocks, 6, n_voxels)
+    loo = blocks.sum(0, keepdim=True) - blocks
+    n, sx, sy, sxx, syy, sxy = loo.unbind(1)
+    moments = (sxx - sx * sx / n, syy - sy * sy / n, sxy - sx * sy / n, n)
+    g = n.shape[0]
+    out = []
+    for stat in stats:
+        v = stat(*moments)
+        out.append(((g - 1) / g * ((v - v.mean(0)) ** 2).sum(0)).to(x.dtype))
+    return out
 
 
 def ols_regression(

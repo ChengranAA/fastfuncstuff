@@ -28,7 +28,12 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.phasereg.deming import deming_regression, ols_regression
+from fastfuncstuff.phasereg.deming import (
+    deming_regression,
+    deming_slope_from_moments,
+    jackknife_variance,
+    ols_regression,
+)
 from fastfuncstuff.phasereg.noise import estimate_variance_ratio
 from fastfuncstuff.processing.filters import savgol_filter_1d, savgol_filter_explore
 from fastfuncstuff.stats.task_coupling import _orthonormal_basis
@@ -95,6 +100,9 @@ class PhaseRegResult:
     coupling_r : Tensor (n_voxels,) or None
         Pearson correlation between the magnitude and phase series the slope was
         fit on.  Only when vein_mask=True.
+    shrink : Tensor (n_voxels,) or None
+        Factor applied to the slope (1/(1+A²/φ), the reliability, or 1 for
+        "none"); 1 under "odr", which scales the residual instead.
     vein_p : Tensor (n_voxels,) or None
         Two-sided p-value that ``coupling_r`` exceeds chance, Sidak-corrected for
         the sPR donor argmax.  Only when vein_mask=True.
@@ -123,6 +131,7 @@ class PhaseRegResult:
     spr_donor_corr: torch.Tensor | None = None
     spr_donor_offset: torch.Tensor | None = None
     coupling_r: torch.Tensor | None = None
+    shrink: torch.Tensor | None = None
     vein_p: torch.Tensor | None = None
     vein_exclude: torch.Tensor | None = None
 
@@ -338,6 +347,8 @@ def phase_regress(
     phase_global_order: int = -1,
     keep_drift: bool = False,
     shrink_mode: str = "slope",
+    reliability_z: float = 2.0,
+    reliability_blocks: int = 10,
     vein_mask: bool = False,
     vein_fdr_q: float = 0.05,
     spr: bool = False,
@@ -458,6 +469,19 @@ def phase_regress(
         whose slope is unreliable, task response included (~73% of the
         response removed, veins and tissue alike, on ds003427). "none": subtract
         A·phase in full; with weakly coupled voxels the slope explodes.
+        "reliability": subtract r·A·phase with r = max(0, 1 − z²·V/A²), V the
+        delete-a-block jackknife variance of the slope as fitted (cap, sPR
+        OLS swap included), and r no larger than the same factor for the
+        magnitude-phase covariance. Unlike "slope", whose s·A can never exceed √φ/2
+        however large A is, a well-determined large slope passes almost whole:
+        the big veins "slope" throttles hardest (MindsEye 2026-10-23: Deming A
+        matched the slope that cancels the face beta, s was 0.10). A slope
+        within z SEs of zero is dropped entirely.
+    reliability_z : float
+        SEs a slope must clear before any of it is applied under
+        shrink_mode="reliability"; t = 3 / 5 / 10 keeps 0.56 / 0.84 / 0.96 at z=2.
+    reliability_blocks : int
+        Contiguous time blocks for the jackknife.
     vein_mask : bool
         Also emit a vein *exclusion* mask: voxels whose magnitude covaries with
         phase beyond chance (oriented vessels). For layer workflows that drop
@@ -564,8 +588,10 @@ def phase_regress(
         raise ValueError(f"Unknown slope_on: {slope_on!r}. Use 'data' or 'residual'.")
     if spr_regression not in (None, "ols", "deming"):
         raise ValueError(f"Unknown spr_regression: {spr_regression!r}. Use 'ols' or 'deming'.")
-    if shrink_mode not in ("slope", "odr", "none"):
-        raise ValueError(f"Unknown shrink_mode: {shrink_mode!r}. Use 'slope', 'odr' or 'none'.")
+    if shrink_mode not in ("slope", "odr", "none", "reliability"):
+        raise ValueError(
+            f"Unknown shrink_mode: {shrink_mode!r}. Use 'slope', 'odr', 'none' or 'reliability'."
+        )
 
     # ── 1. Keep magnitude in raw scanner units ───────────────────────────
     # phaseprep and Stanley fit ODR on raw-unit magnitude. With raw mag and
@@ -886,6 +912,7 @@ def phase_regress(
     r2 = torch.zeros(n_voxels)
     r2_naive = torch.zeros(n_voxels) if r2_mode in ("naive", "both") else None
     inflation_all = torch.zeros(n_voxels)
+    shrink_all = torch.zeros(n_voxels)
     coupling_r = torch.zeros(n_voxels) if vein_mask else None
     n_unstable = 0
     n_capped = 0
@@ -984,6 +1011,39 @@ def phase_regress(
         s = torch.where(bad, torch.zeros_like(s), s)
         b = torch.where(bad, torch.zeros_like(b), b)
 
+        if shrink_mode == "reliability":
+            # The same slope rule as above, re-run on jackknife moments.
+            phi_d = phi_c.double()
+
+            def rule(sxx, syy, sxy, n, in_veins=in_veins, phi_d=phi_d):
+                ols = torch.where(sxx > 1e-30, sxy / sxx.clamp_min(1e-30), torch.zeros_like(sxy))
+                dem = deming_slope_from_moments(sxx, syy, sxy, phi_d)
+                if max_slope_ratio:
+                    dem = torch.sign(dem) * torch.minimum(dem.abs(), max_slope_ratio * ols.abs())
+                out = dem if regression == "deming" else ols
+                if in_veins is not None:
+                    out = torch.where(in_veins, ols if spr_regression == "ols" else dem, out)
+                return out
+
+            def cov(sxx, syy, sxy, n):
+                return sxy / n
+
+            s_var, c_var = jackknife_variance(
+                fit_pha, fit_mag, (rule, cov), n_blocks=reliability_blocks
+            )
+            fp = fit_pha - fit_pha.mean(dim=0)
+            c = (fp * (fit_mag - fit_mag.mean(dim=0))).mean(dim=0)
+            del fp
+            # Positive-part James-Stein on both the slope and the covariance it
+            # rests on: keep the part that stands more than reliability_z SEs clear
+            # of zero. A²/(A²+V) would keep half of a pure-noise slope, and the
+            # slope's own jackknife misses a near-zero covariance (see
+            # jackknife_variance), where uncoupled Deming slopes run to 1e3-1e5.
+            z2 = reliability_z**2
+            r_slope = (1.0 - z2 * s_var / (s * s).clamp_min(1e-30)).clamp_min(0.0)
+            r_cov = (1.0 - z2 * c_var / (c * c).clamp_min(1e-30)).clamp_min(0.0)
+            reliability = torch.where(bad, torch.zeros_like(s), torch.minimum(r_slope, r_cov))
+
         if coupling_r is not None:
             mc = fit_mag - fit_mag.mean(dim=0, keepdim=True)
             pc = fit_pha - fit_pha.mean(dim=0, keepdim=True)
@@ -1007,8 +1067,13 @@ def phase_regress(
         # voxelwise with phaseprep.
         pha_centered = pha_filt - pha_filt.mean(dim=0)
         inflation = 1.0 + (s * s) / phi_c.clamp(min=1e-12)
-        shrink = 1.0 / inflation if shrink_mode != "none" else torch.ones_like(inflation)
-        if in_veins is not None and spr_regression == "ols":
+        if shrink_mode == "reliability":
+            shrink = reliability
+        elif shrink_mode == "none":
+            shrink = torch.ones_like(inflation)
+        else:
+            shrink = 1.0 / inflation
+        if in_veins is not None and spr_regression == "ols" and shrink_mode != "reliability":
             # ODR's factor belongs to the Deming fit; an OLS slope is used as fit
             shrink = torch.where(in_veins, torch.ones_like(shrink), shrink)
 
@@ -1049,6 +1114,7 @@ def phase_regress(
         slope_all[lo:hi] = s.cpu()
         intercept_all[lo:hi] = b.cpu()
         inflation_all[lo:hi] = inflation.cpu()
+        shrink_all[lo:hi] = (shrink if shrink_mode != "odr" else torch.ones_like(shrink)).cpu()
         del s_, mag_dt, pha_filt, mag_res, pha_res_filt, mag, r_obs, eps, corrected, macro
 
     phi_tensor = phi_all if not isinstance(phi, torch.Tensor) else phi
@@ -1127,7 +1193,14 @@ def phase_regress(
             f">2: {int((infl_good > 2).sum().item()):,} voxels, "
             f">10: {int((infl_good > 10).sum().item()):,} voxels"
         )
-        if shrink_mode == "none":
+        if shrink_mode == "reliability":
+            sh = shrink_all[vox_mask]
+            print(
+                f"    shrink_mode='reliability' (z={reliability_z:g}): slope kept "
+                f"median {sh.median().item():.2f}; {int((sh > 0.5).sum().item()):,} voxels keep "
+                f"> half, {int((sh == 0).sum().item()):,} within {reliability_z:g} SE of zero (none applied)."
+            )
+        elif shrink_mode == "none":
             print(
                 "    shrink_mode='none': applying the FULL correction; the "
                 "inflation numbers above are what parity mode would discard."
@@ -1168,6 +1241,7 @@ def phase_regress(
         spr_donor_corr=spr_donor_corr,
         spr_donor_offset=spr_donor_offset,
         coupling_r=coupling_r,
+        shrink=shrink_all,
         vein_p=vein_p,
         vein_exclude=vein_exclude,
     )

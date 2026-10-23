@@ -2963,6 +2963,12 @@ def nwarpforge(
                 pass
             if afni_ext_copied:
                 break
+        if afni_ext_copied:
+            # The master's extension carries the master's history; the output's
+            # history is the data's (AFNI 3dNwarpApply: tross_Copy_History).
+            from fastfuncstuff.io.afni import copy_afni_history
+
+            copy_afni_history(src_hdr, out_hdr)
 
         # Set AFNI view/space from master
         set_afni_space_info(

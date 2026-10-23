@@ -3348,6 +3348,38 @@ def set_afni_atr(
 
     if ni_type == "String":
         body = f' "{_niml_escape_string(value)}"\n'
+def copy_afni_history(source_header: Any, dest_header: Any) -> None:
+    """Give ``dest_header`` the ``HISTORY_NOTE`` of ``source_header`` (or none).
+
+    In-script ``tross_Copy_History``: a resampler that takes its AFNI extension
+    from the grid master must still carry the history of the data it resampled,
+    which is what 3dNwarpApply does. The element moves verbatim, so its NIML
+    escaping is never decoded and re-encoded.
+    """
+    import nibabel as nib
+
+    def _afni_xml(header: Any) -> tuple[int | None, str]:
+        for i, ext in enumerate(getattr(header, "extensions", None) or []):
+            if ext.get_code() == _NIFTI_ECODE_AFNI:
+                return i, ext.content.decode("utf-8", errors="replace")
+        return None, ""
+
+    dest_idx, dest_xml = _afni_xml(dest_header)
+    if dest_idx is None:
+        return
+    pattern = r'<AFNI_atr\s[^>]*atr_name="HISTORY_NOTE"[^>]*>.*?</AFNI_atr>\s*'
+    m = re.search(pattern, _afni_xml(source_header)[1], flags=re.DOTALL)
+    xml = re.sub(pattern, "", dest_xml, flags=re.DOTALL)
+    if m:
+        if "</AFNI_attributes>" in xml:
+            xml = xml.replace("</AFNI_attributes>", m.group(0) + "</AFNI_attributes>", 1)
+        else:
+            xml = xml + m.group(0)
+    dest_header.extensions[dest_idx] = nib.nifti1.Nifti1Extension(
+        _NIFTI_ECODE_AFNI, xml.encode("utf-8")
+    )
+
+
         ni_dimen = "1"
     else:
         body = f" {value}\n"

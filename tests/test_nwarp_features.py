@@ -1111,3 +1111,35 @@ def test_vscale_refuses_what_it_cannot_scale(tmp_path):
     nib.Nifti1Image(np.ones((6, 6, 6), np.float32), _diag_affine(2.0)).to_filename(str(src))
     with pytest.raises(ValueError, match="affine"):
         nwarpforge(str(src), [f"VSCALE:1,1,2:{aff}"], str(tmp_path / "o.nii"), device=DEV, verb=0)
+
+
+def test_output_history_is_the_sources_not_the_masters(tmp_path):
+    # Bug of record: the output took the master's whole AFNI extension, so a
+    # warped BOLD series read as the warpmaster's history (autobox, resample)
+    # and lost the data's own. AFNI 3dNwarpApply copies the source's history.
+    from fastfuncstuff.cli.nwarp import main
+    from fastfuncstuff.io.afni import set_afni_atr
+
+    aff = _diag_affine()
+    data = np.random.default_rng(0).random((6, 7, 5), dtype=np.float32)
+
+    def with_history(name, note):
+        img = nib.Nifti1Image(data, aff)
+        set_afni_atr(img.header, "HISTORY_NOTE", note)
+        img.to_filename(str(tmp_path / name))
+        return str(tmp_path / name)
+
+    src = with_history("src.nii", "ffs_moco -prefix src.nii")
+    master = with_history("master.nii", "ffs_util_autobox -prefix master.nii")
+    ident = tmp_path / "id.aff12.1D"
+    _write_aff1d(ident, [_IDENT12])
+    out = tmp_path / "out.nii"
+    main(["-source", src, "-nwarp", str(ident), "-master", master, "-prefix", str(out),
+          "-device", "cpu", "-quiet"])  # fmt: skip
+
+    xml = "".join(
+        e.get_content().decode() for e in nib.load(str(out)).header.extensions if e.get_code() == 4
+    )
+    assert "ffs_moco -prefix src.nii" in xml
+    assert "ffs_util_autobox" not in xml
+    assert xml.count('atr_name="HISTORY_NOTE"') == 1

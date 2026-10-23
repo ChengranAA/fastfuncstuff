@@ -1361,6 +1361,7 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
     moco_arrays = " ".join(f"MOCO_{ln.upper()}" for ln in _lanes(plan) if ln != LANE_SBREF)
     lines.append(
         "declare -A MAG PHASE NOISE SBREF TR PEDIR TRT JSON FRAG CHAIN AVGCHAIN XRUNBASE EVENTS "
+        "EVOPTS "
         f"{moco_arrays} PRECHAIN REFGRID JAC"
         # Keys are "ses:task:run": undeclared, bash takes SURFCHAIN as an indexed
         # array and evaluates the key as arithmetic, failing every assignment.
@@ -1419,6 +1420,9 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
             ev = _events_script_path(plan, pr, bids_root)
             if ev:
                 lines.append(f"EVENTS[{q(k)}]={q(ev)}")
+                shape = _event_shape_args(plan, b.task, bids_root)
+                if shape:
+                    lines.append(f"EVOPTS[{q(k)}]={q(shape)}")
         # These values contain the bash var $FMT and must expand at assignment,
         # so they are double-quoted (not shlex-quoted). The key and the values
         # are our own constructed names — no shell metacharacters beyond $FMT.
@@ -1785,7 +1789,7 @@ def _stage_nordic(plan: Plan) -> str:
             # pixdim[4] is the per-partition time, not the volume TR the design is
             # sampled at.
             *(
-                ['${ev:+-events "${ev}"}', '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}']
+                ['${ev:+-events "${ev}"}', '"${evopts[@]}"', '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}']
                 if _nordic_events_on(opt)
                 else []
             ),
@@ -1808,6 +1812,8 @@ echo '== stage00: NORDIC denoise =='
 # .echo-N.part-phase); a joint cross-echo denoising is still to be tested.
 for k in "${{RUN_KEYS[@]}}"; do
   ev="${{EVENTS[$k]:-}}"   # unset for a run whose events did not resolve; set -u
+  # EVOPTS is shell-quoted text (-event_cols / -event_filter_*); eval keeps its quoting.
+  evopts=(); [ -n "$ev" ] && eval "evopts=(${{EVOPTS[$k]:-}})"
   {_ECHO_LOOP}
     outf="stage00.nordic.${{FRAG[$k]}}${{esfx}}.nii{_nordic_fmt(plan)}"
     mag="{_ECHO_MAG}"; ph="{_ECHO_PHASE}"
@@ -2061,8 +2067,13 @@ def _stage_locomoco(plan: Plan, script_stem: str) -> str:
         # The design, for whichever step reads it. -tr rides along because a 3D
         # acquisition's header pixdim[4] is the per-partition time, not the volume TR
         # the design is sampled at.
+        # EVOPTS is shell-quoted text; the manifest is shlex-split, which unquotes it.
         *(
-            ['${ev:+-events "${ev}"}', '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}']
+            [
+                '${ev:+-events "${ev}"}',
+                "${ev:+${EVOPTS[$k]:-}}",
+                '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}',
+            ]
             if _locomoco_events_on(plan.options)
             else []
         ),
@@ -5481,6 +5492,28 @@ def _events_script_path(plan: Plan, pr: PlanRun, bids_root: str | None) -> str |
     if plan.options.run_glm:
         return stimuli_map(plan, bids_root).get(src, src)
     return src
+
+
+def _event_shape_args(plan: Plan, task: str, bids_root: str | None) -> str:
+    """``-event_cols`` / ``-event_filter_*`` for ``task``, shell-quoted, or "".
+
+    The per-run stages (NORDIC's task QC, locomoco's -detask) read the same TSVs as
+    the GLM, so they must read the same columns and rows: without these a task whose
+    conditions live in a non-BIDS column was modelled from ``trial_type`` there.
+    Resolved across the task's files exactly as the GLM stage does, fallback included.
+    """
+    from fastfuncstuff.autoproc.glm import resolve_event_cols
+
+    opt = plan.options
+    prs = [pr for pr in plan.runs if pr.bold.task == task]
+    cols, _warn = resolve_event_cols(task, events_for_task(task, prs, bids_root, opt), opt)
+    q = shlex.quote
+    out = [f"-event_cols {' '.join(q(c) for c in cols)}"] if cols else []
+    out += [
+        f"-event_filter_{f.action} {q(f.column)} " + " ".join(q(v) for v in f.values)
+        for f in opt.event_filters.get(task, [])
+    ]
+    return " ".join(out)
 
 
 def _events_args(task: str, prs: list[PlanRun], bids_root: str | None, opt=None) -> str:

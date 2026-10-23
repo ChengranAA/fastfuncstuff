@@ -2031,6 +2031,69 @@ def test_detask_is_opt_in(tmp_path):
     assert "-events" in line and "-task_qc" not in line
 
 
+def test_per_run_stages_read_the_glms_event_columns(tmp_path):
+    """-sep_spec_event_cols / -event_filter_* reached ffs_reml but not stage00/03, so
+    locomoco -detask modelled the task from trial_type while the GLM used the column
+    asked for. Run through bash: a filter value with a space has to survive both the
+    shlex-split manifest and stage00's direct call."""
+    import shlex
+    import subprocess
+
+    from fastfuncstuff.design.bids_events import EventFilter
+
+    pr = _bids_run(tmp_path, "01", "foo", "1")
+    ev = tmp_path / "sub-X/ses-01/func/sub-X_ses-01_task-foo_run-1_events.tsv"
+    ev.write_text("onset\tduration\tcondition\ttrial_type\n0\t10\tface\tevent\n")
+    subj = Subject("X", [Session("01", [pr])])
+    opt = Options(
+        locomoco=True,
+        locomoco_detask="fit:2",
+        want_nordic=True,
+        nordic_task_qc=True,
+        sep_spec_event_cols={"foo": ("onset", "duration", "condition")},
+        event_filters={"foo": [EventFilter(column="condition", values=["a b"], action="out")]},
+    )
+    s = write_script(build_plan(subj, opt), "wd", bids_root=str(tmp_path))
+    evopts = next(ln for ln in s.splitlines() if ln.startswith("EVOPTS["))
+    want = ["-event_cols", "onset", "duration", "condition"]
+    want += ["-event_filter_out", "condition", "a b"]
+
+    line = _locomoco_manifest(s).replace('>> "$lmbatch"', "")
+    out = subprocess.run(
+        ["bash", "-c", f"declare -A EVOPTS TR; k=01:foo:1; ev=x.tsv; {evopts}\n{line}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    toks = shlex.split(out)
+    i = toks.index("-event_cols")
+    assert toks[i : i + len(want)] == want
+
+    nordic = _nordic_command(s)
+    assert '"${evopts[@]}"' in nordic
+    stage00 = s.split("stage00: NORDIC denoise")[-1]
+    setup = next(ln for ln in stage00.splitlines() if "evopts=()" in ln)
+    out = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'declare -A EVOPTS; k=01:foo:1; ev=x.tsv; {evopts}\n{setup}\nprintf "%s\\n" "${{evopts[@]}}"',
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert out.splitlines() == want
+
+    # BIDS-default columns and no filters: nothing extra is emitted.
+    plain = write_script(
+        build_plan(subj, Options(locomoco=True, locomoco_detask="fit:2")),
+        "wd",
+        bids_root=str(tmp_path),
+    )
+    assert "EVOPTS[01" not in plain
+
+
 def _nordic_command(script: str) -> str:
     """The ffs_nordic invocation stage00 emits, joined onto one line."""
     lines = script.split("stage00: NORDIC denoise")[-1].splitlines()

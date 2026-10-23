@@ -76,7 +76,10 @@ def test_a_closing_depth_window_does_not_dispatch_for_its_gone_viewport(tmp_path
         session.close()
 
 
-def test_a_pinned_profile_stays_through_a_move_and_exports_beside_the_live_one(tmp_path):
+def test_a_pinned_dataset_follows_the_region_beside_another_and_exports(tmp_path):
+    """PIN keeps the dataset, not the curve: after switching to another dataset
+    and moving the region, the pinned trace is the first dataset over the *new*
+    region, so two processing stages compare spot by spot."""
     from fastfuncstuff.viewer.session import ViewerSession
     from fastfuncstuff.viewer.ui.depthwindow import DepthWindow, export_table
     from fastfuncstuff.viewer.vocab import LoadSurfaces, OpenView, SetDepthView, SetXYZ
@@ -94,20 +97,31 @@ def test_a_pinned_profile_stays_through_a_move_and_exports_beside_the_live_one(t
         win.apply(session.state.viewports.get("D1"))
         first = win.result
         assert first is not None
+        shell = first.layer_name
         win.pin()
-        session.do(SetDepthView("D1", "disc", 8.0, "", ""))
+        win.pin()  # the same dataset twice is one pin
+        assert len(win.plot.pins) == 1
+        base = session.state.layers.base
+        assert base is not None
+        session.do(SetDepthView("D1", "disc", 8.0, base.key, ""))
         win.refresh(SetDepthView.aspects)
-        assert win.result is not first and len(win.plot.pins) == 1
+        assert win.result is not None and win.result.layer_name == base.name
+        assert len(win.plot.pins) == 1
         pin = win.plot.pins[0]
-        assert "4 mm disc" in pin.label
-        np.testing.assert_allclose(pin.mean, np.nanmean(first.profiles, axis=0))
+        assert pin.label == shell
+        assert pin.n_vertices == win.result.n_vertices > first.n_vertices
+        # The pin is the shell over the 8 mm disc: what profiling it live there gives.
         win.plot.resize(400, 300)
         win.plot.grab()  # paints the pin and the live trace without raising
         out = tmp_path / "p.tsv"
         export_table(win.result, out, win.plot.pins)
         lines = out.read_text().splitlines()
-        assert lines[0].startswith("# pin1: ") and "4 mm disc" in lines[0]
+        assert lines[0] == f"# pin1: {shell}"
         assert any(ln.startswith("pin1 mean\t") for ln in lines)
+        session.do(SetDepthView("D1", "disc", 8.0, "", ""))
+        win.refresh(SetDepthView.aspects)
+        assert win.result.layer_name == shell
+        np.testing.assert_allclose(win.plot.pins[0].mean, np.nanmean(win.result.profiles, axis=0))
         win.clear_pins()
         assert win.plot.pins == [] and not win.unpin_button.isEnabled()
         win.close()

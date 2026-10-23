@@ -11,8 +11,10 @@ A time series gives depth x time as well: the region's mean at every depth
 and volume, with the time cursor -- the depth timecourses a laminar analysis
 starts from -- and EXPORT writes them as a table, ``(n_time, K)``.
 
-PIN freezes the current mean +- SD as a coloured trace, so another overlay,
-dataset or region can be laid over it; the axes stretch to hold every trace.
+PIN keeps the profiled dataset on the plot as a coloured trace that follows
+the region and the time cursor, so selecting another dataset lays the two side
+by side wherever you click -- what a processing step changed, spot by spot.
+The axes stretch to hold every trace.
 
 The region is published to the surface store, so a surface window shows
 which cortex the profile came from.
@@ -54,9 +56,20 @@ class DepthResult:
     series: np.ndarray | None = None
 
 
+@dataclass
+class PinnedLayer:
+    """A dataset kept on the plot, re-profiled over whatever region is live."""
+
+    key: str
+    #: A bucket's sub-brick as pinned; ``None`` follows the time cursor.
+    brick: int | None
+    result: DepthResult | None = None
+    built: tuple | None = None
+
+
 @dataclass(frozen=True)
 class PinnedProfile:
-    """A profile kept on the plot after the region or overlay moved on."""
+    """One pinned dataset's profile over the current region, as drawn."""
 
     label: str
     fractions: np.ndarray  # (K,)
@@ -72,18 +85,29 @@ class PinnedProfile:
         return cls(label, result.fractions.copy(), mean, sd, result.n_vertices)
 
 
+def _volume_of(session, layer, brick: int | None = None) -> int:
+    if layer.time_linked:
+        return int(session.state.time_index)
+    return int(layer.volume_index if brick is None else brick)
+
+
 def depth_profiles(
-    session, vertices: dict[str, np.ndarray], layer, fractions: np.ndarray, equivolume: bool
+    session,
+    vertices: dict[str, np.ndarray],
+    layer,
+    fractions: np.ndarray,
+    equivolume: bool,
+    brick: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
     """``(V, K)`` profiles at the current volume, ``(T, K)`` region-mean
     timecourses, and the full ``(V, K, T)`` samples behind them.
 
     Timecourses only for a time-linked layer whose full series is resident;
     otherwise ``None`` (the series is still loading, or the layer is a stat
-    map whose sub-bricks are not time).
+    map whose sub-bricks are not time). ``brick`` overrides a bucket's shown
+    sub-brick, for a pin that keeps the one it was pinned on.
     """
-    st = session.state
-    idx = int(st.time_index if layer.time_linked else layer.volume_index)
+    idx = _volume_of(session, layer, brick)
     res = session.store.get(layer.key)
     four_d = layer.time_linked and res.array is not None and res.array.ndim == 4
     volume = res.array if four_d else session.volume(layer.key, idx)
@@ -340,6 +364,9 @@ class DepthWindow(QtWidgets.QWidget):
         self.result: DepthResult | None = None
         self._built: tuple | None = None
         self._vertices: dict[str, np.ndarray] = {}
+        self._pinned: list[PinnedLayer] = []
+        #: The live trace's layer and volume, which PIN keeps.
+        self._live: tuple[str, int | None] | None = None
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -368,11 +395,14 @@ class DepthWindow(QtWidgets.QWidget):
         bar.addWidget(self.roi_box)
         bar.addStretch(1)
         pin = QtWidgets.QPushButton("PIN")
-        pin.setToolTip("Keep this profile on the plot to compare against (p; shift+p clears)")
+        pin.setToolTip(
+            "Keep this dataset on the plot, following the region, to compare"
+            " another against (p; shift+p clears)"
+        )
         pin.clicked.connect(self.pin)
         bar.addWidget(pin)
         self.unpin_button = QtWidgets.QPushButton("UNPIN")
-        self.unpin_button.setToolTip("Clear every pinned profile (shift+p)")
+        self.unpin_button.setToolTip("Clear every pinned dataset (shift+p)")
         self.unpin_button.clicked.connect(self.clear_pins)
         self.unpin_button.setEnabled(False)
         bar.addWidget(self.unpin_button)
@@ -396,8 +426,8 @@ class DepthWindow(QtWidgets.QWidget):
                 Key("(", "smaller disc", lambda: self._radius_by(1 / 1.25), group="depth"),
                 Key(")", "larger disc", lambda: self._radius_by(1.25), group="depth"),
                 Key("f", "follow the crosshair / pin the region", self._toggle_follow, group="depth"),
-                Key("p", "pin this profile to compare against", self.pin, group="depth"),
-                Key("shift+p", "clear the pinned profiles", self.clear_pins, group="depth"),
+                Key("p", "pin this dataset to compare against", self.pin, group="depth"),
+                Key("shift+p", "clear the pinned datasets", self.clear_pins, group="depth"),
                 Key("click (heatmap)", "go to that volume", None, group="depth"),
                 Key("h", "this list", self.help.toggle, group="window"),
                 Key("ctrl+w", "close this window", self.close, group="window"),
@@ -444,21 +474,19 @@ class DepthWindow(QtWidgets.QWidget):
             self._dispatch(SetSurfaceEquivolume(self.vid, not vp.equivolume))
 
     def pin(self) -> None:
-        r = self.result
-        if r is None or r.n_vertices == 0:
+        if self._live is None or self.result is None or self.result.n_vertices == 0:
             return
-        vp = self._viewport()
-        label = f"{r.layer_name} · {r.region}"
-        if r.timecourses is not None:
-            label += f" · vol {r.time_index}"
-        if vp is not None and not vp.equivolume:
-            label += " · equidistant"
-        self.plot.pins.append(PinnedProfile.of(r, label))
+        key, brick = self._live
+        if any((q.key, q.brick) == (key, brick) for q in self._pinned):
+            return
+        # The live result is this dataset over this region: the pin starts from it.
+        self._pinned.append(PinnedLayer(key, brick, self.result, self._built))
         self.unpin_button.setEnabled(True)
-        self.plot.update()
+        self.refresh(Aspect.ALL)
 
     def clear_pins(self) -> None:
-        self.plot.pins.clear()
+        self._pinned.clear()
+        self.plot.pins = []
         self.unpin_button.setEnabled(False)
         self.plot.update()
 
@@ -546,52 +574,83 @@ class DepthWindow(QtWidgets.QWidget):
             self._region_key = region_key
             surfaces.publish_depth_roi(self._vertices)
             self.roi_changed.emit()
-        idx = int(st.time_index if layer.time_linked else layer.volume_index)
-        key = (
-            tuple((h, ids.tobytes()) for h, ids in self._vertices.items()),
-            layer.key,
-            idx if not layer.time_linked else "series",
-            vp.equivolume,
-            tuple(sorted(surfaces.version.items())),
-        )
+        idx = _volume_of(self.session, layer)
+        self._live = (layer.key, None if layer.time_linked else idx)
         n = sum(ids.size for ids in self._vertices.values())
+        pins: list[PinnedProfile] = []
         if n == 0:
             self.result = None
             self.plot.message = "no cortex here: click within 3 mm of the ribbon"
             self.plot.result = None
             self.time_plot.data = None
-        elif key != self._built:
-            fractions = np.linspace(-MARGIN, 1 + MARGIN, int(vp.depth_bins))
-            profiles, courses, samples = depth_profiles(
-                self.session, self._vertices, layer, fractions, vp.equivolume
-            )
-            keep = samples if samples is not None and samples.nbytes < 512 * 2**20 else None
-            self.result = DepthResult(
-                fractions,
-                profiles,
-                courses,
-                n,
-                self._region_name(vp),
-                _shown(layer, idx),
-                idx,
-                keep,
-            )
-            self._built = key
-        elif self.result is not None and self.result.timecourses is not None:
-            # Same region and series: only the current volume moved.
-            self.result.time_index = idx
-            if self.result.series is not None:
-                self.result.profiles = self.result.series[:, :, idx]
-            else:
-                self.result.profiles = depth_profiles(
-                    self.session, self._vertices, layer, self.result.fractions, vp.equivolume
-                )[0]
+        else:
+            self.result, self._built = self._profile(vp, layer, None, self.result, self._built)
+            for q in self._pinned:
+                pinned = st.layers.find(q.key)
+                if pinned is None:  # unloaded since: nothing left to profile
+                    continue
+                q.result, q.built = self._profile(vp, pinned, q.brick, q.result, q.built)
+                assert q.result is not None
+                pins.append(PinnedProfile.of(q.result, q.result.layer_name))
+        self.plot.pins = pins
         self.plot.result = self.result
         self.time_plot.data = None if self.result is None else self.result.timecourses
         self.time_plot.cursor = idx
         self.time_plot.setVisible(self.time_plot.data is not None)
         self.plot.update()
         self.time_plot.update()
+
+    def _profile(
+        self,
+        vp: Viewport,
+        layer,
+        brick: int | None,
+        result: DepthResult | None,
+        built: tuple | None,
+    ) -> tuple[DepthResult | None, tuple | None]:
+        """One layer's profile over the current region, and the key it was built for.
+
+        Re-samples only when the region, layer or depth spacing moved; a series
+        whose cursor alone moved is re-sliced instead.
+        """
+        idx = _volume_of(self.session, layer, brick)
+        key = (
+            tuple((h, ids.tobytes()) for h, ids in self._vertices.items()),
+            layer.key,
+            idx if not layer.time_linked else "series",
+            vp.equivolume,
+            tuple(sorted(self.session.surfaces.version.items())),
+        )
+        if key != built:
+            fractions = np.linspace(-MARGIN, 1 + MARGIN, int(vp.depth_bins))
+            profiles, courses, samples = depth_profiles(
+                self.session, self._vertices, layer, fractions, vp.equivolume, brick
+            )
+            keep = samples if samples is not None and samples.nbytes < 512 * 2**20 else None
+            n = sum(ids.size for ids in self._vertices.values())
+            return (
+                DepthResult(
+                    fractions,
+                    profiles,
+                    courses,
+                    n,
+                    self._region_name(vp),
+                    _shown(layer, idx),
+                    idx,
+                    keep,
+                ),
+                key,
+            )
+        if result is not None and result.timecourses is not None:
+            # Same region and series: only the current volume moved.
+            result.time_index = idx
+            if result.series is not None:
+                result.profiles = result.series[:, :, idx]
+            else:
+                result.profiles = depth_profiles(
+                    self.session, self._vertices, layer, result.fractions, vp.equivolume
+                )[0]
+        return result, built
 
     def _roi_generation(self, key: str) -> int | None:
         """The ROI layer's data version: a painted layer changes in place."""
@@ -679,6 +738,7 @@ __all__ = [
     "DepthPlot",
     "DepthResult",
     "DepthWindow",
+    "PinnedLayer",
     "PinnedProfile",
     "depth_profiles",
     "export_table",

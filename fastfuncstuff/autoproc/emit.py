@@ -5502,13 +5502,18 @@ def _event_shape_args(plan: Plan, task: str, bids_root: str | None) -> str:
     conditions live in a non-BIDS column was modelled from ``trial_type`` there.
     Resolved across the task's files exactly as the GLM stage does, fallback included.
     """
-    from fastfuncstuff.autoproc.glm import resolve_event_cols
+    from fastfuncstuff.autoproc.glm import requested_event_ignore, resolve_event_cols
 
     opt = plan.options
     prs = [pr for pr in plan.runs if pr.bold.task == task]
     cols, _warn = resolve_event_cols(task, events_for_task(task, prs, bids_root, opt), opt)
     q = shlex.quote
     out = [f"-event_cols {' '.join(q(c) for c in cols)}"] if cols else []
+    # Only when asked for: the spec's own default drop list is not forwarded,
+    # so a pipeline that never passed -event_ignore keeps fitting what it did.
+    ignore = requested_event_ignore(task, opt)
+    if ignore:
+        out += [f"-event_ignore {' '.join(q(c) for c in ignore)}"]
     out += [
         f"-event_filter_{f.action} {q(f.column)} " + " ".join(q(v) for v in f.values)
         for f in opt.event_filters.get(task, [])

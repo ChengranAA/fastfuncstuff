@@ -22,7 +22,7 @@ from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import find_events
 from fastfuncstuff.autoproc.naming import STAGE_NUMBERS
 from fastfuncstuff.autoproc.plan import Plan, PlanRun, run_noise_vols
-from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
+from fastfuncstuff.design.spec import DEFAULT_DROP_TRIAL_TYPES, DEFAULT_EVENT_COLUMNS
 
 
 def spec_path(task: str, opt=None) -> str:
@@ -113,6 +113,17 @@ def requested_event_cols(task: str, opt) -> tuple[str, str, str] | None:
     return per_task or opt.spec_event_cols
 
 
+def requested_event_ignore(task: str, opt) -> list[str] | None:
+    """Trial types to leave out of ``task``'s design, or None for the default.
+
+    ``-sep_event_ignore TASK ...`` wins over the dataset-wide ``-event_ignore``;
+    ``None`` means :data:`~fastfuncstuff.design.spec.DEFAULT_DROP_TRIAL_TYPES`,
+    and an empty list means model everything.
+    """
+    per_task = (opt.sep_event_ignore or {}).get(task)
+    return per_task if per_task is not None else opt.event_ignore
+
+
 def resolve_event_cols(
     task: str, events_paths: list, opt
 ) -> tuple[tuple[str, str, str] | None, str | None]:
@@ -171,6 +182,9 @@ def cut_event_warnings(task: str, runs_events: list, opt) -> list[str]:
     cols, _ = resolve_event_cols(task, paths, opt)
     onset_col, dur_col, tt_col = cols or DEFAULT_EVENT_COLUMNS
     filters = opt.event_filters.get(task)
+    # An ignored trial type is not in the design, so a cut that strands it is
+    # not news — and "no events left" about it would be a lie.
+    ignored = set(requested_event_ignore(task, opt) or DEFAULT_DROP_TRIAL_TYPES)
 
     out: list[str] = []
     seen: set[str] = set()
@@ -189,6 +203,8 @@ def cut_event_warnings(task: str, runs_events: list, opt) -> list[str]:
             continue
         late: dict[str, int] = {}
         for row in rows:
+            if row["_trial_type"] in ignored:
+                continue
             seen.add(row["_trial_type"])
             if row["_onset"] >= end_sec:
                 late[row["_trial_type"]] = late.get(row["_trial_type"], 0) + 1
@@ -300,6 +316,9 @@ def _kept_status(dest: Path, task: str, opt) -> str:
     requested = opt.event_filters.get(task, [])
     if [f.describe() for f in kept.meta.event_filters] != [f.describe() for f in requested]:
         problems.append("its event_filters differ from the ones requested")
+    want_drop = requested_event_ignore(task, opt)
+    if want_drop is not None and sorted(kept.meta.drop_trial_types) != sorted(want_drop):
+        problems.append("its drop_trial_types differ from the -event_ignore requested")
     have = {c.label for c in kept.contrasts}
     missing = [
         c.label
@@ -435,6 +454,7 @@ def write_design_specs(
                 round_onset=round_onset,
                 round_duration=round_duration,
                 event_filters=opt.event_filters.get(task),
+                drop_trial_types=requested_event_ignore(task, opt),
             )
         except (ValueError, OSError) as exc:
             rows.append((task, str(dest), f"skipped: {exc}"))

@@ -186,6 +186,12 @@ class Options:
     # the defaults for that task, with a warning.
     spec_event_cols: tuple[str, str, str] | None = None
     sep_spec_event_cols: dict[str, tuple[str, str, str]] = field(default_factory=dict)
+    # Trial types left out of the model entirely (ffs_reml -event_ignore, written
+    # as [meta].drop_trial_types). None = the spec's own default list; a given
+    # list REPLACES it, and an empty list models every trial type.
+    # ``sep_event_ignore`` wins for the task it names.
+    event_ignore: list[str] | None = None
+    sep_event_ignore: dict[str, list[str]] = field(default_factory=dict)
     # Event-time rounding written into every [[events]] block: decimal places
     # (0 = nearest second) or "TR". Same wide + per-task split as glm_blur. The
     # common reason is duration jitter: from_events splits a condition into one

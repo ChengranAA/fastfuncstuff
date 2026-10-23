@@ -33,7 +33,7 @@ from fastfuncstuff.autoproc.family import family_dir
 from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
-from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
+from fastfuncstuff.design.spec import DEFAULT_DROP_TRIAL_TYPES, DEFAULT_EVENT_COLUMNS
 from fastfuncstuff.processing import censor as censor_defaults
 
 # The tuned-preset recipe -do_mni runs under. Named once: the op string says it
@@ -1096,6 +1096,30 @@ def build_parser() -> argparse.ArgumentParser:
         "over -spec_event_cols for the task it names, so one oddly-columned task "
         "does not force the others to be spelled out.",
     )
+    g.add_argument(
+        "-event_ignore",
+        "-event-ignore",
+        nargs="*",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to leave out of the model entirely, for EVERY task "
+        "(ffs_reml -event_ignore; written as drop_trial_types in each design TOML, and "
+        "passed to the per-run stages that read the same events). This REPLACES the "
+        "default drop list " + ", ".join(DEFAULT_DROP_TRIAL_TYPES) + ", so "
+        "`-event_ignore gray` drops gray and MODELS rest; bare `-event_ignore` with no "
+        "labels models every trial type. Matching is on the whole label, not a substring.",
+    )
+    g.add_argument(
+        "-sep_event_ignore",
+        "-sep-event-ignore",
+        nargs="+",
+        action="append",
+        default=None,
+        metavar="TASK LABEL",
+        help="per-task version of -event_ignore; repeat once per task. Wins over "
+        "-event_ignore for the task it names: `-sep_event_ignore IVYmetamer gray` "
+        "leaves the other tasks on the default list. TASK alone models everything.",
+    )
 
     g.add_argument(
         "-round_onsets",
@@ -1822,6 +1846,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         ("-round_onsets", opt.sep_round_onsets),
         ("-round_durations", opt.sep_round_durations),
         ("-event_filter_in/out", opt.event_filters),
+        ("-sep_event_ignore", opt.sep_event_ignore),
         ("-prebuilt_contrasts", opt.prebuilt_contrasts),
     ):
         for task in sorted(per_task):
@@ -1925,6 +1950,39 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                         f"not in {Path(path).name} (columns: {', '.join(header)})."
                     )
                     break
+
+    # A -event_ignore label that matches nothing is a typo doing nothing, and the
+    # condition the user meant to drop is still in the model. Whole-label match.
+    if opt.run_glm and (opt.event_ignore or opt.sep_event_ignore):
+        from fastfuncstuff.autoproc.glm import requested_event_ignore, resolve_event_cols
+        from fastfuncstuff.design.bids_events import read_tsv_rows
+
+        for task in sorted(all_tasks):
+            want = requested_event_ignore(task, opt)
+            if not want:
+                continue
+            if opt.events:
+                paths = [Path(e) for e in opt.events]
+            else:
+                paths = [ev for _, ev in _events_by_run(args.bids_dir, task, subject) if ev]
+            if not paths:
+                continue
+            cols, _warn = resolve_event_cols(task, paths, opt)
+            onset_col, dur_col, tt_col = cols or DEFAULT_EVENT_COLUMNS
+            present: set[str] = set()
+            for path in dict.fromkeys(paths):
+                try:
+                    rows, _ = read_tsv_rows(path, onset_col, dur_col, tt_col)
+                except (OSError, ValueError):
+                    present = set()
+                    break
+                present.update(r["_trial_type"] for r in rows)
+            unseen = [lab for lab in want if lab not in present] if present else []
+            if unseen:
+                warnings.append(
+                    f"-event_ignore task-{task}: {', '.join(unseen)} match no trial_type "
+                    f"(present: {', '.join(sorted(present))}) — nothing is dropped for them."
+                )
 
     # Events: not a hard error (preprocessing still runs), but warn per task so
     # the user knows the GLM will fail without them.
@@ -2189,6 +2247,16 @@ def _resolve_event_cols(
     for task, *cols in args.sep_spec_event_cols or []:
         per_task[task[len("task-") :] if task.startswith("task-") else task] = tuple(cols)
     return wide, per_task  # type: ignore[return-value]
+
+
+def _resolve_event_ignore(args) -> tuple[list[str] | None, dict[str, list[str]]]:
+    """``(dataset-wide labels, {task: labels})`` from -event_ignore /
+    -sep_event_ignore. A task named twice keeps the last list."""
+    per_task: dict[str, list[str]] = {}
+    for task, *labels in args.sep_event_ignore or []:
+        per_task[task[len("task-") :] if task.startswith("task-") else task] = list(labels)
+    wide = list(args.event_ignore) if args.event_ignore is not None else None
+    return wide, per_task
 
 
 def _events_by_run(bids_dir: str, task: str, subject) -> list[tuple[BoldRun, Path | None]]:
@@ -2682,6 +2750,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     event_cols, event_cols_by_task = _resolve_event_cols(args)
+    event_ignore, event_ignore_by_task = _resolve_event_ignore(args)
     glm_blur, sep_glm_blur = _resolve_glm_blur(args)
     round_onsets, sep_round_onsets = _resolve_round_modes(args.round_onsets, "-round_onsets")
     round_durations, sep_round_durations = _resolve_round_modes(
@@ -2741,6 +2810,8 @@ def main(argv: list[str] | None = None) -> int:
         glm_spec_overwrite=args.glm_spec_overwrite,
         spec_event_cols=event_cols,
         sep_spec_event_cols=event_cols_by_task,
+        event_ignore=event_ignore,
+        sep_event_ignore=event_ignore_by_task,
         round_onsets=round_onsets,
         sep_round_onsets=sep_round_onsets,
         round_durations=round_durations,

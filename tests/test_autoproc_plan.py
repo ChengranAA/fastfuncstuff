@@ -2704,6 +2704,50 @@ def test_round_flags_reach_the_design_toml(tmp_path: Path):
     assert {(e.round_onset, e.round_duration) for e in imagery.events} == {(1, 0)}
 
 
+def test_event_ignore_is_per_task_and_reaches_the_design_toml(tmp_path: Path):
+    """-event_ignore drops a trial type from the model for every task;
+    -sep_event_ignore wins for the task it names. Both land in that task's TOML
+    as drop_trial_types, and REPLACE the rest/baseline default."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+    from fastfuncstuff.design.spec import load_spec
+
+    func = _bids_two_tasks(tmp_path)
+    (func / "sub-ME1_ses-SM_task-floc_run-01_events.tsv").write_text(
+        "onset\tduration\ttrial_type\n2\t4\tface\n10\t4\tgray\n18\t4\trest\n"
+    )
+    plan = build_plan(
+        scan_subject(tmp_path, "ME1"),
+        Options(run_glm=True, event_ignore=["gray"], sep_event_ignore={"imagery": []}),
+    )
+    write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+
+    floc = load_spec(tmp_path / "wd" / "stage11.design.task-floc.toml")
+    assert floc.meta.drop_trial_types == ["gray"]
+    # The default list is replaced, not added to: 'rest' is now modelled.
+    assert {e.trial_type for e in floc.events} == {"face", "rest"}
+    imagery = load_spec(tmp_path / "wd" / "stage11.design.task-imagery.toml")
+    assert imagery.meta.drop_trial_types == []
+
+
+def test_event_ignore_parses_and_defaults_to_none():
+    from fastfuncstuff.cli.autoproc import _resolve_event_ignore, build_parser
+
+    p = build_parser()
+    base = ["-bids_dir", "/b", "-subject", "X"]
+    # No flag at all leaves the spec's own default drop list in charge.
+    assert _resolve_event_ignore(p.parse_args(base)) == (None, {})
+    # A bare -event_ignore is "model everything", which is not the same as None.
+    assert _resolve_event_ignore(p.parse_args([*base, "-event-ignore"])) == ([], {})
+    wide, per_task = _resolve_event_ignore(
+        p.parse_args(
+            [*base, "-event_ignore", "gray", "-sep_event_ignore", "task-floc", "rest", "cue"]
+        )
+    )
+    assert wide == ["gray"]
+    assert per_task == {"floc": ["rest", "cue"]}
+
+
 def test_event_filters_parse_per_task():
     from fastfuncstuff.cli.autoproc import _resolve_event_filters, build_parser
 

@@ -17,6 +17,7 @@ T1w. Everything is returned as plain dataclasses; reference/warp logic lives in
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 import re
 from dataclasses import dataclass, field
@@ -109,8 +110,11 @@ def load_sidecar(nifti: Path, bids_root: Path) -> dict:
 # it must be dropped: a `part-mag_bold.nii.gz` run pairs with a `..._events.tsv`
 # that has no `part-` at all. Naively swapping `_bold`→`_events` misses it.
 _EVENTS_ENTITIES = ("sub", "ses", "task", "acq", "ce", "dir", "rec", "run")
-# Order in which entities are dropped to widen the search, finest first. `task`
-# is never dropped — an events file without it belongs to a different task.
+# Preference order for dropping entities to widen the search, finest first.
+# `task` is never dropped — an events file without it belongs to a different
+# task. Any *subset* is tried, not just prefixes of this list: a hand-written
+# `task-X_run-01_events.tsv` sitting next to the runs drops sub and ses while
+# keeping run, which no finest-first prefix ever produces.
 _EVENTS_DROP_ORDER = ("rec", "ce", "dir", "acq", "run", "ses", "sub")
 
 
@@ -118,8 +122,9 @@ def find_events(bold_path: Path, bids_root: Path | str | None = None) -> Path | 
     """The events TSV for a BOLD run, following BIDS inheritance.
 
     Searches the run's own directory first, then each parent up to ``bids_root``
-    (session → subject → dataset root), trying progressively fewer entities so a
-    shared ``task-<T>_events.tsv`` at the root is found after the per-run file.
+    (session → subject → dataset root), trying every subset of the droppable
+    entities so both a shared ``task-<T>_events.tsv`` and a partly-stripped
+    ``task-<T>_run-<N>_events.tsv`` are found, most specific first.
     Returns None when the task has no events anywhere (a resting-state run, or a
     dataset where the timing simply was not shared).
     """
@@ -128,13 +133,18 @@ def find_events(bold_path: Path, bids_root: Path | str | None = None) -> Path | 
     if "task" not in keys:
         return None
 
+    droppable = [k for k in _EVENTS_DROP_ORDER if k in keys]
+    subsets = [
+        combo for n in range(len(droppable) + 1) for combo in itertools.combinations(droppable, n)
+    ]
+    # Fewest entities dropped first (most specific match wins); ties broken by
+    # dropping the finer entity, which `combinations` already emits in order.
     stems: list[str] = []
-    for drop in (0, *range(1, len(_EVENTS_DROP_ORDER) + 1)):
-        dropped = set(_EVENTS_DROP_ORDER[:drop])
-        kept = [k for k in keys if k not in dropped]
-        s = "_".join(f"{k}-{ents[k]}" for k in kept)
-        if s not in stems:
-            stems.append(s)
+    for dropped in subsets:
+        kept = [k for k in keys if k not in set(dropped)]
+        stem = "_".join(f"{k}-{ents[k]}" for k in kept)
+        if stem not in stems:
+            stems.append(stem)
 
     # Walk up in the *given* form (relative stays relative, matching how the rest
     # of the scanner records paths); resolve only to test against bids_root.

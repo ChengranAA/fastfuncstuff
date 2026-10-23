@@ -468,6 +468,33 @@ def test_find_events_inherits_from_coarser_levels(tmp_path: Path):
     assert find_events(bold, tmp_path) == run_ev
 
 
+def test_find_events_hand_written_task_run_only(tmp_path: Path):
+    """Hand-written timing is usually named `task-<T>_run-<N>_events.tsv`: it keeps
+    run but drops sub/ses/acq, which a finest-first *prefix* of the drop order can
+    never produce. Each run must still get its own file, not run-01 for all."""
+    func = tmp_path / "sub-pilot01" / "ses-01" / "func"
+    for run in ("01", "02"):
+        bold = func / f"sub-pilot01_ses-01_task-fullcheck_acq-axial_run-{run}_part-mag_bold.nii.gz"
+        _touch(bold, {"RepetitionTime": 2.0})
+        (func / f"task-fullcheck_run-{run}_events.tsv").write_text("onset\tduration\n1\t2\n")
+
+    for run in ("01", "02"):
+        bold = func / f"sub-pilot01_ses-01_task-fullcheck_acq-axial_run-{run}_part-mag_bold.nii.gz"
+        assert find_events(bold, tmp_path) == func / f"task-fullcheck_run-{run}_events.tsv"
+
+
+def test_find_events_prefers_the_more_specific_stem(tmp_path: Path):
+    """With subsets in play two candidates can sit in one directory; the one that
+    drops fewer entities wins, so a full BIDS name beats a stripped one."""
+    func = tmp_path / "sub-pilot01" / "ses-01" / "func"
+    bold = func / "sub-pilot01_ses-01_task-fullcheck_run-01_part-mag_bold.nii.gz"
+    _touch(bold, {"RepetitionTime": 2.0})
+    (func / "task-fullcheck_run-01_events.tsv").write_text("onset\n1\n")
+    full = func / "sub-pilot01_ses-01_task-fullcheck_run-01_events.tsv"
+    full.write_text("onset\n1\n")
+    assert find_events(bold, tmp_path) == full
+
+
 def test_find_events_none_for_a_task_without_them(tmp_path: Path):
     func = tmp_path / "sub-ME1" / "ses-SM" / "func"
     bold = func / "sub-ME1_ses-SM_task-rest_bold.nii.gz"

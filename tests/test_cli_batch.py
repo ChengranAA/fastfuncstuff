@@ -121,6 +121,32 @@ def test_run_batch_isolates_failures(capsys):
     assert "FAILED" in capsys.readouterr().out
 
 
+def test_run_batch_history_names_the_run_not_the_manifest(monkeypatch):
+    # Bug of record: every ffs_nwarp -batch output carried only the outer
+    # "-batch manifest.txt" line, so a file's history never said how it was made.
+    from fastfuncstuff.io.afni import _history_commandline
+
+    monkeypatch.setattr("sys.argv", ["/env/bin/ffs_test", "-batch", "m.txt", "-device", "cpu"])
+    recorded: list[str] = []
+    run_batch_jobs(
+        tool="ffs_test",
+        jobs=[
+            ("line 1", "-source a.nii -prefix a_out.nii"),
+            ("line 2", "-source b.nii -prefix b_out.nii"),
+        ],
+        device=torch.device("cpu"),
+        parse_line=lambda line, base: _ns(),
+        dispatch=lambda a, d: recorded.append(_history_commandline()),
+        verb=0,
+    )
+    assert recorded == [
+        "ffs_test -source a.nii -prefix a_out.nii  [batch: ffs_test -batch m.txt -device cpu]",
+        "ffs_test -source b.nii -prefix b_out.nii  [batch: ffs_test -batch m.txt -device cpu]",
+    ]
+    # Outside the runner, history is the real command line again.
+    assert _history_commandline() == "ffs_test -batch m.txt -device cpu"
+
+
 def test_run_batch_rejects_nested_batch(capsys):
     with pytest.raises(SystemExit):
         run_batch_jobs(

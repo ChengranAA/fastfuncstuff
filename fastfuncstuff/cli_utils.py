@@ -4974,6 +4974,9 @@ def run_batch_jobs(
 
     from tqdm import tqdm
 
+    from fastfuncstuff.io.afni import _history_commandline, history_commandline
+
+    outer_commandline = _history_commandline()
     if verb >= 1:
         print(f"{tool} batch: {len(jobs)} runs on device={device}")
 
@@ -4996,7 +4999,10 @@ def run_batch_jobs(
                     if verb >= 1:
                         tqdm.write(f"[{label}] skip: all {len(outs)} output(s) exist")
                     continue
-            dispatch(run_args, device)
+            # The outer line stays in the entry because its flags are this run's
+            # defaults, so the run line alone would not reproduce the file.
+            with history_commandline(f"{tool} {line}  [batch: {outer_commandline}]"):
+                dispatch(run_args, device)
         except KeyboardInterrupt:
             raise
         except (Exception, SystemExit) as exc:

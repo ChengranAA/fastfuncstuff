@@ -44,6 +44,8 @@ Examples
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import functools
 import io
 import os
@@ -2573,6 +2575,26 @@ def _generate_afni_idcode() -> str:
     return f"AFN_{raw[:22]}"
 
 
+_HISTORY_COMMANDLINE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "ffs_history_commandline", default=None
+)
+
+
+@contextlib.contextmanager
+def history_commandline(commandline: str):
+    """Record ``commandline`` instead of ``sys.argv`` in history written inside.
+
+    For in-process batch runs: every output of a ``-batch`` job would otherwise
+    carry the outer ``ffs_x -batch manifest.txt`` line, which says nothing about
+    how that particular file was made.
+    """
+    token = _HISTORY_COMMANDLINE_OVERRIDE.set(commandline)
+    try:
+        yield
+    finally:
+        _HISTORY_COMMANDLINE_OVERRIDE.reset(token)
+
+
 def _history_commandline() -> str:
     """The exact ffs_* CLI invocation, joined like AFNI's ``tross_commandline``.
 
@@ -2583,6 +2605,10 @@ def _history_commandline() -> str:
     """
     import os
     import sys
+
+    override = _HISTORY_COMMANDLINE_OVERRIDE.get()
+    if override is not None:
+        return override
 
     argv = list(sys.argv)
     if argv:
@@ -3322,32 +3348,6 @@ def _niml_escape_string(cn: str) -> str:
     return "".join(escapes.get(ch, ch) for ch in cn)
 
 
-def set_afni_atr(
-    header: Any,
-    name: str,
-    value: str,
-    ni_type: str = "String",
-) -> None:
-    """Inject/replace an arbitrary AFNI attribute in the NIfTI extension (ecode=4).
-
-    In-script equivalent of ``3drefit -atrstring <name> '<value>'``. Used for
-    attributes with no dedicated helper — e.g. the ``AFNI_CLUSTSIM_*`` cluster
-    tables that ClustSim injects. ``ni_type="String"`` wraps the value in quotes
-    (AFNI's string form); pass ``ni_type="float"``/``"int"`` for numeric bodies,
-    where *value* is the already-formatted whitespace-separated body.
-
-    Reuses an existing AFNI extension or creates a minimal one, mirroring
-    :func:`_set_afni_brick_labels`.
-    """
-    import nibabel as nib
-
-    try:
-        extensions = header.extensions
-    except AttributeError:
-        return
-
-    if ni_type == "String":
-        body = f' "{_niml_escape_string(value)}"\n'
 def copy_afni_history(source_header: Any, dest_header: Any) -> None:
     """Give ``dest_header`` the ``HISTORY_NOTE`` of ``source_header`` (or none).
 
@@ -3380,6 +3380,32 @@ def copy_afni_history(source_header: Any, dest_header: Any) -> None:
     )
 
 
+def set_afni_atr(
+    header: Any,
+    name: str,
+    value: str,
+    ni_type: str = "String",
+) -> None:
+    """Inject/replace an arbitrary AFNI attribute in the NIfTI extension (ecode=4).
+
+    In-script equivalent of ``3drefit -atrstring <name> '<value>'``. Used for
+    attributes with no dedicated helper — e.g. the ``AFNI_CLUSTSIM_*`` cluster
+    tables that ClustSim injects. ``ni_type="String"`` wraps the value in quotes
+    (AFNI's string form); pass ``ni_type="float"``/``"int"`` for numeric bodies,
+    where *value* is the already-formatted whitespace-separated body.
+
+    Reuses an existing AFNI extension or creates a minimal one, mirroring
+    :func:`_set_afni_brick_labels`.
+    """
+    import nibabel as nib
+
+    try:
+        extensions = header.extensions
+    except AttributeError:
+        return
+
+    if ni_type == "String":
+        body = f' "{_niml_escape_string(value)}"\n'
         ni_dimen = "1"
     else:
         body = f" {value}\n"

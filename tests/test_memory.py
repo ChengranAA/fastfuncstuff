@@ -806,3 +806,78 @@ class TestNordicBudgetSharedCard:
         assert memory_module.nordic_fits_on_gpu(dev, 5 * self.GiB)
         assert not memory_module.nordic_fits_on_gpu(dev, 7 * self.GiB)
         assert memory_module.nordic_fits_on_gpu(torch.device("cpu"), 10**15)
+
+
+# --- host huge pages ---------------------------------------------------------
+
+GB = 1024**3
+_BUDDYINFO = """\
+Node 0, zone      DMA      0      0      0      0      0      0      0      0      1      1      2
+Node 0, zone    DMA32      5      4      3      2      1      0      0      0      0      3      0
+Node 0, zone   Normal 9000 8000 7000 6000 5000 4000 3000 2000 1000    100     50
+"""
+
+
+def test_buddyinfo_counts_only_blocks_a_huge_page_fits():
+    # order 9 = 2 MB, order 10 = 4 MB: DMA 1*2+2*4, DMA32 3*2, Normal 100*2+50*4 MB
+    mb = memory_module.parse_buddyinfo_free_bytes(_BUDDYINFO) / 1024**2
+    assert mb == 10 + 6 + 400
+
+
+def _decide(**kw):
+    base = dict(enabled="madvise", defrag="madvise", hugepage_free=3 * GB, mem_total=251 * GB)
+    return memory_module.decide_numpy_hugepage(**(base | kw))[0]
+
+
+def test_numpy_hugepage_off_when_2mb_blocks_short_under_sync_defrag():
+    # The 2026-10-23 state that stalled NORDIC: ~3 GB in 2 MB blocks, defrag=madvise.
+    assert _decide() is False
+    assert _decide(defrag="defer+madvise") is False
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"defrag": "defer"},  # compaction already backgrounded
+        {"defrag": "never"},
+        {"enabled": "never"},
+        {"hugepage_free": 100 * GB},  # fresh host: keep the ~12% huge pages buy
+        {"numpy_env_set": True},  # the user chose explicitly
+        {"hugepage_free": None},  # not Linux
+    ],
+)
+def test_numpy_hugepage_left_alone(kw):
+    assert _decide(**kw) is None
+
+
+def test_numpy_hugepage_floor_scales_with_ram_and_plan():
+    # 32 GB laptop: floor is 8 GB, not 16
+    assert _decide(mem_total=32 * GB, hugepage_free=10 * GB) is None
+    assert _decide(mem_total=32 * GB, hugepage_free=6 * GB) is False
+    # a planned footprint above the floor raises the bar
+    assert _decide(hugepage_free=20 * GB, planned_bytes=30 * GB) is False
+
+
+def test_numpy_hugepage_ffs_override_wins():
+    assert _decide(ffs_setting="on") is True
+    assert _decide(ffs_setting="off", hugepage_free=100 * GB, defrag="defer") is False
+    assert _decide(ffs_setting="on", numpy_env_set=True) is True
+
+
+def test_configure_numpy_hugepages_applies_decision(monkeypatch, capsys):
+    from numpy._core import multiarray
+
+    calls = []
+    monkeypatch.setattr(multiarray, "_set_madvise_hugepage", lambda v: calls.append(v) or True)
+    monkeypatch.setattr(memory_module, "_read_thp_mode", lambda name: "madvise")
+    monkeypatch.setattr(memory_module, "_read_hugepage_free_bytes", lambda: 1 * GB)
+    monkeypatch.delenv("NUMPY_MADVISE_HUGEPAGE", raising=False)
+    monkeypatch.delenv("FFS_NUMPY_HUGEPAGE", raising=False)
+    assert memory_module.configure_numpy_hugepages() is False
+    assert calls == [False]
+    assert "numpy huge pages off" in capsys.readouterr().err
+
+    calls.clear()
+    monkeypatch.setattr(memory_module, "_read_hugepage_free_bytes", lambda: 200 * GB)
+    assert memory_module.configure_numpy_hugepages() is None
+    assert calls == []

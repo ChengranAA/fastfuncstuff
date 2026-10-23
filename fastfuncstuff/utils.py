@@ -687,6 +687,9 @@ def configure_torch_backends(
       - CPU thread count from :func:`resolve_cpu_threads` (for CPU and MPS
         fallback paths), which honours ``FFS_NUM_THREADS`` / ``OMP_NUM_THREADS``
         / the scheduler's allocation rather than seizing every core.
+      - numpy's huge-page madvise off when the host's free 2 MB blocks are
+        short and THP would compact synchronously
+        (:func:`memory.configure_numpy_hugepages`).
 
     Pass ``tf32=False`` from the registration tools. They are gather- and
     grid_sample-bound rather than GEMM-bound, so TF32 buys them almost nothing,
@@ -708,6 +711,9 @@ def configure_torch_backends(
         torch.backends.cudnn.allow_tf32 = False
     # CPU is the linalg fallback under MPS and the primary device for
     # device=cpu, so the thread count matters even on a GPU run.
+    from .memory import configure_numpy_hugepages
+
+    configure_numpy_hugepages()
     n_cpu, _source = resolve_cpu_threads(n_threads)
     torch.set_num_threads(n_cpu)
     try:

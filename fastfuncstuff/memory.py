@@ -290,6 +290,143 @@ def get_available_memory(
             return int(128 * 1024**3 * safety_factor)
 
 
+# --- host huge pages ---------------------------------------------------------
+# numpy madvises every large array MADV_HUGEPAGE. Under a THP defrag mode that
+# compacts synchronously for madvised memory (the kernel default, ``madvise``),
+# each such page fault on a host whose RAM is full of fragmented page cache
+# stalls in direct compaction that mostly fails. On a 251 GB box with ~210 GB of
+# cache, one NORDIC run lost 10-17 s to it at 52-60% memory pressure, and
+# systemd-oomd acts on pressure, not on free RAM: it killed the whole terminal.
+# With numpy's madvise off the same run had zero stalls and no slowdown; on a
+# host with free 2 MB blocks the huge pages are worth ~12%, so keep them there.
+# See fmri_wiki "THP compaction stalls".
+_THP_DIR = "/sys/kernel/mm/transparent_hugepage"
+# Defrag modes in which a madvised fault compacts synchronously. ``defer`` and
+# ``never`` hand compaction to kcompactd/kswapd, so there is nothing to avoid.
+_THP_SYNC_DEFRAG = frozenset({"always", "madvise", "defer+madvise"})
+HUGEPAGE_ORDER = 9  # 2 MB on 4 KB pages; the smallest block a THP fault can use
+HUGEPAGE_FREE_FLOOR_BYTES = 16 * 1024**3
+HUGEPAGE_FREE_FLOOR_FRACTION = 0.25  # of MemTotal, so a 32 GB laptop asks for 8 GB
+
+
+def _read_thp_mode(name: str) -> str | None:
+    """The bracketed choice in ``/sys/kernel/mm/transparent_hugepage/<name>``."""
+    try:
+        with open(f"{_THP_DIR}/{name}") as f:
+            text = f.read()
+    except OSError:
+        return None
+    start, end = text.find("["), text.find("]")
+    return text[start + 1 : end] if 0 <= start < end else None
+
+
+def parse_buddyinfo_free_bytes(
+    text: str, min_order: int = HUGEPAGE_ORDER, page_size: int = 4096
+) -> int:
+    """Free bytes held in blocks of order ``>= min_order``, summed over every zone.
+
+    This, not MemFree, is what a huge-page fault can be served from without
+    compaction: MemFree counts 4 KB fragments that no 2 MB page fits into.
+    """
+    total = 0
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 5 or fields[2] != "zone":
+            continue
+        for order, count in enumerate(fields[4:]):
+            if order >= min_order:
+                total += int(count) * (page_size << order)
+    return total
+
+
+def _read_hugepage_free_bytes() -> int | None:
+    try:
+        with open("/proc/buddyinfo") as f:
+            text = f.read()
+    except OSError:
+        return None
+    return parse_buddyinfo_free_bytes(text, page_size=os.sysconf("SC_PAGE_SIZE"))
+
+
+def decide_numpy_hugepage(
+    *,
+    enabled: str | None,
+    defrag: str | None,
+    hugepage_free: int | None,
+    mem_total: int,
+    planned_bytes: int = 0,
+    ffs_setting: str = "auto",
+    numpy_env_set: bool = False,
+) -> tuple[bool | None, str]:
+    """Whether to change numpy's huge-page madvise; ``None`` means leave it.
+
+    Pure, so the policy is testable without the host's memory state.
+    """
+    setting = ffs_setting.strip().lower() or "auto"
+    if setting in ("on", "1", "true", "yes"):
+        return True, "FFS_NUMPY_HUGEPAGE=on"
+    if setting in ("off", "0", "false", "no"):
+        return False, "FFS_NUMPY_HUGEPAGE=off"
+    if numpy_env_set:
+        return None, "NUMPY_MADVISE_HUGEPAGE set by the user"
+    if enabled is None or defrag is None or hugepage_free is None:
+        return None, "no THP information (not Linux, or sysfs unreadable)"
+    if enabled == "never":
+        return None, "THP disabled"
+    if defrag not in _THP_SYNC_DEFRAG:
+        return None, f"defrag={defrag} never stalls a fault"
+    need = max(
+        planned_bytes, min(HUGEPAGE_FREE_FLOOR_BYTES, int(mem_total * HUGEPAGE_FREE_FLOOR_FRACTION))
+    )
+    if hugepage_free >= need:
+        return None, f"{hugepage_free / 1024**3:.1f} GB free in 2 MB blocks"
+    return False, (
+        f"only {hugepage_free / 1024**3:.1f} GB of RAM is free in 2 MB blocks and THP defrag={defrag} "
+        "would stall each large allocation compacting the rest"
+    )
+
+
+def configure_numpy_hugepages(planned_bytes: int = 0, verbose: bool = True) -> bool | None:
+    """Turn numpy's MADV_HUGEPAGE off for this process when it would stall.
+
+    Called once per CLI from ``configure_torch_backends``; tools that know their
+    host footprint can call it again with ``planned_bytes``. Returns the value
+    set, or ``None`` when numpy's setting was left alone.
+    """
+    from numpy._core import multiarray
+
+    # Private API; a numpy without it has nothing to steer.
+    _set_madvise_hugepage = getattr(multiarray, "_set_madvise_hugepage", None)
+    if _set_madvise_hugepage is None:
+        return None
+    try:
+        import psutil
+
+        mem_total = psutil.virtual_memory().total
+    except ImportError:
+        mem_total = 0
+    decision, reason = decide_numpy_hugepage(
+        enabled=_read_thp_mode("enabled"),
+        defrag=_read_thp_mode("defrag"),
+        hugepage_free=_read_hugepage_free_bytes(),
+        mem_total=mem_total,
+        planned_bytes=planned_bytes,
+        ffs_setting=os.environ.get("FFS_NUMPY_HUGEPAGE", "auto"),
+        numpy_env_set="NUMPY_MADVISE_HUGEPAGE" in os.environ,
+    )
+    if decision is None:
+        return None
+    previous = _set_madvise_hugepage(decision)
+    if verbose and previous and not decision:
+        import sys
+
+        print(
+            f"numpy huge pages off for this run: {reason} (FFS_NUMPY_HUGEPAGE=on overrides)",
+            file=sys.stderr,
+        )
+    return decision
+
+
 def bytes_per_voxel_glm(
     n_timepoints: int,
     n_regressors: int,

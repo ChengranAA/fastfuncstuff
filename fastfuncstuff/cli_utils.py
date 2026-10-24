@@ -1073,6 +1073,7 @@ def load_hrfopt_library(
     model_durations: list[float] | None = None,
     verbose: bool = True,
     resample: bool = False,
+    pairs: bool = False,
 ) -> tuple[torch.Tensor, list[float] | None]:
     """The library the ``-hrfopt_prefix`` indices were chosen from, plus model durations.
 
@@ -1102,6 +1103,11 @@ def load_hrfopt_library(
     Voxels still carrying ``-1`` (no assignment) are set **in place** in
     ``hrf_indices`` to the library curve closest to the canonical HRF (see
     :func:`assign_unassigned_hrf`).
+
+    An ``ffs_hrftdv`` library holds an early/late *pair* per entry,
+    ``(E, 2, n_t)``, fit as two columns per condition.  Only a caller that
+    builds those designs passes ``pairs=True``; anyone else would fit the pair
+    as one curve, so the library is refused rather than flattened.
     """
     from fastfuncstuff.design.hrf import get_hrf_library
 
@@ -1115,6 +1121,14 @@ def load_hrfopt_library(
         hrf_library = saved["hrf_library"].to(device)
         if verbose:
             print(f"  Loaded HRF library from {sidecar}: {tuple(hrf_library.shape)}")
+        if hrf_library.ndim == 3 and not pairs:
+            sys.exit(
+                f"ERROR: {sidecar.name} holds early/late HRF pairs (ffs_hrftdv), fit as "
+                f"two columns per condition.\n       Only ffs_reml -hrf_opt builds that "
+                f"design; this tool would fit each pair as a single curve."
+            )
+        if resample and hrf_library.ndim == 3:
+            sys.exit(f"ERROR: {sidecar.name} holds HRF pairs, which cannot be resampled here.")
         # The curves are bare samples: their spacing lives only in the metadata.
         # Convolved at another -microtime_dt they stretch or shrink in time, and
         # every voxel gets a shape ffs_hrfopt never chose -- silently.
@@ -1168,7 +1182,8 @@ def load_hrfopt_library(
 
     assign_unassigned_hrf(
         hrf_indices,
-        hrf_library,
+        # A pair is ranked by its early curve when picking the fallback entry.
+        hrf_library[:, 0] if hrf_library.ndim == 3 else hrf_library,
         microtime_dt,
         canonical_mode=str(saved_meta.get("canonical_mode") or "spmg1"),
         verbose=verbose,

@@ -1184,6 +1184,8 @@ Examples:
         help=(
             "Per-voxel HRF mode. PREFIX from ffs_hrfopt — loads {PREFIX}_hrf_index.nii.gz (.shape.gii for surface input) "
             "and {PREFIX}_hrf_library.pt. Each voxel is fit with its assigned HRF. "
+            "A PREFIX from ffs_hrftdv assigns an early/late PAIR instead, fit together as "
+            "two columns per condition ({cond}_early, {cond}_late). "
             "Requires -events or -onsets; mutually exclusive with -matrix."
         ),
     )
@@ -2806,6 +2808,7 @@ def main():
         # Per-voxel HRF: load assignments + library if -hrfopt_prefix set
         hrf_library_obj = None
         hrf_indices_obj = None
+        pair_basis = False
         model_durations = durations
         if args.hrfopt_prefix:
             from fastfuncstuff.cli_utils import load_hrf_index_for_input
@@ -2835,11 +2838,22 @@ def main():
                 microtime_dt=args.microtime_dt,
                 device=device,
                 model_durations=list(durations),
+                pairs=True,
             )
             assert _durations is not None
             model_durations = _durations
             unique_hrfs, counts = torch.unique(hrf_indices_obj, return_counts=True)
             print(f"  HRF library shape: {tuple(hrf_library_obj.shape)}")
+            if hrf_library_obj.ndim == 3:
+                # ffs_hrftdv: an early and a late curve per entry, fit together as
+                # two columns per condition so the late one can take the venous part.
+                pair_basis = True
+                n_basis = int(hrf_library_obj.shape[1])
+                suffixes = (
+                    ["_early", "_late"] if n_basis == 2 else [f"_b{k}" for k in range(n_basis)]
+                )
+                condition_labels_full = [f"{c}{s}" for c in condition_labels for s in suffixes]
+                print(f"  Early/late pairs: {n_basis} columns per condition")
             print(
                 f"  {len(unique_hrfs)} unique HRFs across {hrf_indices_obj.numel():,} volume voxels"
             )
@@ -3005,6 +3019,11 @@ def main():
         )
         stim_vec_labels: list[str] = []
         stim_vec_groups: list[tuple[str, int, int]] = []
+        if stim_vec_blocks and pair_basis:
+            sys.exit(
+                "ERROR: -stim_vec cannot yet be combined with an ffs_hrftdv pair library "
+                "(-hrf_opt): the vectors would need an early/late split of their own."
+            )
         if stim_vec_blocks:
             print()
             print(f"Adding {len(stim_vec_blocks)} continuous stimulus vector block(s)...")
@@ -3113,8 +3132,8 @@ def main():
             column_labels.extend(block.get_column_names())
 
         # Build stim_bots and stim_tops
-        if is_fir_model:
-            # FIR: each condition has n_basis columns
+        if is_fir_model or pair_basis:
+            # FIR, and early/late pairs: each condition has n_basis columns
             stim_bots = []
             stim_tops = []
             for cond_idx in range(n_conditions):

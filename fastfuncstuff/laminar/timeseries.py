@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 from fastfuncstuff.laminar.forward import build_cache, g_obs, rhs
 from fastfuncstuff.laminar.params import ModelSpec, zero_params
 from fastfuncstuff.memory import estimate_chunk_size
-from fastfuncstuff.utils import accum_dtype, linalg_device
+from fastfuncstuff.utils import accum_dtype, cpu_if_mps, linalg_device
 
 
 @dataclass
@@ -183,7 +183,7 @@ def dynamic_inverse(
         )
         # Positive covariance required; the ridge is explicit and relative to its scale.
         cov = 0.95 * cov + 0.05 * cov.diagonal(dim1=-2, dim2=-1).mean(-1)[:, None, None] * eye.real
-        chol = torch.linalg.cholesky(cov)
+        chol = torch.linalg.cholesky(cov.to(cpu_if_mps(dev, "cholesky"))).to(dev)
         whiten = torch.linalg.solve_triangular(chol, eye.real.expand(b, -1, -1), upper=False).to(
             cdtype
         )
@@ -193,13 +193,18 @@ def dynamic_inverse(
         scale = (
             gram[:, 0].diagonal(dim1=-2, dim2=-1).real.mean(-1).clamp_min(torch.finfo(dtype).eps)
         )
+        solve_device = cpu_if_mps(dev, "solve")
+        rhs_solve = (hw.mH @ whiten[:, None]).to(solve_device)
         scores, inverses = [], []
         total = y.square().sum((0, 2, 3)).clamp_min(torch.finfo(dtype).eps)
         for strength in strengths:
             inverse = torch.linalg.solve(
-                gram + strength * scale[:, None, None, None] * penalty[None, :, None, None] * eye,
-                hw.mH @ whiten[:, None],
-            )
+                (
+                    gram
+                    + strength * scale[:, None, None, None] * penalty[None, :, None, None] * eye
+                ).to(solve_device),
+                rhs_solve,
+            ).to(dev)
             inverses.append(inverse)
             if R > 1:
                 train = (yf.sum(0, keepdim=True) - yf) / (R - 1)

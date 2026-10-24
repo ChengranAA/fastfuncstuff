@@ -5,6 +5,7 @@ import subprocess
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.laminar.params import ModelSpec
@@ -52,15 +53,24 @@ def _runs():
     )
 
 
-def test_voxel_mapping_preserves_baseline_units_and_deepest_series():
+@pytest.mark.parametrize("transfer_mode", ["dynamic", "static"])
+def test_voxel_mapping_preserves_baseline_units_and_deepest_series(transfer_mode):
     runs, depth, labels, spec = _runs()
     res = devein_volume_runs(
-        runs, depth, labels, spec, strengths=(0.01,), pad_seconds=0, verbose=False
+        runs,
+        depth,
+        labels,
+        spec,
+        strengths=(0.01,),
+        pad_seconds=0,
+        transfer_mode=transfer_mode,
+        verbose=False,
     )
     assert res.valid.all()
     for raw, out, rem in zip(runs, res.corrected, res.removed_psc, strict=True):
         torch.testing.assert_close(out, raw - rem * raw.mean(-1, keepdim=True) / 100)
         torch.testing.assert_close(out[depth > 0.8], raw[depth > 0.8])
+        torch.testing.assert_close(out.mean(-1), raw.mean(-1), rtol=1e-6, atol=1e-5)
         assert rem[depth < 0.3].abs().max() > 0.001
     assert np.isfinite(res.noise_gain).all()
 

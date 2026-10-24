@@ -64,6 +64,12 @@ Segmentation-only depth maps cannot resolve touching gyri or true subvoxel PSFs.
         help="Retain local response (incl. own AV) or venules only",
     )
     p.add_argument(
+        "-transfer_mode",
+        choices=("dynamic", "static"),
+        default="dynamic",
+        help="Static holds the DC mixing at every frequency, as a control",
+    )
+    p.add_argument(
         "-vascular_json",
         help="JSON with p0 baseline overrides and scalar log-deviations under parameters",
     )
@@ -177,6 +183,7 @@ def main():
         spec,
         params=params,
         target=args.target,
+        transfer_mode=args.transfer_mode,
         strengths=tuple(args.strengths),
         pad_seconds=args.pad_seconds,
         cutoff_hz=args.cutoff_hz,

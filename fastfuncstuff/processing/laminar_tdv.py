@@ -101,6 +101,7 @@ def devein_volume_runs(
     *,
     params: dict[str, torch.Tensor] | None = None,
     target: str = "local",
+    transfer_mode: str = "dynamic",
     strengths: tuple[float, ...] = (0.001, 0.01, 0.1, 1.0),
     pad_seconds: float = 60.0,
     cutoff_hz: float = 0.1,
@@ -157,6 +158,10 @@ def devein_volume_runs(
     pad = min(int(round(pad_seconds / spec.TR)), T - 1)
     system = linearized_vasculature(replace(spec, N=K), params)
     frequencies = torch.fft.rfftfreq(T + 2 * pad, spec.TR)
+    if transfer_mode not in ("dynamic", "static"):
+        raise ValueError("transfer_mode must be dynamic or static")
+    if transfer_mode == "static":
+        frequencies = torch.zeros_like(frequencies)
     full, desired = vascular_transfer(system, frequencies, target)
     result = dynamic_inverse(
         profiles,

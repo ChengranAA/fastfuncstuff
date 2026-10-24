@@ -36,7 +36,7 @@ def linearized_vasculature(
 
     K independent vascular inputs avoid interpreting the Gaussian neuronal-depth
     basis as drainage. This is a local approximation, not a nonlinear inversion.
-    Float64 is confined to generating the small physiological transfer system.
+    The small physiological Jacobian is generated in float64.
     """
     work = linalg_device(spec.device)
     s = replace(spec, dtype=torch.float64, device=work)
@@ -144,7 +144,7 @@ def dynamic_inverse(
     if not torch.isfinite(profiles).all():
         raise ValueError("profiles must be finite")
     dev = device or profiles.device
-    dtype = accum_dtype(dev)
+    dtype = accum_dtype(dev) if profiles.dtype == torch.float64 else torch.float32
     cdtype = torch.complex128 if dtype == torch.float64 else torch.complex64
     H, G = full.to(device=dev, dtype=cdtype), target.to(device=dev, dtype=cdtype)
     correction, predicted = torch.empty_like(profiles), torch.empty_like(profiles)

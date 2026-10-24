@@ -612,6 +612,18 @@ def bytes_per_voxel_prf(
     return (6 * n_pixels + 30 * n_timepoints) * 4
 
 
+def bytes_per_voxel_lag_bank(n_timepoints: int, n_cols: int, n_candidates: int) -> int:
+    """
+    Estimate memory per voxel for scoring a bank of shifted/stretched designs.
+
+    Each voxel's projected series (T float32) meets every candidate's Q factor:
+    ``Q^T y`` is ``n_candidates x n_cols`` and its squares the same again, then
+    the per-candidate R² row and an argmax over it. The Q factors themselves are
+    shared by every voxel, so they are not per-voxel cost.
+    """
+    return 4 * (2 * n_timepoints + 2 * n_candidates * n_cols + 2 * n_candidates)
+
+
 def bytes_per_voxel_l1_detrend(n_timepoints: int, n_basis: int) -> int:
     """
     Estimate memory per voxel for the batched L1 detrend (outlier counting).
@@ -1863,6 +1875,8 @@ def estimate_chunk_size(
         # n_trials carries the dataset count (the lss precedent for an
         # operation-specific multiplicity).
         bytes_per_voxel = bytes_per_voxel_paired_corr(n_timepoints, max(2, n_trials))
+    elif operation == "lag_bank":
+        bytes_per_voxel = bytes_per_voxel_lag_bank(n_timepoints, n_regressors, max(1, n_designs))
     elif operation == "phasereg":
         # n_trials > 1 flags the data-driven SGF search (phase_filter="explore").
         bytes_per_voxel = bytes_per_voxel_phasereg(n_timepoints, explore=n_trials > 1)

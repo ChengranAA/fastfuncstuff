@@ -1,0 +1,535 @@
+"""Temporal deveining by response timing: the primitives behind ``ffs_hrftdv``.
+
+Large draining veins deliver the BOLD response later and wider than the
+capillary bed they drain (Kay et al. 2020, TDM; wiki [[Kay 2020]]).  TDM finds
+one early and one late timecourse for a whole dataset and fits both, as two
+competing columns per condition, so the late column soaks up the venous part.
+Two of its assumptions do not hold in general: one timecourse pair for the whole
+brain, and FIR estimates of short events as the input.  Here the pair belongs
+to a cortical *column*, anchored on that column's own HRF, and every candidate
+goes through the GLM convolved with the real events, so any design works.
+
+The steps, each a function below:
+
+1. **Units.**  Ribbon voxels are grouped into geodesic patches of the
+   midthickness mesh (through each voxel's owning vertex), so a patch is a
+   column: every depth under a few mm of cortex.  Voxels just outside the
+   ribbon join the nearest ribbon voxel's patch; everything else is tiled.
+2. **Unit shape.**  Each unit's mean response picks the best library curve.
+3. **Per-voxel lag and width.**  Every voxel scores the unit curve shifted by
+   ``tau`` and stretched by ``w`` about its peak (so ``tau`` is a pure peak
+   shift).  Exact shifting, not a derivative: the linearisation is only good
+   to about +-0.5 s (see ``design/shifted_hrf.py``).
+4. **Early/late pair.**  R²-weighted low and high percentiles of the
+   responsive voxels' lags, each with the width of the voxels near it.
+5. **Library.**  Pairs are snapped to a grid and become a ``(E, 2, n_t)``
+   library plus an index map, which ``ffs_reml -hrf_opt`` fits as two columns
+   per condition.
+
+Measured on 1 mm floc data (TR 2, 10 s blocks, 2 runs): patch-relative lag
+replicates run to run (r 0.46 at R² > 0.2), rises 0.26 s from white to pial, is
+later in dark-EPI and vein-mask voxels, and is unrelated to slice time.  Width
+is weakly identified with block designs.  The early/late fit flattens the depth
+profile of the early betas, at a real cost in sensitivity (VIF ~10).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+
+import numpy as np
+import torch
+from torch import Tensor
+from tqdm.auto import tqdm
+
+from fastfuncstuff.utils import parabolic_peak_offset
+
+DEFAULT_WIDTHS = (0.6, 0.75, 0.875, 1.0, 1.15, 1.3, 1.5)
+"""Stretch factors about the peak.  Wide on purpose: at low R² the fit piles up
+on the grid's bounds, and a bound that is too tight hides that."""
+
+
+@dataclass(frozen=True)
+class LagGrid:
+    """The candidate (width, lag) grid; candidate ``i`` is ``(i // n_lags, i % n_lags)``."""
+
+    lags: np.ndarray
+    widths: np.ndarray
+
+    @classmethod
+    def make(cls, max_lag: float, step: float = 0.1, widths: Sequence[float] = DEFAULT_WIDTHS):
+        n = int(round(max_lag / step))
+        return cls(np.round(np.arange(-n, n + 1) * step, 6), np.asarray(widths, dtype=np.float64))
+
+    @property
+    def step(self) -> float:
+        return float(self.lags[1] - self.lags[0]) if self.lags.size > 1 else 0.0
+
+    @property
+    def n(self) -> int:
+        return self.lags.size * self.widths.size
+
+
+def stretch_shift(h: np.ndarray, dt: float, lag: float, width: float) -> np.ndarray:
+    """``h`` stretched by ``width`` about its peak, then moved ``lag`` seconds; peak 1.
+
+    Stretching about the onset would also move the peak by ``(w - 1) * t_peak``,
+    so lag and width would trade against each other.  Nothing before t = 0.
+    """
+    t = np.arange(h.size) * dt
+    tpk = t[int(np.argmax(h))]
+    arg = tpk + (t - tpk - lag) / width
+    v = np.interp(arg, t, h, left=0.0, right=0.0)
+    v[arg < 0] = 0.0
+    pk = float(np.abs(v).max())
+    return v / pk if pk > 0 else v
+
+
+def lag_width_bank(h: np.ndarray, dt: float, grid: LagGrid) -> np.ndarray:
+    """``(grid.n, n_t)`` candidates in grid order (width-major, then lag)."""
+    return np.stack([stretch_shift(h, dt, lag, w) for w in grid.widths for lag in grid.lags])
+
+
+def as_bank(design: Tensor, n_curves: int) -> Tensor:
+    """``(T, P * C)`` condition-major, curve-minor design -> ``(C, T, P)``."""
+    T = design.shape[0]
+    return design.reshape(T, -1, n_curves).permute(2, 0, 1)
+
+
+def orthonormal_nuisance(nuisance_per_run: Sequence[Tensor], device: torch.device) -> list[Tensor]:
+    """Per-run orthonormal bases of the nuisance column space (rank-safe)."""
+    out = []
+    for n in nuisance_per_run:
+        n = n.to(device=device, dtype=torch.float64)
+        if n.shape[1] == 0:
+            out.append(n)
+            continue
+        u, s, _ = torch.linalg.svd(n, full_matrices=False)
+        out.append(u[:, s > 1e-8 * s[0]])
+    return out
+
+
+def project_runs(x: Tensor, q_runs: Sequence[Tensor], run_starts: Sequence[int]) -> Tensor:
+    """Remove each run's nuisance from the rows of ``x`` (``(..., T, k)``), run by run.
+
+    Per run rather than block-diagonal: the same projection as
+    ``glm/xval.py:project_out_nuisance_per_run``, applied to a stack of designs.
+    """
+    out = x.clone()
+    bounds = list(run_starts) + [x.shape[-2]]
+    for q, a, b in zip(q_runs, bounds[:-1], bounds[1:], strict=True):
+        if q.shape[1] == 0:
+            continue
+        seg = out[..., a:b, :]
+        qq = q.to(seg.dtype)
+        out[..., a:b, :] = seg - qq @ (qq.transpose(0, 1) @ seg)
+    return out
+
+
+def bank_q(designs: Tensor) -> Tensor:
+    """Orthonormal bases of each projected candidate design, ``(C, T, P)``."""
+    q, _ = torch.linalg.qr(designs.double())
+    return q.float()
+
+
+def screen_responsive(
+    y: Tensor,
+    design: Tensor,
+    n_nuisance: int,
+    p_thresh: float,
+    device: torch.device,
+    chunk_size: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Voxels whose projected series an F-test on ``design`` passes, with a positive mean beta.
+
+    ``y`` is ``(T, V)`` and ``design`` ``(T, P)``, both nuisance-projected. Positive only:
+    a negative response's lag says nothing about veins draining it.
+    """
+    from scipy.stats import f as fdist
+
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    T, V = y.shape
+    P = design.shape[1]
+    x = design.to(device=device, dtype=torch.float64)
+    pinv = torch.linalg.pinv(x)
+    q, _ = torch.linalg.qr(x)
+    chunk = chunk_size or estimate_chunk_size(V, T, P, device, operation="glm")
+    r2 = np.empty(V)
+    mean_beta = np.empty(V)
+    for a in range(0, V, chunk):
+        yc = y[:, a : a + chunk].to(device=device, dtype=torch.float64)
+        ss = ((q.T @ yc) ** 2).sum(0)
+        r2[a : a + chunk] = (ss / (yc**2).sum(0).clamp_min(1e-12)).cpu().numpy()
+        mean_beta[a : a + chunk] = (pinv @ yc).mean(0).cpu().numpy()
+    dof = T - n_nuisance - P
+    F = (r2 / P) / np.clip((1 - r2) / dof, 1e-12, None)
+    p = fdist.sf(F, P, dof)
+    return (p < p_thresh) & (mean_beta > 0), r2
+
+
+def unit_shapes(means: Tensor, q_lib: Tensor) -> tuple[np.ndarray, np.ndarray]:
+    """Best library curve for each unit's mean series: index ``(U,)`` and R² ``(S, U)``.
+
+    In-sample R² is a fair referee here: every candidate has the same number
+    of columns, so none can win on complexity.
+    """
+    m = means.to(device=q_lib.device, dtype=torch.float32)
+    ss = (torch.einsum("stp,tu->spu", q_lib, m) ** 2).sum(1)
+    r2 = ss / (m**2).sum(0).clamp_min(1e-12)
+    return r2.argmax(0).cpu().numpy(), r2.cpu().numpy()
+
+
+@dataclass
+class LagFit:
+    lag: np.ndarray  # (V,) seconds, relative to the unit curve's peak
+    width: np.ndarray  # (V,) stretch about the peak
+    r2: np.ndarray  # (V,) at the best candidate
+    at_bound: np.ndarray  # (V,) bool: lag on the edge of the grid
+
+
+def fit_lag_width(
+    y: Tensor,
+    q: Tensor,
+    grid: LagGrid,
+    device: torch.device,
+    chunk_size: int | None = None,
+) -> LagFit:
+    """Each voxel's best (width, lag) candidate, with sub-step parabolic lag refinement.
+
+    ``y`` is ``(T, V)`` nuisance-projected data (any device), ``q`` the
+    candidates' Q factors ``(grid.n, T, P)`` on ``device``.  R² of a candidate
+    is ``||Q^T y||² / ||y||²``: the projection is the whole fit.
+    """
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    T, V = y.shape
+    C, _, P = q.shape
+    n_w, n_l = grid.widths.size, grid.lags.size
+    chunk = chunk_size or estimate_chunk_size(
+        V, T, P, device, operation="lag_bank", n_designs=C, empty_cache=False
+    )
+    lags_t = torch.as_tensor(grid.lags, device=device, dtype=torch.float32)
+    out = LagFit(np.empty(V), np.empty(V), np.empty(V), np.zeros(V, bool))
+    for a in range(0, V, chunk):
+        yc = y[:, a : a + chunk].to(device=device, dtype=torch.float32)
+        ss = (torch.einsum("ctp,tv->cpv", q, yc) ** 2).sum(1)
+        r2 = (ss / (yc**2).sum(0).clamp_min(1e-12)).view(n_w, n_l, -1)
+        best = r2.reshape(C, -1).argmax(0)
+        wi, li = best // n_l, best % n_l
+        cols = torch.arange(best.numel(), device=device)
+        curve = r2[wi, :, cols].T  # (n_l, v): the lag profile at each voxel's width
+        off = parabolic_peak_offset(curve, li, dim=0) if n_l >= 3 else torch.zeros_like(lags_t[li])
+        edge = (li == 0) | (li == n_l - 1)
+        sl = slice(a, a + yc.shape[1])
+        out.lag[sl] = (lags_t[li] + torch.where(edge, 0.0, off) * grid.step).cpu().numpy()
+        out.width[sl] = grid.widths[wi.cpu().numpy()]
+        out.r2[sl] = r2.reshape(C, -1).max(0).values.cpu().numpy()
+        out.at_bound[sl] = edge.cpu().numpy()
+    return out
+
+
+def weighted_percentile(x: np.ndarray, w: np.ndarray, q: float) -> float:
+    """``q``-th percentile of ``x`` with weights ``w`` (step interpolation)."""
+    o = np.argsort(x)
+    c = np.cumsum(w[o])
+    return float(x[o][min(int(np.searchsorted(c, q / 100.0 * c[-1])), x.size - 1)])
+
+
+@dataclass(frozen=True)
+class ColumnPair:
+    early_lag: float
+    late_lag: float
+    early_width: float
+    late_width: float
+    n_voxels: int
+    fallback: bool = False
+
+
+def column_pair(
+    lag: np.ndarray,
+    width: np.ndarray,
+    r2: np.ndarray,
+    percentiles: tuple[float, float] = (10.0, 90.0),
+    tail: float = 20.0,
+    min_voxels: int = 8,
+) -> ColumnPair | None:
+    """Early and late lags of one unit from its usable voxels (R²-weighted).
+
+    Percentiles rather than the extremes: the extremes of noisy estimates are
+    biased outward, and with them the pair would be set by the two worst
+    voxels.  Each end takes the weighted median width of the voxels in its
+    ``tail`` percent, so the narrower early curve and the wider late one come
+    from the data.
+    """
+    if lag.size < min_voxels:
+        return None
+    w = np.clip(r2, 1e-6, None)
+    lo, hi = (weighted_percentile(lag, w, p) for p in percentiles)
+    lo_cut, hi_cut = weighted_percentile(lag, w, tail), weighted_percentile(lag, w, 100 - tail)
+    sel_lo, sel_hi = lag <= lo_cut, lag >= hi_cut
+    return ColumnPair(
+        lo,
+        hi,
+        weighted_percentile(width[sel_lo], w[sel_lo], 50),
+        weighted_percentile(width[sel_hi], w[sel_hi], 50),
+        int(lag.size),
+    )
+
+
+def surface_patches(
+    mid: np.ndarray,
+    faces: np.ndarray,
+    seeds: np.ndarray,
+    radius_mm: float,
+    seed: int = 0,
+) -> np.ndarray:
+    """Geodesic patches covering ``seeds``: a label per mesh vertex (-1 = not reached).
+
+    Greedy cover (a random seed order, each new centre claiming its geodesic
+    ball), then every vertex to its nearest centre along the mesh -- along
+    the mesh so a patch never jumps a sulcus to the opposite bank.
+    """
+    from scipy.sparse.csgraph import dijkstra
+
+    from fastfuncstuff.surface.mesh import MeshTopology, geodesic_ball
+
+    topo = MeshTopology.from_faces(faces, mid.shape[0])
+    covered = np.zeros(mid.shape[0], bool)
+    centres = []
+    for v in np.random.default_rng(seed).permutation(np.unique(seeds)):
+        if covered[v]:
+            continue
+        centres.append(int(v))
+        ball, _ = geodesic_ball(mid, topo, int(v), radius_mm)
+        covered[ball] = True
+    labels = np.full(mid.shape[0], -1, np.int64)
+    if not centres:
+        return labels
+    _, _, src = dijkstra(
+        topo.edge_graph(mid),
+        indices=centres,
+        min_only=True,
+        return_predecessors=True,
+        limit=2.0 * radius_mm,
+    )
+    reached = src >= 0
+    lookup = np.full(mid.shape[0], -1, np.int64)
+    lookup[centres] = np.arange(len(centres))
+    labels[reached] = lookup[src[reached]]
+    return labels
+
+
+def volume_tiles(ijk: np.ndarray, voxel_mm: Sequence[float], tile_mm: float) -> np.ndarray:
+    """Cubic tiles of side ``tile_mm`` over voxel coordinates ``(N, 3)``: a label per voxel."""
+    cell = np.floor(ijk * np.asarray(voxel_mm) / tile_mm).astype(np.int64)
+    _, labels = np.unique(cell, axis=0, return_inverse=True)
+    return labels.reshape(-1)
+
+
+def extend_labels(labels: np.ndarray, voxel_mm: Sequence[float], extend_mm: float) -> np.ndarray:
+    """Volume of labels (-1 empty) grown by up to ``extend_mm`` into empty voxels.
+
+    Each empty voxel takes the label of the *nearest* labelled voxel, so where
+    two gyri touch, the gap splits between them instead of either claiming it.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    if extend_mm <= 0 or not (labels >= 0).any():
+        return labels
+    dist, idx = distance_transform_edt(labels < 0, sampling=voxel_mm, return_indices=True)
+    grown = labels[tuple(idx)]
+    return np.where((labels < 0) & (dist <= extend_mm), grown, labels)
+
+
+@dataclass
+class PairLibrary:
+    curves: np.ndarray  # (E, 2, n_t): early, late
+    entries: np.ndarray  # (E, 5): shape index, early lag, late lag, early width, late width
+    index: np.ndarray  # (U,) entry of each unit
+
+    def table(self, shape_labels: Sequence[str]) -> list[dict]:
+        return [
+            {
+                "entry": i + 1,
+                "shape": shape_labels[int(e[0])],
+                "early_lag": float(e[1]),
+                "late_lag": float(e[2]),
+                "early_width": float(e[3]),
+                "late_width": float(e[4]),
+            }
+            for i, e in enumerate(self.entries)
+        ]
+
+
+def build_pair_library(
+    shapes: np.ndarray,
+    unit_shape: np.ndarray,
+    pairs: Sequence[ColumnPair],
+    dt: float,
+    lag_step: float,
+    widths: Sequence[float],
+) -> PairLibrary:
+    """Snap each unit's pair to the lag step and width grid; one curve pair per distinct key.
+
+    Snapping keeps the library small: ``ffs_reml`` builds a design per entry,
+    and units with the same timing within ``lag_step`` share one.
+    """
+    wgrid = np.asarray(widths, dtype=np.float64)
+
+    def snap_w(w: float) -> float:
+        return float(wgrid[np.argmin(np.abs(wgrid - w))])
+
+    keys = np.array(
+        [
+            (
+                int(s),
+                round(p.early_lag / lag_step) * lag_step,
+                round(p.late_lag / lag_step) * lag_step,
+                snap_w(p.early_width),
+                snap_w(p.late_width),
+            )
+            for s, p in zip(unit_shape, pairs, strict=True)
+        ]
+    ).round(6)
+    entries, index = np.unique(keys, axis=0, return_inverse=True)
+    curves = np.stack(
+        [
+            np.stack(
+                [
+                    stretch_shift(shapes[int(e[0])], dt, e[1], e[3]),
+                    stretch_shift(shapes[int(e[0])], dt, e[2], e[4]),
+                ]
+            )
+            for e in entries
+        ]
+    ).astype(np.float32)
+    return PairLibrary(curves, entries, index.reshape(-1))
+
+
+@dataclass
+class TdvResult:
+    unit: np.ndarray  # (V,) unit label
+    unit_kind: np.ndarray  # (U,) 0 surface patch, 1 volume tile
+    shape: np.ndarray  # (V,) library curve of the voxel's unit
+    fit: LagFit
+    rel_lag: np.ndarray  # (V,) lag minus the unit's R²-weighted median (responsive units)
+    responsive: np.ndarray  # (V,) bool
+    screen_r2: np.ndarray  # (V,)
+    pairs: list[ColumnPair]  # (U,)
+    library: PairLibrary
+    voxel_entry: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))  # (V,) 0-based
+
+    @property
+    def n_fallback(self) -> int:
+        return sum(p.fallback for p in self.pairs)
+
+
+def fit_hrftdv(
+    y: Tensor,
+    unit: np.ndarray,
+    unit_kind: np.ndarray,
+    shapes: np.ndarray,
+    design_for: Callable[[np.ndarray], Tensor],
+    project: Callable[[Tensor], Tensor],
+    responsive: np.ndarray,
+    screen_r2: np.ndarray,
+    grid: LagGrid,
+    dt: float,
+    *,
+    percentiles: tuple[float, float] = (10.0, 90.0),
+    min_voxels: int = 8,
+    lag_step: float = 0.2,
+    device: torch.device,
+    verbose: bool = True,
+) -> TdvResult:
+    """Steps 2-5 of the module docstring for every voxel of ``y`` (``(T, V)``, projected).
+
+    ``design_for(curves)`` builds the ``(T, P * C)`` task design for ``C``
+    impulse curves; ``project`` removes the nuisance from a ``(..., T, k)``
+    stack.  ``unit`` labels each voxel ``0..U-1``.
+    """
+    V = y.shape[1]
+    U = int(unit.max()) + 1
+    S = shapes.shape[0]
+
+    # -- step 2: each unit's curve, from the mean of its responsive voxels
+    q_lib = bank_q(project(as_bank(design_for(shapes), S).to(device)))
+    sums = torch.zeros(y.shape[0], U, dtype=torch.float64)
+    counts = np.bincount(unit[responsive], minlength=U)
+    resp_idx = np.flatnonzero(responsive)
+    for a in range(0, resp_idx.size, 50000):
+        sel = resp_idx[a : a + 50000]
+        sums.index_add_(1, torch.as_tensor(unit[sel]), y[:, sel].double().cpu())
+    means = (sums / torch.as_tensor(np.clip(counts, 1, None))).float()
+    best, _ = unit_shapes(means, q_lib)
+    del q_lib
+    has = counts > 0
+    fallback_shape = (
+        int(np.bincount(best[has], weights=counts[has], minlength=S).argmax()) if has.any() else 0
+    )
+    best = np.where(has, best, fallback_shape)
+    shape = best[unit]
+
+    # -- step 3: lag x width per voxel, one bank per curve in use
+    fit = LagFit(np.full(V, np.nan), np.full(V, np.nan), np.full(V, np.nan), np.zeros(V, bool))
+    used = np.unique(shape)
+    for s in tqdm(used, desc="lag x width", leave=True, disable=not verbose or used.size < 2):
+        vox = np.flatnonzero(shape == s)
+        q = bank_q(
+            project(as_bank(design_for(lag_width_bank(shapes[s], dt, grid)), grid.n).to(device))
+        )
+        part = fit_lag_width(y[:, vox], q, grid, device)
+        del q
+        fit.lag[vox], fit.width[vox], fit.r2[vox], fit.at_bound[vox] = (
+            part.lag,
+            part.width,
+            part.r2,
+            part.at_bound,
+        )
+
+    # -- step 4: a pair per unit from its usable voxels
+    usable = responsive & ~fit.at_bound
+    pairs: list[ColumnPair | None] = []
+    rel = np.full(V, np.nan)
+    order = np.argsort(unit, kind="stable")
+    bounds = np.searchsorted(unit[order], np.arange(U + 1))
+    for u in range(U):
+        members = order[bounds[u] : bounds[u + 1]]
+        m = members[usable[members]]
+        pair = column_pair(fit.lag[m], fit.width[m], fit.r2[m], percentiles, min_voxels=min_voxels)
+        pairs.append(pair)
+        if m.size:
+            rel[members] = fit.lag[members] - weighted_percentile(
+                fit.lag[m], np.clip(fit.r2[m], 1e-6, None), 50
+            )
+    valid = [p for p in pairs if p is not None]
+    if valid:
+        glob = ColumnPair(
+            float(np.median([p.early_lag for p in valid])),
+            float(np.median([p.late_lag for p in valid])),
+            float(np.median([p.early_width for p in valid])),
+            float(np.median([p.late_width for p in valid])),
+            0,
+            fallback=True,
+        )
+    else:
+        # Nothing responsive anywhere: a pair one lag step either side of the curve.
+        glob = ColumnPair(-lag_step, lag_step, 1.0, 1.0, 0, fallback=True)
+    filled = [p if p is not None else glob for p in pairs]
+
+    # -- step 5: the library reml reads
+    library = build_pair_library(shapes, best, filled, dt, lag_step, grid.widths)
+    return TdvResult(
+        unit=unit,
+        unit_kind=unit_kind,
+        shape=shape,
+        fit=fit,
+        rel_lag=rel,
+        responsive=responsive,
+        screen_r2=screen_r2,
+        pairs=filled,
+        library=library,
+        voxel_entry=library.index[unit],
+    )

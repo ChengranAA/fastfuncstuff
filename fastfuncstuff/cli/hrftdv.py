@@ -113,7 +113,7 @@ def create_parser() -> FfsArgumentParser:
     units.add_argument(
         "-patch_mm",
         type=float,
-        default=3.0,
+        default=5.0,
         help="Geodesic radius of a cortical patch (the column a pair belongs to)",
     )
     units.add_argument(

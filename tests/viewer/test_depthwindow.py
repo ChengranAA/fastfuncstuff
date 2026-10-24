@@ -54,6 +54,60 @@ def test_profile_of_a_disc_reads_wm_gm_csf_and_exports(tmp_path):
         app.processEvents()
 
 
+def test_depth_time_view_is_percent_of_each_depths_own_mean_after_detrend():
+    """A deep and a superficial depth with the same 2% response but a 3x baseline
+    and a drift read the same once scaled by their own means; the old
+    mean-subtracted panel drew the superficial one 3x larger."""
+    from fastfuncstuff.viewer.ui.depthwindow import depth_time_view
+
+    t = np.arange(120, dtype=np.float64)
+    bump = (np.sin(2 * np.pi * t / 20) > 0).astype(np.float64)
+    bump -= bump.mean()
+    drift = np.linspace(-1, 1, t.size)
+    data = np.stack([100 * (1 + 0.02 * bump) + 5 * drift, 300 * (1 + 0.02 * bump) + 15 * drift], 1)
+    view, is_psc = depth_time_view(data, 1)
+    assert is_psc
+    np.testing.assert_allclose(view[:, 0], view[:, 1], atol=1e-9)
+    # The drift is gone: what is left is the 2% square wave, less its own linear part.
+    wave = 2.0 * bump
+    expected = wave - np.polyval(np.polyfit(t, wave, 1), t)
+    np.testing.assert_allclose(view[:, 0], expected, atol=1e-9)
+    # Not detrended, the drift survives (mean removed only); -1 and 0 coincide.
+    raw, _ = depth_time_view(data, -1)
+    np.testing.assert_allclose(raw, depth_time_view(data, 0)[0], atol=1e-9)
+    assert np.ptp(raw[:, 0]) > 8
+    # A series with a non-positive mean has no percent: own units, still detrended.
+    resid, is_psc = depth_time_view(data - data.mean(0), 1)
+    assert not is_psc and abs(resid.mean()) < 1e-9
+
+
+def test_depth_detrend_is_the_viewports_and_steps_with_d(tmp_path):
+    from fastfuncstuff.viewer.commands import Aspect
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.depthwindow import DepthWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetViewDetrend
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), np.float32), np.eye(4)), tmp_path / "a.nii")
+    session = ViewerSession(device=torch.device("cpu"))
+    try:
+        session.load(str(tmp_path / "a.nii"))
+        session.do(OpenView("D1", "depth", "axial"))
+        win = DepthWindow("D1", session, session.do)
+        win.apply(session.state.viewports.get("D1"))
+        assert win.detrend_box.currentData() == 1  # linear by default, as a carpet
+        session.do(SetViewDetrend("D1", 3))
+        win.refresh(Aspect.VIEWPORTS)
+        assert win.detrend_box.currentData() == 3
+        win._cycle_detrend()
+        assert session.state.viewports.get("D1").detrend == 4
+        assert "SET_VIEW_DETREND D1 4" in session.to_script()
+        win.close()
+    finally:
+        session.close()
+        app.processEvents()
+
+
 def test_a_closing_depth_window_does_not_dispatch_for_its_gone_viewport(tmp_path):
     """Closing moves focus off the radius box, whose editingFinished then fired
     SET_DEPTH_VIEW for a viewport the close had already removed: KeyError 'D1'."""

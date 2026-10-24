@@ -31,11 +31,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.surface.profiles import sample_depths
 from fastfuncstuff.viewer.commands import Aspect, Command
+from fastfuncstuff.viewer.derive import drift_basis
 from fastfuncstuff.viewer.ui import theme
+from fastfuncstuff.viewer.ui.gridgraph import DETREND_LABELS
 from fastfuncstuff.viewer.ui.shortcuts import Binding as Key
 from fastfuncstuff.viewer.ui.shortcuts import ShortcutHelp, jump_back_key, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
-from fastfuncstuff.viewer.vocab import SetDepthView, SetIndex, SetSurfaceEquivolume
+from fastfuncstuff.viewer.vocab import SetDepthView, SetIndex, SetSurfaceEquivolume, SetViewDetrend
 
 SOURCES = ("disc", "annot", "layer")
 #: How far past white (below 0) and pial (above 1) the profile runs.
@@ -275,6 +277,29 @@ def _pin_color(n: int) -> QtGui.QColor:
     return QtGui.QColor.fromRgbF(*series[n % len(series)][:3])
 
 
+def depth_time_view(data: np.ndarray, order: int) -> tuple[np.ndarray, bool]:
+    """``(T, K)`` depth timecourses as percent signal change, Legendre drift removed.
+
+    Each depth is scaled by its own mean, so a superficial depth's larger
+    baseline does not make its response look larger than a deep one's, and
+    the colour scale compares like with like. ``order`` -1 and 0 coincide:
+    PSC removes the mean either way. Returns ``(view, is_psc)``: data with a
+    depth whose mean is not positive (a residual, phase, a stat series) has
+    no percent to speak of, so it comes back detrended in its own units.
+    """
+    d = np.asarray(data, dtype=np.float64)
+    mean = np.nanmean(d, axis=0)
+    if order >= 0 and d.shape[0] > 1:
+        filled = np.where(np.isfinite(d), d, mean)
+        basis = drift_basis(d.shape[0], int(order))
+        d = d - basis @ (basis.T @ filled)
+    else:
+        d = d - mean
+    if np.all(np.isfinite(mean) & (mean > 0)):
+        return 100.0 * d / mean, True
+    return d, False
+
+
 class DepthTimePlot(QtWidgets.QWidget):
     """Region mean at every depth (rows, pial on top) and volume (columns)."""
 
@@ -285,6 +310,8 @@ class DepthTimePlot(QtWidgets.QWidget):
         self.data: np.ndarray | None = None  # (T, K)
         self.fractions: np.ndarray | None = None
         self.cursor = 0
+        #: Legendre order projected out before drawing; display only.
+        self.detrend = Viewport.detrend
         self.setMinimumHeight(90)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
@@ -298,10 +325,8 @@ class DepthTimePlot(QtWidgets.QWidget):
         if self.data is None or self.data.size == 0:
             p.end()
             return
-        d = self.data.T[::-1]  # (K, T), pial row first
-        # Each depth relative to its own mean, so the time structure shows at
-        # every depth rather than only where the baseline is largest.
-        d = d - np.nanmean(d, axis=1, keepdims=True)
+        view, is_psc = depth_time_view(self.data, self.detrend)
+        d = view.T[::-1]  # (K, T), pial row first
         top = float(np.nanpercentile(np.abs(d), 98)) or 1.0
         unit = np.clip(0.5 + 0.5 * d / top, 0, 1)
         lut = (
@@ -322,9 +347,12 @@ class DepthTimePlot(QtWidgets.QWidget):
         p.setPen(QtGui.QColor(c.faint))
         p.drawText(QtCore.QPointF(2, area.top() + 10), "pial")
         p.drawText(QtCore.QPointF(2, area.bottom()), "white")
-        p.drawText(
-            QtCore.QPointF(area.left(), area.bottom() + 14), "time  (each depth minus its mean)"
+        trend = dict(DETREND_LABELS).get(self.detrend, f"poly {self.detrend}")
+        units = (
+            f"% signal change, ±{top:.2g}" if is_psc else f"each depth minus its mean, ±{top:.3g}"
         )
+        removed = "" if self.detrend <= 0 else f", {trend} detrend"
+        p.drawText(QtCore.QPointF(area.left(), area.bottom() + 14), f"time  ({units}{removed})")
         T = self.data.shape[0]
         x = area.left() + (self.cursor + 0.5) / max(T, 1) * area.width()
         p.setPen(QtGui.QPen(QtGui.QColor(c.warn)))
@@ -393,6 +421,18 @@ class DepthWindow(QtWidgets.QWidget):
         self.roi_box.setToolTip("ROI layer the region comes from (source: ROI layer)")
         self.roi_box.activated.connect(self._changed)
         bar.addWidget(self.roi_box)
+        self.detrend_box = QtWidgets.QComboBox()
+        for order, label in DETREND_LABELS:
+            self.detrend_box.addItem(label, userData=order)
+        self.detrend_box.setToolTip(
+            "Legendre drift projected out of the depth x time panel (d steps).\n"
+            "Display only: EXPORT writes the region's raw timecourses."
+        )
+        self.detrend_box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.detrend_box.activated.connect(
+            lambda _: self._set_detrend(int(self.detrend_box.currentData()))
+        )
+        bar.addWidget(self.detrend_box)
         bar.addStretch(1)
         pin = QtWidgets.QPushButton("PIN")
         pin.setToolTip(
@@ -428,6 +468,7 @@ class DepthWindow(QtWidgets.QWidget):
                 Key("f", "follow the crosshair / pin the region", self._toggle_follow, group="depth"),
                 Key("p", "pin this dataset to compare against", self.pin, group="depth"),
                 Key("shift+p", "clear the pinned datasets", self.clear_pins, group="depth"),
+                Key("d", "next detrend order (depth x time)", self._cycle_detrend, group="depth"),
                 Key("click (heatmap)", "go to that volume", None, group="depth"),
                 Key("h", "this list", self.help.toggle, group="window"),
                 Key("ctrl+w", "close this window", self.close, group="window"),
@@ -472,6 +513,18 @@ class DepthWindow(QtWidgets.QWidget):
         vp = self._viewport()
         if vp is not None:
             self._dispatch(SetSurfaceEquivolume(self.vid, not vp.equivolume))
+
+    def _set_detrend(self, order: int) -> None:
+        if self._viewport() is not None:
+            self._dispatch(SetViewDetrend(self.vid, int(order)))
+
+    def _cycle_detrend(self) -> None:
+        vp = self._viewport()
+        if vp is None:
+            return
+        orders = [k for k, _ in DETREND_LABELS]
+        at = orders.index(vp.detrend) if vp.detrend in orders else 0
+        self._set_detrend(orders[(at + 1) % len(orders)])
 
     def pin(self) -> None:
         if self._live is None or self.result is None or self.result.n_vertices == 0:
@@ -520,6 +573,9 @@ class DepthWindow(QtWidgets.QWidget):
         self.radius_spin.setValue(vp.radius)
         self.radius_spin.blockSignals(False)
         self.radius_spin.setEnabled(vp.depth_source == "disc")
+        self.detrend_box.blockSignals(True)
+        self.detrend_box.setCurrentIndex(max(self.detrend_box.findData(int(vp.detrend)), 0))
+        self.detrend_box.blockSignals(False)
         self.roi_box.setEnabled(vp.depth_source == "layer")
 
     def _profiled_layer(self, vp: Viewport):
@@ -596,7 +652,9 @@ class DepthWindow(QtWidgets.QWidget):
         self.plot.result = self.result
         self.time_plot.data = None if self.result is None else self.result.timecourses
         self.time_plot.cursor = idx
+        self.time_plot.detrend = int(vp.detrend)
         self.time_plot.setVisible(self.time_plot.data is not None)
+        self.detrend_box.setVisible(self.time_plot.data is not None)
         self.plot.update()
         self.time_plot.update()
 

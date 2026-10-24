@@ -308,8 +308,15 @@ class WindowManager(QtCore.QObject):
                     self._heavy(win, dirty, holding, scrolling)
             elif isinstance(win, DepthWindow):
                 # The clicked spot (CROSSHAIR), the volume shown (TIME), what
-                # is loaded (LAYERS) and an edit moving white/pial (SLICES).
-                if dirty & (Aspect.CROSSHAIR | Aspect.TIME | Aspect.LAYERS | Aspect.SLICES):
+                # is loaded (LAYERS), an edit moving white/pial (SLICES) and
+                # its own detrend (VIEWPORTS; unchanged inputs re-sample nothing).
+                if dirty & (
+                    Aspect.CROSSHAIR
+                    | Aspect.TIME
+                    | Aspect.LAYERS
+                    | Aspect.SLICES
+                    | Aspect.VIEWPORTS
+                ):
                     self._heavy(win, dirty, holding, scrolling)
             elif isinstance(win, ProfileWindow):
                 # The crosshair (to follow), an edit (SLICES: re-sample what

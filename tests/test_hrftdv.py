@@ -214,3 +214,30 @@ def test_fit_hrftdv_finds_a_later_pair_where_voxels_are_later():
     assert a.early_lag < 0 < a.late_lag
     assert res.voxel_entry.shape == (60,) and set(res.voxel_entry) == {0, 1}
     assert np.nanmax(np.abs(res.rel_lag[:30])) < 0.9
+
+
+def test_pooled_late_pattern_recovers_the_units_late_condition_mix():
+    """Early carries conditions 1:0.7, late 0.2:1.0; the pooled pattern is the
+    late mix, L1-normalised, and the unit with no responsive voxel takes it too."""
+    T, n_runs = 200, 2
+    h = _hrf()
+    build = _design_for(_events(n_runs, T, seed=5), T)
+    project, _, _ = _projector(n_runs, T)
+    early, late = tdv.stretch_shift(h, DT, -0.5, 1.0), tdv.stretch_shift(h, DT, 1.5, 1.2)
+    lib = tdv.PairLibrary(
+        np.stack([early, late])[None].astype(np.float32), np.zeros((1, 5)), np.zeros(2, int)
+    )
+    x = build(np.stack([early, late])).numpy()  # (T, 4): a_early, a_late, b_early, b_late
+    rng = np.random.default_rng(0)
+    ys = [
+        x @ np.array([1.0, 0.2, 0.7, 1.0]) + 0.05 * rng.standard_normal(T * n_runs)
+        for _ in range(20)
+    ]
+    y = project(torch.as_tensor(np.stack(ys, 1))[None])[0].float()
+    unit = np.r_[np.zeros(10, int), np.ones(10, int)]
+    responsive = np.r_[np.ones(10, bool), np.zeros(10, bool)]
+    pat = tdv.pooled_late_patterns(y, unit, responsive, lib, build, project, CPU)
+    np.testing.assert_allclose(pat[0], [0.2 / 1.2, 1.0 / 1.2], atol=0.03)
+    np.testing.assert_allclose(pat[1], pat[0])
+    regs = tdv.late_regressors(lib, pat, build)
+    np.testing.assert_allclose(regs[:, 0], x[:, [1, 3]] @ pat[0], rtol=1e-5, atol=1e-6)

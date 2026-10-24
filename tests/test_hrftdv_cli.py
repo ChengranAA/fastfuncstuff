@@ -112,3 +112,53 @@ def test_hrftdv_finds_lag_rising_with_depth_and_reml_fits_its_pairs(tmp_path):
     )
     deep, sup = resp & (frac < 0.3), resp & (frac > 0.7)
     assert np.median(late_share[sup]) > np.median(late_share[deep]) + 0.2
+
+
+@pytest.mark.slow  # 15s
+def test_pooled_late_writes_an_early_library_and_dsort_runs_reml_fits(tmp_path):
+    """-pooled_late: one early column per condition from {prefix}_early, one late
+    column per voxel from the per-run -dsort files. The late sizes must grow toward
+    pial (later voxels), and voxels outside every unit (zero dsort) must still fit."""
+    from fastfuncstuff.cli.util_concalc import _read_brick_labels
+
+    ribbon, frac = _write(tmp_path)
+    subj = _subject(tmp_path)
+    common = ["-input", "run1.nii.gz", "run2.nii.gz", "-events", "ev1.tsv", "ev2.tsv"]
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.hrftdv", *common]
+        + ["-fs_subj", str(subj), "-hemi", "lh", "-tr", "1", "-device", "cpu"]
+        + ["-patch_mm", "6", "-tile_mm", "0", "-pooled_late", "-prefix", "tdv"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
+    )
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    early = torch.load(tmp_path / "tdv_early_hrf_library.pt", weights_only=False)
+    assert early["hrf_library"].ndim == 2
+    dsort = [tmp_path / f"tdv_late_dsort.run-0{r}.nii.gz" for r in (1, 2)]
+    assert all(p.exists() for p in dsort)
+    assert nib.load(dsort[0]).shape == (N, N, N, NT)
+
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.reml", *common]
+        + ["-TR", "1", "-device", "cpu", "-hrf_opt", "tdv_early"]
+        + ["-dsort", *map(str, dsort), "-dsort_betas", "yes", "-Rbuck", "o"],
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        cwd=tmp_path,
+    )
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    out = nib.load(tmp_path / "o.nii.gz")
+    names = _read_brick_labels(out)
+    vol = np.asanyarray(out.dataobj)
+    assert np.isfinite(vol).all()
+    a = vol[..., names.index("a#0_Coef")]
+    resp = ribbon & (a > 0)
+    assert resp.mean() > 0.5 * ribbon.mean()
+    late = 0.5 * (
+        vol[..., names.index("dsort0_run1#0_Coef")] + vol[..., names.index("dsort0_run2#0_Coef")]
+    )
+    deep, sup = resp & (frac < 0.3), resp & (frac > 0.7)
+    assert np.median(late[sup]) > np.median(late[deep])

@@ -408,6 +408,75 @@ def build_pair_library(
     return PairLibrary(curves, entries, index.reshape(-1))
 
 
+def pooled_late_patterns(
+    y: Tensor,
+    unit: np.ndarray,
+    responsive: np.ndarray,
+    library: PairLibrary,
+    design_for: Callable[[np.ndarray], Tensor],
+    project: Callable[[Tensor], Tensor],
+    device: torch.device,
+) -> np.ndarray:
+    """Each unit's late *condition pattern*, ``(U, P)``, unit L1 norm.
+
+    The free early/late model gives every voxel a late beta per condition, and
+    two collinear columns per condition fight: one goes strongly negative to
+    pay for the other.  Venous signal is drained from upstream tissue, so its
+    mix of conditions should be the neighbourhood's rather than the voxel's
+    own.  That pattern is fit once per unit, early and late together on the
+    mean of its responsive voxels, and each voxel then needs a single late
+    column (its size), which ``ffs_reml -dsort`` fits.  Units with no
+    responsive voxel take the median pattern of the rest.
+
+    The price is an assumption: whatever selectivity the whole unit shares is
+    called late, so a genuinely smooth pattern loses some of its early part.
+    """
+    U = int(unit.max()) + 1
+    T = y.shape[0]
+    sums = torch.zeros(T, U, dtype=torch.float64)
+    counts = np.bincount(unit[responsive], minlength=U)
+    idx = np.flatnonzero(responsive)
+    for a in range(0, idx.size, 50000):
+        sel = idx[a : a + 50000]
+        sums.index_add_(1, torch.as_tensor(unit[sel]), y[:, sel].double().cpu())
+    means = (sums / torch.as_tensor(np.clip(counts, 1, None))).to(device)
+    pattern = np.full((U, 0), np.nan)
+    for e in range(library.curves.shape[0]):
+        units = np.flatnonzero((library.index == e) & (counts > 0))
+        if units.size == 0:
+            continue
+        x = project(design_for(library.curves[e]))  # (T, 2P): early, late per condition
+        beta = torch.linalg.lstsq(x, means[:, torch.as_tensor(units, device=device)]).solution
+        late = beta[1::2].T.cpu().numpy()  # (n, P)
+        if pattern.shape[1] == 0:
+            pattern = np.full((U, late.shape[1]), np.nan)
+        pattern[units] = late / np.clip(np.abs(late).sum(1, keepdims=True), 1e-12, None)
+    if pattern.shape[1] == 0:
+        raise ValueError("no unit has a responsive voxel: no late pattern to pool")
+    fill = np.nanmedian(pattern, axis=0)
+    fill /= max(float(np.abs(fill).sum()), 1e-12)
+    pattern[~np.isfinite(pattern).all(1)] = fill
+    return pattern
+
+
+def late_regressors(
+    library: PairLibrary, pattern: np.ndarray, design_for: Callable[[np.ndarray], Tensor]
+) -> np.ndarray:
+    """``(T, U)``: each unit's pooled late column, its pair's late curve x its pattern."""
+    U = pattern.shape[0]
+    out = None
+    for e in range(library.curves.shape[0]):
+        units = np.flatnonzero(library.index == e)
+        if units.size == 0:
+            continue
+        x = design_for(library.curves[e][1]).double().cpu().numpy()  # (T, P)
+        if out is None:
+            out = np.zeros((x.shape[0], U), np.float32)
+        out[:, units] = x @ pattern[units].T
+    assert out is not None
+    return out
+
+
 @dataclass
 class TdvResult:
     unit: np.ndarray  # (V,) unit label

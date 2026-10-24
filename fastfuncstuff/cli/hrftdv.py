@@ -181,6 +181,16 @@ def create_parser() -> FfsArgumentParser:
         help="Lag snapping for the library (s): units within a step share an entry",
     )
     model.add_argument(
+        "-pooled_late",
+        action="store_true",
+        help="Also write the pooled-late model: {prefix}_early_hrf_* (one early curve per "
+        "voxel, for -hrf_opt) and {prefix}_late_dsort.run-NN (each voxel's single late "
+        "column: its unit's late curve x the unit's late condition pattern, for -dsort). "
+        "One late column instead of one per condition stops the early and late betas "
+        "fighting (VIF ~16 -> ~4 on an event design), at the cost of calling the "
+        "unit's shared selectivity late",
+    )
+    model.add_argument(
         "-p_thresh",
         type=float,
         default=1e-4,
@@ -522,6 +532,46 @@ def main(argv: list[str] | None = None) -> None:
     )
     Path(f"{pfx.stem}_metadata.json").write_text(json.dumps(meta, indent=2, default=str))
 
+    dsort_files: list[str] = []
+    if args.pooled_late:
+        pattern = tdv.pooled_late_patterns(
+            y, unit_of, responsive, res.library, design_for, project, device
+        )
+        regs = tdv.late_regressors(res.library, pattern, design_for)  # (T, U)
+        early_meta = {**meta, "pooled_late": True, "basis_labels": ["early"]}
+        torch.save(
+            {
+                "hrf_library": torch.as_tensor(res.library.curves[:, 0]),
+                "hrf_index": torch.as_tensor(res.voxel_entry),
+                "metadata": early_meta,
+                "duration_convolved": False,
+            },
+            f"{pfx.stem}_early_hrf_library.pt",
+        )
+        save_nifti(
+            np.stack([vol(entry), vol(np.nan_to_num(res.fit.r2))], -1),
+            f"{pfx.stem}_early_hrf_index{ext}",
+            affine=affine,
+            brick_labels=["early_entry", "lag_fit_r2"],
+        )
+        bounds = [*run_starts, n_timepoints]
+        for r, (a, b) in enumerate(zip(bounds[:-1], bounds[1:], strict=True)):
+            # Voxels outside the units keep a zero column; reml's per-voxel GLS
+            # stays finite with it (tests/test_hrftdv_cli.py).
+            out = np.zeros((int(np.prod(shape)), b - a), np.float32)
+            out[vox] = regs[a:b, unit_of].T
+            path = f"{pfx.stem}_late_dsort.run-{r + 1:02d}{ext}"
+            save_nifti(out.reshape(*shape, b - a), path, affine=affine, tr=tr)
+            dsort_files.append(path)
+            del out
+        names = timing.condition_labels
+        med = np.median(pattern[unit_kind == 0], axis=0) if (unit_kind == 0).any() else pattern[0]
+        if verbose:
+            print(
+                "  Pooled late: median cortical pattern "
+                + ", ".join(f"{n} {w:+.2f}" for n, w in zip(names, med, strict=False))
+            )
+
     if verbose:
         print()
         print(
@@ -546,6 +596,11 @@ def main(argv: list[str] | None = None) -> None:
                         )
         print(f"  Wrote {pfx.stem}_hrf_index{ext}, _hrf_library.pt, _tdv{ext}, _pairs.tsv")
         print(f"  Next: ffs_reml ... -hrf_opt {pfx.stem}  ({time.time() - t0:.0f} s)")
+        if dsort_files:
+            print(
+                f"     or: ffs_reml ... -hrf_opt {pfx.stem}_early -dsort {' '.join(dsort_files)} "
+                "-dsort_betas yes ..."
+            )
 
 
 if __name__ == "__main__":

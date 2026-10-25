@@ -1,4 +1,9 @@
-"""ffs_laminar_tdv: continuous model-based removal of ascending-vein transport."""
+"""ffs_laminar_tdv (EXPERIMENTAL): continuous model-based removal of ascending-vein transport.
+
+Not a validated preprocessing step. Physiology is fixed (no calibration yet), and
+on ds003427 the corrected GE moved slightly AWAY from SE. See the wiki's
+Laminar timeseries deveining note before relying on its output.
+"""
 
 from __future__ import annotations
 
@@ -105,6 +110,7 @@ def main():
     from fastfuncstuff.processing.io import load_image, save_image
     from fastfuncstuff.processing.laminar_tdv import depth_patches, devein_volume_runs
 
+    print("ffs_laminar_tdv is EXPERIMENTAL: fixed physiology, not validated on real data")
     device = setup_device(args.device)
     files = parse_input_files(args.input)
     pfx = parse_prefix(args.prefix)

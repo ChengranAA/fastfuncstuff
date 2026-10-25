@@ -612,6 +612,14 @@ def bytes_per_voxel_prf(
     return (6 * n_pixels + 30 * n_timepoints) * 4
 
 
+def bytes_per_unit_laminar_dynamic(
+    n_timepoints: int, n_depths: int, n_runs: int, n_strengths: int
+) -> int:
+    """Spectra, complex inverses per strength, batched K x K solves (float64 budget)."""
+    nf = n_timepoints // 2 + 1
+    return 16 * nf * (n_depths * n_depths * (14 + n_strengths) + 8 * n_depths * n_runs)
+
+
 def bytes_per_voxel_lag_bank(n_timepoints: int, n_cols: int, n_candidates: int) -> int:
     """
     Estimate memory per voxel for scoring a bank of shifted/stretched designs.
@@ -1875,6 +1883,10 @@ def estimate_chunk_size(
         # n_trials carries the dataset count (the lss precedent for an
         # operation-specific multiplicity).
         bytes_per_voxel = bytes_per_voxel_paired_corr(n_timepoints, max(2, n_trials))
+    elif operation == "laminar_dynamic":
+        bytes_per_voxel = bytes_per_unit_laminar_dynamic(
+            n_timepoints, n_regressors, n_runs, n_designs
+        )
     elif operation == "lag_bank":
         bytes_per_voxel = bytes_per_voxel_lag_bank(n_timepoints, n_regressors, max(1, n_designs))
     elif operation == "phasereg":

@@ -189,3 +189,32 @@ per-depth amplitudes absorb drainage strength when local and drained shapes
 are alike — only pooling over many patches resolves it. Caveat: the CBF shape
 is fixed, so on real data t0v also absorbs HRF-shape mismatch — a chosen t0v
 is fit-to-shape, not measured transit time. Events cannot choose `-ridge`.
+
+## Per-voxel transport gains (2026-10-26)
+
+Why: on MindsEye 7T (sub-ME462566, 0.8 mm, TR 2.5, 6 runs, `-ridge 0.8`) the
+column-level correction removed ~10% of a ribbon voxel's PSC SD, and 0.77%
+against 8.5% in the top-1% |Coef| voxels; 46.5% of those voxels lie outside the
+ribbon. A column correction gives every voxel at a depth the same removal, so a
+vein voxel keeps its excess. Physiology cannot fix that: across s_d 0.1–1.6 the
+model's pial leak share only moves 0.54→0.59.
+
+What (`-removal voxel`, default): each voxel regresses its detrended PSC on its
+column's local BOLD at its depth (free), transported BOLD (gain, ridged toward
+1) and d(transport)/dt (shift, toward 0); ridge strength per voxel by
+leave-one-run-out over `-gain_lambdas` (1e4 ≈ column model). Removed = gain ×
+transport + shift × derivative. A shell `-extend_mm` (2 mm) past the ribbon
+inherits each nearest ribbon voxel's column and depth (pial veins), and gets
+gains but never builds a column.
+
+Trap found building it: veins also corrupt the column. Unweighted, three 5×
+vein voxels inflate the pial bin; the inverse explains the excess as LOCAL
+signal, so normal voxels' local regressor carries transport and their gain
+falls to 0.4. Cleaning the excess linearly and refitting is a fixed point
+(normal voxels' negative excess exactly cancels the veins'). Precision-weighting
+the profiles, min(1, (bin median SD / voxel SD)²), fixes it: gains 4.85 / 0.89
+against truths 5 / 1 (`test_voxel_gains_remove_a_veins_excess_and_keep_local_signal`).
+
+Caveats: the voxel's own data enters its column profile (mostly the local term);
+a genuine local response that correlates with deep activity can be taken as
+transport where the local regressor does not explain it — VASO is the referee.

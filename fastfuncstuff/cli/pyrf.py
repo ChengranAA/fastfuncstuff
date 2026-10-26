@@ -40,6 +40,7 @@ from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_load_threads_arg,
     add_ortvec_arguments,
+    add_ribbon_sampling_args,
     add_verbose_arg,
     build_nuisance_per_run,
     collect_nuisance_blocks,
@@ -48,7 +49,9 @@ from fastfuncstuff.cli_utils import (
     parse_input_files,
     parse_prefix,
     resolve_polort,
+    sample_input_to_ribbon,
     setup_device,
+    split_ribbon_outputs,
 )
 from fastfuncstuff.denoise.sequential import extract_noise_pcs_per_run
 from fastfuncstuff.design.hrf import (
@@ -184,6 +187,26 @@ HRF CONVENTION
   there, and downsample -- identical by the algebra above, but S times the work
   on the pixels-by-time axis. It would only buy something for apertures sampled
   faster than the TR, which this tool does not currently accept.
+
+SURFACE DATA
+  Two ways in. GIfTI runs (?h.func.gii from ffs_nwarp -surf) are ordinary input:
+  they fit on vertices, -mask takes a .shape.gii on the same mesh, and -do_blur
+  becomes a heat kernel on the mesh. Or hand the tool volumes and a FreeSurfer
+  subject with -fs_subj, and it samples the ribbon itself (the equivolume depth
+  mean) before fitting. That is the cheap lever on cost: the fit is linear in
+  vertices, and the ribbon is a small fraction of a whole-brain voxel grid.
+
+  -fs_subj assumes -input is already in register with the subject's anatomy --
+  the chain is the identity. Data still in EPI space goes through ffs_nwarp -surf
+  with its real warp chain, which writes the same files.
+
+  Both hemispheres are fit as ONE dataset on a merged (two-component) mesh, so
+  there is one super-grid pass, one HRF selection and one noise pool rather than
+  two of each; nothing crosses the midline, because the components are not
+  connected. Every output is then split into {prefix}.lh / {prefix}.rh files.
+  One consequence worth knowing: -denoise's noise pool can only see what was
+  sampled, so a ribbon fit draws its nuisance components from cortex alone. A
+  whole-brain pool for a surface fit is not implemented.
 
 NOISE CEILING
   Runs with a bit-identical aperture movie have the same expected response, so
@@ -870,6 +893,9 @@ def create_parser() -> argparse.ArgumentParser:
         default=250,
         help="Random Gaussian tiles in the screening basis",
     )
+
+    surface = parser.add_argument_group("cortical surface")
+    add_ribbon_sampling_args(surface, tool="the pRF fit")
 
     processing = parser.add_argument_group("processing")
     processing.add_argument("-mask", default=None, help="Optional brain mask")
@@ -1805,6 +1831,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     prefix_info = parse_prefix(args.prefix)
     input_files = parse_input_files(args.input)
+    if args.fs_subj and not prefix_info.nifti_ext.endswith(".gii"):
+        # A fit on vertices can only be written per-vertex; say so rather than
+        # writing a (V, 1, 1) volume nobody can display on the mesh.
+        prefix_info = parse_prefix(f"{prefix_info.stem}.func.gii")
+        if args.verb:
+            print(f"-fs_subj writes surface results: using {prefix_info.stem}.func.gii")
     if bool(args.stimulus) == bool(args.stim_sources):
         parser.error(
             "Specify exactly one of -stimulus or -stim-pngs/-stim-pngs-multi/"
@@ -1854,6 +1886,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.do_blur is not None and not args.mask:
             parser.error("-do_blur on surface input needs -mask (the cortex and coverage)")
+    if args.fs_subj and args.noise_pool_mask:
+        parser.error("-noise_pool_mask is not supported with -fs_subj: the fit is the ribbon")
     if args.stim_downsample < 0:
         parser.error("-stim-downsample must be non-negative (0 keeps the native resolution)")
     if args.candidate_chunk < 1 or (args.batch_size is not None and args.batch_size < 1):
@@ -1879,6 +1913,11 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(f"Stimulus source does not exist: {location}")
 
     device = setup_device(args.device)
+    ribbon = sample_input_to_ribbon(args, parser, input_files, prefix_info.stem, device=device)
+    if ribbon is not None:
+        input_files = ribbon.runs
+        # Cortex and full coverage in every run: the vertices that have data to fit.
+        args.mask = args.mask or ribbon.mask
     # The loaded region is the union of where we fit and where the noise pool may
     # come from; which of the two a loaded voxel belongs to is tracked below.
     fit_mask_flat, pool_mask_flat, load_mask_flat = _resolve_masks(args, input_files[0], parser)
@@ -2397,6 +2436,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Wrote per-HRF R2 map: {prefix_info.stem}_hrf_r2{prefix_info.nifti_ext}")
     elif args.save_hrf_r2 and args.verb:
         print("-save_hrf_r2 ignored: needs -hrf_select refine with more than one HRF")
+    if ribbon is not None:
+        split_ribbon_outputs(prefix_info.stem, verbose=args.verb > 0)
     return 0
 
 

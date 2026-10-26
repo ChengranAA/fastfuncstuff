@@ -3175,6 +3175,144 @@ def add_outlier_censor_args(parser_or_group) -> None:
     )
 
 
+def add_ribbon_sampling_args(group, tool: str = "the fit") -> None:
+    """``-fs_subj`` and friends: sample ``-input`` volumes onto a subject's ribbon.
+
+    The flags a voxel tool needs to fit the cortical ribbon instead of the volume.
+    Spellings follow ``ffs_nwarp -surf*``, which does the same sampling with a real
+    warp chain, so a user moving between the two reads one vocabulary.
+    """
+    group.add_argument(
+        "-fs_subj",
+        "-surf_sample",
+        dest="fs_subj",
+        metavar="SUBJ",
+        default=None,
+        help=(
+            "FreeSurfer subject (a path, or a name in $SUBJECTS_DIR): sample the -input "
+            f"volumes onto its cortical ribbon and run {tool} on the vertices instead of "
+            "the voxels. Both hemispheres are fit as one dataset and every output is "
+            "split into .lh / .rh GIfTI files. -input must already be in register with "
+            "the subject's anatomy (the chain is the identity); for data still in EPI "
+            "space, sample it with ffs_nwarp -surf and pass the .func.gii as -input"
+        ),
+    )
+    group.add_argument(
+        "-surf_master",
+        metavar="DSET",
+        default=None,
+        help="The anatomy the surfaces were built on, and the space -input is assumed "
+        "to be in. Default: the subject's own SUMA/brain.nii.gz or mri/brain.mgz.",
+    )
+    group.add_argument(
+        "-surf_mesh",
+        default="native",
+        help="Target mesh: 'native' (the subject's own vertices) or a template folder "
+        "such as onavg-ico64, which every subject then shares.",
+    )
+    group.add_argument(
+        "-surf_hemi",
+        nargs="+",
+        default=["lh", "rh"],
+        choices=["lh", "rh"],
+        help="Hemispheres to sample and fit.",
+    )
+    group.add_argument(
+        "-surf_depths",
+        nargs="+",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="Equivolume depths to average, 0 = white and 1 = pial. Default: the five "
+        "equivolume bin centres, i.e. the ribbon mean.",
+    )
+    group.add_argument(
+        "-surf_sample_mode",
+        choices=["footprint", "point"],
+        default="footprint",
+        help="footprint reads the vertex's own patch of cortex (the EPI voxel face); "
+        "point reads one interpolated value per vertex and depth.",
+    )
+    group.add_argument(
+        "-surf_dir",
+        metavar="DIR",
+        default=None,
+        help="Where the sampled runs, geometry and mask go. Default: {prefix}_surf.",
+    )
+    group.add_argument(
+        "-surf_resample",
+        action="store_true",
+        help="Sample again even when {prefix}_surf already holds these runs sampled the "
+        "same way (subject, mesh, depths, mode). Sampling is minutes per run.",
+    )
+    group.add_argument(
+        "-surf_keep_runs",
+        action="store_true",
+        help="Also keep each run's per-hemisphere time series, not only the merged one "
+        "the fit reads (doubles the sampled data on disk).",
+    )
+
+
+def sample_input_to_ribbon(args, parser, input_files: list[str], stem: str, device=None):
+    """Run ``-fs_subj`` sampling, returning the sample (or None when it is off).
+
+    The caller then fits ``sample.runs`` in place of its volumes and, when it has no
+    mask of its own, ``sample.mask`` (cortex and full coverage in every run).
+    """
+    if not getattr(args, "fs_subj", None):
+        return None
+
+    from fastfuncstuff.io.gifti import is_gifti
+    from fastfuncstuff.processing.ribbon_sample import sample_runs_to_ribbon
+    from fastfuncstuff.processing.surface_projection import DEFAULT_DEPTHS
+
+    if any(is_gifti(str(path).split("[")[0]) for path in input_files):
+        parser.error("-fs_subj samples volumes; -input is already surface data")
+    if args.surf_depths is not None and not all(0 <= f <= 1 for f in args.surf_depths):
+        parser.error("-surf_depths are fractions of the ribbon, 0 (white) to 1 (pial)")
+    try:
+        return sample_runs_to_ribbon(
+            [str(path) for path in input_files],
+            args.fs_subj,
+            out_dir=args.surf_dir or f"{stem}_surf",
+            master_path=args.surf_master,
+            mesh=args.surf_mesh,
+            hemis=tuple(args.surf_hemi),
+            fractions=tuple(args.surf_depths) if args.surf_depths else DEFAULT_DEPTHS,
+            sample=args.surf_sample_mode,
+            keep_hemi_runs=args.surf_keep_runs,
+            reuse=not args.surf_resample,
+            verb=getattr(args, "verb", 1),
+            device=device,
+        )
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(f"-fs_subj: {error}")
+
+
+def split_ribbon_outputs(stem: str, verbose: bool = True) -> list[str]:
+    """Split every ``{stem}*`` GIfTI result on a merged mesh into .lh / .rh files.
+
+    A post-pass over what the tool wrote, rather than a hook in each writer: the
+    merged file says in its own metadata where the hemispheres are, so any output
+    that landed on that mesh can be split without the tool knowing it exists.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.processing.ribbon_sample import MERGED_HEMIS_KEY, split_merged_surface
+
+    written = []
+    for path in sorted(Path(stem).parent.glob(f"{Path(stem).name}*.gii")):
+        image = nib.load(str(path))
+        if not isinstance(image, nib.gifti.GiftiImage) or MERGED_HEMIS_KEY not in image.meta:
+            continue
+        parts = split_merged_surface(path)
+        path.unlink()
+        written += parts
+        if verbose:
+            print(f"  split {path.name} -> {', '.join(Path(p).name for p in parts)}")
+    return written
+
+
 def add_paired_surface_args(group) -> None:
     """``-surface_input`` / ``-surface_mask``: fit GIfTI runs jointly with ``-input`` volumes."""
     group.add_argument(

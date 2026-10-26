@@ -107,8 +107,12 @@ def test_cli_writes_full_grid_and_keeps_outside_voxels(tmp_path):
             "3",
             "-tr",
             "2",
-            "-strengths",
+            "-ridge",
             ".01",
+            "-te",
+            ".025",
+            "-b0",
+            "7",
             "-device",
             "cpu",
             "-prefix",
@@ -125,3 +129,71 @@ def test_cli_writes_full_grid_and_keeps_outside_voxels(tmp_path):
     assert out.shape == raw.shape
     meta = json.loads((tmp_path / "out_metadata.json").read_text())
     assert meta["n_valid"] == 59
+
+
+def test_cli_refuses_to_guess_echo_time(tmp_path):
+    runs, *_ = _runs()
+    info = {"affine": np.eye(4)}
+    save_image(runs[0].T.reshape(-1, 5, 4, 3), tmp_path / "r0.nii.gz", info)
+    (tmp_path / "r0.json").write_text(json.dumps({"MagneticFieldStrength": 7}))
+    from fastfuncstuff.cli.laminar_tdv import main
+
+    with pytest.raises(SystemExit, match="-te"):
+        main(["-input", str(tmp_path / "r0.nii.gz"), "-fs_subj", str(tmp_path), "-ridge",
+              "0.1", "-prefix", str(tmp_path / "o")])  # fmt: skip
+
+
+@pytest.mark.slow  # 17s
+def test_cli_surfaces_remove_deep_drainage_and_leave_the_rest(tmp_path):
+    """Sphere-shell ribbon, one deep source: removal grows toward pial, off-ribbon is untouched."""
+    import nibabel as nib
+
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+    from tests.viewer.test_surfaces import RADIUS, _subject
+
+    vox, n, T, K, tr = 1.0, 60, 90, 3, 2.0
+    aff = np.diag([vox, vox, vox, 1.0])
+    aff[:3, 3] = -(n - 1) * vox / 2
+    ijk = np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1)
+    r = np.linalg.norm(ijk * vox + aff[:3, 3], axis=-1)
+    frac = np.clip((r - RADIUS) / (0.2 * RADIUS), 0, 1)  # 0 white .. 1 pial
+    ribbon = (r > RADIUS) & (r < 1.2 * RADIUS)
+    spec = ModelSpec(N=K, K=K, TR=tr, device=CPU)
+    freq = torch.fft.rfftfreq(T, tr)
+    h, _ = vascular_transfer(linearized_vasculature(spec), freq)
+    torch.manual_seed(3)
+    a = torch.zeros(T, K, dtype=torch.float64)
+    a[:, -1] = torch.randn(T, dtype=torch.float64) * 0.2  # deepest model depth only
+    a = torch.fft.irfft(torch.fft.rfft(a, dim=0) / (1 + (freq[:, None] / 0.04) ** 4), n=T, dim=0)
+    y = torch.fft.irfft(torch.einsum("fkn,fn->fk", h, torch.fft.rfft(a, dim=0)), n=T, dim=0)
+    read = depth_interpolation(1 - frac[ribbon], K)  # model order: 0 = pial
+    signal = (read @ y.numpy().T).astype(np.float32)
+    rng = np.random.default_rng(0)
+    for run in (1, 2):
+        data = 100 + rng.normal(0, 0.05, (n, n, n, T)).astype(np.float32)
+        data[ribbon] += signal
+        nib.save(nib.Nifti1Image(data, aff), str(tmp_path / f"run{run}.nii.gz"))
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.laminar_tdv", "-input", "run1.nii.gz",
+         "run2.nii.gz", "-fs_subj", str(_subject(tmp_path)), "-hemi", "lh", "-depths", str(K),
+         "-ridge", "0.001", "-te", "0.025", "-b0", "7", "-tr", str(tr), "-pad_seconds", "0",
+         "-device", "cpu", "-prefix", "ltdv"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=tmp_path,
+    )  # fmt: skip
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    from fastfuncstuff.cli.util_concalc import _read_brick_labels
+
+    img = nib.load(tmp_path / "ltdv_ltdv.nii.gz")
+    names, b = _read_brick_labels(img), np.asanyarray(img.dataobj)
+    valid = b[..., names.index("valid")] > 0
+    assert valid[ribbon].mean() > 0.8 and not valid[r < 0.8 * RADIUS].any()
+    depth = b[..., names.index("depth")]
+    assert np.corrcoef(depth[valid], frac[valid])[0, 1] > 0.8
+    rms = b[..., names.index("removed_rms")]
+    deep, sup = valid & (frac < 0.25), valid & (frac > 0.75)
+    assert np.median(rms[sup]) > 5 * np.median(rms[deep])
+    raw = np.asanyarray(nib.load(tmp_path / "run1.nii.gz").dataobj)
+    out = np.asanyarray(nib.load(tmp_path / "ltdv_corrected_run-01.nii.gz").dataobj)
+    np.testing.assert_array_equal(out[~valid], raw[~valid])
+    leak = signal[(frac[ribbon] > 0.75)].std(1).mean()
+    assert np.abs(out[sup] - 100).std(-1).mean() < 0.5 * leak

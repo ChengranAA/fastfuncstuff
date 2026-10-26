@@ -1,6 +1,6 @@
 # Continuous laminar BOLD deveining (experimental)
 
-Branch: `feat/laminar-timeseries-deveining`. CLI: `ffs_laminar_tdv`, or
+CLI: `ffs_laminar_tdv` (on main since 2026-10-25), or
 `python -m fastfuncstuff.cli.laminar_tdv` before reinstalling entry points.
 
 This implementation passes physiological and synthetic recovery tests, but **does
@@ -52,7 +52,7 @@ layers. Extra sampled bins cannot create independent spatial information.
 
 With repeated runs that have identical stimulus timing, choose a regularization
 value per patch by leave-one-GE-run-out full-response prediction. SE is withheld
-from selection. For rest or unmatched tasks, specify one fixed strength; this
+from selection. For rest or unmatched tasks, give one `-ridge` value; this
 avoids cross-validating against unrelated activity. Fixed-strength runs currently
 also need equal lengths (process unequal runs separately).
 
@@ -65,12 +65,22 @@ regularization framework.
 
 ## Usage
 
-Depth order is mandatory. The ds003427 maps are 0=pial, 1=white; many other tools
-use the opposite convention.
+Surfaces are the usual input (2026-10-26): columns are geodesic midthickness
+patches through each voxel's owning vertex, built by the same
+`processing/hrftdv.py:ribbon_patches` that `ffs_hrftdv` uses, with equivolume
+depth. `-te`/`-b0` come from the BIDS sidecar or must be given. `ffs_laminar_tdv
+-help` documents every flag, including what `-ridge` (formerly `-strengths`) means.
 
 ```sh
-python -m fastfuncstuff.cli.laminar_tdv \
-  -input ge_run-01.nii.gz ge_run-02.nii.gz ge_run-03.nii.gz \
+ffs_laminar_tdv -input ge_run-0{1,2,3}.nii.gz -fs_subj $SUBJECTS_DIR/sub-01 \
+  -repeated_runs -prefix ltdv/sub-01
+```
+
+Segmentation depth maps still work instead of surfaces; then depth order is
+mandatory (the ds003427 maps are 0=pial, 1=white):
+
+```sh
+ffs_laminar_tdv -input ge_run-0{1,2,3}.nii.gz \
   -depth depth.nii.gz -gmfrac gmfrac.nii.gz -depth_order pial_to_white \
   -repeated_runs -te 0.023 -b0 7 -device cpu,4 -prefix tdv
 ```
@@ -79,9 +89,10 @@ Outputs:
 
 - `_corrected_run-NN`: corrected BOLD in original signal units;
 - `_removed_psc_run-NN`: estimated transported contribution in PSC;
-- `_smooth_psc_run-NN`: full-model reconstruction, a smoothing-only control;
-- `_diagnostics`: regularization, GE prediction R², profile noise gain, valid mask,
-  and patch ID;
+- `_fit_psc_run-NN` (`-save_fit`): full-model reconstruction, a smoothing-only
+  control (was `_smooth_psc`, always written);
+- `_ltdv` (was `_diagnostics`): ridge, GE prediction R², profile noise gain,
+  removed RMS, valid mask, patch ID, and depth (0 white, 1 pial);
 - `_metadata.json`: parameters, conventions, input files and coverage.
 
 The fitted-model control omits voxel residuals and is spatially pooled. Any gain

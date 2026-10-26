@@ -186,7 +186,10 @@ what to expect
   -> superficial leakage and keeps superficial-only responses (96-98% of
   amplitude).  On ds003427 (7T, segmentation depths) the corrected GE moved
   slightly away from SE (median voxel r with SE .100 -> .083), most likely
-  because the fixed physiology does not fit those data.  Check it against an
+  because the fixed physiology does not fit those data (that was the column-only
+  version).  With voxel gains on 7T data (0.8 mm, 6 runs), the top 1% of voxels
+  by task amplitude lost ~0.3 of their PSC SD instead of ~0.1 (shell: 0.27
+  instead of untouched), while typical voxels barely changed.  Check it against an
   independent reference (VASO, SE) before using it.  The correction changes
   the noise covariance a later GLM sees.
 """

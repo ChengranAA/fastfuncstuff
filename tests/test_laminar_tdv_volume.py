@@ -257,3 +257,59 @@ def test_cli_events_choose_the_generating_physiology(tmp_path):
     assert int(np.argmax(r2)) == 1  # t0v = 1
     meta = json.loads((tmp_path / "out_metadata.json").read_text())
     assert meta["p0"]["t0v"] == 1.0 and len(meta["physiology_cv"]) == 3
+
+
+def _vein_runs(n_runs=3, T=160, K=3, vein_gain=5.0, seed=5):
+    """One column; three pial-side voxels carry vein_gain x the transported signal."""
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+
+    spec = ModelSpec(N=K, K=K, TR=2, device=CPU)
+    freq = torch.fft.rfftfreq(T, spec.TR)
+    h, g = vascular_transfer(linearized_vasculature(spec), freq)
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), 20)
+    vein = np.zeros(depth.size, bool)
+    vein[[0, 3, 6]] = True  # superficial voxels (depth 1/6, model order 0 = pial)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    torch.manual_seed(seed)
+    runs, local_truth = [], []
+    for _ in range(n_runs):
+        a = torch.randn(T, K, dtype=torch.float64) * 0.003
+        a = torch.fft.irfft(
+            torch.fft.rfft(a, dim=0) / (1 + (freq[:, None] / 0.04) ** 4), n=T, dim=0
+        )
+        af = torch.fft.rfft(a, dim=0)
+        loc = torch.fft.irfft(torch.einsum("fkn,fn->fk", g, af), n=T, dim=0)
+        tr_ = torch.fft.irfft(torch.einsum("fkn,fn->fk", h - g, af), n=T, dim=0)
+        lv, tv = read @ loc.T, read @ tr_.T
+        gain = torch.where(torch.from_numpy(vein)[:, None], vein_gain, 1.0)
+        psc = lv + gain * tv + 0.002 * torch.randn(depth.size, T, dtype=torch.float64)
+        runs.append((200 * (1 + psc / 100)).float())
+        local_truth.append(lv)
+    return runs, local_truth, depth, vein, spec
+
+
+def test_voxel_gains_remove_a_veins_excess_and_keep_local_signal():
+    from fastfuncstuff.processing.laminar_tdv import devein_volume_runs
+
+    runs, truth, depth, vein, spec = _vein_runs()
+    labels = np.zeros(depth.size, int)
+    kw = dict(strengths=(0.001,), pad_seconds=0, polort=1, verbose=False)
+    col = devein_volume_runs(runs, depth, labels, spec, removal="column", **kw)
+    vox = devein_volume_runs(runs, depth, labels, spec, removal="voxel", **kw)
+
+    def err(res, sel):  # corrected PSC vs the local truth, all runs
+        out = []
+        for raw, cor, lt in zip(runs, res.corrected, truth, strict=True):
+            psc = 100 * (cor / raw.mean(-1, keepdim=True) - 1)
+            psc = psc - psc.mean(-1, keepdim=True)
+            lt = lt - lt.mean(-1, keepdim=True)
+            out.append(((psc[sel] - lt[sel].float()) ** 2).mean())
+        return float(torch.stack(out).mean())
+
+    superficial = depth < 0.3
+    assert err(vox, vein) < 0.2 * err(col, vein)
+    normal = superficial & ~vein
+    assert err(vox, normal) < 2 * err(col, normal) + 1e-6
+    b = vox.gains.beta
+    assert np.median(b[vein, 1]) > 3 and abs(np.median(b[normal, 1]) - 1) < 0.5
+    np.testing.assert_array_equal(vox.corrected[0][depth > 0.8], runs[0][depth > 0.8])

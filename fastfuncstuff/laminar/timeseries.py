@@ -223,6 +223,61 @@ def design_crossval(
     return sse, total
 
 
+def loro_prior_ridge(
+    xtx: torch.Tensor,
+    xty: torch.Tensor,
+    yy: torch.Tensor,
+    prior: torch.Tensor,
+    penalized: torch.Tensor,
+    lambdas: tuple[float, ...],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-voxel ridge toward a prior mean, its strength chosen by leave-one-run-out.
+
+    ``xtx`` ``(R, b, P, P)``, ``xty`` ``(R, b, P)`` and ``yy`` ``(R, b)`` are each
+    run's normal equations. Coefficients flagged in ``penalized`` are pulled toward
+    ``prior`` by ``lambda * scale``, where ``scale`` is their mean all-run Gram
+    diagonal, so lambda is unitless: large returns the prior, small a free fit.
+    Unpenalized coefficients are fit freely and compete for the same variance.
+
+    Returns coefficients refit on all runs at each voxel's chosen lambda, the
+    chosen index ``(b,)``, and held-out SSE per lambda ``(L, b)``.
+    """
+    R = xtx.shape[0]
+    if R < 2 or not lambdas or any(x <= 0 for x in lambdas):
+        raise ValueError("need >=2 runs and positive lambdas")
+    dev, dtype = xtx.device, xtx.dtype
+    pen = penalized.to(device=dev, dtype=dtype)
+    mu = prior.to(device=dev, dtype=dtype)
+    tot_a, tot_b = xtx.sum(0), xty.sum(0)
+    diag = tot_a.diagonal(dim1=-2, dim2=-1)
+    scale = (diag * pen).sum(-1) / pen.sum().clamp_min(1)
+    # A regressor that is all zero (the deepest depth has nothing below it)
+    # must still give a solvable system; it then returns its prior, times zero.
+    floor = 1e-6 * diag.mean(-1) + torch.finfo(dtype).tiny
+    scale = scale.clamp_min(floor)
+    solve_device = cpu_if_mps(dev, "solve")
+
+    def solve(a, b, lam):
+        d = lam[:, None] * scale[:, None] * pen + floor[:, None]
+        return torch.linalg.solve(
+            (a + torch.diag_embed(d)).to(solve_device), (b + d * mu)[..., None].to(solve_device)
+        ).to(dev)[..., 0]
+
+    sse = torch.zeros(len(lambdas), xtx.shape[1], device=dev, dtype=dtype)
+    for li, lam in enumerate(lambdas):
+        lam_b = torch.full_like(scale, lam)
+        for r in range(R):
+            beta = solve(tot_a - xtx[r], tot_b - xty[r], lam_b)
+            sse[li] += (
+                yy[r]
+                - 2 * (beta * xty[r]).sum(-1)
+                + (beta[:, None] @ xtx[r] @ beta[..., None])[:, 0, 0]
+            )
+    best = sse.argmin(0)
+    lam_best = torch.as_tensor(lambdas, device=dev, dtype=dtype)[best]
+    return solve(tot_a, tot_b, lam_best), best, sse
+
+
 @dataclass
 class DynamicResult:
     correction: torch.Tensor  # (R,U,T,K), transported contribution, sample depths

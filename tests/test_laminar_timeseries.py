@@ -227,3 +227,31 @@ def test_design_crossval_prefers_the_generating_physiology(name, grid, truth):
         for v in grid
     ]
     assert int(np.argmin(scores)) == grid.index(truth)
+
+
+def test_loro_prior_ridge_returns_prior_when_strong_and_finds_a_real_gain():
+    from fastfuncstuff.laminar.timeseries import loro_prior_ridge
+
+    torch.manual_seed(0)
+    R, b, T = 3, 200, 80
+    X = torch.randn(R, b, T, 2, dtype=torch.float64)
+    true_gain = torch.where(torch.arange(b) < 100, 4.0, 1.0).double()  # half veins
+    y = (
+        X[..., 0]
+        + true_gain[None, :, None] * X[..., 1]
+        + 0.5 * torch.randn(R, b, T, dtype=torch.float64)
+    )
+    xtx, xty = torch.einsum("rbtp,rbtq->rbpq", X, X), torch.einsum("rbtp,rbt->rbp", X, y)
+    yy = y.square().sum(-1)
+    prior, pen = torch.tensor([0.0, 1.0]), torch.tensor([0.0, 1.0])
+    beta, best, sse = loro_prior_ridge(xtx, xty, yy, prior, pen, (1e8,))
+    torch.testing.assert_close(beta[:, 1], torch.ones(b, dtype=torch.float64), atol=1e-4, rtol=0)
+    beta, best, sse = loro_prior_ridge(xtx, xty, yy, prior, pen, (0.01, 1e8))
+    assert (best[:100] == 0).all() and (beta[:100, 1] - 4).abs().max() < 0.2
+    assert (beta[100:, 1] - 1).abs().max() < 0.2
+    # An all-zero regressor (the deepest depth) still solves, at its prior.
+    xtx[..., 1, :] = 0
+    xtx[..., :, 1] = 0
+    xty[..., 1] = 0
+    beta, _, _ = loro_prior_ridge(xtx, xty, yy, prior, pen, (0.01, 1.0))
+    assert torch.isfinite(beta).all()

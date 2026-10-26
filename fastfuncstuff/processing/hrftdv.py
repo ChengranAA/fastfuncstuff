@@ -381,13 +381,29 @@ def extend_labels(labels: np.ndarray, voxel_mm: Sequence[float], extend_mm: floa
     Each empty voxel takes the label of the *nearest* labelled voxel, so where
     two gyri touch, the gap splits between them instead of either claiming it.
     """
-    from scipy.ndimage import distance_transform_edt
-
     if extend_mm <= 0 or not (labels >= 0).any():
         return labels
+    src = nearest_labelled(labels, voxel_mm, extend_mm)
+    grown = labels.reshape(-1)[np.maximum(src, 0)].reshape(labels.shape)
+    return np.where(src.reshape(labels.shape) >= 0, grown, labels)
+
+
+def nearest_labelled(labels: np.ndarray, voxel_mm: Sequence[float], extend_mm: float) -> np.ndarray:
+    """Flat index of each empty voxel's nearest labelled voxel within ``extend_mm``.
+
+    -1 for labelled voxels and those farther away. Nearest, so where two gyri
+    touch the gap splits between them.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    out = np.full(labels.size, -1, np.int64)
+    if extend_mm <= 0 or not (labels >= 0).any():
+        return out
     dist, idx = distance_transform_edt(labels < 0, sampling=voxel_mm, return_indices=True)
-    grown = labels[tuple(idx)]
-    return np.where((labels < 0) & (dist <= extend_mm), grown, labels)
+    near = np.ravel_multi_index(tuple(idx), labels.shape).reshape(-1)
+    take = ((labels < 0) & (dist <= extend_mm)).reshape(-1)
+    out[take] = near[take]
+    return out
 
 
 @dataclass

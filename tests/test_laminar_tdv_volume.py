@@ -105,6 +105,8 @@ def test_cli_writes_full_grid_and_keeps_outside_voxels(tmp_path):
             "columns.nii.gz",
             "-depths",
             "3",
+            "-extend_mm",
+            "0",  # the outside voxel would otherwise be shell
             "-tr",
             "2",
             "-ridge",
@@ -140,7 +142,7 @@ def test_cli_refuses_to_guess_echo_time(tmp_path):
 
     with pytest.raises(SystemExit, match="-te"):
         main(["-input", str(tmp_path / "r0.nii.gz"), "-fs_subj", str(tmp_path), "-ridge",
-              "0.1", "-prefix", str(tmp_path / "o")])  # fmt: skip
+              "0.1", "-removal", "column", "-prefix", str(tmp_path / "o")])  # fmt: skip
 
 
 @pytest.mark.slow  # 17s
@@ -187,6 +189,8 @@ def test_cli_surfaces_remove_deep_drainage_and_leave_the_rest(tmp_path):
     names, b = _read_brick_labels(img), np.asanyarray(img.dataobj)
     valid = b[..., names.index("valid")] > 0
     assert valid[ribbon].mean() > 0.8 and not valid[r < 0.8 * RADIUS].any()
+    shell = b[..., names.index("shell")] > 0
+    assert shell.sum() > 100 and not shell[(r < RADIUS - 3) | (r > 1.2 * RADIUS + 3)].any()
     depth = b[..., names.index("depth")]
     assert np.corrcoef(depth[valid], frac[valid])[0, 1] > 0.8
     rms = b[..., names.index("removed_rms")]

@@ -57,12 +57,32 @@ what it does
                  are FIXED: published priors, or -vascular_json.
     4. inverse   per patch and frequency, a ridge inverse finds the depth
                  blood-flow histories that explain the profiles (-ridge).
-    5. remove    model(all depths' inputs) - model(each depth's own input) =
-                 the transported part.  It is mapped back to voxels by depth and
-                 subtracted.  Each voxel's mean and drift are kept exactly.
+    5. split     model(all depths' inputs) - model(each depth's own input) =
+                 the transported part; model(own input) = the local part.  Both
+                 are read out at every voxel's depth.
+    6. voxels    (-removal voxel, the default) each voxel regresses its own
+                 data on its column's local part (free), transported part (a
+                 gain, pulled toward 1) and that part's time derivative (a
+                 timing shift, pulled toward 0).  It loses gain x transport +
+                 shift x derivative; its local part and residual stay.  How
+                 hard the pull is, per voxel, is chosen by leave-one-run-out
+                 (-gain_lambdas).  -removal column skips this: every voxel at a
+                 depth loses the same column transport.
+       Each voxel's mean and drift are kept exactly.
 
-  Voxels outside the ribbon, not positive in every run, or in a patch that
-  does not reach every model depth pass through unchanged.
+  Why per voxel: the column describes what drains through a depth and when; a
+  vein voxel carries several times more of it than the column mean, and the
+  column alone takes from it what it takes from its neighbours.  Because the
+  local part competes for the same variance, a gain only takes what the
+  voxel's own local response cannot explain.  The column profiles are
+  precision-weighted (a voxel weighs min(1, (median SD at its depth / its SD)^2)),
+  so veins do not define their column.
+
+  Coverage: the ribbon, plus a shell up to -extend_mm beyond it (pial veins sit
+  just outside pial).  Shell voxels take the column and depth of their nearest
+  ribbon voxel and only get voxel gains; they do not build the columns.
+  Subcortical and other voxels, those not positive in every run, and patches
+  that do not reach every model depth pass through bit-identical.
 
 ridge regularization (-ridge)
 
@@ -72,6 +92,9 @@ ridge regularization (-ridge)
   faster than the slow vascular model can explain are not inverted.  More
   shrinkage means a smaller transport estimate, so LESS is removed: when the
   data are unsure the tool corrects less, not more.
+
+  With -removal voxel the gains rescale the transport per voxel, so -ridge
+  shapes the column estimate more than it sets the amount removed.
 
   Several values: each patch picks its own by leave-one-run-out, predicting
   each run from the mean of the others and keeping the LAMBDA that predicts
@@ -106,6 +129,15 @@ events (optional; any schedule, each run its own)
   response is read as drainage.  Events do not choose -ridge: a design-fitted
   signal has no noise left for the ridge to trade against.
 
+voxel gains (-gain_lambdas)
+
+  Each LAMBDA pulls a voxel's gain toward 1 and shift toward 0 with a strength
+  relative to its own transport regressor's energy: 1e4 is the column model,
+  0.01 a nearly free fit.  Every voxel keeps the LAMBDA whose fit on the other
+  runs best predicts each held-out run; any schedule works, events are not
+  used, and at least 2 runs are needed.  gain_cv in the bucket is the held-out
+  R² gained over the column model; 0 means the voxel looks like its column.
+
 physiology (-vascular_json)
 
   {"p0": {"s_d": 0.6, "w_v": 0.4},    baseline values (laminar/params.py:P0)
@@ -131,7 +163,9 @@ outputs
   {prefix}_fit_psc_run-NN.nii.gz      (-save_fit) the full model reconstruction:
                                       a smoothing-only control
   {prefix}_ltdv.nii.gz                bucket: ridge, ge_cv_r2, noise_gain,
-                                      removed_rms, valid, patch, depth
+                                      removed_rms, valid, shell, patch, depth
+                                      (+ voxel: gain_local, gain_transport,
+                                      gain_shift, gain_lambda, gain_cv)
                                       (+ events: phys_cv_r2, phys_best)
   {prefix}_physiology_cv.tsv          (events) each candidate's pooled held-out R²
   {prefix}_metadata.json
@@ -139,7 +173,9 @@ outputs
   ridge is each patch's LAMBDA; ge_cv_r2 the held-out R² of the full model
   (selection runs only, never SE); noise_gain the white-noise RMS gain of the
   correction (1 = noise unchanged); removed_rms the RMS of the removed series
-  (% signal change, all runs); depth is equivolume, 0 at white, 1 at pial.
+  (% signal change, all runs); depth is equivolume, 0 at white, 1 at pial
+  (a shell voxel's is its nearest ribbon voxel's).  -save_fit with -removal
+  voxel writes each voxel's own fit (local + gain x transport + shift).
   phys_cv_r2 is each patch's held-out R² under the chosen physiology, and
   phys_best the candidate (row of the TSV) that patch alone would have chosen:
   a map of how much the choice varies, not a per-patch correction.
@@ -214,6 +250,15 @@ def create_parser() -> FfsArgumentParser:
         "between neighbouring columns",
     )
 
+    surf.add_argument(
+        "-extend_mm",
+        type=float,
+        default=2.0,
+        help="Also correct voxels up to this far outside the ribbon (into WM and past "
+        "pial, where pial veins sit), each with its nearest ribbon voxel's column and "
+        "depth. Voxel removal only; 0 = ribbon only",
+    )
+
     vol = parser.add_argument_group("Volume depth (instead of surfaces)")
     vol.add_argument(
         "-depth",
@@ -270,6 +315,25 @@ def create_parser() -> FfsArgumentParser:
         default=None,
         metavar="JSON",
         help="Override the fixed physiology. See 'physiology' below",
+    )
+
+    vox = parser.add_argument_group("Voxel removal")
+    vox.add_argument(
+        "-removal",
+        choices=("voxel", "column"),
+        default="voxel",
+        help="voxel: each voxel scales its column's transport by its own gain (needs "
+        ">= 2 runs). column: every voxel at a depth loses the same column transport",
+    )
+    vox.add_argument(
+        "-gain_lambdas",
+        type=float,
+        nargs="+",
+        default=[0.01, 0.1, 1.0, 10.0, 1e4],
+        metavar="LAMBDA",
+        help="How hard a voxel's gain is pulled toward the column model (1e4 = the "
+        "column, 0.01 = free); each voxel picks one by leave-one-run-out. See 'voxel "
+        "gains' below",
     )
 
     inv = parser.add_argument_group("Inverse")
@@ -459,6 +523,11 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit("ERROR: need -depths >= 2 and 0 < -gm_threshold <= 1")
     if any(x <= 0 for x in args.ridge):
         sys.exit("ERROR: -ridge values must be positive")
+    if any(x <= 0 for x in args.gain_lambdas) or args.extend_mm < 0:
+        sys.exit("ERROR: -gain_lambdas must be positive and -extend_mm >= 0")
+    if args.removal == "voxel" and len(args.input) < 2:
+        sys.exit("ERROR: -removal voxel picks each voxel's gain by leave-one-run-out: "
+                 "give >= 2 runs, or -removal column")  # fmt: skip
     if args.onsets and args.events:
         sys.exit("ERROR: give -onsets/-durations or -events, not both")
     if args.onsets and args.durations is None:
@@ -557,7 +626,15 @@ def main(argv: list[str] | None = None) -> None:
         labels_vol = cols.numpy().astype(np.int64) - 1
         candidates &= labels_vol >= 0
 
-    cand_idx = np.flatnonzero(candidates)
+    from fastfuncstuff.processing.hrftdv import nearest_labelled
+
+    spacing = np.sqrt(np.square(header["affine"][:3, :3]).sum(0))[::-1]  # (Z, Y, X)
+    extend = args.extend_mm if args.removal == "voxel" else 0.0
+    shell_c = (
+        nearest_labelled(np.where(candidates, 0, -1), spacing, extend).reshape(candidates.shape)
+        >= 0
+    )
+    cand_idx = np.flatnonzero(candidates | shell_c)
     series, covered = [], np.ones(cand_idx.size, bool)
     for i, path in enumerate(files):
         d, h = (first, header) if i == 0 else load_image(path)
@@ -573,21 +650,28 @@ def main(argv: list[str] | None = None) -> None:
         series.append(s)
         del d
     del first
-    mask = np.zeros(candidates.size, bool)
-    mask[cand_idx[covered]] = True
-    mask = mask.reshape(candidates.shape)
-    if not mask.any():
+    ok = np.zeros(candidates.size, bool)
+    ok[cand_idx[covered]] = True
+    ribbon = candidates & ok.reshape(candidates.shape)
+    if not ribbon.any():
         sys.exit("ERROR: no ribbon voxels positive in every run")
-    runs = [s[torch.from_numpy(covered)] for s in series]
-    del series
-    depth = depth_vol[mask]
+    lab_vol = np.full(candidates.shape, -1, np.int64)
     if labels_vol is None:
         from fastfuncstuff.processing.laminar_tdv import depth_patches
 
-        spacing = np.sqrt(np.square(header["affine"][:3, :3]).sum(0))[::-1]
-        labels = depth_patches(mask, depth_vol, spacing, args.patch_mm)
+        lab_vol[ribbon] = depth_patches(ribbon, depth_vol, spacing, args.patch_mm)
     else:
-        labels = labels_vol[mask]
+        lab_vol[ribbon] = labels_vol[ribbon]
+    # Shell voxels inherit the nearest covered ribbon voxel's column and depth.
+    src = nearest_labelled(lab_vol, spacing, extend).reshape(candidates.shape)
+    shell = shell_c & ok.reshape(candidates.shape) & (src >= 0)
+    lab_vol[shell] = lab_vol.reshape(-1)[src[shell]]
+    depth_vol = np.where(shell, depth_vol.reshape(-1)[np.maximum(src, 0)], depth_vol)
+    mask = ribbon | shell
+    rows = np.searchsorted(cand_idx, np.flatnonzero(mask))
+    runs = [s[torch.from_numpy(rows)] for s in series]
+    del series
+    depth, labels, in_columns = depth_vol[mask], lab_vol[mask], ribbon[mask]
 
     polort = max_polort(resolve_polort(args.polort, [n_t] * len(runs), tr, verbose=verbose))
     overrides = json.loads(Path(args.vascular_json).read_text()) if args.vascular_json else {}
@@ -609,7 +693,10 @@ def main(argv: list[str] | None = None) -> None:
     if timing is not None:
         from fastfuncstuff.processing.laminar_tdv import column_profiles, physiology_crossval
 
-        columns = column_profiles(runs, depth, labels, args.depths, polort, device)
+        columns = column_profiles(
+            runs, depth, labels, args.depths, polort, device, use=in_columns,
+            robust=args.removal == "voxel",
+        )  # fmt: skip
         design_for = _design_builder(args, timing, files, n_t, tr, verbose)
         candidates = [replace(baselines, **values) for values in grid]
         cv = physiology_crossval(
@@ -629,7 +716,8 @@ def main(argv: list[str] | None = None) -> None:
     if verbose:
         print(
             f"  {len(runs)} runs x {n_t} volumes, TR {tr:g} s, TE {te * 1e3:g} ms, {b0:g} T; "
-            f"{len(labels):,} ribbon voxels in {len(np.unique(labels)):,} patches; "
+            f"{int(in_columns.sum()):,} ribbon + {int((~in_columns).sum()):,} shell voxels in "
+            f"{len(np.unique(labels)):,} patches; {args.removal} removal; "
             f"target {args.target}, {args.transfer_mode} transfer, "
             + ("events-chosen physiology" if cv is not None else "fixed physiology")
         )
@@ -646,6 +734,9 @@ def main(argv: list[str] | None = None) -> None:
         cutoff_hz=args.cutoff_hz,
         polort=polort,
         columns=columns,
+        removal=args.removal,
+        in_columns=in_columns,
+        gain_lambdas=tuple(args.gain_lambdas),
         verbose=verbose,
     )
     del runs
@@ -673,9 +764,15 @@ def main(argv: list[str] | None = None) -> None:
         "noise_gain": result.noise_gain,
         "removed_rms": removed_rms,
         "valid": result.valid,
+        "shell": ~in_columns,
         "patch": labels + 1,
         "depth": 1 - depth,  # 0 white .. 1 pial, as ffs_hrftdv writes it
     }
+    if result.gains is not None:
+        for i, term in enumerate(("local", "transport", "shift")):
+            bricks[f"gain_{term}"] = result.gains.beta[:, i]
+        bricks["gain_lambda"] = result.gains.lam
+        bricks["gain_cv"] = result.gains.cv_gain
     if cv is not None and columns is not None:
         patch_r2, patch_best = np.zeros(len(depth), np.float32), np.zeros(len(depth), np.float32)
         r2 = cv.patch_r2
@@ -720,7 +817,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if verbose:
         v = result.valid
-        print(f"\n  Corrected {int(v.sum()):,}/{int(mask.sum()):,} ribbon voxels "
+        print(f"\n  Corrected {int(v.sum()):,}/{int(mask.sum()):,} ribbon + shell voxels "
               f"({int(mask.sum() - v.sum()):,} in patches missing a depth: unchanged)")  # fmt: skip
         if v.any():
             if len(args.ridge) > 1:
@@ -729,13 +826,26 @@ def main(argv: list[str] | None = None) -> None:
                     f"{r:g} {np.mean(chosen == np.float32(r)):.0%}" for r in args.ridge))  # fmt: skip
                 print(f"  Held-out R² of the model (median): {np.nanmedian(result.cv_r2[v]):.3f}")
             print(f"  Noise gain (median): {np.median(result.noise_gain[v]):.3f}")
-            print("  Removed RMS by depth (% signal; 0 = white, 1 = pial):")
+            g = result.gains
+            print("  Removed RMS (% signal) by depth, 0 = white, 1 = pial"
+                  + (";  transport gain median / 95th pct" if g is not None else "") + ":")  # fmt: skip
             wp = 1 - depth
-            for a in np.linspace(0, 0.8, 5):
-                k = v & (wp >= a) & (wp < a + 0.2 + 1e-9)
-                if k.any():
-                    print(f"    {a:.1f}-{a + 0.2:.1f}  n={int(k.sum()):7d}  "
-                          f"median {np.median(removed_rms[k]):.3f}")  # fmt: skip
+            groups = [(f"{a:.1f}-{a + 0.2:.1f}", in_columns & (wp >= a) & (wp < a + 0.2 + 1e-9))
+                      for a in np.linspace(0, 0.8, 5)] + [("shell", ~in_columns)]  # fmt: skip
+            for name, k in groups:
+                k = v & k
+                if not k.any():
+                    continue
+                line = f"    {name:7s}  n={int(k.sum()):7d}  median {np.median(removed_rms[k]):.3f}"
+                if g is not None:
+                    gt = g.beta[k, 1]
+                    line += f"   gain {np.median(gt):5.2f} / {np.percentile(gt, 95):5.2f}"
+                print(line)
+            if g is not None:
+                free = g.lam[v] < max(args.gain_lambdas)
+                print(f"  Own gain beat the column model (held out) in {free.mean():.0%} of "
+                      f"voxels; median held-out R² gained there "
+                      f"{np.median(g.cv_gain[v][free]) if free.any() else 0:.3f}")  # fmt: skip
         print(f"  Wrote {pfx.stem}_corrected_run-NN{ext}, _removed_psc_run-NN, _ltdv{ext} "
               f"({time.time() - t0:.0f} s)")  # fmt: skip
 

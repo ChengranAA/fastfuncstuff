@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -12,7 +13,7 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.glm.xval import project_out_nuisance_per_run
-from fastfuncstuff.laminar.params import ModelSpec
+from fastfuncstuff.laminar.params import P0, ModelSpec
 from fastfuncstuff.laminar.timeseries import (
     dynamic_inverse,
     linearized_vasculature,
@@ -82,6 +83,143 @@ def depth_interpolation(depth: np.ndarray, K: int) -> np.ndarray:
 
 
 @dataclass
+class ColumnProfiles:
+    """Each valid patch's detrended PSC depth profile and how its bins were read."""
+
+    members: list[np.ndarray]  # voxel indices per valid patch
+    profiles: torch.Tensor  # R x U x T x K
+    sampling: torch.Tensor  # U x K x K, physiological depths -> measured bins
+    noise_cov: torch.Tensor  # U x K x K, bin covariance from shared voxels
+    read: np.ndarray  # V x K point-sample weights
+    nuisance: list[torch.Tensor]  # per run, T x n_poly
+
+
+def column_profiles(
+    runs: list[torch.Tensor],
+    depth: np.ndarray,
+    labels: np.ndarray,
+    K: int,
+    polort: int,
+    device: torch.device,
+) -> ColumnProfiles:
+    """Percent change, per-run Legendre drift removed, averaged into K bins per patch.
+
+    Patches that do not observe every model depth are left out (they pass through).
+    """
+    if not runs or any(r.ndim != 2 or r.shape != runs[0].shape for r in runs):
+        raise ValueError("runs must have the same (voxels,time) shape")
+    V, T = runs[0].shape
+    if len(labels) != V or len(depth) != V or T < 4:
+        raise ValueError("depth/labels must match voxels and runs need >=4 samples")
+    if not all(torch.isfinite(r).all() and (r.mean(-1) > 0).all() for r in runs):
+        raise ValueError("runs need finite data and positive voxel means")
+    R = len(runs)
+    read = depth_interpolation(depth, K)
+    unique, inverse = np.unique(labels, return_inverse=True)
+    members, samples, covs, sampling = [], [], [], []
+    psc = torch.cat([100 * (r / r.mean(-1, keepdim=True) - 1) for r in runs], -1)
+    starts = [i * T for i in range(R)]
+    nuisance = [construct_polynomial_matrix(T, polort, device, torch.float32) for _ in runs]
+    psc, _ = project_out_nuisance_per_run(
+        psc, torch.empty(R * T, 0, device=device), nuisance, starts, device=device, verbose=False
+    )
+    # Spatial means use CPU storage; only the depth inverse is sent to compute.
+    psc_np = psc.cpu().numpy().reshape(V, R, T).transpose(1, 0, 2)
+    del psc
+    for unit in range(len(unique)):
+        ix = np.flatnonzero(inverse == unit)
+        W = read[ix].T
+        mass = W.sum(-1)
+        # Every model depth must be observed; interpolating missing depths would
+        # manufacture the independent information the inverse needs.
+        if ix.size < 2 * K or mass.min() < 1.0:
+            continue
+        S = W / mass[:, None]
+        members.append(ix)
+        sampling.append(S @ read[ix])
+        covs.append(S @ S.T)
+        samples.append(np.stack([S @ psc_np[r, ix] for r in range(R)]).transpose(0, 2, 1))
+    if not samples:
+        raise ValueError("no patch spans every model depth; enlarge patches or reduce -depths")
+    return ColumnProfiles(
+        members,
+        torch.as_tensor(np.stack(samples, axis=1)),
+        torch.as_tensor(np.stack(sampling)),
+        torch.as_tensor(np.stack(covs)),
+        read,
+        nuisance,
+    )
+
+
+@dataclass
+class PhysiologyCV:
+    """Leave-one-run-out design prediction for each candidate physiology."""
+
+    candidates: list[P0]
+    sse: np.ndarray  # P x U held-out whitened SSE
+    total: np.ndarray  # U
+
+    @property
+    def pooled_r2(self) -> np.ndarray:
+        return 1 - self.sse.sum(1) / self.total.sum()
+
+    @property
+    def patch_r2(self) -> np.ndarray:
+        return 1 - self.sse / np.maximum(self.total, 1e-30)
+
+    @property
+    def best(self) -> int:
+        return int(np.argmax(self.pooled_r2))
+
+
+def physiology_crossval(
+    columns: ColumnProfiles,
+    candidates: list[P0],
+    spec: ModelSpec,
+    design_for: Callable[[torch.Tensor], list[torch.Tensor]],
+    *,
+    params: dict[str, torch.Tensor] | None = None,
+    microtime_dt: float = 0.1,
+    tail_seconds: float = 60.0,
+    verbose: bool = True,
+) -> PhysiologyCV:
+    """Score candidate fixed physiologies by how well each run's events predict it.
+
+    ``design_for(cbf_curve)`` returns per-run ``(T, C)`` regressors for a CBF
+    response sampled every ``microtime_dt`` s. Every candidate is scored on the
+    same profiles, so the comparison is paired. See ``design_crossval`` for what
+    the free amplitudes can and cannot tell apart.
+    """
+    from fastfuncstuff.laminar.timeseries import cbf_kernel, design_crossval
+
+    R, U, T, K = columns.profiles.shape
+    n_fft = T + int(np.ceil(tail_seconds / spec.TR))
+    freq = torch.fft.rfftfreq(n_fft, spec.TR)
+    sse = np.empty((len(candidates), U))
+    total = np.empty(U)
+    for i, p0 in enumerate(
+        tqdm(
+            candidates, desc="Physiology CV", leave=True, disable=not verbose or len(candidates) < 2
+        )
+    ):
+        cand = replace(spec, N=K, p0=p0)
+        full, _ = vascular_transfer(linearized_vasculature(cand, params), freq)
+        designs = design_for(cbf_kernel(cand, params, microtime_dt))
+        err, tot = design_crossval(
+            columns.profiles,
+            designs,
+            full,
+            n_fft,
+            nuisance=columns.nuisance,
+            sampling=columns.sampling,
+            noise_cov=columns.noise_cov,
+            device=spec.device,
+        )
+        sse[i], total[:] = err.numpy(), tot.numpy()
+    return PhysiologyCV(list(candidates), sse, total)
+
+
+@dataclass
 class VolumeTdvResult:
     corrected: list[torch.Tensor]  # input units, V x T per run, original means retained
     removed_psc: list[torch.Tensor]  # V x T
@@ -106,6 +244,7 @@ def devein_volume_runs(
     pad_seconds: float = 60.0,
     cutoff_hz: float = 0.1,
     polort: int = 2,
+    columns: ColumnProfiles | None = None,
     verbose: bool = True,
 ) -> VolumeTdvResult:
     """Estimate patch transport jointly, subtract from individual voxel data.
@@ -113,48 +252,23 @@ def devein_volume_runs(
     Multi-strength selection assumes matched task timing across equal-length
     runs. SE data must never enter this function or select its hyperparameters.
     Insufficient-depth patches pass through unchanged and are marked invalid.
+    ``columns`` reuses profiles already built (with the same ``polort``).
     """
-    if not runs or any(r.ndim != 2 or r.shape != runs[0].shape for r in runs):
-        raise ValueError("runs must have the same (voxels,time) shape")
-    V, T = runs[0].shape
-    if len(labels) != V or len(depth) != V or T < 4 or pad_seconds < 0:
-        raise ValueError("depth/labels must match voxels; need >=4 samples and nonnegative padding")
-    if not all(torch.isfinite(r).all() and (r.mean(-1) > 0).all() for r in runs):
-        raise ValueError("runs need finite data and positive voxel means")
+    if pad_seconds < 0:
+        raise ValueError("padding must be nonnegative")
     device = spec.device
     R, K = len(runs), spec.K
-    read = depth_interpolation(depth, K)
-    unique, inverse = np.unique(labels, return_inverse=True)
-    members, samples, covs, sampling = [], [], [], []
+    if columns is None:
+        columns = column_profiles(runs, depth, labels, K, polort, device)
+    V, T = runs[0].shape
+    members, read, nuisance = columns.members, columns.read, columns.nuisance
     means = [r.mean(-1, keepdim=True) for r in runs]
-    psc = torch.cat([100 * (r / m - 1) for r, m in zip(runs, means, strict=True)], -1)
     starts = [i * T for i in range(R)]
-    nuisance = [construct_polynomial_matrix(T, polort, device, torch.float32) for _ in runs]
-    psc, _ = project_out_nuisance_per_run(
-        psc, torch.empty(R * T, 0, device=device), nuisance, starts, device=device, verbose=False
-    )
-    # Spatial means use CPU storage; only the depth inverse is sent to compute.
-    psc_np = psc.cpu().numpy().reshape(V, R, T).transpose(1, 0, 2)
-    for unit in range(len(unique)):
-        ix = np.flatnonzero(inverse == unit)
-        W = read[ix].T
-        mass = W.sum(-1)
-        # Every model depth must be observed; interpolating missing depths would
-        # manufacture the independent information the inverse needs.
-        if ix.size < 2 * K or mass.min() < 1.0:
-            continue
-        S = W / mass[:, None]
-        members.append(ix)
-        sampling.append(S @ read[ix])
-        covs.append(S @ S.T)
-        samples.append(np.stack([S @ psc_np[r, ix] for r in range(R)]).transpose(0, 2, 1))
     removed = [torch.zeros_like(r) for r in runs]
     smooth = [torch.zeros_like(r) for r in runs]
     diagnostics = [np.full(V, np.nan, np.float32) for _ in range(3)]
     valid = np.zeros(V, bool)
-    if not samples:
-        raise ValueError("no patch spans every model depth; enlarge patches or reduce -depths")
-    profiles = torch.as_tensor(np.stack(samples, axis=1))
+    profiles = columns.profiles
     pad = min(int(round(pad_seconds / spec.TR)), T - 1)
     system = linearized_vasculature(replace(spec, N=K), params)
     frequencies = torch.fft.rfftfreq(T + 2 * pad, spec.TR)
@@ -167,8 +281,8 @@ def devein_volume_runs(
         profiles,
         full,
         desired,
-        sampling=torch.as_tensor(np.stack(sampling)),
-        noise_cov=torch.as_tensor(np.stack(covs)),
+        sampling=columns.sampling,
+        noise_cov=columns.noise_cov,
         strengths=strengths,
         tr=spec.TR,
         pad=pad,

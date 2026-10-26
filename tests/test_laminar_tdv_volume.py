@@ -197,3 +197,63 @@ def test_cli_surfaces_remove_deep_drainage_and_leave_the_rest(tmp_path):
     np.testing.assert_array_equal(out[~valid], raw[~valid])
     leak = signal[(frac[ribbon] > 0.75)].std(1).mean()
     assert np.abs(out[sup] - 100).std(-1).mean() < 0.5 * leak
+
+
+def test_cli_events_choose_the_generating_physiology(tmp_path):
+    """Three runs, three different schedules: leave-one-run-out must pick the true t0v."""
+    from dataclasses import replace
+
+    from fastfuncstuff.laminar.pipeline import reference_p0
+    from fastfuncstuff.laminar.timeseries import (
+        cbf_kernel,
+        linearized_vasculature,
+        vascular_transfer,
+    )
+
+    T, K, tr, shape = 150, 3, 2.0, (5, 4, 3)
+    # Truth on the CLI's own baselines, so only t0v differs between candidates.
+    spec = ModelSpec(N=K, K=K, TR=tr, p0=replace(reference_p0(), t0v=1.0), device=CPU)
+    n_fft = T + 30
+    h, _ = vascular_transfer(linearized_vasculature(spec), torch.fft.rfftfreq(n_fft, tr))
+    kernel = cbf_kernel(spec, dt=0.1).double().numpy()
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), 20)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    beta = torch.tensor([[2.0, 1.0], [1.5, 0.5], [1.0, 1.0]], dtype=torch.float64)  # depth x cond
+    rng = np.random.default_rng(7)
+    info = {"affine": np.eye(4)}
+    for run in range(3):
+        on = np.round(np.cumsum(rng.uniform(5, 11, 40)), 1)
+        on = on[on < T * tr - 20]
+        cond = rng.integers(0, 2, on.size)
+        (tmp_path / f"ev{run}.tsv").write_text(
+            "onset\tduration\ttrial_type\n"
+            + "".join(f"{o:.1f}\t2\t{'ab'[c]}\n" for o, c in zip(on, cond, strict=True))
+        )
+        stim = np.zeros((2, int(T * tr / 0.1)))
+        for o, c in zip(on, cond, strict=True):
+            stim[c, int(round(o / 0.1)) : int(round((o + 2) / 0.1))] = 1
+        X = np.stack([np.convolve(s, kernel)[: s.size][::20][:T] * 0.1 for s in stim], -1)
+        Xf = torch.fft.rfft(torch.from_numpy(X), n=n_fft, dim=0)
+        Z = torch.fft.irfft(h[..., None] * Xf[:, None, None, :], n=n_fft, dim=0)[:T]
+        y = torch.einsum("tknc,nc->tk", Z, beta)  # PSC at model depths
+        psc = read @ y.T + 0.05 * torch.randn(len(depth), T, dtype=torch.float64)
+        data = (300 * (1 + psc / 100)).float()
+        save_image(data.T.reshape(T, *shape), tmp_path / f"r{run}.nii.gz", info)
+    save_image(torch.as_tensor(depth.reshape(shape)), tmp_path / "depth.nii.gz", info)
+    save_image(torch.ones(shape), tmp_path / "gm.nii.gz", info)
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.laminar_tdv", "-input", "r0.nii.gz",
+         "r1.nii.gz", "r2.nii.gz", "-events", "ev0.tsv", "ev1.tsv", "ev2.tsv",
+         "-cv_p0", "t0v", "0.5", "1", "2", "-depth", "depth.nii.gz", "-gmfrac", "gm.nii.gz",
+         "-depth_order", "pial_to_white", "-patch_mm", "50", "-depths", str(K), "-ridge", "0.1",
+         "-te", "0.025", "-b0", "7", "-tr", str(tr), "-polort", "1", "-device", "cpu",
+         "-prefix", "out"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=tmp_path,
+    )  # fmt: skip
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    rows = (tmp_path / "out_physiology_cv.tsv").read_text().splitlines()
+    assert rows[0].split("\t")[:2] == ["candidate", "t0v"]
+    r2 = [float(r.split("\t")[2]) for r in rows[1:]]
+    assert int(np.argmax(r2)) == 1  # t0v = 1
+    meta = json.loads((tmp_path / "out_metadata.json").read_text())
+    assert meta["p0"]["t0v"] == 1.0 and len(meta["physiology_cv"]) == 3

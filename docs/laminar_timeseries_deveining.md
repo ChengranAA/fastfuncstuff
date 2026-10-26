@@ -174,3 +174,18 @@ Saved averaged PSC volumes, paired voxel scores, JSON summaries and the depth
 figure live at
 `/mnt/belegost/openneuro_data/ds003427/derivatives/laminar_tdv/2026-10-24/`.
 The working scratch directory is `/tmp/laminar_tdv/`.
+
+## Events-based physiology cross-validation (2026-10-26)
+
+With `-events`/`-onsets`, `-cv_p0 NAME V ...` (default `s_d 0.2 0.4 0.8 × t0v
+0.5 1 2`) scores fixed physiologies by leave-one-run-out: each run's events,
+through the model's own linearised stimulus→CBF response (`cbf_kernel`, peak
+2.0 s), give each depth a CBF source with free per-depth, per-condition
+amplitudes; the transfer matrix predicts the held-out run (schedules may
+differ). The best pooled held-out R² is used; the correction itself stays
+event-free. Simulation (`ident.py`-style, K=5): t0v separates strongly (R²
+0.50 vs 0.41/0.34); s_d barely (≤0.003 R² even at TR 1, low noise), because free
+per-depth amplitudes absorb drainage strength when local and drained shapes
+are alike — only pooling over many patches resolves it. Caveat: the CBF shape
+is fixed, so on real data t0v also absorbs HRF-shape mismatch — a chosen t0v
+is fit-to-shape, not measured transit time. Events cannot choose `-ridge`.

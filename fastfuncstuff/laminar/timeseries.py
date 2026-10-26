@@ -96,6 +96,133 @@ def vascular_transfer(
     return full, desired
 
 
+def stabilized_cov(cov: torch.Tensor) -> torch.Tensor:
+    """Bin noise covariance made positive definite by an explicit, scale-relative ridge."""
+    eye = torch.eye(cov.shape[-1], device=cov.device, dtype=cov.dtype)
+    return 0.95 * cov + 0.05 * cov.diagonal(dim1=-2, dim2=-1).mean(-1)[..., None, None] * eye
+
+
+def cbf_kernel(
+    spec: ModelSpec,
+    params: dict[str, torch.Tensor] | None = None,
+    dt: float = 0.1,
+    seconds: float = 40.0,
+) -> torch.Tensor:
+    """Stimulus -> local CBF impulse response of the model's neuronal and NVC blocks.
+
+    Linearised at rest and peak-normalised, sampled every ``dt`` s. Depths share
+    scalar parameters, so one depth's response is every depth's; this is the
+    response shape a task design gives each depth's CBF source.
+    """
+    work = linalg_device(spec.device)
+    s = replace(spec, dtype=torch.float64, device=work)
+    p = (
+        zero_params(s)
+        if params is None
+        else {k: v.to(device=work, dtype=s.dtype) for k, v in params.items()}
+    )
+    cache = replace(build_cache(s, p), n2k=torch.eye(s.K, device=work, dtype=s.dtype))
+    n4 = 4 * s.N
+    x = torch.zeros(s.n_states, device=work, dtype=s.dtype)
+    u = torch.zeros(s.n_inputs, device=work, dtype=s.dtype)
+    jac = torch.func.jacfwd(lambda z: rhs(z, u, cache, s.N, s.K))(x)[:n4, :n4]
+    step = torch.linalg.matrix_exp(jac * dt)
+    state = torch.zeros(n4, device=work, dtype=s.dtype)
+    state[0] = 1.0  # excitatory drive at depth 0
+    out = torch.empty(int(round(seconds / dt)), dtype=s.dtype)
+    for i in range(out.numel()):
+        out[i] = state[3 * s.N]
+        state = step @ state
+    peak = out[out.abs().argmax()]
+    return (out / peak).float()
+
+
+def design_crossval(
+    profiles: torch.Tensor,
+    designs: list[torch.Tensor],
+    full: torch.Tensor,
+    n_fft: int,
+    *,
+    nuisance: list[torch.Tensor],
+    sampling: torch.Tensor | None = None,
+    noise_cov: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Leave-one-run-out prediction of depth profiles from each run's own events.
+
+    Each patch's CBF sources are its design (``designs[r]``, ``(T, C)``, CBF-shaped)
+    times free amplitudes per depth and condition -- one response shape at every
+    depth -- seen through ``full`` (``(F, K, K)`` at ``rfftfreq(n_fft, TR)``). The
+    amplitudes are fit on the other runs and predict the held-out one, so the runs'
+    schedules may all differ. ``n_fft - T`` zero samples take each response's tail.
+    Regressors are detrended with ``nuisance[r]`` as the profiles were. Free
+    amplitudes absorb much of a drainage-strength change, so differences between
+    physiologies are small: compare candidates on the same profiles, pooled.
+
+    Returns per-patch held-out whitened SSE and total sum of squares, ``(U,)`` each.
+    """
+    R, U, T, K = profiles.shape
+    if R < 2 or len(designs) != R or len(nuisance) != R or n_fft < T:
+        raise ValueError("need >=2 runs, a design and nuisance per run, and n_fft >= T")
+    dev = device or profiles.device
+    dtype = accum_dtype(dev)
+    H = full.to(device=dev, dtype=torch.complex128 if dtype == torch.float64 else torch.complex64)
+    zs, grams = [], []
+    for X, nuis in zip(designs, nuisance, strict=True):
+        Xf = torch.fft.rfft(X.to(device=dev, dtype=dtype), n=n_fft, dim=0)
+        Z = torch.fft.irfft(H[..., None] * Xf[:, None, None, :], n=n_fft, dim=0)[:T]
+        Z = Z.reshape(T, K, -1)  # (time, physiological depth, source depth x condition)
+        q, _ = torch.linalg.qr(nuis.to(device=dev, dtype=dtype))
+        Z = Z - (q @ (q.T @ Z.reshape(T, -1))).reshape(Z.shape)
+        zs.append(Z)
+        grams.append(torch.einsum("tjp,tkq->jkpq", Z, Z))
+    P = zs[0].shape[-1]
+    sse = torch.empty(U, dtype=torch.float64)
+    total = torch.empty(U, dtype=torch.float64)
+    chunk = estimate_chunk_size(U, T, K, dev, operation="laminar_design_cv", n_runs=R, n_designs=P)
+    eye_k = torch.eye(K, device=dev, dtype=dtype)
+    eye_p = torch.eye(P, device=dev, dtype=dtype)
+    solve_device = cpu_if_mps(dev, "solve")
+    for start in range(0, U, chunk):
+        stop = min(U, start + chunk)
+        b = stop - start
+        S = (
+            eye_k.expand(b, -1, -1)
+            if sampling is None
+            else sampling[start:stop].to(device=dev, dtype=dtype)
+        )
+        cov = (
+            eye_k.expand(b, -1, -1)
+            if noise_cov is None
+            else noise_cov[start:stop].to(device=dev, dtype=dtype)
+        )
+        cw = torch.cholesky_inverse(
+            torch.linalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky")))
+        ).to(dev)
+        metric = S.mT @ cw @ S  # whitened fit, in physiological depths
+        G = torch.stack([torch.einsum("bjk,jkpq->bpq", metric, g) for g in grams])
+        y = profiles[:, start:stop].to(device=dev, dtype=dtype)
+        v = y @ (cw @ S)[None]  # (R, b, T, K)
+        rhs_ = torch.stack([torch.einsum("tjp,btj->bp", z, v[r]) for r, z in enumerate(zs)])
+        yy = torch.einsum("rbtm,bmn,rbtn->rb", y, cw, y)
+        err = torch.zeros(b, device=dev, dtype=dtype)
+        for r in range(R):
+            g_tr, b_tr = G.sum(0) - G[r], rhs_.sum(0) - rhs_[r]
+            eps = 1e-6 * g_tr.diagonal(dim1=-2, dim2=-1).mean(-1).clamp_min(1e-30)
+            beta = torch.linalg.solve(
+                (g_tr + eps[:, None, None] * eye_p).to(solve_device),
+                b_tr[..., None].to(solve_device),
+            ).to(dev)[..., 0]
+            err += (
+                yy[r]
+                - 2 * (beta * rhs_[r]).sum(-1)
+                + (beta[:, None] @ G[r] @ beta[..., None])[:, 0, 0]
+            )
+        sse[start:stop] = err.double().cpu()
+        total[start:stop] = yy.sum(0).double().cpu()
+    return sse, total
+
+
 @dataclass
 class DynamicResult:
     correction: torch.Tensor  # (R,U,T,K), transported contribution, sample depths
@@ -181,9 +308,7 @@ def dynamic_inverse(
             if noise_cov is None
             else noise_cov[start:stop].to(device=dev, dtype=dtype)
         )
-        # Positive covariance required; the ridge is explicit and relative to its scale.
-        cov = 0.95 * cov + 0.05 * cov.diagonal(dim1=-2, dim2=-1).mean(-1)[:, None, None] * eye.real
-        chol = torch.linalg.cholesky(cov.to(cpu_if_mps(dev, "cholesky"))).to(dev)
+        chol = torch.linalg.cholesky(stabilized_cov(cov).to(cpu_if_mps(dev, "cholesky"))).to(dev)
         whiten = torch.linalg.solve_triangular(chol, eye.real.expand(b, -1, -1), upper=False).to(
             cdtype
         )

@@ -24,7 +24,13 @@ from pathlib import Path
 import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg
+from fastfuncstuff.cli_utils import (
+    add_bids_events_args,
+    add_device_arg,
+    add_microtime_offset_arg,
+    add_round_onsets_arguments,
+    add_verbose_arg,
+)
 from fastfuncstuff.surface.ribbon_args import add_ribbon_args
 
 _EPILOG = """\
@@ -80,6 +86,26 @@ targets (-target)
   micro  keep only the venule (microvascular) part: also strips each depth's
          local ascending-vein signal.  Larger change; closer in spirit to SE.
 
+events (optional; any schedule, each run its own)
+
+  With -events or -onsets, the fixed physiology can be chosen from a grid
+  (-cv_p0) instead of taken on trust.  Each run's events, through the model's
+  own stimulus -> CBF response, give every depth a CBF source with a free
+  amplitude per depth and condition; the vascular model turns those into a
+  predicted GE profile.  Leave-one-run-out: amplitudes fit on the other runs
+  predict the held-out run, whose schedule may differ.  The candidate with the
+  best held-out R² pooled over all patches is used for the correction, which
+  itself still uses no events, so non-task fluctuations are corrected too.
+  Pooled, because the score is weak per patch (below).
+
+  What it can tell apart: parameters that change response SHAPE (t0v, the tau_*)
+  separate clearly.  s_d, the drainage strength, barely does: free amplitudes
+  per depth absorb most of it, so its curve is shallow (simulated, 0.4 vs 0.8:
+  ~0.001 R²) and only pooling over many patches resolves it.  The score assumes
+  every depth's own response has one shape; a genuinely later superficial
+  response is read as drainage.  Events do not choose -ridge: a design-fitted
+  signal has no noise left for the ridge to trade against.
+
 physiology (-vascular_json)
 
   {"p0": {"s_d": 0.6, "w_v": 0.4},    baseline values (laminar/params.py:P0)
@@ -106,12 +132,17 @@ outputs
                                       a smoothing-only control
   {prefix}_ltdv.nii.gz                bucket: ridge, ge_cv_r2, noise_gain,
                                       removed_rms, valid, patch, depth
+                                      (+ events: phys_cv_r2, phys_best)
+  {prefix}_physiology_cv.tsv          (events) each candidate's pooled held-out R²
   {prefix}_metadata.json
 
   ridge is each patch's LAMBDA; ge_cv_r2 the held-out R² of the full model
   (selection runs only, never SE); noise_gain the white-noise RMS gain of the
   correction (1 = noise unchanged); removed_rms the RMS of the removed series
   (% signal change, all runs); depth is equivolume, 0 at white, 1 at pial.
+  phys_cv_r2 is each patch's held-out R² under the chosen physiology, and
+  phys_best the candidate (row of the TSV) that patch alone would have chosen:
+  a map of how much the choice varies, not a per-patch correction.
 
 what to expect
 
@@ -153,6 +184,24 @@ def create_parser() -> FfsArgumentParser:
         metavar="TESLA",
         help="Field strength (default: MagneticFieldStrength from the sidecar)",
     )
+
+    ev = parser.add_argument_group("Events (optional: cross-validate the physiology)")
+    ev.add_argument("-onsets", nargs="+", default=None, help="AFNI onset files, one per condition")
+    ev.add_argument("-durations", nargs="+", default=None, help="Durations for -onsets (s)")
+    add_bids_events_args(ev, events_help="BIDS *_events.tsv files, one per run")
+    add_round_onsets_arguments(ev, hyphen=False)
+    ev.add_argument(
+        "-cv_p0",
+        nargs="+",
+        action="append",
+        default=None,
+        metavar=("NAME", "VALUE"),
+        help="A physiology grid to score: a P0 baseline name and its candidate values "
+        "(-cv_p0 s_d 0.2 0.4 0.8). Repeat for more names; every combination is scored. "
+        "Default with events: s_d 0.2 0.4 0.8 x t0v 0.5 1 2. See 'events' below",
+    )
+    ev.add_argument("-microtime_dt", type=float, default=0.1, help="Microtime step (s)")
+    add_microtime_offset_arg(ev)
 
     surf = parser.add_argument_group("Cortical ribbon (surfaces; the usual input)")
     add_ribbon_args(surf)
@@ -303,6 +352,89 @@ def _volume_units(args, header, load_image):
     return mask, np.where(mask, d, np.nan)
 
 
+DEFAULT_CV_GRID = (("s_d", (0.2, 0.4, 0.8)), ("t0v", (0.5, 1.0, 2.0)))
+
+
+def _physiology_grid(spec: list[list[str]] | None) -> list[dict[str, float]]:
+    """-cv_p0 NAME V ... (repeatable) -> every combination, as P0 overrides."""
+    import itertools
+    from dataclasses import fields
+
+    from fastfuncstuff.laminar.params import P0
+
+    names = {f.name for f in fields(P0) if f.type in ("float", float)}
+    axes = []
+    for item in spec or []:
+        if len(item) < 2:
+            sys.exit("ERROR: -cv_p0 needs a name and at least one value")
+        if item[0] not in names:
+            sys.exit(f"ERROR: -cv_p0 {item[0]}: not a P0 baseline ({', '.join(sorted(names))})")
+        try:
+            axes.append((item[0], tuple(float(v) for v in item[1:])))
+        except ValueError:
+            sys.exit(f"ERROR: -cv_p0 {item[0]}: values must be numbers")
+    axes = axes or list(DEFAULT_CV_GRID)
+    return [dict(zip([a for a, _ in axes], combo, strict=True))
+            for combo in itertools.product(*[v for _, v in axes])]  # fmt: skip
+
+
+def _design_builder(args, timing, files, n_t, tr, verbose):
+    """Per-run (T, C) regressors for a CBF response curve, as ffs_hrftdv builds them."""
+    import torch
+
+    from fastfuncstuff.cli_utils import (
+        apply_onset_rounding,
+        microtime_offset_bins,
+        resolve_microtime_dt,
+        resolve_microtime_offset,
+    )
+    from fastfuncstuff.design.matrices import build_task_design
+
+    dt = resolve_microtime_dt(tr, args.microtime_dt)
+    try:
+        offset = resolve_microtime_offset(args.microtime_offset, files, tr)
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
+    onset_bin = microtime_offset_bins(offset, tr, dt)
+    onsets = apply_onset_rounding(args, timing.all_onsets, tr, offset, verbose=verbose)
+    durations = list(timing.durations)
+    starts = [i * n_t for i in range(len(files))]
+
+    def design_for(curve):
+        x = build_task_design(
+            curve.float()[None],
+            n_t * len(files),
+            starts,
+            tr=tr,
+            microtime_dt=dt,
+            microtime_onset=onset_bin,
+            event_onsets=onsets,
+            durations=durations,
+            device=torch.device("cpu"),
+        )
+        return list(x.split(n_t, 0))
+
+    design_for.microtime_dt = dt  # ty: ignore[unresolved-attribute]
+    return design_for
+
+
+def _write_cv_table(path: str, grid: list[dict[str, float]], cv) -> list[dict]:
+    best_per_patch = np.argmax(cv.patch_r2, axis=0)
+    rows = []
+    for i, (values, r2) in enumerate(zip(grid, cv.pooled_r2, strict=True)):
+        rows.append({"candidate": i + 1, **values, "pooled_r2": float(r2),
+                     "patch_share": float(np.mean(best_per_patch == i))})  # fmt: skip
+    cols = list(rows[0])
+    with open(path, "w") as fh:
+        fh.write("\t".join(cols) + "\n")
+        for row in rows:
+            fh.write(
+                "\t".join(f"{row[c]:g}" if isinstance(row[c], float) else str(row[c]) for c in cols)
+                + "\n"
+            )
+    return rows
+
+
 def _same_grid(a: dict, b: dict) -> bool:
     return bool(np.allclose(a["affine"], b["affine"], atol=1e-4))
 
@@ -327,6 +459,13 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit("ERROR: need -depths >= 2 and 0 < -gm_threshold <= 1")
     if any(x <= 0 for x in args.ridge):
         sys.exit("ERROR: -ridge values must be positive")
+    if args.onsets and args.events:
+        sys.exit("ERROR: give -onsets/-durations or -events, not both")
+    if args.onsets and args.durations is None:
+        sys.exit("ERROR: -durations is required with -onsets")
+    timed = bool(args.onsets or args.events)
+    if args.cv_p0 and not timed:
+        sys.exit("ERROR: -cv_p0 scores physiologies from events: give -events or -onsets")
     if len(args.ridge) > 1 and not args.repeated_runs:
         sys.exit("ERROR: several -ridge values are chosen between by leave-one-run-out, "
                  "which needs runs with the same task timing: add -repeated_runs, or "
@@ -342,13 +481,36 @@ def main(argv: list[str] | None = None) -> None:
     from fastfuncstuff.processing.laminar_tdv import devein_volume_runs
 
     verbose = args.verb >= 1
-    print("ffs_laminar_tdv is EXPERIMENTAL: fixed physiology, not validated on real data")
+    print("ffs_laminar_tdv is EXPERIMENTAL: model physiology, not validated on real data")
     device = setup_device(args.device)
     files = [str(f) for f in parse_input_files(args.input)]
     pfx = parse_prefix(args.prefix)
     ext = ".nii.gz" if pfx.nifti_ext.endswith(".gii") else pfx.nifti_ext
     Path(pfx.stem).parent.mkdir(parents=True, exist_ok=True)
     te, b0 = _acquisition(args, files[0])
+    grid = _physiology_grid(args.cv_p0) if timed else []
+    timing = None
+    if timed:
+        from fastfuncstuff.cli_utils import (
+            bids_event_kwargs,
+            check_bids_event_args,
+            parse_timing_spec,
+        )
+
+        check_bids_event_args(args, has_events=bool(args.events))
+        if len(files) < 2:
+            sys.exit("ERROR: physiology cross-validation needs at least 2 runs")
+        try:
+            timing = parse_timing_spec(
+                events=args.events,
+                onsets=args.onsets,
+                durations_arg=args.durations,
+                n_runs=len(files),
+                **bids_event_kwargs(args),
+                input_files=files,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            sys.exit(f"ERROR: {exc}")
 
     # Units need only the grid, so each run is read once here and reduced to
     # the candidate voxels; the full series is read again only to write it.
@@ -443,11 +605,33 @@ def main(argv: list[str] | None = None) -> None:
         if name not in params or params[name].ndim:
             sys.exit(f"ERROR: -vascular_json: {name} is not a scalar vascular parameter")
         params[name] = torch.as_tensor(val, device=device, dtype=spec.dtype)
+    columns, cv = None, None
+    if timing is not None:
+        from fastfuncstuff.processing.laminar_tdv import column_profiles, physiology_crossval
+
+        columns = column_profiles(runs, depth, labels, args.depths, polort, device)
+        design_for = _design_builder(args, timing, files, n_t, tr, verbose)
+        candidates = [replace(baselines, **values) for values in grid]
+        cv = physiology_crossval(
+            columns, candidates, spec, design_for, params=params,
+            microtime_dt=design_for.microtime_dt, verbose=verbose,
+        )  # fmt: skip
+        baselines = candidates[cv.best]
+        spec = replace(spec, p0=baselines)
+        rows = _write_cv_table(f"{pfx.stem}_physiology_cv.tsv", grid, cv)
+        if verbose:
+            print("  Physiology, leave-one-run-out from events (pooled held-out R²):")
+            for row in rows:
+                star = " <- used" if row["candidate"] == cv.best + 1 else ""
+                vals = ", ".join(f"{k} {v:g}" for k, v in grid[row["candidate"] - 1].items())
+                print(f"    {row['candidate']:3d}  {vals:28s} {row['pooled_r2']:.4f}  "
+                      f"(best in {row['patch_share']:.0%} of patches){star}")  # fmt: skip
     if verbose:
         print(
             f"  {len(runs)} runs x {n_t} volumes, TR {tr:g} s, TE {te * 1e3:g} ms, {b0:g} T; "
             f"{len(labels):,} ribbon voxels in {len(np.unique(labels)):,} patches; "
-            f"target {args.target}, {args.transfer_mode} transfer, fixed physiology"
+            f"target {args.target}, {args.transfer_mode} transfer, "
+            + ("events-chosen physiology" if cv is not None else "fixed physiology")
         )
     result = devein_volume_runs(
         runs,
@@ -461,6 +645,7 @@ def main(argv: list[str] | None = None) -> None:
         pad_seconds=args.pad_seconds,
         cutoff_hz=args.cutoff_hz,
         polort=polort,
+        columns=columns,
         verbose=verbose,
     )
     del runs
@@ -491,6 +676,13 @@ def main(argv: list[str] | None = None) -> None:
         "patch": labels + 1,
         "depth": 1 - depth,  # 0 white .. 1 pial, as ffs_hrftdv writes it
     }
+    if cv is not None and columns is not None:
+        patch_r2, patch_best = np.zeros(len(depth), np.float32), np.zeros(len(depth), np.float32)
+        r2 = cv.patch_r2
+        for u, ix in enumerate(columns.members):
+            patch_r2[ix] = r2[cv.best, u]
+            patch_best[ix] = int(np.argmax(r2[:, u])) + 1
+        bricks["phys_cv_r2"], bricks["phys_best"] = patch_r2, patch_best
     bucket = torch.zeros(len(bricks), *header["shape"])
     for i, values in enumerate(bricks.values()):
         bucket[i][torch.from_numpy(mask)] = torch.as_tensor(
@@ -512,7 +704,17 @@ def main(argv: list[str] | None = None) -> None:
         "n_ribbon": int(mask.sum()),
         "n_patches": int(len(np.unique(labels))),
         "depth_convention": "ltdv depth brick: 0 = white, 1 = pial",
-        "calibration": "fixed physiology; leave-one-run-out ridge on the inputs only",
+        "calibration": (
+            "physiology chosen from events by pooled leave-one-run-out design prediction"
+            if cv is not None
+            else "fixed physiology"
+        ),
+        "physiology_cv": None
+        if cv is None
+        else [
+            {**values, "pooled_r2": float(r2)}
+            for values, r2 in zip(grid, cv.pooled_r2, strict=True)
+        ],
     }
     Path(f"{pfx.stem}_metadata.json").write_text(json.dumps(meta, indent=2, default=str))
 

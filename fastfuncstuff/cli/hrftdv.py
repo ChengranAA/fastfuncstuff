@@ -244,7 +244,7 @@ def main(argv: list[str] | None = None) -> None:
     from fastfuncstuff.design.shifted_hrf import build_shape_library
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.processing import hrftdv as tdv
-    from fastfuncstuff.surface.volume_depth import cortical_depth_volumes, resolve_ribbon_surfaces
+    from fastfuncstuff.surface.volume_depth import resolve_ribbon_surfaces
 
     verbose = args.verb >= 1
     pfx = parse_prefix(args.prefix)
@@ -307,25 +307,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     except ValueError as exc:
         sys.exit(f"ERROR: {exc}")
-    dv = cortical_depth_volumes(surfaces, affine, shape, n_layers=3, owners=True, device=device)
-    assert dv.owner_hemi is not None and dv.owner_vertex is not None
-    in_cov = coverage.reshape(-1)[dv.gm_idx]
-    gm_idx, o_hemi, o_vert = dv.gm_idx[in_cov], dv.owner_hemi[in_cov], dv.owner_vertex[in_cov]
-    depth_flat = np.full(int(np.prod(shape)), np.nan, np.float32)
-    depth_flat[dv.gm_idx] = dv.equivol
-    label = np.full(int(np.prod(shape)), -1, np.int64)
-    n_units = 0
-    for h, s in enumerate(surfaces):
-        sel = o_hemi == h
-        if not sel.any():
-            continue
-        mid = 0.5 * (np.asarray(s.white, np.float64) + np.asarray(s.pial, np.float64))
-        vlab = tdv.surface_patches(mid, np.asarray(s.faces), o_vert[sel], args.patch_mm)
-        lab = vlab[o_vert[sel]]
-        ok = lab >= 0
-        label[gm_idx[sel][ok]] = lab[ok] + n_units
-        n_units += int(vlab.max()) + 1
+    patches = tdv.ribbon_patches(surfaces, affine, shape, coverage, args.patch_mm, device)
+    depth_flat, n_units = patches.depth, patches.n_patches
     n_patches = n_units
+    label = patches.label
     label_vol = tdv.extend_labels(label.reshape(shape), voxel_mm, args.extend_mm)
     label_vol[~coverage] = -1
     label = label_vol.reshape(-1)

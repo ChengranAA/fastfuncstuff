@@ -941,6 +941,17 @@ def _load_stimulus_run(path: str, downsample: int = 0) -> tuple[torch.Tensor, tu
     return frames.contiguous(), (rows, columns)
 
 
+def _pad_stimulus_frames(frames: torch.Tensor, target: int, location: str) -> torch.Tensor:
+    """Extend a stimulus to ``target`` frames with blank (no-stimulus) frames."""
+    n_missing = target - frames.shape[0]
+    print(
+        f"  Note: {location} has {frames.shape[0]} frames for a {target}-TR run; "
+        f"padding the last {n_missing} TR(s) with blank frames (no visual stimulus)"
+    )
+    padding = torch.zeros((n_missing, frames.shape[1]), dtype=frames.dtype)
+    return torch.cat((frames, padding), dim=0).contiguous()
+
+
 def _load_stimulus_sources(
     sources: list[str | list[str]],
     run_lengths: list[int],
@@ -953,6 +964,12 @@ def _load_stimulus_sources(
     one run's frames to be reused by all of them -- the two cases retinotopy
     actually produces, and the frame count tells them apart unambiguously. A
     repeated identical sweep (the common design) is the reuse case.
+
+    A source short of the run it maps to is zero-padded at the end, because the
+    stimulus program writes a frame per presented TR while the scan usually runs
+    a few volumes past it; a blank frame is literally "no stimulus then". Only
+    the unambiguous shortfalls are padded: a short multi-run *concatenated*
+    source cannot say which run the missing frames belong to.
     """
     runs: list[torch.Tensor] = []
     stimulus_shape: tuple[int, int] | None = None
@@ -983,6 +1000,13 @@ def _load_stimulus_sources(
         mapped_lengths = run_lengths[len(runs) : len(runs) + n_runs]
         expected_frames = sum(mapped_lengths)
         n_frames = frames.shape[0]
+        uniform_length = mapped_lengths[0] if len(set(mapped_lengths)) == 1 else None
+        if n_frames < expected_frames and n_runs == 1:
+            frames = _pad_stimulus_frames(frames, expected_frames, location)
+            n_frames = expected_frames
+        elif n_runs > 1 and uniform_length is not None and n_frames < uniform_length:
+            frames = _pad_stimulus_frames(frames, uniform_length, location)
+            n_frames = uniform_length
         if n_frames == expected_frames:
             offset = 0
             for run_length in mapped_lengths:

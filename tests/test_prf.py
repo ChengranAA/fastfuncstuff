@@ -1777,3 +1777,35 @@ def test_supergrid_drive_hoist_matches_per_hrf_fit(monkeypatch):
     reference = prf.fit_prf_supergrid(data, stimuli, (3, 3), grid, library, [0, 17], **kwargs)
     for name in ("candidate_index", "hrf_index", "gain", "correlation", "correlation_per_hrf"):
         torch.testing.assert_close(getattr(new, name), getattr(reference, name), rtol=0, atol=0)
+
+
+def test_short_source_is_padded_with_blank_frames(monkeypatch, capsys):
+    """A stimulus program that stops before the scan does gets blank tail frames."""
+    frames = torch.ones(3, 6)
+
+    monkeypatch.setattr(
+        "fastfuncstuff.cli.pyrf._load_stimulus_run",
+        lambda path, downsample=0: (frames, (2, 3)),
+    )
+
+    runs, shape = _load_stimulus_sources(["short"], [5])
+
+    assert shape == (2, 3)
+    assert runs[0].shape == (5, 6)
+    torch.testing.assert_close(runs[0][:3], frames)
+    assert runs[0][3:].abs().max() == 0
+    assert "padding the last 2 TR(s)" in capsys.readouterr().out
+
+
+def test_short_reused_source_is_padded_once_per_run(monkeypatch):
+    """A reused sweep shorter than its runs pads to one run's length, not the concatenation."""
+    frames = torch.ones(3, 6)
+
+    monkeypatch.setattr(
+        "fastfuncstuff.cli.pyrf._load_stimulus_run",
+        lambda path, downsample=0: (frames, (2, 3)),
+    )
+
+    runs, _ = _load_stimulus_sources([["one_sweep", "2"]], [4, 4])
+
+    assert [run.shape for run in runs] == [(4, 6), (4, 6)]

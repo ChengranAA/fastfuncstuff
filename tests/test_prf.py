@@ -1809,3 +1809,21 @@ def test_short_reused_source_is_padded_once_per_run(monkeypatch):
     runs, _ = _load_stimulus_sources([["one_sweep", "2"]], [4, 4])
 
     assert [run.shape for run in runs] == [(4, 6), (4, 6)]
+
+
+@pytest.mark.parametrize(
+    ("hrf_mode", "expected"),
+    [("library", "grid+1"), ("canonical", "grid+1"), ("pighs", "grid-2")],
+)
+def test_hrf_select_defaults_to_a_window_matched_to_the_library(hrf_mode, expected, tmp_path):
+    """The default refines a narrow window, ranked for pighs because it is unordered."""
+    from fastfuncstuff.cli.pyrf import _default_hrf_select, create_parser
+
+    parsed = create_parser().parse_args(
+        ["-input", str(tmp_path / "run.nii.gz"), "-hrf", hrf_mode, "-prefix", "out.nii.gz"]
+    )
+
+    # None at parse time so an explicit -hrf_select is distinguishable from the
+    # default; main() resolves it against the library actually requested.
+    assert parsed.hrf_select is None
+    assert _default_hrf_select(parsed.hrf_mode) == expected

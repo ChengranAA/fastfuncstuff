@@ -258,10 +258,10 @@ RELIABILITY  (-xval halves)
   climb is just a shrinking sample.
 
 CHOOSING SETTINGS  (measured on 3 runs x 300 TRs, one subject -- confirm on yours)
-  -hrf_select     'grid+1' is the sweet spot: it agrees with the full 20-HRF
-                  search on 96% of well-fit voxels at equal R2, for well under
-                  half the time. Plain 'grid' is cheaper again and still agrees
-                  ~84% of the time; the grid choice is within one library step
+  -hrf_select     'grid+1' is the sweet spot and the default: it agrees with the
+                  full 20-HRF search on 96% of well-fit voxels at equal R2, for
+                  well under half the time. Plain 'grid' is cheaper again and
+                  still agrees ~84% of the time; the grid choice is within one library step
                   of the refined one essentially always, which is exactly why
                   grid+1 works and grid+2 adds nothing. grid+N walks the library
                   by INDEX, so it only makes sense when the library is ordered by
@@ -320,6 +320,17 @@ PLEASE CITE Kay et al. 2013 if you publish results from this tool.
 # Sub-bricks that describe the input data rather than the fit, and so stay valid
 # for voxels that were never fitted.
 _DATA_COLUMNS = frozenset({"meanvol"})
+
+
+def _default_hrf_select(hrf_mode: str) -> str:
+    """The -hrf_select the library wants: a narrow window, indexed or ranked.
+
+    Not the full 'refine': the super-grid's pick is within one library step of
+    the refined one essentially always, so a +-1 window buys ~96% agreement for
+    well under half the cost. A PIGHS library is not ordered by shape, so its
+    window has to be ranked by grid fit rather than walked by index.
+    """
+    return "grid-2" if hrf_mode == "pighs" else "grid+1"
 
 
 def _hrf_select_spec(value: str) -> str:
@@ -452,10 +463,10 @@ def create_parser() -> argparse.ArgumentParser:
         help=(
             "HRF source. 'canonical' is a single fixed double-gamma, which skips "
             "per-HRF selection entirely and is by far the fastest. 'library' is the "
-            "20-HRF double-gamma family (or -hrf_library); pair it with "
-            "-hrf_select grid+1. 'pighs' generates a half-cosine family of "
-            "-num_hrfs shapes; its draws are not ordered by shape, so pair it "
-            "with -hrf_select grid-2 rather than grid+1"
+            "20-HRF double-gamma family (or -hrf_library), refined per voxel in a "
+            "grid+1 window. 'pighs' generates a half-cosine family of "
+            "-num_hrfs shapes; its draws are not ordered by shape, so it defaults "
+            "to a grid-2 window instead"
         ),
     )
     model.add_argument(
@@ -602,15 +613,18 @@ def create_parser() -> argparse.ArgumentParser:
         "-hrf-select",
         "-hrf_select",
         type=_hrf_select_spec,
-        default="refine",
+        default=None,
         metavar="{refine,grid,grid+N,grid-N}",
         help=(
-            "How the per-voxel HRF is chosen. 'refine' refits the pRF under every "
-            "HRF and keeps the best. 'grid' keeps the super-grid's choice, which "
+            "How the per-voxel HRF is chosen. Defaults to grid+1 for -hrf "
+            "canonical/library and grid-2 for -hrf pighs, whose library is not "
+            "ordered by shape. 'refine' refits the pRF under every "
+            "HRF and keeps the best, the reference at ~4.7x the single-HRF runtime. "
+            "'grid' keeps the super-grid's choice, which "
             "matches the refined one ~84%% of the time on well-fit voxels. 'grid+N' "
             "refits only the HRFs within N *library index* steps of the grid choice: "
-            "grid+1 reaches ~96%% agreement at equal R2 for well under half the time, "
-            "and is the recommended setting for -hrf library. grid+2 measured "
+            "grid+1 reaches ~96%% agreement at equal R2 for well under half the time. "
+            "grid+2 measured "
             "identical to grid+1, because the grid choice is within one library step "
             "essentially always. The window slides at the library edges, so a voxel "
             "that picked HRF 1 is still scored on three HRFs. 'grid-N' instead refits "
@@ -1810,6 +1824,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("-num_hrfs must be positive")
     if args.hrf_library and args.hrf_mode != "library":
         parser.error("-hrf_library applies only to -hrf library")
+    if args.hrf_select is None:
+        args.hrf_select = _default_hrf_select(args.hrf_mode)
     if args.stim_downsample < 0:
         parser.error("-stim-downsample must be non-negative (0 keeps the native resolution)")
     if args.candidate_chunk < 1 or (args.batch_size is not None and args.batch_size < 1):

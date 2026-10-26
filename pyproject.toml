@@ -208,6 +208,13 @@ exclude = ["tests*", "examples*"]
 # profiling a single test -- NOT `-p no:xdist`, which unloads the plugin and
 # then dies on this very `-n`.
 addopts = "-m 'not gpu' -n auto"
+# The repo root on sys.path, because a handful of viewer tests import fixtures from
+# each other (`from tests.viewer.test_surfaces import ...`). `python -m pytest` adds
+# the working directory for free and the `pytest` script does not, so without this
+# the two invocations disagree: `make test-fast` reported 22 collection errors that
+# `python -m pytest` did not have. Set it here rather than in the Makefile so a
+# hand-typed `pytest tests/` behaves the same way.
+pythonpath = ["."]
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"

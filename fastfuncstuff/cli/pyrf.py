@@ -874,6 +874,22 @@ def create_parser() -> argparse.ArgumentParser:
     processing = parser.add_argument_group("processing")
     processing.add_argument("-mask", default=None, help="Optional brain mask")
     processing.add_argument(
+        "-do-blur",
+        "-do_blur",
+        dest="do_blur",
+        type=float,
+        metavar="FWHM",
+        default=None,
+        help=(
+            "Spatially smooth each run before fitting, FWHM in mm: a 3D Gaussian for "
+            "volume input, a heat kernel on the mesh for GIfTI input (which needs "
+            "-mask, the cortex and coverage). Blur before masking, so the edge is "
+            "not smoothed against zeros. pRF position is a centroid and survives "
+            "smoothing better than most quantities, but rfsize does not -- the blur "
+            "adds to it in quadrature"
+        ),
+    )
+    processing.add_argument(
         "-do-scale", "-do_scale", action="store_true", help="Scale to percent signal"
     )
     add_device_arg(processing, extra="MPS is available for the float32 grid and refinement paths.")
@@ -1826,6 +1842,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("-hrf_library applies only to -hrf library")
     if args.hrf_select is None:
         args.hrf_select = _default_hrf_select(args.hrf_mode)
+    from fastfuncstuff.io.gifti import is_gifti
+
+    if is_gifti(str(input_files[0]).split("[")[0]):
+        # The loader needs a GIfTI mask to know which mesh a mask belongs to, and
+        # -noise_pool_mask reaches it as a flat array (the fit/pool union).
+        if args.noise_pool_mask:
+            parser.error(
+                "-noise_pool_mask is not supported for surface input: pass the pool's "
+                "vertices in -mask and fit them, or sample the pool as its own dataset"
+            )
+        if args.do_blur is not None and not args.mask:
+            parser.error("-do_blur on surface input needs -mask (the cortex and coverage)")
     if args.stim_downsample < 0:
         parser.error("-stim-downsample must be non-negative (0 keeps the native resolution)")
     if args.candidate_chunk < 1 or (args.batch_size is not None and args.batch_size < 1):
@@ -1859,6 +1887,7 @@ def main(argv: list[str] | None = None) -> int:
         tr=args.tr,
         mask_file=None if load_mask_flat is not None else args.mask,
         mask_array=load_mask_flat,
+        blur_fwhm=args.do_blur,
         do_scale=args.do_scale,
         device=device,
         force_cpu=args.keep_on_cpu,

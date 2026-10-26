@@ -105,10 +105,16 @@ def test_cli_writes_full_grid_and_keeps_outside_voxels(tmp_path):
             "columns.nii.gz",
             "-depths",
             "3",
+            "-extend_mm",
+            "0",  # the outside voxel would otherwise be shell
             "-tr",
             "2",
-            "-strengths",
+            "-ridge",
             ".01",
+            "-te",
+            ".025",
+            "-b0",
+            "7",
             "-device",
             "cpu",
             "-prefix",
@@ -125,3 +131,189 @@ def test_cli_writes_full_grid_and_keeps_outside_voxels(tmp_path):
     assert out.shape == raw.shape
     meta = json.loads((tmp_path / "out_metadata.json").read_text())
     assert meta["n_valid"] == 59
+
+
+def test_cli_refuses_to_guess_echo_time(tmp_path):
+    runs, *_ = _runs()
+    info = {"affine": np.eye(4)}
+    save_image(runs[0].T.reshape(-1, 5, 4, 3), tmp_path / "r0.nii.gz", info)
+    (tmp_path / "r0.json").write_text(json.dumps({"MagneticFieldStrength": 7}))
+    from fastfuncstuff.cli.laminar_tdv import main
+
+    with pytest.raises(SystemExit, match="-te"):
+        main(["-input", str(tmp_path / "r0.nii.gz"), "-fs_subj", str(tmp_path), "-ridge",
+              "0.1", "-removal", "column", "-prefix", str(tmp_path / "o")])  # fmt: skip
+
+
+@pytest.mark.slow  # 17s
+def test_cli_surfaces_remove_deep_drainage_and_leave_the_rest(tmp_path):
+    """Sphere-shell ribbon, one deep source: removal grows toward pial, off-ribbon is untouched."""
+    import nibabel as nib
+
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+    from tests.viewer.test_surfaces import RADIUS, _subject
+
+    vox, n, T, K, tr = 1.0, 60, 90, 3, 2.0
+    aff = np.diag([vox, vox, vox, 1.0])
+    aff[:3, 3] = -(n - 1) * vox / 2
+    ijk = np.stack(np.meshgrid(*[np.arange(n)] * 3, indexing="ij"), -1)
+    r = np.linalg.norm(ijk * vox + aff[:3, 3], axis=-1)
+    frac = np.clip((r - RADIUS) / (0.2 * RADIUS), 0, 1)  # 0 white .. 1 pial
+    ribbon = (r > RADIUS) & (r < 1.2 * RADIUS)
+    spec = ModelSpec(N=K, K=K, TR=tr, device=CPU)
+    freq = torch.fft.rfftfreq(T, tr)
+    h, _ = vascular_transfer(linearized_vasculature(spec), freq)
+    torch.manual_seed(3)
+    a = torch.zeros(T, K, dtype=torch.float64)
+    a[:, -1] = torch.randn(T, dtype=torch.float64) * 0.2  # deepest model depth only
+    a = torch.fft.irfft(torch.fft.rfft(a, dim=0) / (1 + (freq[:, None] / 0.04) ** 4), n=T, dim=0)
+    y = torch.fft.irfft(torch.einsum("fkn,fn->fk", h, torch.fft.rfft(a, dim=0)), n=T, dim=0)
+    read = depth_interpolation(1 - frac[ribbon], K)  # model order: 0 = pial
+    signal = (read @ y.numpy().T).astype(np.float32)
+    rng = np.random.default_rng(0)
+    for run in (1, 2):
+        data = 100 + rng.normal(0, 0.05, (n, n, n, T)).astype(np.float32)
+        data[ribbon] += signal
+        nib.save(nib.Nifti1Image(data, aff), str(tmp_path / f"run{run}.nii.gz"))
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.laminar_tdv", "-input", "run1.nii.gz",
+         "run2.nii.gz", "-fs_subj", str(_subject(tmp_path)), "-hemi", "lh", "-depths", str(K),
+         "-ridge", "0.001", "-te", "0.025", "-b0", "7", "-tr", str(tr), "-pad_seconds", "0",
+         "-device", "cpu", "-prefix", "ltdv"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=tmp_path,
+    )  # fmt: skip
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    from fastfuncstuff.cli.util_concalc import _read_brick_labels
+
+    img = nib.load(tmp_path / "ltdv_ltdv.nii.gz")
+    names, b = _read_brick_labels(img), np.asanyarray(img.dataobj)
+    valid = b[..., names.index("valid")] > 0
+    assert valid[ribbon].mean() > 0.8 and not valid[r < 0.8 * RADIUS].any()
+    shell = b[..., names.index("shell")] > 0
+    assert shell.sum() > 100 and not shell[(r < RADIUS - 3) | (r > 1.2 * RADIUS + 3)].any()
+    depth = b[..., names.index("depth")]
+    assert np.corrcoef(depth[valid], frac[valid])[0, 1] > 0.8
+    rms = b[..., names.index("removed_rms")]
+    deep, sup = valid & (frac < 0.25), valid & (frac > 0.75)
+    assert np.median(rms[sup]) > 5 * np.median(rms[deep])
+    raw = np.asanyarray(nib.load(tmp_path / "run1.nii.gz").dataobj)
+    out = np.asanyarray(nib.load(tmp_path / "ltdv_corrected_run-01.nii.gz").dataobj)
+    np.testing.assert_array_equal(out[~valid], raw[~valid])
+    leak = signal[(frac[ribbon] > 0.75)].std(1).mean()
+    assert np.abs(out[sup] - 100).std(-1).mean() < 0.5 * leak
+
+
+def test_cli_events_choose_the_generating_physiology(tmp_path):
+    """Three runs, three different schedules: leave-one-run-out must pick the true t0v."""
+    from dataclasses import replace
+
+    from fastfuncstuff.laminar.pipeline import reference_p0
+    from fastfuncstuff.laminar.timeseries import (
+        cbf_kernel,
+        linearized_vasculature,
+        vascular_transfer,
+    )
+
+    T, K, tr, shape = 150, 3, 2.0, (5, 4, 3)
+    # Truth on the CLI's own baselines, so only t0v differs between candidates.
+    spec = ModelSpec(N=K, K=K, TR=tr, p0=replace(reference_p0(), t0v=1.0), device=CPU)
+    n_fft = T + 30
+    h, _ = vascular_transfer(linearized_vasculature(spec), torch.fft.rfftfreq(n_fft, tr))
+    kernel = cbf_kernel(spec, dt=0.1).double().numpy()
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), 20)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    beta = torch.tensor([[2.0, 1.0], [1.5, 0.5], [1.0, 1.0]], dtype=torch.float64)  # depth x cond
+    rng = np.random.default_rng(7)
+    info = {"affine": np.eye(4)}
+    for run in range(3):
+        on = np.round(np.cumsum(rng.uniform(5, 11, 40)), 1)
+        on = on[on < T * tr - 20]
+        cond = rng.integers(0, 2, on.size)
+        (tmp_path / f"ev{run}.tsv").write_text(
+            "onset\tduration\ttrial_type\n"
+            + "".join(f"{o:.1f}\t2\t{'ab'[c]}\n" for o, c in zip(on, cond, strict=True))
+        )
+        stim = np.zeros((2, int(T * tr / 0.1)))
+        for o, c in zip(on, cond, strict=True):
+            stim[c, int(round(o / 0.1)) : int(round((o + 2) / 0.1))] = 1
+        X = np.stack([np.convolve(s, kernel)[: s.size][::20][:T] * 0.1 for s in stim], -1)
+        Xf = torch.fft.rfft(torch.from_numpy(X), n=n_fft, dim=0)
+        Z = torch.fft.irfft(h[..., None] * Xf[:, None, None, :], n=n_fft, dim=0)[:T]
+        y = torch.einsum("tknc,nc->tk", Z, beta)  # PSC at model depths
+        psc = read @ y.T + 0.05 * torch.randn(len(depth), T, dtype=torch.float64)
+        data = (300 * (1 + psc / 100)).float()
+        save_image(data.T.reshape(T, *shape), tmp_path / f"r{run}.nii.gz", info)
+    save_image(torch.as_tensor(depth.reshape(shape)), tmp_path / "depth.nii.gz", info)
+    save_image(torch.ones(shape), tmp_path / "gm.nii.gz", info)
+    res = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "fastfuncstuff.cli.laminar_tdv", "-input", "r0.nii.gz",
+         "r1.nii.gz", "r2.nii.gz", "-events", "ev0.tsv", "ev1.tsv", "ev2.tsv",
+         "-cv_p0", "t0v", "0.5", "1", "2", "-depth", "depth.nii.gz", "-gmfrac", "gm.nii.gz",
+         "-depth_order", "pial_to_white", "-patch_mm", "50", "-depths", str(K), "-ridge", "0.1",
+         "-te", "0.025", "-b0", "7", "-tr", str(tr), "-polort", "1", "-device", "cpu",
+         "-prefix", "out"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=tmp_path,
+    )  # fmt: skip
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+    rows = (tmp_path / "out_physiology_cv.tsv").read_text().splitlines()
+    assert rows[0].split("\t")[:2] == ["candidate", "t0v"]
+    r2 = [float(r.split("\t")[2]) for r in rows[1:]]
+    assert int(np.argmax(r2)) == 1  # t0v = 1
+    meta = json.loads((tmp_path / "out_metadata.json").read_text())
+    assert meta["p0"]["t0v"] == 1.0 and len(meta["physiology_cv"]) == 3
+
+
+def _vein_runs(n_runs=3, T=160, K=3, vein_gain=5.0, seed=5):
+    """One column; three pial-side voxels carry vein_gain x the transported signal."""
+    from fastfuncstuff.laminar.timeseries import linearized_vasculature, vascular_transfer
+
+    spec = ModelSpec(N=K, K=K, TR=2, device=CPU)
+    freq = torch.fft.rfftfreq(T, spec.TR)
+    h, g = vascular_transfer(linearized_vasculature(spec), freq)
+    depth = np.tile(np.array([1 / 6, 0.5, 5 / 6]), 20)
+    vein = np.zeros(depth.size, bool)
+    vein[[0, 3, 6]] = True  # superficial voxels (depth 1/6, model order 0 = pial)
+    read = torch.from_numpy(depth_interpolation(depth, K)).double()
+    torch.manual_seed(seed)
+    runs, local_truth = [], []
+    for _ in range(n_runs):
+        a = torch.randn(T, K, dtype=torch.float64) * 0.003
+        a = torch.fft.irfft(
+            torch.fft.rfft(a, dim=0) / (1 + (freq[:, None] / 0.04) ** 4), n=T, dim=0
+        )
+        af = torch.fft.rfft(a, dim=0)
+        loc = torch.fft.irfft(torch.einsum("fkn,fn->fk", g, af), n=T, dim=0)
+        tr_ = torch.fft.irfft(torch.einsum("fkn,fn->fk", h - g, af), n=T, dim=0)
+        lv, tv = read @ loc.T, read @ tr_.T
+        gain = torch.where(torch.from_numpy(vein)[:, None], vein_gain, 1.0)
+        psc = lv + gain * tv + 0.002 * torch.randn(depth.size, T, dtype=torch.float64)
+        runs.append((200 * (1 + psc / 100)).float())
+        local_truth.append(lv)
+    return runs, local_truth, depth, vein, spec
+
+
+def test_voxel_gains_remove_a_veins_excess_and_keep_local_signal():
+    from fastfuncstuff.processing.laminar_tdv import devein_volume_runs
+
+    runs, truth, depth, vein, spec = _vein_runs()
+    labels = np.zeros(depth.size, int)
+    kw = dict(strengths=(0.001,), pad_seconds=0, polort=1, verbose=False)
+    col = devein_volume_runs(runs, depth, labels, spec, removal="column", **kw)
+    vox = devein_volume_runs(runs, depth, labels, spec, removal="voxel", **kw)
+
+    def err(res, sel):  # corrected PSC vs the local truth, all runs
+        out = []
+        for raw, cor, lt in zip(runs, res.corrected, truth, strict=True):
+            psc = 100 * (cor / raw.mean(-1, keepdim=True) - 1)
+            psc = psc - psc.mean(-1, keepdim=True)
+            lt = lt - lt.mean(-1, keepdim=True)
+            out.append(((psc[sel] - lt[sel].float()) ** 2).mean())
+        return float(torch.stack(out).mean())
+
+    superficial = depth < 0.3
+    assert err(vox, vein) < 0.2 * err(col, vein)
+    normal = superficial & ~vein
+    assert err(vox, normal) < 2 * err(col, normal) + 1e-6
+    b = vox.gains.beta
+    assert np.median(b[vein, 1]) > 3 and abs(np.median(b[normal, 1]) - 1) < 0.5
+    np.testing.assert_array_equal(vox.corrected[0][depth > 0.8], runs[0][depth > 0.8])

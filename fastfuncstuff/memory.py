@@ -620,6 +620,21 @@ def bytes_per_unit_laminar_dynamic(
     return 16 * nf * (n_depths * n_depths * (14 + n_strengths) + 8 * n_depths * n_runs)
 
 
+def bytes_per_unit_laminar_design_cv(
+    n_timepoints: int, n_depths: int, n_runs: int, n_params: int
+) -> int:
+    """Per-run normal equations and whitened profiles for design leave-one-run-out (float64)."""
+    return 8 * (
+        n_runs * (n_params * n_params + n_params + 2 * n_timepoints * n_depths)
+        + 4 * n_params * n_params
+    )
+
+
+def bytes_per_voxel_laminar_voxel_gain(n_timepoints: int, n_depths: int, n_lambdas: int) -> int:
+    """Data, three regressors and their column profiles per voxel, all runs (float32)."""
+    return 4 * n_timepoints * (6 + 3 * n_depths) + 8 * (4 * n_lambdas + 64)
+
+
 def bytes_per_voxel_lag_bank(n_timepoints: int, n_cols: int, n_candidates: int) -> int:
     """
     Estimate memory per voxel for scoring a bank of shifted/stretched designs.
@@ -1887,6 +1902,12 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_unit_laminar_dynamic(
             n_timepoints, n_regressors, n_runs, n_designs
         )
+    elif operation == "laminar_design_cv":
+        bytes_per_voxel = bytes_per_unit_laminar_design_cv(
+            n_timepoints, n_regressors, n_runs, n_designs
+        )
+    elif operation == "laminar_voxel_gain":
+        bytes_per_voxel = bytes_per_voxel_laminar_voxel_gain(n_timepoints, n_regressors, n_designs)
     elif operation == "lag_bank":
         bytes_per_voxel = bytes_per_voxel_lag_bank(n_timepoints, n_regressors, max(1, n_designs))
     elif operation == "phasereg":

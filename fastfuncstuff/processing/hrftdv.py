@@ -328,19 +328,82 @@ def volume_tiles(ijk: np.ndarray, voxel_mm: Sequence[float], tile_mm: float) -> 
     return labels.reshape(-1)
 
 
+@dataclass
+class RibbonPatches:
+    """Ribbon voxels grouped into cortical columns, flat C-order over ``(X, Y, Z)``."""
+
+    label: np.ndarray  # patch per voxel, -1 = not a covered ribbon voxel
+    n_patches: int
+    depth: np.ndarray  # equivolume, 0 white .. 1 pial, NaN outside the ribbon
+
+
+def ribbon_patches(
+    surfaces: Sequence,
+    affine: np.ndarray,
+    shape: tuple[int, int, int],
+    coverage: np.ndarray,
+    patch_mm: float,
+    device: torch.device | None = None,
+) -> RibbonPatches:
+    """Covered ribbon voxels -> geodesic midthickness patches via their owning vertex.
+
+    ``coverage`` is ``(X, Y, Z)``; patch numbers run on across hemispheres. Depth
+    is kept for every ribbon voxel, covered or not.
+    """
+    from fastfuncstuff.surface.volume_depth import cortical_depth_volumes
+
+    dv = cortical_depth_volumes(
+        list(surfaces), affine, shape, n_layers=3, owners=True, device=device
+    )
+    assert dv.owner_hemi is not None and dv.owner_vertex is not None
+    in_cov = coverage.reshape(-1)[dv.gm_idx]
+    gm_idx, o_hemi, o_vert = dv.gm_idx[in_cov], dv.owner_hemi[in_cov], dv.owner_vertex[in_cov]
+    depth = np.full(int(np.prod(shape)), np.nan, np.float32)
+    depth[dv.gm_idx] = dv.equivol
+    label = np.full(int(np.prod(shape)), -1, np.int64)
+    n_units = 0
+    for h, s in enumerate(surfaces):
+        sel = o_hemi == h
+        if not sel.any():
+            continue
+        mid = 0.5 * (np.asarray(s.white, np.float64) + np.asarray(s.pial, np.float64))
+        vlab = surface_patches(mid, np.asarray(s.faces), o_vert[sel], patch_mm)
+        lab = vlab[o_vert[sel]]
+        ok = lab >= 0
+        label[gm_idx[sel][ok]] = lab[ok] + n_units
+        n_units += int(vlab.max()) + 1
+    return RibbonPatches(label, n_units, depth)
+
+
 def extend_labels(labels: np.ndarray, voxel_mm: Sequence[float], extend_mm: float) -> np.ndarray:
     """Volume of labels (-1 empty) grown by up to ``extend_mm`` into empty voxels.
 
     Each empty voxel takes the label of the *nearest* labelled voxel, so where
     two gyri touch, the gap splits between them instead of either claiming it.
     """
-    from scipy.ndimage import distance_transform_edt
-
     if extend_mm <= 0 or not (labels >= 0).any():
         return labels
+    src = nearest_labelled(labels, voxel_mm, extend_mm)
+    grown = labels.reshape(-1)[np.maximum(src, 0)].reshape(labels.shape)
+    return np.where(src.reshape(labels.shape) >= 0, grown, labels)
+
+
+def nearest_labelled(labels: np.ndarray, voxel_mm: Sequence[float], extend_mm: float) -> np.ndarray:
+    """Flat index of each empty voxel's nearest labelled voxel within ``extend_mm``.
+
+    -1 for labelled voxels and those farther away. Nearest, so where two gyri
+    touch the gap splits between them.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    out = np.full(labels.size, -1, np.int64)
+    if extend_mm <= 0 or not (labels >= 0).any():
+        return out
     dist, idx = distance_transform_edt(labels < 0, sampling=voxel_mm, return_indices=True)
-    grown = labels[tuple(idx)]
-    return np.where((labels < 0) & (dist <= extend_mm), grown, labels)
+    near = np.ravel_multi_index(tuple(idx), labels.shape).reshape(-1)
+    take = ((labels < 0) & (dist <= extend_mm)).reshape(-1)
+    out[take] = near[take]
+    return out
 
 
 @dataclass

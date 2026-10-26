@@ -1,5 +1,6 @@
 """Continuous inversion must remove upward leakage without removing local activity."""
 
+import numpy as np
 import pytest
 import torch
 
@@ -151,3 +152,106 @@ def test_dynamic_micro_recovery_against_nonlinear_time_varying_forward(system):
     assert ((corrected[interior] - clean[interior]) ** 2).mean() < 0.05 * (
         (y[interior] - clean[interior]) ** 2
     ).mean()
+
+
+def test_cbf_kernel_is_a_positive_delayed_response():
+    from fastfuncstuff.laminar.timeseries import cbf_kernel
+
+    h = cbf_kernel(ModelSpec(N=3, K=3, device=CPU), dt=0.1, seconds=40)
+    peak = int(h.argmax())
+    # Measured: starts at 0, peaks at 2.0 s (CBF leads BOLD), undershoot ~5% by 10 s.
+    assert h[0] == 0 and h.max() == 1 and 1.0 < peak * 0.1 < 5.0
+    assert h[-20:].abs().max() < 0.1
+
+
+def _design_runs(spec, n_runs=3, T=200, seed=0):
+    """Two conditions, a different random event schedule per run, CBF-shaped regressors."""
+    from fastfuncstuff.laminar.timeseries import cbf_kernel
+
+    h = cbf_kernel(spec, dt=0.1).double()
+    rng = torch.Generator().manual_seed(seed)
+    out = []
+    for _ in range(n_runs):
+        stim = torch.zeros(2, int(T * spec.TR / 0.1))
+        t = 5.0
+        while t < T * spec.TR - 20:
+            stim[int(torch.randint(2, (1,), generator=rng)), int(t / 0.1) : int((t + 2) / 0.1)] = 1
+            t += 4 + 8 * float(torch.rand(1, generator=rng))
+        x = torch.stack(
+            [torch.from_numpy(np.convolve(s.numpy(), h.numpy())[: s.numel()]) for s in stim]
+        )
+        out.append(x[:, :: int(round(spec.TR / 0.1))][:, :T].T * 0.1)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("name", "grid", "truth"), [("t0v", (0.5, 1.0, 2.0), 1.0), ("s_d", (0.1, 0.4, 1.6), 0.4)]
+)
+def test_design_crossval_prefers_the_generating_physiology(name, grid, truth):
+    """Different schedules per run; pooled over patches the truth must predict best."""
+    from dataclasses import replace
+
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+    from fastfuncstuff.laminar.params import P0
+    from fastfuncstuff.laminar.timeseries import design_crossval
+
+    K, T, U, tr = 3, 200, 64, 2.0
+    n_fft = T + 30
+    base = ModelSpec(N=K, K=K, TR=tr, device=CPU)
+    designs = _design_runs(base, T=T)
+    nuis = [construct_polynomial_matrix(T, 1, CPU, torch.float64) for _ in designs]
+
+    def transfer(value):
+        spec = replace(base, p0=replace(P0(), **{name: value}))
+        return vascular_transfer(linearized_vasculature(spec), torch.fft.rfftfreq(n_fft, tr))[0]
+
+    torch.manual_seed(1)
+    beta = 0.02 * (1 + 0.3 * torch.randn(U, K * 2, dtype=torch.float64))
+    h = transfer(truth)
+    prof = []
+    for X, q in zip(designs, nuis, strict=True):
+        Xf = torch.fft.rfft(X, n=n_fft, dim=0)
+        Z = torch.fft.irfft(h[..., None] * Xf[:, None, None, :], n=n_fft, dim=0)[:T].reshape(
+            T, K, -1
+        )
+        y = torch.einsum("tkp,up->utk", Z, beta)
+        y = y + 0.5 * y.std() * torch.randn_like(y)
+        qq, _ = torch.linalg.qr(q)
+        prof.append(
+            y
+            - torch.einsum("ts,us k->utk".replace(" ", ""), qq, torch.einsum("ts,utk->usk", qq, y))
+        )
+    profiles = torch.stack(prof)
+    scores = [
+        design_crossval(profiles, designs, transfer(v), n_fft, nuisance=nuis, device=CPU)[0].sum()
+        for v in grid
+    ]
+    assert int(np.argmin(scores)) == grid.index(truth)
+
+
+def test_loro_prior_ridge_returns_prior_when_strong_and_finds_a_real_gain():
+    from fastfuncstuff.laminar.timeseries import loro_prior_ridge
+
+    torch.manual_seed(0)
+    R, b, T = 3, 200, 80
+    X = torch.randn(R, b, T, 2, dtype=torch.float64)
+    true_gain = torch.where(torch.arange(b) < 100, 4.0, 1.0).double()  # half veins
+    y = (
+        X[..., 0]
+        + true_gain[None, :, None] * X[..., 1]
+        + 0.5 * torch.randn(R, b, T, dtype=torch.float64)
+    )
+    xtx, xty = torch.einsum("rbtp,rbtq->rbpq", X, X), torch.einsum("rbtp,rbt->rbp", X, y)
+    yy = y.square().sum(-1)
+    prior, pen = torch.tensor([0.0, 1.0]), torch.tensor([0.0, 1.0])
+    beta, best, sse = loro_prior_ridge(xtx, xty, yy, prior, pen, (1e8,))
+    torch.testing.assert_close(beta[:, 1], torch.ones(b, dtype=torch.float64), atol=1e-4, rtol=0)
+    beta, best, sse = loro_prior_ridge(xtx, xty, yy, prior, pen, (0.01, 1e8))
+    assert (best[:100] == 0).all() and (beta[:100, 1] - 4).abs().max() < 0.2
+    assert (beta[100:, 1] - 1).abs().max() < 0.2
+    # An all-zero regressor (the deepest depth) still solves, at its prior.
+    xtx[..., 1, :] = 0
+    xtx[..., :, 1] = 0
+    xty[..., 1] = 0
+    beta, _, _ = loro_prior_ridge(xtx, xty, yy, prior, pen, (0.01, 1.0))
+    assert torch.isfinite(beta).all()

@@ -378,6 +378,25 @@ def test_visible_layers_skips_hidden_and_transparent():
     assert [ly.key for ly in stack.visible_layers()] == ["a"]
 
 
+def test_flip_with_below_alternates_the_pair():
+    """`O`: both drawn means hide the top, and after that it is a straight swap."""
+    stack = LayerStack()
+    for k in "abc":
+        stack.add(_layer(k))
+    assert stack.flip_with_below("c") == [("c", False), ("b", True)]
+    stack.update("c", visible=False)
+    assert stack.flip_with_below("c") == [("c", True), ("b", False)]
+    stack.update("c", visible=True)
+    stack.update("b", visible=False)
+    assert stack.flip_with_below("c") == [("c", False), ("b", True)]
+
+
+def test_flip_with_below_has_nothing_to_do_at_the_bottom():
+    stack = LayerStack()
+    stack.add(_layer("a"))
+    assert stack.flip_with_below("a") == []
+
+
 def test_every_registered_command_has_a_handler():
     """A command reachable from a script is reachable from a replay.
 

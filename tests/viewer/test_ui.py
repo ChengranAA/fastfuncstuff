@@ -762,6 +762,40 @@ def test_an_image_window_has_its_own_keys(win):
     assert "o" in {b.keys for b in image.help._bindings}
 
 
+def _check_states(win):
+    """The tick boxes, top row first -- the list is drawn over a bottom-first stack."""
+    from PySide6 import QtCore
+
+    listed = win.layer_list
+    return [
+        listed.item(r).checkState() is QtCore.Qt.CheckState.Checked for r in range(listed.count())
+    ]
+
+
+def test_o_in_an_image_window_hides_the_overlay_and_unticks_its_box(win, qapp):
+    """The tick box follows LAYERS; a hide from another window is only SLICES."""
+    image = image_of(win, Plane.AXIAL)
+    overlay = win.session.state.layers.overlay
+    assert overlay is not None and overlay.visible
+    image._toggle_visible()
+    qapp.processEvents()
+    assert not win.session.state.layers.get(overlay.key).visible
+    assert _check_states(win) == [False, True]
+
+
+def test_shift_o_flips_the_overlay_against_the_layer_under_it(win, qapp):
+    image = image_of(win, Plane.AXIAL)
+    top = win.session.state.layers.overlay
+    below = win.session.state.layers.base
+    assert top is not None and below is not None
+    image._flip_with_below()
+    qapp.processEvents()
+    assert _check_states(win) == [False, True]
+    image._flip_with_below()
+    qapp.processEvents()
+    assert _check_states(win) == [True, False]
+
+
 # ---------------------------------------------------------------------------
 # the graph must not lose the trace the map was computed from
 # ---------------------------------------------------------------------------
@@ -994,12 +1028,12 @@ def test_an_image_window_sheds_its_header_as_it_narrows(win, qapp):
     image.resize(420, 420)
     qapp.processEvents()
     assert image.header.isVisible()
-    assert image.solo_button.text() == "S[O]LO"
+    assert image.solo_button.text() == "[S]OLO"
 
     image.resize(240, 240)
     qapp.processEvents()
     assert image.header.isVisible()
-    assert image.solo_button.text() == "[o]", "compact buttons keep only the key"
+    assert image.solo_button.text() == "[S]", "compact buttons keep only the key"
 
     image.resize(120, 120)
     qapp.processEvents()

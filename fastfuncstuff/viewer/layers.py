@@ -376,6 +376,25 @@ class LayerStack:
     def visible_layers(self) -> list[Layer]:
         return [ly for ly in self.layers if ly.visible and ly.opacity > 0.0]
 
+    def flip_with_below(self, key: str) -> list[tuple[str, bool]]:
+        """Visibility changes that A/B a layer against the one under it.
+
+        The gesture is comparing two maps of the same thing: with both drawn
+        the top one goes off, and from then on each call swaps the pair, so one
+        key held between presses is the whole comparison. Returns the changes
+        rather than applying them, because the windows that offer it have to
+        send them through the command bus to be recorded.
+        """
+        i = self.index_of(key)
+        if i == 0:
+            return []
+        top, below = self.layers[i], self.layers[i - 1]
+        if top.visible == below.visible:
+            # Both on (the usual start) or both off: land on the one below,
+            # which is the half of the alternation a first press asks for.
+            return [(top.key, False), (below.key, True)]
+        return [(top.key, below.visible), (below.key, top.visible)]
+
     @property
     def base(self) -> Layer | None:
         """The bottom layer -- what AFNI would call the underlay."""

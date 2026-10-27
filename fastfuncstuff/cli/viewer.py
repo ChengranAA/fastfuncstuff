@@ -50,7 +50,8 @@ keys (main window)
   d                    dark / light palette
   arrows / PgUp PgDn   move the crosshair
   , .                  step time            v  play / pause (a in a 3-D window)
-  [ ]                  select layer       space  show / hide layer
+  [ ]                  select layer       o  show / hide the overlay (space too)
+  O                    flip the overlay against the layer under it (again: back)
   { }  u  Del          lower / raise layer, make underlay, remove
   t T                  threshold down / up
   a  alpha mode        s  sign mode       b  boxed      c  colormap
@@ -58,7 +59,7 @@ keys (main window)
   ctrl+O  open         ctrl+S  save session script       h  this list
   ctrl+P               print (and copy) the ffs_viewer command that reopens
                        what is loaded -- files, directory, surfaces; not edits
-  O                    cycle surface outlines (white+pial / white / pial / off)
+  alt+o                cycle surface outlines (white+pial / white / pial / off)
   ctrl+shift+S         save edited surfaces as ?h.<surf>.<suffix> copies
   ctrl+shift+I         install edits over the originals (asks; keeps backups)
   V                    3-D surface window (data sampled between white and pial)
@@ -67,7 +68,8 @@ keys (main window)
 
 keys (image window)
   1 2 3                axial / sagittal / coronal
-  o                    solo the selected layer (flip between layers with [ ])
+  o  O                 show / hide the overlay, or flip it against the one below
+  S                    solo the selected layer (flip between layers with [ ])
   l                    follow the crosshair, or unlock to park a slice
   + -  0               zoom in / out, fit the whole plane
   right-drag           pan            ctrl+click  set the InstaCorr seed

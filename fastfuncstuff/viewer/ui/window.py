@@ -1907,7 +1907,19 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("v", "play / pause", self._toggle_play, group="time"),
                 Binding("[", "previous layer", lambda: self._cycle_layer(-1), group="layer"),
                 Binding("]", "next layer", lambda: self._cycle_layer(1), group="layer"),
-                Binding("space", "show / hide layer", self._toggle_visible, group="layer"),
+                Binding(
+                    "o",
+                    "show / hide the overlay (the selected layer)",
+                    self._toggle_visible,
+                    group="layer",
+                    aliases=("space",),
+                ),
+                Binding(
+                    "shift+o",
+                    "flip the overlay against the layer under it (press again to swap back)",
+                    self._flip_with_below,
+                    group="layer",
+                ),
                 Binding("t", "threshold down", lambda: self._nudge_threshold(-0.05), group="layer"),
                 Binding(
                     "shift+t", "threshold up", lambda: self._nudge_threshold(0.05), group="layer"
@@ -1948,7 +1960,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     for n, letter in enumerate(LETTERS[:5], start=1)
                 ],
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
-                Binding("shift+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
+                Binding("alt+o", "cycle surface outlines", self._cycle_outlines, group="layer"),
                 Binding("shift+v", "open a 3-D surface window", self._new_surface, group="windows"),
                 Binding(
                     "ctrl+m",
@@ -2190,6 +2202,24 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._dispatch(SetLayerVisible(key, not layer.visible))
         self._sync_layer_list()
 
+    def _flip_with_below(self) -> None:
+        """A/B the selected layer against the one under it in the stack."""
+        key = self.current_key()
+        if key is None:
+            return
+        changes = self.session.state.layers.flip_with_below(key)
+        if not changes:
+            self.statusBar().showMessage("nothing under this layer to flip against", 2000)
+            return
+        for layer_key, on in changes:
+            self._dispatch(SetLayerVisible(layer_key, on))
+        shown = next(
+            (self.session.state.layers.get(k).name for k, on in changes if on),
+            "nothing",
+        )
+        self.statusBar().showMessage(f"showing {shown}", 2000)
+        self._sync_layer_list()
+
     def _item_checked(self, item: QtWidgets.QListWidgetItem) -> None:
         """A tick box was clicked: show or hide that layer.
 
@@ -2426,6 +2456,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # follow those aspects and not only LAYERS -- listening for the
             # wrong one is what left it showing the previous colour scale.
             self._sync_layer_controls()
+            self._sync_layer_checks()
             # A mode's parameters can be a reading of the picture rather than
             # an input to it -- Align's sliders follow a drag in an image
             # window -- so they are re-read whenever the picture moves.
@@ -2536,6 +2567,28 @@ class ViewerWindow(QtWidgets.QMainWindow):
         listed.rows_changed()
         self._sync_layer_controls()
         self._schedule_values()
+
+    def _sync_layer_checks(self) -> None:
+        """The tick boxes alone, for a visibility change made in another window.
+
+        The rows follow LAYERS; `o` and `O` in an image window are SLICES --
+        which a threshold drag is too, so the full row sync is too heavy to
+        hang on it -- and the list sat showing a hidden layer as drawn.
+        """
+        listed = self.layer_list
+        role = QtCore.Qt.ItemDataRole.UserRole
+        listed.blockSignals(True)
+        for r in range(listed.count()):
+            item = listed.item(r)
+            layer = self.session.state.layers.find(item.data(role))
+            if layer is None:
+                continue
+            check = (
+                QtCore.Qt.CheckState.Checked if layer.visible else QtCore.Qt.CheckState.Unchecked
+            )
+            if item.checkState() != check:
+                item.setCheckState(check)
+        listed.blockSignals(False)
 
     def _dispatch_input(self, key: str) -> None:
         self._dispatch(SetInput(key))

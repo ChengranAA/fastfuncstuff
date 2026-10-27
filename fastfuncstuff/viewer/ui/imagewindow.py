@@ -47,6 +47,7 @@ from fastfuncstuff.viewer.vocab import (
     SetEdges,
     SetIJK,
     SetLayerOpacity,
+    SetLayerVisible,
     SetPan,
     SetSeed,
     SetSurfaceBrush,
@@ -144,7 +145,7 @@ class ImageWindow(QtWidgets.QWidget):
 
         self.solo_button = self._button(
             "SOLO",
-            "o",
+            "S",
             "Draw only the selected layer. With [ and ] this flips between "
             "neighbouring layers in place, which is how alignment is checked.",
         )
@@ -347,7 +348,19 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding("PgUp", "next slice", lambda: self._step(1), group="navigate"),
                 Binding("PgDown", "previous slice", lambda: self._step(-1), group="navigate"),
-                Binding("o", "solo the selected layer", self.solo_button.click, group="view"),
+                Binding(
+                    "o",
+                    "show / hide the overlay (the selected layer)",
+                    self._toggle_visible,
+                    group="layer",
+                ),
+                Binding(
+                    "shift+o",
+                    "flip the overlay against the layer under it (press again to swap back)",
+                    self._flip_with_below,
+                    group="layer",
+                ),
+                Binding("shift+s", "solo the selected layer", self.solo_button.click, group="view"),
                 Binding(
                     "\\",
                     "tile the visible images, one per pane, zoom and pan shared (every window)",
@@ -401,7 +414,7 @@ class ImageWindow(QtWidgets.QWidget):
                     group="view",
                 ),
                 Binding(
-                    "shift+o",
+                    "alt+o",
                     "surface outlines: both, white, pial, off",
                     self._cycle_outlines,
                     group="surface",
@@ -630,6 +643,19 @@ class ImageWindow(QtWidgets.QWidget):
 
     def _selected(self):
         return self.session.state.selected_layer()
+
+    def _toggle_visible(self) -> None:
+        layer = self._selected()
+        if layer is not None:
+            self._dispatch(SetLayerVisible(layer.key, not layer.visible))
+
+    def _flip_with_below(self) -> None:
+        """A/B the selected layer against the one under it in the stack."""
+        layer = self._selected()
+        if layer is None:
+            return
+        for key, on in self.session.state.layers.flip_with_below(layer.key):
+            self._dispatch(SetLayerVisible(key, on))
 
     def _toggle_edges(self) -> None:
         layer = self._selected()

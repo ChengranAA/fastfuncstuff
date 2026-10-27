@@ -53,7 +53,7 @@ def test_each_row_keeps_its_full_labels_while_they_fit(window):
     session, win, app = window
     win.resize(900, 400)
     app.processEvents()
-    assert win.solo_button.text() != "[o]" and win.edit_button.text() != "[g]"
+    assert win.solo_button.text() != "[S]" and win.edit_button.text() != "[g]"
     win.resize(250, 400)
     app.processEvents()
-    assert win.solo_button.text() == "[o]" and win.edit_button.text() == "[g]"
+    assert win.solo_button.text() == "[S]" and win.edit_button.text() == "[g]"

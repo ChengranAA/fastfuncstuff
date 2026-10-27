@@ -406,6 +406,11 @@ def corr_session(tmp_path):
     data = rng.normal(0, 1.0, (nx, ny, nz, nt)).astype(np.float32)
     signal = np.sin(2 * np.pi * np.arange(nt) / 15.0).astype(np.float32)
     data[2:5, 3:6, 2:4, :] += signal * 6.0
+    # A head for InstaCorr's automask to find: a bright ellipsoid over the
+    # seed and blob, air in the corners. Pure noise has no brain to mask.
+    gi, gj, gk = np.mgrid[:nx, :ny, :nz]
+    head = ((gi - 4.5) / 6.2) ** 2 + ((gj - 5.5) / 7.2) ** 2 + ((gk - 3.5) / 5.0) ** 2 <= 1.0
+    data[head] += 100.0
     _write(tmp_path, "anat.nii.gz", rng.random((nx, ny, nz)) * 100)
     _write(tmp_path, "bold.nii.gz", data, tr=2.0)
 
@@ -504,6 +509,7 @@ def test_a_seed_on_a_finer_underlay_lands_on_the_right_run_voxel(tmp_path):
         s.do(AddOverlay(str(tmp_path / "bold.nii.gz")))
         s.store.ensure_ram(s.state.layers.keys[1])
         s.do(SetMode("instacorr"))
+        s.set_mode_param("automask", "0")  # pure noise has no brain to find
         # Both grids share an origin, so run voxel (7, 8, 5) is anat voxel (14, 16, 10).
         s.do(SetSeed(14, 16, 10))
         layer = s.state.layers.find_by_source("mode:instacorr")
@@ -786,9 +792,10 @@ def test_preparation_keeps_time_as_the_last_axis(corr_session):
     """Every operation runs along time, so time must be the contiguous axis."""
     corr_session.do(SetMode("instacorr"))
     corr_session.do(SetSeed(3, 4, 2))
-    prepared = corr_session.mode._prepared
-    n_voxels = int(np.prod(corr_session.mode._shape))
-    assert prepared.shape == (n_voxels, 60)
+    prepared = corr_session.mode._rows()
+    n_brain = int((corr_session.mode._lookup >= 0).sum())
+    assert prepared.shape == (n_brain, 60)
+    assert 0 < n_brain < int(np.prod(corr_session.mode._shape)), "only the brain is kept"
 
 
 def test_the_mode_reports_where_its_data_lives(corr_session):
@@ -802,10 +809,75 @@ def test_repeated_seed_moves_do_not_re_prepare(corr_session):
     """The prepared array stays resident; a click is one mat-vec."""
     corr_session.do(SetMode("instacorr"))
     corr_session.do(SetSeed(3, 4, 2))
-    prepared = corr_session.mode._prepared
+    prepared = corr_session.mode._rows().data_ptr()
     for pos in ((4, 5, 3), (2, 3, 1), (3, 4, 2)):
         corr_session.do(SetSeed(*pos))
-        assert corr_session.mode._prepared is prepared, "seed move re-prepared"
+        assert corr_session.mode._rows().data_ptr() == prepared, "seed move re-prepared"
+
+
+def test_instacorr_keeps_only_the_brain_and_draws_nothing_outside(corr_session):
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    layer = corr_session.state.layers.find_by_source("mode:instacorr")
+    vol = corr_session.store.get(layer.key).array[..., 0]
+    outside = corr_session.mode._lookup < 0
+    assert outside.any() and not vol[outside].any()
+
+
+def test_leaving_instacorr_hands_its_rows_back_to_the_store(corr_session):
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    key = corr_session.mode._hold_key
+    assert corr_session.store.holds(key)
+    corr_session.do(SetMode("plain"))
+    assert not corr_session.store.holds(key)
+
+
+def test_a_card_too_full_to_prepare_on_falls_back_to_the_cpu(corr_session, monkeypatch):
+    """A fit holding the card must not stop InstaCorr; it prepares slower instead."""
+    from fastfuncstuff.viewer.modes.instacorr import InstaCorrMode
+
+    real = InstaCorrMode._prepare_rows
+    tried: list[str] = []
+
+    def full_card(self, keep, device, progress):
+        tried.append(device.type)
+        if len(tried) == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory")
+        return real(self, keep, device, progress)
+
+    monkeypatch.setattr(InstaCorrMode, "_prepare_rows", full_card)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    assert tried[-1] == "cpu"
+    assert corr_session.state.layers.find_by_source("mode:instacorr") is not None
+
+
+@pytest.mark.gpu
+def test_instacorr_on_cuda_draws_the_cpu_map(corr_session, tmp_path):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    want = (
+        corr_session.store.get(corr_session.state.layers.find_by_source("mode:instacorr").key)
+        .array[..., 0]
+        .copy()
+    )
+
+    s = ViewerSession(device=torch.device("cuda"))
+    try:
+        s.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))  # the fixture's files
+        s.do(SetOverlay(str(tmp_path / "bold.nii.gz")))
+        s.store.ensure_ram(s.state.layers.keys[1])
+        s.do(SetMode("instacorr"))
+        s.do(SetSeed(3, 4, 2))
+        assert s.mode._rows().device.type == "cuda", "the rows should be mirrored"
+        got = s.store.get(s.state.layers.find_by_source("mode:instacorr").key).array[..., 0]
+        np.testing.assert_allclose(got, want, atol=1e-4)
+    finally:
+        s.close()
 
 
 def test_a_picked_overlay_is_what_the_controls_act_on(session, datadir):
@@ -967,9 +1039,9 @@ def test_instacorr_waits_for_go_and_cuts_volumes(corr_session):
     s.do(SetMode("instacorr"))
     s.do(SetSeed(3, 4, 2))
     s.set_mode_param("drop_first", "4")
-    assert s.mode.pending and s.mode._prepared.shape[-1] == 60
+    assert s.mode.pending and s.mode._rows().shape[-1] == 60
     s.mode.action("go")
-    assert not s.mode.pending and s.mode._prepared.shape[-1] == 56
+    assert not s.mode.pending and s.mode._rows().shape[-1] == 56
 
 
 def test_instacorr_seed_roi_follows_a_stroke(corr_session):

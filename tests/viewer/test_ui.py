@@ -278,6 +278,7 @@ def test_switching_to_a_mode_renders_its_declared_controls(win, qapp):
         "fbot",
         "ftop",
         "blur",
+        "automask",
         "seed_radius",
         "seed_roi",
         "drop_first",
@@ -782,6 +783,7 @@ def test_the_graph_keeps_the_source_trace_after_a_seed(win, qapp, tmp_path):
     graph = open_graph(win, qapp)
 
     win.refresh(win.session.do(SetMode("instacorr")))
+    win.session.set_mode_param("automask", "0")  # pure noise has no brain to find
     assert win.session.mode.prepare()
     win.refresh(win.session.do(SetSeed(3, 4, 3)))
     win.refresh(win.session.do(SetIJK(3, 4, 3)))

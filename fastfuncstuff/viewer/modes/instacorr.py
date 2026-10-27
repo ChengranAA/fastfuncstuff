@@ -23,6 +23,7 @@ import torch
 
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.modes.base import (
+    BoolControl,
     ChoiceControl,
     ComputedOverlay,
     Control,
@@ -94,6 +95,13 @@ class InstaCorrMode(Mode):
                 unit=" mm",
                 help="Spatial smoothing applied before correlating.",
             ),
+            BoolControl(
+                name="automask",
+                label="brain only",
+                default=True,
+                help="Correlate inside 3dAutomask's brain only. A third of the voxels, so a "
+                "seed is a third of the time and memory; off for a phantom or a cropped run.",
+            ),
             *self.gate_controls(),
             OptionalFloatControl(
                 name="seed_radius",
@@ -134,11 +142,15 @@ class InstaCorrMode(Mode):
     def preparation_params(self) -> frozenset[str]:
         # seed_radius only affects which columns are averaged at compute time,
         # so changing it must not trigger a multi-second re-preparation.
-        return frozenset({"polort", "fbot", "ftop", "blur", "drop_first", "drop_last"})
+        return frozenset({"polort", "fbot", "ftop", "blur", "automask", "drop_first", "drop_last"})
 
     def __init__(self) -> None:
-        self._prepared: torch.Tensor | None = None
-        self._valid: torch.Tensor | None = None
+        #: Prepared rows live in the session's store under this key (RAM, plus a
+        #: device mirror while the budget allows) -- see :meth:`_rows`.
+        self._hold_key: str | None = None
+        #: ``(nx, ny, nz)`` int32: each voxel's row, -1 where nothing was kept.
+        self._lookup: np.ndarray | None = None
+        self._n_time = 0
         self._shape: tuple[int, int, int] = (0, 0, 0)
         self._affine: np.ndarray | None = None
         self._source: np.ndarray | None = None
@@ -195,26 +207,47 @@ class InstaCorrMode(Mode):
         The instance is kept for its parameters, and the map stays in the
         stack, so coming back costs one re-preparation and nothing else.
         """
-        self._prepared = None
-        self._valid = None
+        self._release()
         self._source = None
         self._source_key = None
         self._dirty = True
         super().detach()
 
     # -- preparation ---------------------------------------------------
+    def _rows(self) -> torch.Tensor | None:
+        """The prepared ``(rows, T)``: the device mirror if it has one, else RAM.
+
+        Not pinned to either. A seed is one mat-vec -- 6-17 ms on six cores
+        for a real run's brain -- so when the budget or another process has
+        taken the mirror back, correlating from RAM is still interactive, and
+        cheaper than re-uploading for a click.
+        """
+        if self._hold_key is None or self.session is None:
+            return None
+        try:
+            return self.session.store.working(self._hold_key)
+        except KeyError:
+            return None
+
+    def _release(self) -> None:
+        if self._hold_key is not None and self.session is not None:
+            self.session.store.drop_working(self._hold_key)
+        self._hold_key = None
+        self._lookup = None
+
     def prepare(self, progress: ProgressFn | None = None) -> bool:
-        """Detrend, bandpass, blur and normalize. Seconds on a real dataset."""
-        if not self._dirty and self._prepared is not None:
+        """Detrend, bandpass, blur and normalize. Seconds on a real dataset.
+
+        Runs on the compute device, where it is 50x faster than on the CPU
+        (24 ms against 1.3 s for 550k voxels x 400), and keeps only the result:
+        the store holds it in RAM and mirrors it while the budget allows. A
+        card too full to prepare on -- a fit running -- falls back to the CPU
+        rather than failing.
+        """
+        if not self._dirty and self._rows() is not None:
             return True
         if not self._capture_source() or self._source is None:
             return False
-
-        def step(fraction: float, message: str) -> None:
-            if progress is not None:
-                progress(fraction, message)
-
-        device = self.session.store.device if self.session is not None else torch.device("cpu")
         nx, ny, nz, nt_full = self._source.shape
         try:
             self._window = self.time_window(nt_full)
@@ -222,8 +255,58 @@ class InstaCorrMode(Mode):
             self._roi_message = str(exc)
             self._dirty = False
             return False
+
+        if bool(self.params.get("automask", True)):
+            from fastfuncstuff.viewer.series import automask_from_series
+
+            # The whole run, not the window: it is the array the carpet and the
+            # other modes ask about, so the mask comes back from their cache.
+            keep = automask_from_series(self._source, device=self._device())
+        else:
+            keep = np.ones((nx, ny, nz), dtype=bool)
+        if not keep.any():
+            self._roi_message = "the brain mask is empty; turn 'brain only' off"
+            self._dirty = False
+            return False
+
+        self._release()
+        device = self._device()
+        try:
+            rows = self._prepare_rows(keep, device, progress)
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            rows = self._prepare_rows(keep, torch.device("cpu"), progress)
+
+        assert self.session is not None
+        self._hold_key = f"instacorr:{id(self)}"
+        self.session.store.hold(self._hold_key, rows)
+        del rows
+        lookup = np.full((nx, ny, nz), -1, dtype=np.int32)
+        lookup[keep] = np.arange(int(keep.sum()), dtype=np.int32)
+        self._lookup = lookup
+        self._shape = (nx, ny, nz)
+        self._n_time = len(range(*self._window.indices(nt_full)))
+        self._dirty = False
+        if progress is not None:
+            progress(1.0, "ready")
+        return True
+
+    def _device(self) -> torch.device:
+        return self.session.store.device if self.session is not None else torch.device("cpu")
+
+    def _prepare_rows(
+        self, keep: np.ndarray, device: torch.device, progress: ProgressFn | None
+    ) -> torch.Tensor:
+        """``(kept voxels, T)`` detrended, filtered, unit-norm rows on ``device``."""
+
+        def step(fraction: float, message: str) -> None:
+            if progress is not None:
+                progress(fraction, message)
+
+        assert self._source is not None
         source = self._source[..., self._window]
         nt = source.shape[-1]
+        flat = torch.as_tensor(np.flatnonzero(keep.reshape(-1)), device=device)
 
         blur = float(self.params.get("blur") or 0.0)
         if blur > 0:
@@ -236,15 +319,15 @@ class InstaCorrMode(Mode):
             # The blur keeps its input's strides, so this is still the store's
             # (X,Y,Z,T) layout under a (T,X,Y,Z) view: permuting back to
             # (V,T) is free, where reshaping as (T,V) would copy it twice.
-            data = vol.permute(1, 2, 3, 0).reshape(-1, nt)
+            data = vol.permute(1, 2, 3, 0).reshape(-1, nt)[flat]
+            del vol
         else:
-            # The store keeps the array C-contiguous, so this is a free view of
-            # data that is already resident -- no copy, no upload on CPU.
+            # The store keeps the array C-contiguous, so (V, T) is a free view
+            # and the row gather reads whole time courses. Gathered before the
+            # upload, so only the brain crosses to the device.
             step(0.1, "arranging")
             data = torch.as_tensor(source, dtype=torch.float32).reshape(-1, nt)
-            if device.type != "cpu":
-                step(0.2, "to device")
-                data = data.to(device)
+            data = data[flat.cpu()].to(device)
 
         # Time is the last axis from here on, which is also the axis every
         # operation below runs along -- so each one reads contiguously.
@@ -254,19 +337,13 @@ class InstaCorrMode(Mode):
         data = self._bandpass(data)
 
         step(0.85, "normalize")
-        # Out of place: until here ``data`` may still be a view of the store's
-        # array. Everything after works on this fresh copy, in place.
         data = data - data.mean(-1, keepdim=True)
         norm = data.norm(dim=-1, keepdim=True)
-        # Constant voxels -- outside the brain, mostly -- would divide by zero
-        # and then correlate perfectly with everything.
-        self._valid = (norm > 1e-9).squeeze(-1)
+        # Constant voxels would divide by zero and then correlate perfectly
+        # with everything; they become zero rows instead.
+        valid = norm > 1e-9
         data.div_(norm.clamp_(min=1e-9))
-        self._prepared = data.masked_fill_(~self._valid.unsqueeze(-1), 0.0)
-        self._shape = (nx, ny, nz)
-        self._dirty = False
-        step(1.0, "ready")
-        return True
+        return data.masked_fill_(~valid, 0.0)
 
     def _detrend(self, data: torch.Tensor) -> torch.Tensor:
         """Project out Legendre polynomials -- never raw monomials."""
@@ -312,13 +389,12 @@ class InstaCorrMode(Mode):
             return ijk
         return self.session.layer_voxel(self._affine, ijk)
 
-    def _seed_timecourse(self) -> torch.Tensor | None:
-        data, valid = self._prepared, self._valid
-        if data is None or valid is None or self.session is None:
+    def _seed_timecourse(self, data: torch.Tensor) -> torch.Tensor | None:
+        if self._lookup is None or self.session is None:
             return None
         roi_key = self._roi_key()
         if roi_key is not None:
-            return self._roi_timecourse(roi_key)
+            return self._roi_timecourse(data, roi_key)
         if self.session.state.seed is None:
             return None
         seed_ijk = self._to_source(self.session.state.seed)
@@ -329,8 +405,10 @@ class InstaCorrMode(Mode):
         if radius <= 0.0:
             if not (0 <= si < nx and 0 <= sj < ny and 0 <= sk < nz):
                 return None
-            flat = (si * ny + sj) * nz + sk
-            return data[flat] if bool(valid[flat]) else None
+            row = int(self._lookup[si, sj, sk])
+            if row < 0 or float(data[row].norm()) < 0.5:
+                return None  # outside the brain, or a constant voxel
+            return data[row]
 
         rad = [max(0, int(radius / z)) for z in self._zooms]
         ii = torch.arange(max(0, si - rad[0]), min(nx, si + rad[0] + 1))
@@ -344,44 +422,50 @@ class InstaCorrMode(Mode):
             + ((gj - sj) * self._zooms[1]) ** 2
             + ((gk - sk) * self._zooms[2]) ** 2
         )
-        flat = ((gi * ny + gj) * nz + gk)[dist <= radius].reshape(-1).to(data.device)
-        flat = flat[valid[flat]]
-        if flat.numel() == 0:
+        return self._mean_of(data, ((gi * ny + gj) * nz + gk)[dist <= radius].numpy())
+
+    def _mean_of(self, data: torch.Tensor, flat: np.ndarray) -> torch.Tensor | None:
+        """The unit-length mean prepared course of box voxels ``flat``; None if none count."""
+        assert self._lookup is not None
+        rows = self._lookup.reshape(-1)[np.asarray(flat, dtype=np.int64).reshape(-1)]
+        rows = torch.as_tensor(rows[rows >= 0], device=data.device, dtype=torch.long)
+        if rows.numel():
+            rows = rows[data[rows].norm(dim=-1) > 0.5]
+        if rows.numel() == 0:
             return None
-        seed = data[flat].mean(0)
+        seed = data[rows].mean(0)
         seed = seed - seed.mean()
         n = seed.norm()
         return seed / n if float(n) > 1e-9 else None
 
-    def _roi_timecourse(self, key: str) -> torch.Tensor | None:
+    def _roi_timecourse(self, data: torch.Tensor, key: str) -> torch.Tensor | None:
         """The mean prepared time course of a painted ROI's voxels, unit length."""
-        data, valid = self._prepared, self._valid
-        if self.session is None:
+        if self.session is None or self._lookup is None:
             return None
         like = self.session.state.layers.find(self._source_key or "")
-        if data is None or valid is None or like is None:
+        if like is None:
             return None
-        inside = self.session.mask_from_layer(key, like).reshape(-1)
-        flat = torch.as_tensor(np.flatnonzero(inside), device=data.device)
-        flat = flat[valid[flat]]
-        if flat.numel() == 0:
+        flat = np.flatnonzero(self.session.mask_from_layer(key, like).reshape(-1))
+        n_in = int((self._lookup.reshape(-1)[flat] >= 0).sum())
+        seed = self._mean_of(data, flat)
+        if seed is None:
             self._roi_message = "the seed ROI has no voxels inside the brain yet"
             return None
-        self._roi_message = f"seed ROI {key}: {int(flat.numel())} voxels"
-        seed = data[flat].mean(0)
-        seed = seed - seed.mean()
-        n = seed.norm()
-        return seed / n if float(n) > 1e-9 else None
+        self._roi_message = f"seed ROI {key}: {n_in} voxels"
+        return seed
 
     # -- production ----------------------------------------------------
     def compute(self) -> ComputedOverlay | None:
-        if self._prepared is None or self._affine is None:
+        data = self._rows()
+        if data is None or self._affine is None or self._lookup is None:
             return None
-        seed = self._seed_timecourse()
+        seed = self._seed_timecourse(data)
         if seed is None:
             return None
-        r = self._prepared @ seed  # the whole correlation, one mat-vec
-        vol = r.reshape(self._shape).cpu().numpy()
+        r = (data @ seed).cpu().numpy()  # the whole correlation, one mat-vec
+        vol = np.zeros(self._shape, dtype=np.float32)
+        inside = self._lookup >= 0
+        vol[inside] = r[self._lookup[inside]]
         return ComputedOverlay(
             values=np.nan_to_num(vol, nan=0.0),
             affine=self._affine,
@@ -404,7 +488,7 @@ class InstaCorrMode(Mode):
         filter's edges are not sharp -- but the alternative, quoting a p on
         every volume, is wrong by a factor of several for a typical 0.01-0.1 Hz.
         """
-        nt = int(self._prepared.shape[-1]) if self._prepared is not None else 0
+        nt = self._n_time if self._hold_key is not None else 0
         fbot = float(self.params.get("fbot") or 0.0)
         ftop = float(self.params.get("ftop") or 0.0)
         if (fbot <= 0.0 and ftop <= 0.0) or self._tr <= 0.0 or nt < 2:
@@ -450,16 +534,19 @@ class InstaCorrMode(Mode):
                     x_label="TR",
                 )
             )
-        if self._prepared is not None:
+        data = self._rows()
+        if data is not None and self._lookup is not None:
             nx, ny, nz = self._shape
-            if 0 <= i < nx and 0 <= j < ny and 0 <= k < nz:
-                flat = (i * ny + j) * nz + k
+            row = (
+                int(self._lookup[i, j, k]) if (0 <= i < nx and 0 <= j < ny and 0 <= k < nz) else -1
+            )
+            if row >= 0:
                 out.append(
                     Trace(
                         label="prepared",
                         key="prepared",
                         short="icorr prepared",
-                        values=self._prepared[flat].cpu().numpy(),
+                        values=data[row].cpu().numpy(),
                         x_label="TR",
                     )
                 )
@@ -472,10 +559,11 @@ class InstaCorrMode(Mode):
         resident between clicks, and a status line that says so is the
         difference between trusting that and guessing.
         """
-        if self._prepared is None:
+        data = self._rows()
+        if data is None:
             return ""
-        gb = self._prepared.numel() * self._prepared.element_size() / 1e9
-        return f"{gb:.2f} GB on {self._prepared.device.type}"
+        gb = data.numel() * data.element_size() / 1e9
+        return f"{gb:.2f} GB on {data.device.type}"
 
     def status(self) -> str:
         if self._source is None:
@@ -484,7 +572,7 @@ class InstaCorrMode(Mode):
             return "instacorr: preparing…"
         if self._held:
             return f"instacorr: {self.pending_note().lstrip(' ·')}"
-        if self._prepared is None:
+        if self._rows() is None:
             return f"instacorr: {self._roi_message or 'ready to prepare'}"
         where = self.residency()
         if self._roi_key() is not None:

@@ -169,6 +169,15 @@ def build_parser() -> FfsArgumentParser:
         "same layer. Repeat for more.",
     )
     add_device_arg(p, default="auto")
+    p.add_argument(
+        "-vram_budget",
+        metavar="SIZE",
+        default=None,
+        help="Most GPU memory the viewer holds between interactions: 6G, 512M, or a share "
+        "of the card such as 40%%. Default 25%% of the card's total. Everything held also "
+        "has a RAM copy, so a smaller budget costs re-uploads, not results; the viewer "
+        "also hands memory back whenever the card runs short.",
+    )
     return p
 
 
@@ -206,9 +215,11 @@ def main(argv: list[str] | None = None) -> int:
         # Headless replay shares the session and command path the GUI uses, so
         # a script that works here works there.
         from fastfuncstuff.cli_utils import setup_device
+        from fastfuncstuff.viewer.residency import apply_vram_budget
         from fastfuncstuff.viewer.session import ViewerSession
 
         session = ViewerSession(device=setup_device(args.device))
+        apply_vram_budget(args.vram_budget, session.store.device)
         try:
             if args.read:
                 session.read_directory(args.read)
@@ -245,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
         surf_space=args.surf_space,
         meshes=args.mesh,
         surf_data=_surf_data_commands(args.surf_data),
+        vram_budget=args.vram_budget,
     )
 
 

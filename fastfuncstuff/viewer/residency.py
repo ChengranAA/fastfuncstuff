@@ -37,6 +37,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import threading
+import weakref
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -151,6 +152,85 @@ class Resident:
         return int(nx) * int(ny) * int(nz) * max(int(nv), 1) * 4
 
 
+@dataclass
+class Working:
+    """A mode's prepared array: always in RAM, mirrored on the device while it fits.
+
+    The host copy is what makes the mirror cheap to give up. Rebuilding a
+    prepared array (mask, blur, detrend) is the slow half of a mode; with the
+    result kept in RAM, losing the device copy costs one upload -- 64 ms for
+    0.9 GB from pinned memory -- not a re-preparation.
+    """
+
+    key: str
+    host: torch.Tensor
+    tensor: torch.Tensor | None = None
+    used_at: int = 0
+
+    @property
+    def device_bytes(self) -> int:
+        if self.tensor is None:
+            return 0
+        return int(self.tensor.numel() * self.tensor.element_size())
+
+
+#: Default share of the card's *total* memory the viewer may hold. Of total,
+#: not of free: a budget re-read from free memory shrinks as the viewer fills
+#: it and settled near a third of the card for simply looking at runs.
+DEFAULT_DEVICE_SHARE = 0.25
+
+#: Driver-free memory below which :meth:`VolumeStore.relieve` starts handing
+#: device copies back, as a share of the card. Something else -- a fit, as a
+#: rule -- is growing, and the viewer is the one that can afford to wait.
+RELIEF_SHARE = 0.10
+
+#: Every live store. One process can run several controllers, each with its own
+#: store, and they share one card -- so the budget, the free-memory check and
+#: the LRU are all taken across stores, never per store.
+_STORES: weakref.WeakSet[VolumeStore] = weakref.WeakSet()
+
+#: One recency clock for all stores, so their LRU orders interleave. A counter,
+#: not a clock: it cannot go backwards when the system clock does.
+_CLOCK = count(1)
+
+#: ``-vram_budget``, when given: overrides the default share for every store.
+_BUDGET: int | None = None
+
+
+def configure_device_budget(budget: int | None) -> None:
+    """Set (or clear) the process-wide device budget in bytes."""
+    global _BUDGET
+    _BUDGET = budget
+
+
+def apply_vram_budget(text: str | None, device: torch.device) -> None:
+    """``-vram_budget`` from the command line: unset keeps the default share."""
+    configure_device_budget(None if not text else parse_budget(text, device_total(device)))
+
+
+def device_total(device: torch.device) -> int:
+    """The compute device's total memory in bytes; 0 for the CPU."""
+    if device.type == "cuda":
+        return int(torch.cuda.mem_get_info(device)[1])
+    if device.type == "mps":
+        return int(torch.mps.recommended_max_memory())
+    return 0
+
+
+def parse_budget(text: str, total: int) -> int:
+    """``-vram_budget`` as bytes: ``6`` / ``6G`` / ``512M`` absolute, ``30%`` of ``total``."""
+    s = str(text).strip().upper().removesuffix("B")
+    try:
+        if s.endswith("%"):
+            if total <= 0:
+                raise ValueError("a percentage needs a GPU to be a percentage of")
+            return int(total * float(s[:-1]) / 100.0)
+        scale = {"K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}.get(s[-1:], 0)
+        return int(float(s[:-1] if scale else s) * (scale or 2**30))
+    except ValueError as exc:
+        raise ValueError(f"cannot read {text!r} as a memory budget (try 6G or 25%)") from exc
+
+
 class VolumeStore:
     """Holds datasets across the residency tiers, evicting by least-recent use.
 
@@ -174,8 +254,8 @@ class VolumeStore:
         self._device_budget = device_budget
         self._zstd_threads = zstd_threads
         self._items: dict[str, Resident] = {}
+        self._work: dict[str, Working] = {}
         self._lock = threading.RLock()
-        self._clock = 0
         # Made on first spill, not on construction: a session that never runs
         # short of RAM should leave nothing behind in the temp directory. A
         # caller-supplied directory is used as-is and never removed.
@@ -184,11 +264,14 @@ class VolumeStore:
         self._pool = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="ffs-viewer-load"
         )
+        _STORES.add(self)
 
     # -- budgets -------------------------------------------------------
     #
-    # Both go through memory.py rather than being hardcoded, so the 0.5 GPU
-    # safety factor that compensates for the caching allocator applies here too.
+    # RAM goes through memory.py. The device budget is a fixed share of the
+    # card (DEFAULT_DEVICE_SHARE) because the viewer shares it with fits, and
+    # every promotion also checks the driver's free memory so a budget that
+    # was right at startup cannot push a card that has since filled.
 
     @property
     def ram_budget(self) -> int:
@@ -202,7 +285,9 @@ class VolumeStore:
             return self._device_budget
         if self.device.type == "cpu":
             return self.ram_budget
-        return get_available_memory(self.device, empty_cache=False)
+        if _BUDGET is not None:
+            return _BUDGET
+        return int(device_total(self.device) * DEFAULT_DEVICE_SHARE)
 
     def ram_used(self) -> int:
         with self._lock:
@@ -210,7 +295,23 @@ class VolumeStore:
 
     def device_used(self) -> int:
         with self._lock:
-            return sum(r.device_bytes for r in self._items.values())
+            return sum(r.device_bytes for r in self._items.values()) + sum(
+                w.device_bytes for w in self._work.values()
+            )
+
+    def _peers(self) -> list[VolumeStore]:
+        """Every live store computing on this store's device, this one included."""
+        return [s for s in list(_STORES) if s.device == self.device] or [self]
+
+    def device_used_all(self) -> int:
+        """What every store on this device holds there -- what the budget bounds."""
+        return sum(s.device_used() for s in self._peers())
+
+    def _driver_free(self) -> int | None:
+        """Free memory as the CUDA driver sees it, other processes included."""
+        if self.device.type != "cuda":
+            return None
+        return int(torch.cuda.mem_get_info(self.device)[0])
 
     # -- opening -------------------------------------------------------
     def open(self, path: str | Path, key: str | None = None) -> Resident:
@@ -461,7 +562,8 @@ class VolumeStore:
 
         arr = self.ensure_ram(key)
         need = arr.size * torch.empty((), dtype=dtype).element_size()
-        self._make_device_room(need, protect=key)
+        if not self._make_device_room(need, protect=key):
+            raise MemoryError(f"no device room for {key!r} ({need / 2**30:.2f} GB)")
         tensor = torch.from_numpy(arr).to(device=self.device, dtype=dtype)
         with self._lock:
             res.tensor = tensor
@@ -508,9 +610,105 @@ class VolumeStore:
         with self._lock:
             res.array = None
 
+    # -- working arrays --------------------------------------------------
+    def hold(self, key: str, value: torch.Tensor) -> torch.Tensor:
+        """Keep a mode's prepared array: in RAM always, on the device if it fits.
+
+        ``value`` may be on either side. Returns the copy to compute with now --
+        the device mirror when there is one. Replaces anything held under
+        ``key``. On CUDA the caching allocator is emptied afterwards, which is
+        what hands a preparation's temporaries (several times the result)
+        back to the card instead of leaving them reserved.
+        """
+        self.drop_working(key, empty_cache=False)
+        on_device = value.device.type != "cpu"
+        host = value.detach()
+        if on_device:
+            host = torch.empty(
+                value.shape, dtype=value.dtype, pin_memory=self.device.type == "cuda"
+            )
+            host.copy_(value)
+        work = Working(key=key, host=host)
+        with self._lock:
+            self._work[key] = work
+            self._touch(work)
+        size = work.host.numel() * work.host.element_size()
+        if on_device and self._make_device_room(size, protect=key, allocated=True):
+            work.tensor = value.detach()
+        del value
+        self._empty_cache()
+        return work.tensor if work.tensor is not None else work.host
+
+    def working(self, key: str, *, on_device: bool = False) -> torch.Tensor:
+        """A held array: the device mirror if there is one, else the RAM copy.
+
+        ``on_device`` asks for the mirror to be rebuilt when it was evicted --
+        for work that is slow on the CPU (a GLM fit is 60x). It is still a
+        request: with no room the RAM copy comes back and the caller computes
+        on the CPU.
+        """
+        with self._lock:
+            work = self._work.get(key)
+            if work is None:
+                raise KeyError(f"nothing held as {key!r}")
+            self._touch(work)
+            if work.tensor is not None or not on_device or self.device.type == "cpu":
+                return work.tensor if work.tensor is not None else work.host
+        need = work.host.numel() * work.host.element_size()
+        if not self._make_device_room(need, protect=key):
+            return work.host
+        tensor = work.host.to(self.device, non_blocking=work.host.is_pinned())
+        with self._lock:
+            work.tensor = tensor
+        return tensor
+
+    def holds(self, key: str) -> bool:
+        with self._lock:
+            return key in self._work
+
+    def drop_working(self, key: str, *, empty_cache: bool = True) -> None:
+        with self._lock:
+            work = self._work.pop(key, None)
+        if work is not None and work.tensor is not None and empty_cache:
+            work.tensor = None
+            self._empty_cache()
+
+    def _unmirror(self, key: str) -> None:
+        with self._lock:
+            work = self._work.get(key)
+            if work is not None:
+                work.tensor = None
+        self._empty_cache()
+
+    def _empty_cache(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def relieve(self) -> int:
+        """Give device copies back while the card is short; returns bytes released.
+
+        For when something else -- a fit -- started after the viewer filled its
+        budget. Everything released has a RAM copy, so the cost is a re-upload
+        on next use, never lost work. A no-op off CUDA, where there is no driver
+        figure to react to.
+        """
+        free = self._driver_free()
+        if free is None:
+            return 0
+        floor = int(device_total(self.device) * RELIEF_SHARE)
+        released = 0
+        for store, kind, key, size in self._device_lru():
+            if free + released >= floor:
+                break
+            store._evict(kind, key)
+            released += size
+        return released
+
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+        _STORES.discard(self)
         with self._lock:
+            self._work.clear()
             spill_dir = self._spill_dir if self._owns_spill_dir else None
             self._spill_dir = None
             for res in self._items.values():
@@ -519,9 +717,8 @@ class VolumeStore:
             shutil.rmtree(spill_dir, ignore_errors=True)
 
     # -- eviction ------------------------------------------------------
-    def _touch(self, res: Resident) -> None:
-        self._clock += 1
-        res.used_at = self._clock
+    def _touch(self, res: Resident | Working) -> None:
+        res.used_at = next(_CLOCK)
 
     def _lru_order(self, predicate: Callable[[Resident], bool]) -> list[Resident]:
         with self._lock:
@@ -530,14 +727,52 @@ class VolumeStore:
                 key=lambda r: r.used_at,
             )
 
-    def _make_device_room(self, need: int, *, protect: str) -> None:
-        budget = self.device_budget
-        for res in self._lru_order(lambda r: r.tensor is not None):
-            if self.device_used() + need <= budget:
-                return
-            if res.key == protect:
-                continue
-            self.demote(res.key)
+    def _device_lru(self) -> list[tuple[VolumeStore, str, str, int]]:
+        """Every device copy on this device, least recent first: (store, kind, key, bytes).
+
+        Datasets and working arrays, in every store, share one recency order:
+        whichever was touched last is what the person is looking at, whatever
+        kind it is and whichever tab it is in.
+        """
+        entries = []
+        for store in self._peers():
+            with store._lock:
+                entries += [
+                    (r.used_at, id(store), store, "dataset", r.key, r.device_bytes)
+                    for r in store._items.values()
+                    if r.tensor is not None
+                ] + [
+                    (w.used_at, id(store), store, "working", w.key, w.device_bytes)
+                    for w in store._work.values()
+                    if w.tensor is not None
+                ]
+        entries.sort(key=lambda e: (e[0], e[1]))
+        return [(store, kind, key, size) for _t, _i, store, kind, key, size in entries]
+
+    def _evict(self, kind: str, key: str) -> None:
+        if kind == "dataset":
+            self.demote(key)
+        else:
+            self._unmirror(key)
+
+    def _fits(self, need: int, allocated: bool) -> bool:
+        if self.device_used_all() + need > self.device_budget:
+            return False
+        free = self._driver_free()
+        # Leave the relief floor free too, or the next relieve() would hand
+        # straight back what this is about to take. An ``allocated`` array is
+        # already out of the driver's free figure, so it is not charged twice.
+        take = 0 if allocated else need
+        return free is None or take + int(device_total(self.device) * RELIEF_SHARE) <= free
+
+    def _make_device_room(self, need: int, *, protect: str, allocated: bool = False) -> bool:
+        """Evict least-recent device copies until ``need`` fits; whether it does."""
+        for store, kind, key, _size in self._device_lru():
+            if self._fits(need, allocated):
+                return True
+            if not (store is self and key == protect):
+                store._evict(kind, key)
+        return self._fits(need, allocated)
 
     def _enforce_ram_budget(self, *, protect: str) -> None:
         budget = self.ram_budget

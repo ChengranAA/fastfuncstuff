@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.viewer.residency import Tier, VolumeStore
+from fastfuncstuff.viewer.residency import Tier, VolumeStore, parse_budget
 from fastfuncstuff.viewer.session import ViewerSession, derive_range
 from fastfuncstuff.viewer.vocab import SetIJK, SetIndex
 
@@ -132,6 +132,99 @@ def test_closing_drops_the_device_copy(store, dataset):
     assert res.tensor is None
 
 
+# ---------------------------------------------------------------------------
+# one budget: working arrays, every store, the -vram_budget flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("6", 6 * 2**30),
+        ("6G", 6 * 2**30),
+        ("512M", 512 * 2**20),
+        ("1.5gb", int(1.5 * 2**30)),
+        ("25%", 4 * 2**30),
+    ],
+)
+def test_vram_budget_reads_sizes_and_percentages(text, want):
+    assert parse_budget(text, total=16 * 2**30) == want
+
+
+def test_vram_budget_refuses_nonsense():
+    with pytest.raises(ValueError, match="memory budget"):
+        parse_budget("lots", total=16 * 2**30)
+
+
+def test_a_held_array_on_the_cpu_is_its_own_ram_copy(store):
+    value = torch.arange(12.0).reshape(3, 4)
+    got = store.hold("W", value)
+    assert got.data_ptr() == value.data_ptr(), "a CPU store must not copy what it already has"
+    assert store.working("W", on_device=True).data_ptr() == value.data_ptr()
+    store.drop_working("W")
+    assert not store.holds("W")
+
+
+def test_one_budget_spans_every_store(tmp_path, dataset):
+    """Each controller tab has its own store; a per-store budget let N tabs
+    hold N budgets on one card."""
+    path, data = dataset
+    one = data.size * 4
+    a, b = VolumeStore(device=CPU, device_budget=int(one * 1.5)), None
+    try:
+        b = VolumeStore(device=CPU, device_budget=int(one * 1.5))
+        a.promote(a.open(path).key)
+        b.promote(b.open(path).key)
+        assert a.get(str(path)).tensor is None, "the older tab's copy goes first"
+        assert b.get(str(path)).tensor is not None
+    finally:
+        a.shutdown()
+        if b is not None:
+            b.shutdown()
+
+
+CUDA = torch.device("cuda")
+
+
+@pytest.fixture
+def cuda_store():
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    s = VolumeStore(device=CUDA, device_budget=64 * 2**20)
+    yield s
+    s.shutdown()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.gpu
+def test_holding_keeps_a_pinned_ram_copy_beside_the_mirror(cuda_store):
+    got = cuda_store.hold("W", torch.ones(1000, 100, device=CUDA))
+    assert got.device.type == "cuda"
+    work = cuda_store._work["W"]
+    assert work.host.device.type == "cpu" and work.host.is_pinned()
+    assert torch.equal(work.host, got.cpu())
+
+
+@pytest.mark.gpu
+def test_an_evicted_mirror_comes_back_from_ram_not_from_a_rebuild(cuda_store):
+    size = 40 * 2**20 // 4  # two of these overflow the 64 MB budget
+    cuda_store.hold("A", torch.full((size,), 1.0, device=CUDA))
+    cuda_store.hold("B", torch.full((size,), 2.0, device=CUDA))
+    assert cuda_store._work["A"].tensor is None, "LRU must evict A's mirror for B"
+    assert cuda_store.working("A").device.type == "cpu", "without asking, the RAM copy serves"
+    back = cuda_store.working("A", on_device=True)
+    assert back.device.type == "cuda" and float(back[0]) == 1.0
+    assert cuda_store._work["B"].tensor is None
+
+
+@pytest.mark.gpu
+def test_dropping_a_held_array_returns_its_memory_to_the_card(cuda_store):
+    cuda_store.hold("W", torch.ones(8 * 2**20, device=CUDA))
+    before = torch.cuda.memory_reserved()
+    cuda_store.drop_working("W")
+    assert torch.cuda.memory_reserved() <= before - 32 * 2**20
+
+
 def test_missing_file_is_an_error(store, tmp_path):
     with pytest.raises(FileNotFoundError):
         store.open(tmp_path / "nope.nii.gz")
@@ -163,21 +256,24 @@ def test_device_eviction_drops_least_recently_used(tmp_path, dataset):
         store.shutdown()
 
 
-def test_eviction_never_drops_the_dataset_being_promoted(tmp_path, dataset):
+def test_a_promotion_over_budget_is_refused_not_forced(tmp_path, dataset):
+    """It used to go ahead regardless, so the budget only bounded what was
+    *evicted*, never what the viewer actually held."""
     path, data = dataset
     store = VolumeStore(device=CPU, device_budget=1)  # nothing fits
     try:
         key = store.open(path).key
-        t = store.promote(key)
-        assert t is not None
-        assert store.get(key).tensor is not None
+        with pytest.raises(MemoryError):
+            store.promote(key)
+        assert store.get(key).tier is Tier.RAM, "the refused dataset keeps its RAM copy"
     finally:
         store.shutdown()
 
 
 def test_ram_eviction_spares_what_the_device_is_working_on(dataset):
     path, data = dataset
-    store = VolumeStore(device=CPU, ram_budget=1)
+    # On the CPU the device budget defaults to the RAM one; this is about RAM.
+    store = VolumeStore(device=CPU, ram_budget=1, device_budget=2**40)
     try:
         a = store.open(path, key="a")
         store.ensure_ram(a.key)

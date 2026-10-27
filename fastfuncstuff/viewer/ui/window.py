@@ -166,6 +166,8 @@ class Controller:
 
 #: How long a directory has to stay quiet before a rescan runs.
 RESCAN_QUIET_MS = 1200
+#: How often the window checks the card and hands memory back if it is short.
+VRAM_POLL_MS = 2000
 #: Layers shown before the list scrolls. Six covers an anatomy, a run, a mode's
 #: output and a couple of kept copies -- past that the list is being used as a
 #: workspace and scrolling it is better than spending the panel on it.
@@ -217,6 +219,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._build_panel()
         self._build_statusbar()
         self._install_shortcuts()
+
+        # Hands device copies back when something else -- a fit -- is filling
+        # the card, and keeps the readout honest. Cheap: one driver query.
+        self._vram_timer = QtCore.QTimer(self)
+        self._vram_timer.setInterval(VRAM_POLL_MS)
+        self._vram_timer.timeout.connect(self._tick_vram)
+        self._vram_timer.start()
         keep_keys_for_shortcuts(self)
 
         # Mode preparation runs on a worker; the mode is told to defer so a
@@ -2342,6 +2351,27 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.statusBar().addWidget(self.mode_label, 1)
         self.statusBar().addWidget(self.progress)
         self.statusBar().addPermanentWidget(self.value_label)
+        self.vram_label = QtWidgets.QLabel("")
+        self.vram_label.setToolTip(
+            "GPU memory the viewer holds, of its budget (-vram_budget). Everything "
+            "counted here also has a RAM copy, so the viewer hands it back when "
+            "another process needs the card."
+        )
+        self.statusBar().addPermanentWidget(self.vram_label)
+
+    def _tick_vram(self) -> None:
+        store = self.session.store
+        if store.device.type == "cpu":
+            self.vram_label.hide()
+            return
+        released = store.relieve()
+        if released:
+            self.statusBar().showMessage(
+                f"the GPU is short: handed {released / 2**30:.1f} GB back (kept in RAM)", 5000
+            )
+        used, budget = store.device_used_all(), store.device_budget
+        self.vram_label.setText(f"GPU {used / 2**30:.1f}/{budget / 2**30:.1f} GB")
+        self.vram_label.show()
 
     # -- mode preparation ----------------------------------------------
     def _on_prepare_progress(self, fraction: float, message: str) -> None:
@@ -2895,9 +2925,11 @@ def launch(
     meshes: list[str] | None = None,
     surf_space: str | None = None,
     surf_data: list | None = None,
+    vram_budget: str | None = None,
 ) -> int:
     """Open the controller and run the Qt loop."""
     from fastfuncstuff.cli_utils import setup_device
+    from fastfuncstuff.viewer.residency import apply_vram_budget
 
     # The GTK accessibility bridge prints a dbind warning at every start on a
     # desktop whose at-spi bus it cannot reach, and nothing here uses it.
@@ -2905,6 +2937,7 @@ def launch(
     os.environ.setdefault("NO_AT_BRIDGE", "1")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     session = ViewerSession(device=setup_device(device))
+    apply_vram_budget(vram_budget, session.store.device)
     win = ViewerWindow(session)
     quit_on_interrupt(app, win)
 

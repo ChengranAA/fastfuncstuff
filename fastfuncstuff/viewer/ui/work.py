@@ -62,6 +62,21 @@ class _LineWriter(io.TextIOBase):
             self._held = ""
 
 
+def _return_cached_device_memory() -> None:
+    """Hand a finished job's temporaries back to the card.
+
+    A preparation, a motion correction or a derive peaks at several times its
+    result, and PyTorch's caching allocator keeps that peak reserved after the
+    tensors are gone -- invisible to the viewer's budget, but not to a fit
+    starting in another process. What a mode keeps lives in the store and is
+    untouched by this.
+    """
+    import torch
+
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+
 class _Task(QtCore.QRunnable):
     """Any slow job that takes a progress callback and returns truthiness.
 
@@ -91,6 +106,7 @@ class _Task(QtCore.QRunnable):
                     ok = self.job(self.signals.progress.emit)
                 finally:
                     writer.flush()
+                    _return_cached_device_memory()
         except Exception as exc:  # surfaced in the status bar, never swallowed
             # And in full on the terminal: the status bar holds one line for
             # eight seconds, and "quantile()" alone says nothing about where.

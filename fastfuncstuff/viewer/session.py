@@ -25,7 +25,7 @@ from fastfuncstuff.viewer.layers import Layer, SignMode
 from fastfuncstuff.viewer.modes import Mode, registry
 from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
 from fastfuncstuff.viewer.paintlayer import Painter
-from fastfuncstuff.viewer.residency import Resident, VolumeStore
+from fastfuncstuff.viewer.residency import Resident, VolumeStore, _c_order
 from fastfuncstuff.viewer.rois import RoiSet, looks_like_labels, rois_from_frames, rois_from_labels
 from fastfuncstuff.viewer.state import Plane, ViewerState
 from fastfuncstuff.viewer.surfaces import SurfaceStore
@@ -1945,7 +1945,9 @@ class ViewerSession:
                 arr = self.shown_volume(key, idx)
             except (KeyError, FileNotFoundError, ValueError):
                 return None
-            tensor = torch.as_tensor(np.ascontiguousarray(arr), dtype=torch.float32).to(
+            # A frame of the store's (X, Y, Z, T) array is a strided view;
+            # _c_order gathers it with torch's threaded copy, 4x NumPy's.
+            tensor = torch.from_numpy(_c_order(np.asarray(arr, dtype=np.float32))).to(
                 self.display_device
             )
         # One sub-brick per layer is enough: panes share it, and holding more
@@ -1956,31 +1958,22 @@ class ViewerSession:
         return tensor
 
     def _device_frame(self, res: Resident, layer: Layer, idx: int) -> torch.Tensor | None:
-        """Frame ``idx`` of a resident run, sliced on the device; None for the host path.
+        """Frame ``idx`` sliced from a device copy something else already made; else None.
 
-        A frame out of a host array stored (X, Y, Z, T) is a strided gather
-        plus an upload -- ~10 ms a step on a 100x100x72 run, most of scrubbing
-        time. Promoted, it is a slice. The store's promote keeps its own
-        budget and evicts by recency, so this asks rather than claims: the
-        host path stays for a run not yet in RAM, a time view (detrend / PSC
-        is computed on the host), a display on another device (Metal repaints
-        on the CPU), or a card without room.
+        Never promotes. Scrubbing used to promote the whole run so a frame was
+        a device slice, which parked every 4-D layer you had looked at on the
+        card -- about a third of free VRAM for just viewing. The host gather it
+        avoided is 1.4 ms on a 100x100x72x300 run through torch's threaded
+        copy (:meth:`display_volume`), so the trade was not worth it.
         """
+        series = res.tensor
         if (
-            res.info.n_volumes < 2
-            or res.array is None
-            or res.provider is not None
+            series is None
+            or res.info.n_volumes < 2
             or layer.time_detrend >= 0
             or layer.time_psc
-            or self.store.device.type != self.display_device.type
-            # On the CPU a "promoted" copy saves nothing and is still charged
-            # to the store's budget, which would evict other data for it.
-            or self.store.device.type == "cpu"
+            or series.device.type != self.display_device.type
         ):
-            return None
-        try:
-            series = self.store.promote(layer.key)
-        except (RuntimeError, MemoryError):
             return None
         return series[..., idx].contiguous()
 

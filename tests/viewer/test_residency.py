@@ -457,3 +457,31 @@ def test_a_displayed_sub_brick_lands_on_the_display_device(session, dataset):
     key = session.load(path)
     session.store.ensure_ram(key)
     assert session.display_volume(key).device.type == session.display_device.type
+
+
+def test_scrubbing_never_promotes_a_run(session, dataset, monkeypatch):
+    """Scrubbing promoted each whole 4-D run so a frame was a device slice,
+    parking every run you had looked at on the card."""
+    path, data = dataset
+    key = session.load(path)
+    session.store.ensure_ram(key)
+
+    def refuse(*_a, **_k):
+        raise AssertionError("display path promoted a run")
+
+    monkeypatch.setattr(session.store, "promote", refuse)
+    for idx in (3, 7):
+        session.do(SetIndex(idx))
+        vol = session.display_volume(key)
+        assert np.allclose(vol.cpu().numpy(), data[..., idx], atol=1e-5)
+    assert session.store.get(key).tensor is None
+
+
+def test_scrubbing_reuses_a_device_copy_someone_else_made(session, dataset):
+    path, data = dataset
+    key = session.load(path)
+    series = session.store.promote(key)
+    session.do(SetIndex(4))
+    vol = session.display_volume(key)
+    assert np.allclose(vol.cpu().numpy(), data[..., 4], atol=1e-5)
+    assert session.store.get(key).tensor is series

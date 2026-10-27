@@ -662,6 +662,20 @@ class VolumeStore:
             work.tensor = tensor
         return tensor
 
+    def ram_copy(self, key: str) -> torch.Tensor:
+        """A held array's RAM copy -- safe to keep a reference to.
+
+        Keeping the *mirror* would pin it on the card past any eviction; the RAM
+        copy exists for as long as the hold does anyway.
+        """
+        with self._lock:
+            return self._work[key].host
+
+    def mirrored(self, key: str) -> bool:
+        with self._lock:
+            work = self._work.get(key)
+            return work is not None and work.tensor is not None
+
     def holds(self, key: str) -> bool:
         with self._lock:
             return key in self._work

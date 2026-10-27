@@ -678,3 +678,55 @@ def test_an_roi_file_on_the_wrong_grid_is_reported_not_raised(glm_session):
     glm_session.set_mode_param("rois", _rois(glm_session.tmp, shape=(4, 4, 4)))
     mode = glm_session.mode
     assert mode._fit is None and mode._message
+
+
+# -- where the run and the fit live -----------------------------------------
+
+
+def test_the_rows_are_held_by_the_store_and_the_maps_live_in_ram(glm_session):
+    """Both used to stay on the device for as long as the mode was open,
+    outside any budget."""
+    mode = _enter(glm_session)
+    assert glm_session.store.holds(mode._hold_key)
+    assert mode._prepared.y.device.type == "cpu"
+    assert all(t.device.type == "cpu" for t in (mode._fit.betas, mode._fit.tstats, mode._fit.rss))
+    assert mode._fit.prepared is mode._prepared, "the fit must not keep a device copy alive"
+
+
+def test_a_design_change_refits_without_re_gathering(glm_session, monkeypatch):
+    from fastfuncstuff.viewer import instaglm as engine
+
+    _enter(glm_session)
+    calls = []
+    real = engine.prepare
+    monkeypatch.setattr(engine, "prepare", lambda *a, **k: calls.append(1) or real(*a, **k))
+    glm_session.set_mode_param("polort", "1")
+    glm_session.set_mode_param("polort", "3")
+    assert calls == []
+
+
+def test_leaving_instaglm_releases_its_rows(glm_session):
+    key = _enter(glm_session)._hold_key
+    glm_session.do(SetMode("plain"))
+    assert not glm_session.store.holds(key)
+
+
+@pytest.mark.gpu
+def test_an_evicted_mirror_refits_from_ram_with_the_same_answer(glm_session, tmp_path):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    want = float(_enter(glm_session, show="R2", polort=1)._fit.volume("R2")[INSIDE])
+
+    s = ViewerSession(device=torch.device("cuda"))
+    try:
+        s.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+        s.do(SetOverlay(str(tmp_path / "bold.nii.gz")))
+        s.store.ensure_ram(s.state.layers.keys[1])
+        mode = _enter(s, show="R2", polort=0)
+        assert s.store.mirrored(mode._hold_key)
+        s.store._unmirror(mode._hold_key)  # what relieve() does when a fit starts
+        s.set_mode_param("polort", "1")
+        assert s.store.mirrored(mode._hold_key), "refit should re-upload, not stay on the CPU"
+        assert float(s.mode._fit.volume("R2")[INSIDE]) == pytest.approx(want, abs=1e-4)
+    finally:
+        s.close()

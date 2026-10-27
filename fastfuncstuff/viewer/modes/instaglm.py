@@ -26,6 +26,7 @@ required its own fit rather than ``glm/core.py:fit_glm``.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -115,6 +116,8 @@ class InstaGLMMode(Mode):
     def __init__(self) -> None:
         self._prepared: engine.Prepared | None = None
         self._fit: engine.Fit | None = None
+        #: The store key the prepared rows are held under; see :meth:`_on_device`.
+        self._hold_key: str | None = None
         self._source_key: str | None = None
         #: The blur the prepared run was gathered at, so a change is detectable.
         self._blur = 0.0
@@ -397,8 +400,7 @@ class InstaGLMMode(Mode):
         The fit goes with it -- it is voxel sized too -- and the parameters
         stay, so coming back costs one gather and one solve and nothing else.
         """
-        self._prepared = None
-        self._fit = None
+        self._drop_prepared()
         self._source_key = None
         self._dirty = True
         # The task block is design sized, not voxel sized, so it survives:
@@ -411,8 +413,7 @@ class InstaGLMMode(Mode):
             # A full rebuild, source included: the events file may have been
             # edited on disk since it was read, and "press fit again" is the
             # gesture people expect to pick that up.
-            self._prepared = None
-            self._fit = None
+            self._drop_prepared()
             self._task_key = None
             self.invalidate()
             return self.refresh(progress)
@@ -437,14 +438,18 @@ class InstaGLMMode(Mode):
             or self._cut[:2]
             != (int(self.params.get("drop_first") or 0), int(self.params.get("drop_last") or 0))
         ):
-            self._prepared = None
-            self._fit = None
+            self._drop_prepared()
         if self._prepared is None and not self._gather(device, progress):
             return False
         assert self._prepared is not None
+        # The run on the device for this fit: from the store's mirror, or one
+        # upload from its RAM copy when the mirror was handed back -- never a
+        # re-gather. With no room at all it is the RAM copy, and the fit runs
+        # on the CPU: slower (0.2-0.6 s), but a full card is not an error.
+        work = self._on_device()
 
         try:
-            model = self._build_model(device, progress)
+            model = self._build_model(work, progress)
         except (OSError, ValueError, IndexError) as exc:
             self._message = str(exc)
             self._fit = None
@@ -453,7 +458,10 @@ class InstaGLMMode(Mode):
 
         if progress is not None:
             progress(0.6, f"fitting {model.n_columns} regressors")
-        self._fit = engine.fit_model(self._prepared, model, device=device, progress=progress)
+        self._fit = self._to_host(
+            engine.fit_model(work, model, device=work.y.device, progress=progress)
+        )
+        del work
         self._message = f"{model.note}, {model.n_columns} columns, {self._fit.dof} dof"
         if model.n_columns > self._fit.rank:
             # Not an error -- polort 0 beside a constant ortvec is one click
@@ -487,7 +495,7 @@ class InstaGLMMode(Mode):
         data = data[..., window]
         rois = str(self.params.get("rois") or "").strip()
         try:
-            self._prepared = engine.prepare(
+            prepared = engine.prepare(
                 data,
                 affine=np.asarray(layer.affine, dtype=float),
                 tr=tr,
@@ -498,9 +506,17 @@ class InstaGLMMode(Mode):
             )
         except (OSError, ValueError) as exc:
             self._message = str(exc)
-            self._prepared = None
-            self._fit = None
+            self._drop_prepared()
             return False
+        # The store keeps the rows (RAM, mirrored while the budget allows); the
+        # mode keeps only the RAM copy, so an evicted mirror really is freed.
+        store = self.session.store
+        self._hold_key = f"instaglm:{id(self)}"
+        store.hold(self._hold_key, prepared.y)
+        self._prepared = replace(
+            prepared, y=store.ram_copy(self._hold_key), mean=prepared.mean.cpu()
+        )
+        del prepared
         self._rois = rois
         self._blur = float(self.params.get("blur") or 0.0)
         self._source_key = layer.key
@@ -508,8 +524,37 @@ class InstaGLMMode(Mode):
         self._tr = tr
         return True
 
-    def _build_model(self, device: torch.device, progress: ProgressFn | None) -> engine.Model:
+    def _on_device(self) -> engine.Prepared:
+        """The prepared run with its rows on the compute device, if there is room."""
+        assert self._prepared is not None and self.session is not None
+        y = self.session.store.working(self._hold_key, on_device=True)
+        return replace(self._prepared, y=y, mean=self._prepared.mean.to(y.device))
+
+    def _to_host(self, fit: engine.Fit) -> engine.Fit:
+        """The fit with its maps in RAM and its run pointing at the RAM copy.
+
+        Maps are (k, V) each -- a few hundred MB on a real run -- and are read
+        per map switch with elementwise arithmetic, which RAM serves as well as
+        the card. Left on the device they would sit outside every budget.
+        """
         assert self._prepared is not None
+        host = {
+            f.name: v.cpu() if isinstance(v := getattr(fit, f.name), torch.Tensor) else v
+            for f in fields(fit)
+        }
+        host["prepared"] = self._prepared
+        return engine.Fit(**host)
+
+    def _drop_prepared(self) -> None:
+        if self._hold_key is not None and self.session is not None:
+            self.session.store.drop_working(self._hold_key)
+        self._hold_key = None
+        self._prepared = None
+        self._fit = None
+
+    def _build_model(self, work: engine.Prepared, progress: ProgressFn | None) -> engine.Model:
+        assert self._prepared is not None
+        device = work.y.device
         n_time, tr = self._prepared.n_time, self._prepared.tr
         # Timing and ortvec files describe the whole run. The task is convolved
         # over all of it and cut afterwards, so events just before the first kept
@@ -545,9 +590,10 @@ class InstaGLMMode(Mode):
                 ort=ort,
                 ort_labels=ort_labels,
             )
-            first = engine.fit_model(self._prepared, base, device=device)
+            first = engine.fit_model(work, base, device=device)
             pool = engine.noise_pool(first)
-            pcs, _ratios = engine.noise_pcs(self._prepared, pool, base.matrix, n_pcs, device=device)
+            pcs, _ratios = engine.noise_pcs(work, pool, base.matrix, n_pcs, device=device)
+            del first
 
         return engine.build_model(
             n_time=n_time,
@@ -832,7 +878,9 @@ class InstaGLMMode(Mode):
             return ""
         gb = self._prepared.bytes / 1e9
         unit = "ROIs" if self._prepared.roi_names is not None else "voxels"
-        return f"{self._prepared.n_voxels} {unit}, {gb:.2f} GB on {self._prepared.y.device.type}"
+        mirrored = self.session is not None and self.session.store.mirrored(self._hold_key or "")
+        where = self.session.store.device.type if mirrored and self.session else "cpu"
+        return f"{self._prepared.n_voxels} {unit}, {gb:.2f} GB on {where}"
 
     def status(self) -> str:
         if self._preparing:

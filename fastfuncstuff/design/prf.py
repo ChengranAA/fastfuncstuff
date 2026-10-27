@@ -1488,9 +1488,12 @@ def prf_parameter_maps(
     extent = float(max(stimulus_shape))
     center = (1.0 + extent) / 2.0
     exponent = parameters[:, 3].clamp_min(torch.finfo(parameters.dtype).eps)
-    # Larger row index is the upper visual field for the aperture layouts these
-    # tools are given, so vertical position is row - center, not center - row.
-    vertical = parameters[:, 0] - center
+    # Row 0 is the TOP of the aperture -- PNG frames read top-down, and a NIfTI
+    # aperture written by the same stimulus code keeps that order -- so the
+    # upward direction is center - row. This matches analyzePRF, whose
+    # ang = atan2((1+res(1))/2 - R, C - (1+res(2))/2); the opposite sign used to
+    # ship here and showed up as y (and therefore angle) mirrored against MATLAB.
+    vertical = center - parameters[:, 0]
     horizontal = parameters[:, 1] - center
     eccentricity = torch.hypot(vertical, horizontal)
     angle = torch.rad2deg(torch.atan2(vertical, horizontal)).remainder(360.0)

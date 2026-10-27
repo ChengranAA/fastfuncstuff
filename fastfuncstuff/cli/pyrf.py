@@ -97,9 +97,12 @@ OUTPUT
   -stim_downsample settings, so pass -screen_extent for anything you will share.
 
     x, y            pRF center relative to the aperture center. y is positive
-                    upward in the visual field.
-    angle           polar angle in degrees; 0 = right, increasing toward y.
-                    NaN where eccentricity is exactly 0.
+                    upward in the visual field -- the first axis of the stimulus
+                    runs top-down (PNG frame order), so up is toward row 0.
+                    Same sign convention as analyzePRF, so x/y/angle compare
+                    directly against a MATLAB fit of the same apertures.
+    angle           polar angle in degrees; 0 = right, increasing toward y
+                    (counter-clockwise). NaN where eccentricity is exactly 0.
     eccentricity    distance from the aperture center, hypot(x, y).
     sigma           Gaussian standard deviation of the pRF, before the CSS
                     exponent is applied.

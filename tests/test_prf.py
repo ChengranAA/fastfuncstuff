@@ -25,6 +25,7 @@ from fastfuncstuff.design.prf import (
     fit_prf_supergrid,
     gaussian_receptive_fields,
     make_analyzeprf_grid,
+    prf_parameter_maps,
     refine_prf_supergrid,
 )
 
@@ -489,7 +490,8 @@ def test_screen_extent_reports_position_in_degrees(tmp_path):
 
     from fastfuncstuff.cli.pyrf import _save_results
 
-    # One voxel, 10 pixels right of and 4 pixels above the aperture center.
+    # One voxel, 10 pixels right of and 4 pixels above the aperture center
+    # (a SMALLER row is higher in the visual field, as in analyzePRF).
     center = (1.0 + 100.0) / 2.0
     results = types.SimpleNamespace(
         parameters=torch.tensor([[center - 4.0, center + 10.0, 3.0, 0.25]]),
@@ -515,7 +517,7 @@ def test_screen_extent_reports_position_in_degrees(tmp_path):
     values = dict(zip(read_brick_labels(image), image.get_fdata().ravel(), strict=True))
     degrees_per_pixel = 20.0 / 100.0
     assert values["x"] == pytest.approx(10.0 * degrees_per_pixel)
-    assert values["y"] == pytest.approx(-4.0 * degrees_per_pixel)
+    assert values["y"] == pytest.approx(4.0 * degrees_per_pixel)
     assert values["eccentricity"] == pytest.approx(np.hypot(10.0, 4.0) * degrees_per_pixel)
     # rfsize is sigma/sqrt(n), converted with the same factor.
     assert values["rfsize"] == pytest.approx((3.0 / 0.5) * degrees_per_pixel)
@@ -553,7 +555,7 @@ def test_positions_are_center_relative_pixels_without_screen_extent(tmp_path):
     image = nib.load(output)
     values = dict(zip(read_brick_labels(image), image.get_fdata().ravel(), strict=True))
     assert values["x"] == pytest.approx(10.0)
-    assert values["y"] == pytest.approx(-4.0)
+    assert values["y"] == pytest.approx(4.0)
     assert values["eccentricity"] == pytest.approx(np.hypot(10.0, 4.0))
 
 
@@ -1476,6 +1478,26 @@ def _named_maps(parameters):
     from fastfuncstuff.design.prf import prf_parameter_maps
 
     return prf_parameter_maps(parameters, (10, 10), 1.0)
+
+
+def test_vertical_sign_matches_analyzeprf():
+    """Up is toward row 0, as in analyzePRF -- the sign is silently reversible."""
+    stimulus_shape = (100, 100)
+    center = (1.0 + 100.0) / 2.0
+    rows = torch.tensor([center - 4.0, center + 4.0, center])
+    parameters = torch.stack(
+        [rows, torch.full_like(rows, center + 10.0), torch.ones_like(rows), torch.ones_like(rows)],
+        dim=1,
+    )
+
+    maps = prf_parameter_maps(parameters, stimulus_shape, 1.0)
+
+    # analyzePRF: ang = atan2((1+res(1))/2 - R, C - (1+res(2))/2).
+    expected = np.rad2deg(np.arctan2(center - rows.numpy(), 10.0)) % 360.0
+    np.testing.assert_allclose(maps["y"].numpy(), [4.0, -4.0, 0.0])
+    np.testing.assert_allclose(maps["angle"].numpy(), expected, atol=1e-5)
+    # A pRF above the horizontal meridian is in the first quadrant, not the fourth.
+    assert 0.0 < maps["angle"][0] < 90.0
 
 
 def _write_grouped_prf_dataset(tmp_path):

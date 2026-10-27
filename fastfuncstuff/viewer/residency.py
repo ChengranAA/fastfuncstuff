@@ -328,6 +328,10 @@ class VolumeStore:
             return list(self._items)
 
     def close(self, key: str) -> None:
+        # Demote first: dropping the record alone frees the tensor into the
+        # caching allocator, which keeps it reserved -- removing a layer then
+        # showed no change in nvidia-smi.
+        self.demote(key)
         with self._lock:
             res = self._items.pop(key, None)
         if res is not None:

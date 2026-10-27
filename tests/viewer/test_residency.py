@@ -121,6 +121,17 @@ def test_demote_keeps_ram_residency(store, dataset):
     assert store.get(key).tier is Tier.RAM
 
 
+def test_closing_drops_the_device_copy(store, dataset):
+    """Close used to pop the record without demoting, so on CUDA the run sat
+    in the caching allocator and removing a layer freed no VRAM."""
+    path, _ = dataset
+    key = store.open(path).key
+    store.promote(key)
+    res = store.get(key)
+    store.close(key)
+    assert res.tensor is None
+
+
 def test_missing_file_is_an_error(store, tmp_path):
     with pytest.raises(FileNotFoundError):
         store.open(tmp_path / "nope.nii.gz")

@@ -565,7 +565,9 @@ def test_image_windows_draw_both_regions_where_the_slice_cuts_them(tmp_path):
         app.processEvents()
         # With a window, preparation is the window worker's job; run it here.
         s.do(SetMode("rgb"))
-        for k, v in (("live", "1"), ("files", _files(paths)), ("basis", "pick")):
+        for k, v in (("live", "1"), ("view", "contrast"), ("files", _files(paths))):
+            s.do(SetModeParam(k, v))
+        for k, v in (("basis", "pick"),):
             s.do(SetModeParam(k, v))
         for k, v in (("signal", "raw"), ("radius_a", "6"), ("radius_b", "4")):
             s.do(SetModeParam(k, v))
@@ -691,6 +693,7 @@ def test_echoes_view_pins_s0_and_r2_and_hides_the_contrast_tools(tmp_path, sessi
     te = next(c for c in session.mode.panel_controls() if c.name == "te")
     assert te.visible_when is None, "TE is the point of this view, not a te-basis extra"
     assert "optimise" not in {a.name for a in session.mode.panel_actions()}
+    assert session.mode.marks() == [], "no A vs B to compare in this view"
     # Hidden is not gone: the contrast view comes back with what was set there.
     session.do(SetModeParam("view", "contrast"))
     source = session.colour_sources[_rgb(session).key]

@@ -407,7 +407,8 @@ class ImagePane(QtWidgets.QWidget):
             self._paint_highlight(p, rect)
         if self._marks:
             self._paint_marks(p, rect)
-        if self._regions:
+        # A mode's regions sit around the crosshair, so "off" means a clean image.
+        if self._regions and self.cross_style != "off":
             self._paint_regions(p, rect)
         if self._handle is not None:
             self._paint_handle(p, rect)

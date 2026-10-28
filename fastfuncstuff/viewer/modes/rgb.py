@@ -989,6 +989,8 @@ class RGBMode(Mode):
         return (x, y, z)
 
     def marks(self) -> list[Mark]:
+        if self.params.get("view") == "echoes":
+            return []  # no A vs B to compare in this view
         if str(self.params.get("regions") or "spheres") != "spheres":
             return []  # the ROI layer itself shows the regions
         out = []

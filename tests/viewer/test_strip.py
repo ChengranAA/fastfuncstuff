@@ -178,11 +178,20 @@ def test_crosshair_style_cycles_in_every_pane_and_off_draws_nothing(session):
         win.show()
         win.redraw()
         app.processEvents()
+        bare = win.pane.grab().toImage()
+        win.pane.set_regions([(10.0, 10.0, 4.0, 4.0, (1.0, 0.75, 0.15), "A")])
+        app.processEvents()
         lines = win.pane.grab().toImage()
         win._cycle_cross()
         app.processEvents()
         assert win.pane.cross_style == "off" and win.cross_button.isChecked()
-        assert win.pane.grab().toImage() != lines
+        off = win.pane.grab().toImage()
+        assert off != lines
+        # Off is a clean image: the mode's regions go with the crosshair.
+        win.pane.set_regions([])
+        app.processEvents()
+        assert win.pane.grab().toImage() == off
+        assert bare != lines
         # Cells built after the switch take the window's style, not the default.
         win._toggle_strip()
         app.processEvents()

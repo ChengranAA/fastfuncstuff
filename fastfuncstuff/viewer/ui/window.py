@@ -234,11 +234,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.runner.progress.connect(self._on_prepare_progress)
         self.runner.busy_changed.connect(self._on_prepare_busy)
         self._rebuild_queue: list[tuple[Controller, str]] = []
+        #: Controllers whose mode is waiting for the worker. One worker, so a
+        #: seed carried to three tabs prepares them one after another rather
+        #: than dropping the two that found it busy.
+        self._prepare_queue: list[Controller] = []
         #: Open tool dialogs, by tool name. One per tool, reused on re-press.
         self._tool_dialogs: dict[str, ToolDialog] = {}
         # Deferred a turn so the job that just finished has handed its picture
         # over before the next one takes the worker.
-        self.runner.finished.connect(lambda *_: QtCore.QTimer.singleShot(0, self._drain_rebuilds))
+        self.runner.finished.connect(lambda *_: QtCore.QTimer.singleShot(0, self._drain_work))
 
         from fastfuncstuff.viewer.ui.player import Player
 
@@ -421,6 +425,28 @@ class ViewerWindow(QtWidgets.QMainWindow):
             if other is not self._active:
                 self._follow(other, mm if moved else None, state.time_index if stepped else None)
 
+    def _propagate_seed(self) -> None:
+        """Carry the active controller's seed to the rest, by millimetres.
+
+        Each tab correlates its own run from the same place, so two subjects,
+        or raw against denoised, are compared like with like from one click.
+        Off with the link, as the crosshair is.
+        """
+        if not self.linked or len(self.controllers) < 2:
+            return
+        state = self.session.state
+        if state.seed is None or state.grid is None:
+            return
+        mm = state.grid.ijk_to_mm(state.seed)
+        for other in self.controllers:
+            grid = other.session.state.grid
+            if other is self._active or grid is None:
+                continue
+            i, j, k = (round(v) for v in grid.mm_to_ijk(mm))
+            self._refresh_windows(other, other.session.do(SetSeed(i, j, k)))
+            if other.session.mode.needs_prepare:
+                self._queue_prepare(other)
+
     def _set_linked(self, on: bool) -> None:
         self.linked = bool(on)
         if self.linked:
@@ -440,8 +466,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         before_mm, before_time = self.session.state.crosshair_mm, self.session.state.time_index
         self.refresh(self.session.do(cmd))
         self._propagate(before_mm, before_time)
-        if isinstance(cmd, SetSeed) and self.session.mode.needs_prepare:
-            self._prepare_then_refresh()
+        if isinstance(cmd, SetSeed):
+            if self.session.mode.needs_prepare:
+                self._queue_prepare(self._active)
+            self._propagate_seed()
         # A built window's own settings decide its picture, so changing one
         # rebuilds it. Everything else that could invalidate it -- a new
         # overlay, a new layer -- only marks it stale, because this is seconds
@@ -1881,6 +1909,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._rebuild_queue.append((self._active, vid))
         self._drain_rebuilds()
 
+    def _drain_work(self) -> None:
+        """The worker is free: queued preparations first, then window rebuilds.
+
+        Preparations first because they are what a click is waiting on.
+        """
+        while self._prepare_queue and not self.runner.busy:
+            ctl = self._prepare_queue.pop(0)
+            if ctl in self.controllers and ctl.session.mode.needs_prepare:
+                self._prepare_then_refresh(ctl)
+        self._drain_rebuilds()
+
     def _drain_rebuilds(self) -> None:
         while self._rebuild_queue and not self.runner.busy:
             ctl, vid = self._rebuild_queue.pop(0)
@@ -2453,9 +2492,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if not busy:
             self.progress.reset()
 
-    def _prepare_then_refresh(self) -> None:
+    def _queue_prepare(self, ctl: Controller) -> None:
+        """Prepare a controller's mode now, or once the worker is free."""
+        if not self.runner.busy:
+            self._prepare_then_refresh(ctl)
+        elif ctl not in self._prepare_queue:
+            self._prepare_queue.append(ctl)
+
+    def _prepare_then_refresh(self, ctl: Controller | None = None) -> None:
         """Run the mode's slow half on a worker, then install its overlay."""
-        ctl = self._active
+        ctl = self._active if ctl is None else ctl
 
         def ready() -> None:
             dirty = ctl.session.refresh_mode() | Aspect.LAYERS | Aspect.SLICES

@@ -2213,6 +2213,33 @@ def test_a_mac_ctrl_click_seeds_instacorr_and_draws_a_map(win4d, qapp, monkeypat
     assert win4d.session.state.selected == layer.key
 
 
+def test_a_seed_set_in_one_tab_correlates_every_linked_tab(win4d, qapp, tmp_path):
+    """Each tab correlates its own run from the same place, from one click.
+
+    B is set up while A's preparation may still hold the worker, so this also
+    covers the queue: a second preparation used to be dropped, not waited for.
+    """
+    from fastfuncstuff.viewer.vocab import SetOverlay, SetSeed, SetUnderlay
+
+    a = win4d.active
+    win4d._switch_mode("instacorr")
+    b = win4d.new_controller()
+    win4d.refresh(b.session.do(SetUnderlay(str(tmp_path / "anat.nii.gz"))))
+    win4d.refresh(b.session.do(SetOverlay(str(tmp_path / "bold.nii.gz"))))
+    b.session.store.ensure_ram(b.session.state.layers.overlay.key)
+    win4d._switch_mode("instacorr")
+    win4d.activate(a)
+    win4d._dispatch(SetSeed(3, 4, 2))
+    for _ in range(6):
+        win4d.runner.wait(20_000)
+        qapp.processEvents()
+
+    mm = a.session.state.grid.ijk_to_mm(a.session.state.seed)
+    assert b.session.state.grid.ijk_to_mm(b.session.state.seed) == pytest.approx(mm)
+    for ctl in (a, b):
+        assert ctl.session.state.layers.find_by_source("mode:instacorr") is not None, ctl.letter
+
+
 def test_keep_from_the_panel_numbers_the_copies(win4d, qapp):
     from fastfuncstuff.viewer.vocab import SetSeed
 

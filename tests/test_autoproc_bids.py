@@ -76,6 +76,20 @@ def test_sbref_and_phase_pairing_and_mislabeled_phase(tmp_path: Path):
     assert run.sbref_path is not None and run.sbref_path.name.endswith("part-mag_sbref.nii.gz")
 
 
+def test_bare_siemens_p_image_type_is_phase(tmp_path: Path):
+    # HiHiFaces' older conversions mark phase only with the Siemens "P" token (no
+    # "PHASE"), so their _sbref_ph / _phase fmaps were taken for magnitude candidates.
+    from fastfuncstuff.autoproc.bids import _is_phase
+
+    fmap = tmp_path / "sub-1" / "fmap"
+    phase = fmap / "sub-1_dir-LR_run-1_sbref_ph.nii.gz"
+    mag = fmap / "sub-1_dir-LR_run-1_sbref.nii.gz"
+    _touch(phase, {"ImageType": ["ORIGINAL", "PRIMARY", "P", "ND", "MOSAIC"]})
+    _touch(mag, {"ImageType": ["ORIGINAL", "PRIMARY", "M", "ND", "MOSAIC"]})
+    assert _is_phase(phase, parse_entities(phase.name), tmp_path)
+    assert not _is_phase(mag, parse_entities(mag.name), tmp_path)  # "PRIMARY" is not "P"
+
+
 def test_fmap_intendedfor_and_task_fallback(tmp_path: Path):
     """floc fmap has IntendedFor (floc runs only); primary fmap has none →
     task-match. Scanning -task primary must keep only the primary fmap."""

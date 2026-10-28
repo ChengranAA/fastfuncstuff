@@ -379,12 +379,14 @@ def _is_phase(nifti: Path, ents: dict[str, str], bids_root: Path) -> bool:
     """True if this file holds phase data.
 
     quirk: some acquisitions mislabel phase as ``part-sbref_bold``; the only
-    reliable signal is ``ImageType`` containing ``PHASE`` in the sidecar.
+    reliable signal is the sidecar ``ImageType``: ``PHASE`` from newer dcm2niix,
+    or the bare Siemens ``P`` token (vs ``M``) that older conversions keep alone
+    -- HiHiFaces' ``_sbref_ph`` and pre-1.5 ``_phase`` fmaps carry only that.
     """
     if ents.get("part") == "phase":
         return True
     image_type = load_sidecar(nifti, bids_root).get("ImageType") or []
-    return any("PHASE" in str(t).upper() for t in image_type)
+    return any("PHASE" in str(t).upper() or str(t).upper() == "P" for t in image_type)
 
 
 def _norm_id(value: str, prefix: str) -> str:

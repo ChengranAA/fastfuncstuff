@@ -1515,6 +1515,7 @@ def write_partial_r2_with_labels(
     n_regressors: int | None = None,
     apply_afni_metadata: bool = True,
     mode: str = "full",  # "full" or "task" - affects label suffix
+    header: object | None = None,
 ) -> Path:
     """
     Write partial R² per condition with proper AFNI labels and stat parameters.
@@ -1542,6 +1543,8 @@ def write_partial_r2_with_labels(
         Total number of regressors (for AFNI stat params)
     apply_afni_metadata : bool, default=True
         Apply AFNI labels and stat parameters using 3drefit
+    header : nibabel header, optional
+        The input's header; a ``.gii`` output takes its mesh fingerprint from it.
 
     Returns
     -------
@@ -1594,6 +1597,7 @@ def write_partial_r2_with_labels(
         r2_partial_vol.astype(np.float32),
         output_path=output_path,
         affine=affine,
+        header=header,
         brick_labels=brick_labels_arg,
         brick_stataux=brick_stataux,
     )

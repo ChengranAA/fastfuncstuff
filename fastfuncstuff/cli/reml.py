@@ -60,10 +60,11 @@ try:
         compute_run_lengths,
         has_imaging_ext,
         microtime_offset_bins,
+        output_file,
         parse_cv_strategy,
         parse_device_arg,
         parse_input_files,
-        parse_prefix,  # noqa: F401 — TODO: apply parse_prefix to individual output flags
+        parse_prefix,
         polort_column_labels,
         resolve_event_filters,
         resolve_microtime_dt,
@@ -1415,10 +1416,12 @@ def _write_xval_stack(args, layers, volume_shape, affine, header, mask_flat) -> 
         print("  ⚠️  no volume geometry available; xval_r2 not written")
     else:
         from fastfuncstuff.cli_utils import save_r2_ceiling_stack
+        from fastfuncstuff.io.gifti import surface_meta
 
+        ext = ".func.gii" if surface_meta(header) is not None else ".nii.gz"
         path = save_r2_ceiling_stack(
             layers,
-            f"{prefix}_xval_r2.nii.gz",
+            f"{prefix}_xval_r2{ext}",
             volume_shape,
             affine,
             mask_flat=mask_flat,
@@ -1727,6 +1730,35 @@ def _run_surface_clustsim(args, diag, device) -> None:
         print(f"    ⚠️  SurfClustSim failed (the bucket is still valid): {e}")
 
 
+# Whole-file output flags and the GIfTI flavour a bare name gets on surface input:
+# one map per vertex is .shape.gii, anything with sub-bricks or time is .func.gii.
+_SURFACE_OUTPUT_EXT = {
+    **dict.fromkeys(
+        (
+            "Obuck",
+            "Obeta",
+            "Onuisance",
+            "Oerrts",
+            "Ofitts",
+            "Rbuck",
+            "Rbeta",
+            "Rnuisance",
+            "Rfitts",
+            "Rerrts",
+            "Rwherr",
+            "Rvar",
+            "Rlklhd",
+            "save_clean",
+            "save_nuisance",
+            "save_taskfit",
+            "save_runmask",
+        ),
+        ".func.gii",
+    ),  # fmt: skip
+    **dict.fromkeys(("save_dofloss", "save_mask", "save_grandmean"), ".shape.gii"),
+}
+
+
 def _derive_rvar_path(rbuck_path: str) -> str:
     """Append ``_ffsremlvar`` to the Rbuck stem, preserving its multi-suffix
     extension (``.nii.gz`` / ``.nii.zst`` / ``.nii``). Mirrors AFNI's
@@ -1833,7 +1865,7 @@ def _report_loaded_design(design_info: dict, source: str) -> None:
         print(f"  Contrasts ({len(glt_labels)}): {list(glt_labels)}")
 
 
-def print_output_summary(args):
+def print_output_summary(args, out_ext: str = ".nii.gz"):
     """Print summary of requested outputs"""
     print("=" * 70)
     print("📋 Requested Outputs")
@@ -1897,9 +1929,9 @@ def print_output_summary(args):
         label = args.single_trials
         # Only promise the REML file when an -R* output will actually trigger a REML
         # fit; otherwise this is an OLS-only run and reml_*_single is never written.
-        files = [f"ols_{label}_single.nii.gz"]
+        files = [f"ols_{label}_single{out_ext}"]
         if arma_outputs:
-            files.append(f"reml_{label}_single.nii.gz")
+            files.append(f"reml_{label}_single{out_ext}")
         special_outputs.append(
             f"  • Single-trial mode (one regressor per event, chronological output): "
             f"{', '.join(files)}"
@@ -2483,6 +2515,8 @@ def main():
     from fastfuncstuff.io.gifti import is_gifti
 
     surface_input = is_gifti(str(input_files[0]).split("[")[0])
+    # For outputs the tool names itself (single trials, R² maps without -Rbuck).
+    out_ext = ".func.gii" if surface_input else ".nii.gz"
     blurs = [f for f, on in (("-do_blur", args.do_blur is not None),
                              ("-blur_to_fwhm", args.blur_to_fwhm is not None),
                              ("-blur_to_tsnr", args.blur_to_tsnr is not None)) if on]  # fmt: skip
@@ -2541,15 +2575,23 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
+        # A bare (or AFNI-style) output name on surface input means GIfTI: a NIfTI
+        # holding vertices opens as a 1-D volume nowhere useful. Naming them here
+        # once lets every writer and derived sibling (_partialR2, _nods,
+        # _ffsremlvar) follow the extension.
+        for flag, ext in _SURFACE_OUTPUT_EXT.items():
+            value = getattr(args, flag, None)
+            if value and not has_imaging_ext(value):
+                setattr(args, flag, output_file(value, ext).as_file())
         print("📥 Input: surface data (GIfTI, read as V x 1 x 1)")
-        print("📤 Output: name outputs .func.gii / .gii to write GIfTI (else NIfTI)")
+        print("📤 Output: GIfTI unless an output is named .nii/.nii.gz/.nii.zst")
     else:
         print(f"📥 Input format detected: {output_format}")
         print("📤 Output format: NIfTI (.nii.gz) - all outputs written as compressed NIfTI")
     print()
 
     # Print summary of requested outputs
-    print_output_summary(args)
+    print_output_summary(args, out_ext)
 
     # Parse device specification using shared utility
     import os
@@ -3238,14 +3280,16 @@ def main():
                 _ols_vm = _get_voxel_mask(ols_results)
                 _ols_shape = _resolve_shape(ols_results, original_shape)
                 _ols_aff = affine if affine is not None else np.eye(4)
+                _ols_hdr = getattr(ols_results, "nifti_header", None)
                 if args.Oerrts and getattr(ols_results, "residuals", None) is not None:
                     print(f"  • Writing OLS residuals: {args.Oerrts}")
                     save_nifti(
                         _voxels_to_4d_volume(
                             _ensure_numpy(ols_results.residuals), _ols_shape, _ols_vm
                         ),
-                        output_path=replace_afni_extension(args.Oerrts, ".nii.gz"),
+                        output_path=output_file(args.Oerrts).as_file(),
                         affine=_ols_aff,
+                        header=_ols_hdr,
                     )
                 if args.Ofitts and getattr(ols_results, "predicted", None) is not None:
                     print(f"  • Writing OLS fitted model: {args.Ofitts}")
@@ -3253,8 +3297,9 @@ def main():
                         _voxels_to_4d_volume(
                             _ensure_numpy(ols_results.predicted), _ols_shape, _ols_vm
                         ),
-                        output_path=replace_afni_extension(args.Ofitts, ".nii.gz"),
+                        output_path=output_file(args.Ofitts).as_file(),
                         affine=_ols_aff,
+                        header=_ols_hdr,
                     )
 
             # IMPORTANT: When task_indices is passed to fit_glm(), the OLS results
@@ -3305,7 +3350,6 @@ def main():
 
             if args.Obuck:
                 print(f"  • Writing OLS betas + stats (bucket): {args.Obuck}")
-                # Always write NIfTI .nii.gz regardless of input format
                 # Results already contain only stimulus columns (252), use stim_labels
                 contrast_names = getattr(ols_results, "contrast_labels", None)
 
@@ -3369,15 +3413,15 @@ def main():
                 betas_np = _ensure_numpy(_obeta_betas)
                 betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
-                # Always write NIfTI .nii.gz regardless of input format
                 from fastfuncstuff.cli_utils import spinner
 
-                _obeta_path = replace_afni_extension(args.Obeta, ".nii.gz")
+                _obeta_path = output_file(args.Obeta).as_file()
                 with spinner(f"Writing {Path(_obeta_path).name}"):
                     save_nifti(
                         betas_vol,
                         output_path=_obeta_path,
                         affine=affine,
+                        header=getattr(ols_results, "nifti_header", None),
                     )
 
             if args.Onuisance:
@@ -3403,7 +3447,7 @@ def main():
 
             if want_single_trials:
                 if stim_indices:
-                    ols_single_path = f"ols_{want_single_trials}_single.nii.gz"
+                    ols_single_path = f"ols_{want_single_trials}_single{out_ext}"
                     print(f"  • Writing OLS single-trial betas (onset order): {ols_single_path}")
                     if "matrix" in callback_design_info:
                         write_single_trials_output(
@@ -3431,15 +3475,7 @@ def main():
                 and ols_results.r2_partial is not None
             ):
                 # Generate output path by inserting _partialR2 before extension
-                if args.Obuck:
-                    if args.Obuck.endswith(".nii.gz"):
-                        partial_r2_path = args.Obuck.replace(".nii.gz", "_partialR2.nii.gz")
-                    elif args.Obuck.endswith(".nii"):
-                        partial_r2_path = args.Obuck.replace(".nii", "_partialR2.nii.gz")
-                    else:
-                        partial_r2_path = args.Obuck + "_partialR2.nii.gz"
-                else:
-                    partial_r2_path = "OLS_partialR2.nii.gz"
+                partial_r2_path = output_file(args.Obuck or "OLS", out_ext).with_suffix("partialR2")
                 print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
 
                 from fastfuncstuff.glm.outputs import (
@@ -3462,6 +3498,7 @@ def main():
                     volume_shape=_resolve_shape(ols_results, None),
                     voxel_mask=_get_voxel_mask(ols_results),
                     affine=getattr(ols_results, "affine", None),
+                    header=getattr(ols_results, "nifti_header", None),
                     n_timepoints=n_timepoints_ols,
                     n_regressors=n_regressors_ols,
                     apply_afni_metadata=True,
@@ -3523,6 +3560,7 @@ def main():
     guard_volume_shape = None
     guard_keep = None
     guard_affine = None
+    guard_header = None
     preproc_cached_metadata = None
     diag = None
 
@@ -3704,6 +3742,7 @@ def main():
             args.mask = guard_mask_path
             guard_keep = keep
             guard_affine = affine
+            guard_header = nifti_header
 
         if args.blur_to_fwhm is not None or args.blur_to_tsnr is not None:
             print("  Blur TO a target: master = OLS residuals of the unblurred data")
@@ -4006,7 +4045,7 @@ def main():
         volume_shape = results_st.original_shape
         affine = results_st.affine
         voxel_mask = getattr(results_st, "voxel_mask", None)
-        nifti_header = None
+        nifti_header = getattr(results_st, "nifti_header", None)
         st_r2 = xval["r2"]
         assert isinstance(st_r2, torch.Tensor)
         r2_median = float(st_r2.median())
@@ -4041,6 +4080,7 @@ def main():
                 affine=affine,
                 voxel_mask=voxel_mask,
                 nifti_header=nifti_header,
+                nii_ext=out_ext,
             )
 
         print()
@@ -4098,6 +4138,7 @@ def main():
                 rvar_base,
                 Path(str(rvar_base) + ".nii.gz"),
                 Path(str(rvar_base) + ".nii"),
+                Path(str(rvar_base) + ".func.gii"),
             ]:
                 if candidate.exists():
                     rvar_path = candidate
@@ -4154,6 +4195,7 @@ def main():
                 rvar_out_base,
                 Path(str(rvar_out_base) + ".nii.gz"),
                 Path(str(rvar_out_base) + ".nii"),
+                Path(str(rvar_out_base) + ".func.gii"),
             ]:
                 if candidate.exists():
                     print(f"\n⚠️  Note: {candidate} already exists and will be overwritten.")
@@ -4281,11 +4323,12 @@ def main():
                     for _f in _fams
                 ]
                 inc = run_inclusion_map(guard_validity, _vol_fams, _final_keep)
-                runmask_path = replace_afni_extension(args.save_runmask, ".nii.gz")
+                runmask_path = output_file(args.save_runmask).as_file()
                 save_nifti(
                     inc.reshape(*guard_volume_shape, guard_validity.n_runs).numpy(),
                     runmask_path,
                     affine=guard_affine,
+                    header=guard_header,
                 )
                 print(f"  • run-inclusion mask: {runmask_path}")
 
@@ -4294,11 +4337,12 @@ def main():
                 if _dof_loss_masked is not None:
                     loss_vol[_vol_idx] = _dof_loss_masked
                 loss_vol[~_final_keep] = 0.0
-                dofloss_path = replace_afni_extension(args.save_dofloss, ".nii.gz")
+                dofloss_path = output_file(args.save_dofloss).as_file()
                 save_nifti(
                     loss_vol.reshape(*guard_volume_shape).numpy(),
                     dofloss_path,
                     affine=guard_affine,
+                    header=guard_header,
                 )
                 _nz = int((loss_vol > 0).sum())
                 if _nz:
@@ -4371,7 +4415,7 @@ def main():
                 # diag.save_map so it gets the same grid/header handling as the
                 # grand-mean map.
                 if args.save_mask and _user_mask is None:
-                    mask_path = replace_afni_extension(args.save_mask, ".nii.gz")
+                    mask_path = output_file(args.save_mask).as_file()
                     diag.maps["automask"] = _dmask.cpu().numpy().astype(np.float32)
                     diag.save_map("automask", mask_path, _diag_affine, _diag_header)
                     print(f"  • diagnostics automask: {mask_path}")
@@ -4423,9 +4467,7 @@ def main():
             if args.save_grandmean:
                 diag.save_map(
                     "grandmean",
-                    args.save_grandmean
-                    if is_gifti(args.save_grandmean)
-                    else replace_afni_extension(args.save_grandmean, _dext),
+                    output_file(args.save_grandmean, _dext).as_file(),
                     _diag_affine,
                     _diag_header,
                 )
@@ -4616,7 +4658,7 @@ def main():
             else None
         )
         if stim_idx:
-            reml_single_path = f"reml_{args.single_trials}_single.nii.gz"
+            reml_single_path = f"reml_{args.single_trials}_single{out_ext}"
             print(f"  • Writing REML single-trial betas (onset order): {reml_single_path}")
             write_single_trials_output(
                 results,
@@ -4658,25 +4700,26 @@ def main():
         betas_np = _ensure_numpy(_rbeta_betas)
         betas_vol = _reshape_parameter_map(betas_np, volume_shape, voxel_mask)
 
-        # Always write NIfTI .nii.gz regardless of input format
         from fastfuncstuff.cli_utils import spinner
 
-        _rbeta_path = replace_afni_extension(args.Rbeta, ".nii.gz")
+        _rbeta_file = output_file(args.Rbeta)
+        _rbeta_path = _rbeta_file.as_file()
+        _rbeta_header = getattr(results, "nifti_header", None)
         with spinner(f"Writing {Path(_rbeta_path).name}"):
-            save_nifti(betas_vol, output_path=_rbeta_path, affine=affine)
+            save_nifti(betas_vol, output_path=_rbeta_path, affine=affine, header=_rbeta_header)
 
         # -dsort_nods: parallel no-dsort betas.
         if results.nods_results is not None:
-            nods_beta_path = _insert_path_suffix(args.Rbeta, "_nods")
-            print(f"  • Writing no-dsort REML betas only: {nods_beta_path}")
+            _nods_beta_path = _rbeta_file.with_suffix("nods")
+            print(f"  • Writing no-dsort REML betas only: {_nods_beta_path}")
             nods_betas_np = _ensure_numpy(results.nods_results.betas)
             nods_betas_vol = _reshape_parameter_map(nods_betas_np, volume_shape, voxel_mask)
-            _nods_beta_path = replace_afni_extension(nods_beta_path, ".nii.gz")
             with spinner(f"Writing {Path(_nods_beta_path).name}"):
                 save_nifti(
                     nods_betas_vol,
                     output_path=_nods_beta_path,
                     affine=affine,
+                    header=_rbeta_header,
                 )
 
     if args.Rnuisance:
@@ -4704,7 +4747,6 @@ def main():
             nuisance_results = results
             nuisance_names = design_info.get("column_labels")
 
-        # Always write NIfTI .nii.gz regardless of input format
         write_glm_bucket_as_nifti(
             nuisance_results,
             args.Rnuisance,
@@ -4893,18 +4935,12 @@ def main():
             "  ⚠️  Likelihood surface requested but not available (OLS mode or precomputed ARMA params?)"
         )
 
+    # The R² maps sit beside -Rbuck in its format, or under REML_* without one.
+    _rbuck_file = output_file(args.Rbuck or "REML", out_ext)
+
     # Write partial R² if requested and available
     if want_r2_partial and hasattr(results, "r2_partial") and results.r2_partial is not None:
-        # Generate output path by inserting _partialR2 before extension
-        if args.Rbuck:
-            if args.Rbuck.endswith(".nii.gz"):
-                partial_r2_path = args.Rbuck.replace(".nii.gz", "_partialR2.nii.gz")
-            elif args.Rbuck.endswith(".nii"):
-                partial_r2_path = args.Rbuck.replace(".nii", "_partialR2.nii.gz")
-            else:
-                partial_r2_path = args.Rbuck + "_partialR2.nii.gz"
-        else:
-            partial_r2_path = "REML_partialR2.nii.gz"
+        partial_r2_path = _rbuck_file.with_suffix("partialR2")
         print(f"  • Writing REML partial R² per condition: {partial_r2_path}")
 
         from fastfuncstuff.glm.outputs import (
@@ -4927,6 +4963,7 @@ def main():
             volume_shape=_resolve_shape(results, None),
             voxel_mask=_get_voxel_mask(results),
             affine=getattr(results, "affine", None),
+            header=getattr(results, "nifti_header", None),
             n_timepoints=n_timepoints_reml,
             n_regressors=n_regressors_reml,
             apply_afni_metadata=True,
@@ -4944,16 +4981,7 @@ def main():
         and hasattr(results, "r2_partial_nuisance")
         and results.r2_partial_nuisance is not None
     ):
-        # Generate output path
-        if args.Rbuck:
-            if args.Rbuck.endswith(".nii.gz"):
-                nuisance_r2_path = args.Rbuck.replace(".nii.gz", "_nuisance_partialR2.nii.gz")
-            elif args.Rbuck.endswith(".nii"):
-                nuisance_r2_path = args.Rbuck.replace(".nii", "_nuisance_partialR2.nii.gz")
-            else:
-                nuisance_r2_path = args.Rbuck + "_nuisance_partialR2.nii.gz"
-        else:
-            nuisance_r2_path = "REML_nuisance_partialR2.nii.gz"
+        nuisance_r2_path = _rbuck_file.with_suffix("nuisance_partialR2")
 
         print(f"  • Writing REML nuisance partial R² per regressor: {nuisance_r2_path}")
 
@@ -4980,6 +5008,7 @@ def main():
             volume_shape=_resolve_shape(results, None),
             voxel_mask=_get_voxel_mask(results),
             affine=getattr(results, "affine", None),
+            header=getattr(results, "nifti_header", None),
             n_timepoints=n_timepoints_reml,
             n_regressors=n_regressors_reml,
             apply_afni_metadata=True,
@@ -4997,16 +5026,7 @@ def main():
         and hasattr(results, "r2_semipartial")
         and results.r2_semipartial is not None
     ):
-        # Generate output path by inserting _semipartialR2 before extension
-        if args.Rbuck:
-            if args.Rbuck.endswith(".nii.gz"):
-                semipartial_r2_path = args.Rbuck.replace(".nii.gz", "_semipartialR2.nii.gz")
-            elif args.Rbuck.endswith(".nii"):
-                semipartial_r2_path = args.Rbuck.replace(".nii", "_semipartialR2.nii.gz")
-            else:
-                semipartial_r2_path = args.Rbuck + "_semipartialR2.nii.gz"
-        else:
-            semipartial_r2_path = "REML_semipartialR2.nii.gz"
+        semipartial_r2_path = _rbuck_file.with_suffix("semipartialR2")
         print(f"  • Writing REML semi-partial R² per condition: {semipartial_r2_path}")
 
         from fastfuncstuff.glm.outputs import (
@@ -5029,6 +5049,7 @@ def main():
             volume_shape=_resolve_shape(results, None),
             voxel_mask=_get_voxel_mask(results),
             affine=getattr(results, "affine", None),
+            header=getattr(results, "nifti_header", None),
             n_timepoints=n_timepoints_reml,
             n_regressors=n_regressors_reml,
             apply_afni_metadata=True,
@@ -5046,18 +5067,7 @@ def main():
         and hasattr(results, "r2_semipartial_nuisance")
         and results.r2_semipartial_nuisance is not None
     ):
-        # Generate output path
-        if args.Rbuck:
-            if args.Rbuck.endswith(".nii.gz"):
-                nuisance_semi_r2_path = args.Rbuck.replace(
-                    ".nii.gz", "_nuisance_semipartialR2.nii.gz"
-                )
-            elif args.Rbuck.endswith(".nii"):
-                nuisance_semi_r2_path = args.Rbuck.replace(".nii", "_nuisance_semipartialR2.nii.gz")
-            else:
-                nuisance_semi_r2_path = args.Rbuck + "_nuisance_semipartialR2.nii.gz"
-        else:
-            nuisance_semi_r2_path = "REML_nuisance_semipartialR2.nii.gz"
+        nuisance_semi_r2_path = _rbuck_file.with_suffix("nuisance_semipartialR2")
 
         print(f"  • Writing REML nuisance semi-partial R² per regressor: {nuisance_semi_r2_path}")
 
@@ -5084,6 +5094,7 @@ def main():
             volume_shape=_resolve_shape(results, None),
             voxel_mask=_get_voxel_mask(results),
             affine=getattr(results, "affine", None),
+            header=getattr(results, "nifti_header", None),
             n_timepoints=n_timepoints_reml,
             n_regressors=n_regressors_reml,
             apply_afni_metadata=True,
@@ -5108,8 +5119,9 @@ def main():
             )
             save_nifti(
                 predicted_vol,
-                output_path=replace_afni_extension(args.Rfitts, ".nii.gz"),
+                output_path=output_file(args.Rfitts).as_file(),
                 affine=affine,
+                header=getattr(results, "nifti_header", None),
             )
         else:
             print("    ⚠️  Warning: Fitted values not available (predicted=None)")
@@ -5126,11 +5138,11 @@ def main():
             residuals_vol = _voxels_to_4d_volume(
                 _ensure_numpy(results.residuals), volume_shape, voxel_mask
             )
-            # Always write NIfTI .nii.gz regardless of input format
             save_nifti(
                 residuals_vol,
-                output_path=replace_afni_extension(args.Rerrts, ".nii.gz"),
+                output_path=output_file(args.Rerrts).as_file(),
                 affine=affine,
+                header=getattr(results, "nifti_header", None),
             )
         else:
             print("    ⚠️  Warning: Residuals not available")
@@ -5171,8 +5183,9 @@ def main():
                 nuis_ts = reconstruct_partial_timeseries(betas_np, design_np, nuisance_idx)
                 save_nifti(
                     _voxels_to_4d_volume(nuis_ts, volume_shape, voxel_mask),
-                    output_path=replace_afni_extension(args.save_nuisance, ".nii.gz"),
+                    output_path=output_file(args.save_nuisance).as_file(),
                     affine=affine,
+                    header=getattr(results, "nifti_header", None),
                 )
                 del nuis_ts
 
@@ -5185,8 +5198,9 @@ def main():
                 task_only = reconstruct_partial_timeseries(betas_np, design_np, task_idx)
                 save_nifti(
                     _voxels_to_4d_volume(task_only, volume_shape, voxel_mask),
-                    output_path=replace_afni_extension(args.save_taskfit, ".nii.gz"),
+                    output_path=output_file(args.save_taskfit).as_file(),
                     affine=affine,
+                    header=getattr(results, "nifti_header", None),
                 )
                 del task_only
 
@@ -5225,8 +5239,9 @@ def main():
                         clean_ts += baseline[:, None]
                     save_nifti(
                         _voxels_to_4d_volume(clean_ts, volume_shape, voxel_mask),
-                        output_path=replace_afni_extension(args.save_clean, ".nii.gz"),
+                        output_path=output_file(args.save_clean).as_file(),
                         affine=affine,
+                        header=getattr(results, "nifti_header", None),
                     )
                     del clean_ts
 

@@ -84,6 +84,32 @@ def test_surface_obuck_beside_rbuck_is_gifti(world, monkeypatch):
     assert meta["mesh_fingerprint"] == "V_test"
 
 
+def test_surface_outputs_and_their_siblings_stay_gifti(tmp_path, world, monkeypatch):
+    # Bare names on surface input mean GIfTI, and every derived map (R² siblings,
+    # Rvar, single trials) follows its anchor; several of these were coerced to
+    # .nii.gz, or to x.func.gii.nii.gz, and none carried the mesh fingerprint.
+    monkeypatch.chdir(tmp_path)
+    common = ["-input", str(world / "surf.func.gii"), "-events", str(world / "events.tsv"),
+              "-polort", "2", "-tout"]  # fmt: skip
+    _reml(
+        monkeypatch, *common,
+        "-Rbuck", "r", "-Obuck", "o", "-Rbeta", "rb.func.gii", "-Rerrts", "re",
+        "-rpartial", "full", "-r2semipartial", "full",
+    )  # fmt: skip
+    # -Obeta and OLS single trials are written only on an OLS-only run.
+    _reml(
+        monkeypatch, *common, "-Obuck", "o2", "-Obeta", "ob", "-single_trials", "st"
+    )  # fmt: skip
+    assert not list(tmp_path.glob("*.nii*"))
+    expected = [
+        "r", "r_ffsremlvar", "r_partialR2", "r_semipartialR2", "o", "o_partialR2",
+        "o_semipartialR2", "rb", "re", "o2", "ob", "ols_st_single",
+    ]  # fmt: skip
+    for name in expected:
+        _, meta = load_gifti_data(tmp_path / f"{name}.func.gii")
+        assert meta.get("mesh_fingerprint") == "V_test", name
+
+
 def test_surface_mask_and_diagnostics_stay_on_the_mesh(world, monkeypatch):
     _reml(
         monkeypatch,

@@ -213,6 +213,20 @@ def parse_prefix(prefix: str, default_ext: str = ".nii.gz") -> PrefixInfo:
     return PrefixInfo(stem=prefix, nifti_ext=default_ext)
 
 
+def output_file(path: str, default_ext: str = ".nii.gz") -> PrefixInfo:
+    """An output flag's file: the extension named on it (NIfTI or GIfTI) is kept, and
+    an AFNI one (``+orig.HEAD``) or none becomes ``default_ext``. ``.as_file()`` is
+    the path; ``.with_suffix("partialR2")`` a sibling in the same format, so a
+    surface bucket's derived maps stay GIfTI (``s.func.gii`` -> ``s_partialR2.func.gii``).
+    """
+    path = str(path)
+    if not has_imaging_ext(path):
+        from fastfuncstuff.io.afni import replace_afni_extension
+
+        path = replace_afni_extension(path, default_ext)
+    return parse_prefix(path, default_ext)
+
+
 def input_nifti_ext(path: str, fallback: str = ".nii.gz") -> str:
     """The NIfTI extension of an input file, for an output to inherit.
 

@@ -1184,6 +1184,7 @@ def analyze_from_design_matrix(
         # Create simple OLS write callback if output path provided
         ols_write_callback = None
         if ols_output_path is not None:
+            from fastfuncstuff.cli_utils import output_file
             from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
 
             # Capture volume_shape and affine from outer scope for the callback
@@ -1269,9 +1270,11 @@ def analyze_from_design_matrix(
                 # Write single-trials output if requested (check for env var set by ffs_reml.py)
                 import os
 
+                # Siblings of -Obuck keep its format (a surface bucket's stay GIfTI).
+                obuck_file = output_file(str(ols_output_path))
                 single_trials_label = os.environ.get("FASTFUNCSIM_SINGLE_TRIALS")
                 if single_trials_label and callback_stim_indices:
-                    output_filename = f"ols_{single_trials_label}_single.nii.gz"
+                    output_filename = f"ols_{single_trials_label}_single{obuck_file.nifti_ext}"
                     print(f"  • Writing OLS single-trial betas (onset order): {output_filename}")
                     from fastfuncstuff.glm.outputs import write_single_trials_output
 
@@ -1290,20 +1293,7 @@ def analyze_from_design_matrix(
                     and hasattr(ols_results, "r2_partial")
                     and ols_results.r2_partial is not None
                 ):
-                    # Generate output path
-                    if ols_output_path:
-                        if str(ols_output_path).endswith(".nii.gz"):
-                            partial_r2_path = str(ols_output_path).replace(
-                                ".nii.gz", "_partialR2.nii.gz"
-                            )
-                        elif str(ols_output_path).endswith(".nii"):
-                            partial_r2_path = str(ols_output_path).replace(
-                                ".nii", "_partialR2.nii.gz"
-                            )
-                        else:
-                            partial_r2_path = str(ols_output_path) + "_partialR2.nii.gz"
-                    else:
-                        partial_r2_path = "OLS_partialR2.nii.gz"
+                    partial_r2_path = obuck_file.with_suffix("partialR2")
 
                     print(f"  • Writing OLS partial R² per condition: {partial_r2_path}")
 
@@ -1324,6 +1314,7 @@ def analyze_from_design_matrix(
                         volume_shape=_resolve_shape(ols_results, shape_to_use),
                         voxel_mask=_get_voxel_mask(ols_results),
                         affine=affine_to_use,
+                        header=getattr(ols_results, "nifti_header", None),
                         n_timepoints=n_timepoints_ols,
                         n_regressors=n_regressors_ols,
                         apply_afni_metadata=True,
@@ -1342,20 +1333,7 @@ def analyze_from_design_matrix(
                     and hasattr(ols_results, "r2_semipartial")
                     and ols_results.r2_semipartial is not None
                 ):
-                    # Generate output path
-                    if ols_output_path:
-                        if str(ols_output_path).endswith(".nii.gz"):
-                            semipartial_r2_path = str(ols_output_path).replace(
-                                ".nii.gz", "_semipartialR2.nii.gz"
-                            )
-                        elif str(ols_output_path).endswith(".nii"):
-                            semipartial_r2_path = str(ols_output_path).replace(
-                                ".nii", "_semipartialR2.nii.gz"
-                            )
-                        else:
-                            semipartial_r2_path = str(ols_output_path) + "_semipartialR2.nii.gz"
-                    else:
-                        semipartial_r2_path = "OLS_semipartialR2.nii.gz"
+                    semipartial_r2_path = obuck_file.with_suffix("semipartialR2")
 
                     print(f"  • Writing OLS semi-partial R² per condition: {semipartial_r2_path}")
 
@@ -1376,6 +1354,7 @@ def analyze_from_design_matrix(
                         volume_shape=_resolve_shape(ols_results, shape_to_use),
                         voxel_mask=_get_voxel_mask(ols_results),
                         affine=affine_to_use,
+                        header=getattr(ols_results, "nifti_header", None),
                         n_timepoints=n_timepoints_ols,
                         n_regressors=n_regressors_ols,
                         apply_afni_metadata=True,

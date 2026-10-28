@@ -119,6 +119,8 @@ class ImagePane(QtWidgets.QWidget):
         self._coverage: list[tuple[int, int, int, int]] = []
         self._labels: tuple[str, str, str, str] | None = None
         self._readout: list[str] = []
+        #: Overrides the bare slice number in the caption ("39/100").
+        self._slice_text: str | None = None
         self._zoomed = False
         #: Where the align handle sits, as fractional (row, col) image indices,
         #: or ``None`` outside align mode. The ring is drawn around it.
@@ -210,6 +212,12 @@ class ImagePane(QtWidgets.QWidget):
         """How far an oblique window's slice is tilted, for the caption; 0 = not."""
         if degrees != getattr(self, "_tilt", 0.0):
             self._tilt = float(degrees)
+            self.update()
+
+    def set_slice_text(self, text: str | None) -> None:
+        """The slice readout for the caption; ``None`` shows the grid's own number."""
+        if text != self._slice_text:
+            self._slice_text = text
             self.update()
 
     def set_zoomed(self, on: bool) -> None:
@@ -408,7 +416,8 @@ class ImagePane(QtWidgets.QWidget):
             p.setFont(font)
             p.drawText(4, 12, self.caption)
         else:
-            p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}{tilted}")
+            where = pos if self._slice_text is None else self._slice_text
+            p.drawText(6, 15, f"{self.plane.value.upper()}  {where}{zoom}{tilted}")
         if self._brush is not None and self._brush_label:
             p.drawText(6, 30, self._brush_label)
 

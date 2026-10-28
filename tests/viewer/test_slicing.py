@@ -398,3 +398,15 @@ class TestPlaneView:
         first_row = float(idx[0, 0, view.layout.row])
         expected = (full_h - 1 - r0) if view.layout.row_flip else r0
         assert first_row == expected
+
+
+def test_layer_slice_counts_in_the_layers_own_voxels():
+    """A 2 mm overlay on a 1 mm grid: grid slice 40 of 120 is its slice 20 of 60."""
+    from fastfuncstuff.viewer.slicing import layer_slice
+
+    grid = DisplayGrid.from_layer((120, 120, 120), np.eye(4))
+    epi = np.diag([2.0, 2.0, 2.0, 1.0])
+    assert layer_slice(grid, Plane.SAGITTAL, (40, 60, 60), epi, (60, 60, 60)) == (20, 60)
+    # Off the end of its field of view.
+    small = np.diag([2.0, 2.0, 2.0, 1.0])
+    assert layer_slice(grid, Plane.AXIAL, (0, 0, 100), small, (60, 60, 30)) == (None, 30)

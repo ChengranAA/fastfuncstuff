@@ -25,7 +25,7 @@ from fastfuncstuff.viewer.compose import (
     render_viewport,
     tile_layers,
 )
-from fastfuncstuff.viewer.slicing import plane_layout
+from fastfuncstuff.viewer.slicing import layer_slice, plane_layout
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.surfaces import Grab
 from fastfuncstuff.viewer.ui import theme
@@ -1070,6 +1070,9 @@ class ImageWindow(QtWidgets.QWidget):
         if want != drawn:
             self.redraw()
         else:
+            # The selected layer's slice can still change: its grid is not
+            # the display grid, and an oblique one crosses grid slices.
+            self._redraw_readouts(vp)
             self.redraw_crosshair()
 
     def misses(self, lo: np.ndarray, hi: np.ndarray) -> bool:
@@ -1110,13 +1113,34 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.set_highlight(self._highlight_points())
         self._sync_brush()
         self._redraw_strip(vp)
-        if state.grid is not None:
-            layout = plane_layout(state.grid.affine, vp.plane)
-            extent = state.grid.shape[layout.fixed]
-            pos = self.pane.position
-            follow = "" if vp.locked else " parked"
-            self.slice_label.setText(f"{'--' if pos is None else pos}/{extent - 1}{follow}")
+        self._redraw_readouts(vp)
         self.redraw_crosshair()
+
+    def _redraw_readouts(self, vp: Viewport) -> None:
+        """Slice on the image, time in the header -- both of the selected layer.
+
+        Of the selected layer rather than the grid, because with overlays on
+        other grids the grid's numbers belong to whichever image came first,
+        and the one being adjusted is the one whose slice and frame matter.
+        """
+        state = self.session.state
+        layer = state.selected_layer()
+        pos = self.pane.position
+        slice_text = None
+        if state.grid is not None and layer is not None and pos is not None:
+            fixed = plane_layout(state.grid.affine, vp.plane).fixed
+            ijk = list(state.crosshair)
+            ijk[fixed] = pos
+            index, total = layer_slice(state.grid, vp.plane, tuple(ijk), layer.affine, layer.shape)
+            slice_text = f"{'--' if index is None else index}/{total}"
+        self.pane.set_slice_text(slice_text)
+        time_text = ""
+        if layer is not None and layer.n_volumes > 1:
+            frame = min(self.session.layer_time(layer), layer.n_volumes - 1)
+            # A bucket's sub-bricks are not time points; say which it is.
+            time_text = f"{'t' if layer.time_linked else '#'} {frame}/{layer.n_volumes}"
+        parked = "" if vp.locked else "parked"
+        self.slice_label.setText("  ".join(t for t in (time_text, parked) if t))
 
     # -- neighbour strip ----------------------------------------------
     def _set_strip(self, count: int | None = None, step: int | None = None, zoom=None) -> None:

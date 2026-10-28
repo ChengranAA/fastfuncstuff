@@ -343,6 +343,28 @@ def display_to_layer(
     return display_ijk @ rot.T + shift
 
 
+def layer_slice(
+    grid: DisplayGrid,
+    plane: Plane,
+    display_ijk: tuple[int, int, int],
+    layer_affine: np.ndarray,
+    layer_shape: tuple[int, int, int],
+) -> tuple[int | None, int]:
+    """Which of a layer's *own* slices a display position falls in, and how many
+    it has along that plane's normal. ``None`` outside the layer's field of view.
+
+    The display grid's slice number belongs to whatever was loaded first; a 2 mm
+    EPI over a 1 mm anatomy is on slice 20 of 60 while the grid says 40 of 120.
+    """
+    axis = plane_layout(layer_affine, plane).fixed
+    mat = _grid_to_layer(
+        np.asarray(grid.affine, float).tobytes(), np.asarray(layer_affine, float).tobytes()
+    )
+    ijk = mat[:3, :3] @ np.asarray(display_ijk, float) + mat[:3, 3]
+    index, total = int(round(float(ijk[axis]))), int(layer_shape[axis])
+    return (index if 0 <= index < total else None), total
+
+
 @functools.lru_cache(maxsize=256)
 def _grid_to_layer(grid_bytes: bytes, layer_bytes: bytes) -> np.ndarray:
     """``inv(layer) @ grid`` for two 4x4 affines, keyed by their bytes."""

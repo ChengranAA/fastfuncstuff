@@ -1559,8 +1559,10 @@ def write_partial_r2_with_labels(
 
     # Reshape to 4D volume
     if voxel_mask is not None:
-        voxel_mask_np = _ensure_numpy(voxel_mask)
-        voxel_mask_flat = voxel_mask_np.reshape(-1)
+        # Not _ensure_numpy: that casts to float32, and a float mask cannot index.
+        if isinstance(voxel_mask, torch.Tensor):
+            voxel_mask = voxel_mask.detach().cpu().numpy()
+        voxel_mask_flat = np.asarray(voxel_mask, dtype=bool).reshape(-1)
         r2_partial_vol = np.zeros((*volume_shape, n_conditions), dtype=np.float32)
         for cond_idx in range(n_conditions):
             vol_flat = np.zeros(int(np.prod(volume_shape)), dtype=np.float32)

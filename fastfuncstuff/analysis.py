@@ -412,7 +412,6 @@ def analyze_from_design_matrix(
     want_ols_residuals: bool = False,
     want_ols_predicted: bool = False,
     ols_output_path: str | Path | None = None,
-    ols_output_format: str = "nii.gz",
     device: torch.device | None = None,
     mask_file: str | Path | None = None,
     mask_threshold: float = 0.0,
@@ -1265,7 +1264,6 @@ def analyze_from_design_matrix(
                     contrast_results=ols_contrast_results,
                     volume_shape=shape_to_use,
                     affine=affine_to_use,
-                    output_format=ols_output_format,
                 )
 
                 # Write single-trials output if requested (check for env var set by ffs_reml.py)

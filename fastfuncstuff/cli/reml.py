@@ -1754,7 +1754,7 @@ def _insert_path_suffix(path: str, suffix: str) -> str:
     """
     p = Path(path)
     name = p.name
-    for ext in (".nii.gz", ".nii.zst", ".nii"):
+    for ext in (".nii.gz", ".nii.zst", ".nii", ".func.gii", ".shape.gii", ".gii"):
         if name.endswith(ext):
             return str(p.with_name(name[: -len(ext)] + suffix + ext))
     return str(p.with_name(p.stem + suffix + p.suffix))
@@ -4178,7 +4178,6 @@ def main():
             want_ols_residuals=bool(args.Oerrts),
             want_ols_predicted=bool(args.Ofitts),
             ols_output_path=ols_output_path,
-            ols_output_format=output_format,
             device=device,
             mask_file=args.mask,
             cache_file=args.cache if (args.cache and cache_metadata is None) else None,
@@ -4599,7 +4598,6 @@ def main():
                 condition_names=fitted_labels,
                 contrast_names=getattr(nods, "contrast_labels", None),
                 contrast_results=nods_contrasts,
-                output_format="nifti_gz",
                 add_fdr=args.add_fdr,
             )
 

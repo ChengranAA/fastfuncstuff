@@ -69,6 +69,21 @@ def test_surface_glm_matches_the_volume_glm_and_keeps_the_mesh(world, monkeypatc
     assert (world / "s_ffsremlvar.func.gii").exists()
 
 
+def test_surface_obuck_beside_rbuck_is_gifti(world, monkeypatch):
+    # With -Rbuck the OLS bucket is written from inside the ARMA fit, which used
+    # to force the input-format guess ("nii.gz" for anything not .nii) onto it:
+    # autoproc's stage12s got stats-ols.*.nii.gz holding a mesh.
+    _reml(
+        monkeypatch,
+        "-input", str(world / "surf.func.gii"),
+        "-events", str(world / "events.tsv"), "-polort", "2", "-tout",
+        "-Obuck", str(world / "o.func.gii"), "-Rbuck", str(world / "r.func.gii"),
+    )  # fmt: skip
+    assert not list(world.glob("o*.nii*"))
+    _, meta = load_gifti_data(world / "o.func.gii")
+    assert meta["mesh_fingerprint"] == "V_test"
+
+
 def test_surface_mask_and_diagnostics_stay_on_the_mesh(world, monkeypatch):
     _reml(
         monkeypatch,

@@ -184,6 +184,11 @@ class Layer:
         return self.source.startswith("mode:")
 
     @property
+    def is_result(self) -> bool:
+        """A map a mode made, live or kept: what the stack keeps above new data."""
+        return self.is_computed or self.source.startswith("kept:")
+
+    @property
     def is_derived(self) -> bool:
         return self.source.startswith("derived:")
 
@@ -294,11 +299,22 @@ class LayerStack:
             return None
 
     def add(self, layer: Layer, *, at: int | None = None) -> Layer:
-        """Insert a layer, on top by default."""
+        """Insert a layer: by default on top, but under the results already there.
+
+        A correlation map is what is being looked at, and loading another run
+        or an anatomy to compare it against should not bury it. Only the
+        results at the very top count, so one that was dragged down the
+        stack on purpose stays where it was put. A paint layer still goes on
+        top: it is being drawn, often as the seed of the very map below it.
+        """
         if self.find(layer.key) is not None:
             raise ValueError(f"layer {layer.key!r} already in the stack")
         if at is None:
-            self.layers.append(layer)
+            at = len(self.layers)
+            if not (layer.is_result or layer.source.startswith("paint:")):
+                while at > 0 and self.layers[at - 1].is_result:
+                    at -= 1
+            self.layers.insert(at, layer)
         else:
             self.layers.insert(max(0, min(at, len(self.layers))), layer)
         return layer

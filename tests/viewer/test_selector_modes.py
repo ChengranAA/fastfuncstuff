@@ -499,6 +499,17 @@ def test_an_instacorr_ortvec_of_the_wrong_length_is_reported(corr_session, tmp_p
     assert "40 rows" in s.mode.status()
 
 
+def test_loading_more_data_leaves_the_map_on_top(corr_session, tmp_path):
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.do(SetSeed(3, 4, 2))
+    _write(tmp_path, "other.nii.gz", np.ones((10, 12, 8), dtype=np.float32))
+    s.do(Load(str(tmp_path / "other.nii.gz")))
+    stack = s.state.layers
+    assert stack[len(stack) - 1].source == "mode:instacorr"
+    assert stack[len(stack) - 2].name.startswith("other")
+
+
 def test_instacorr_stays_within_correlation_bounds(corr_session):
     corr_session.do(SetMode("instacorr"))
     corr_session.do(SetSeed(3, 4, 2))

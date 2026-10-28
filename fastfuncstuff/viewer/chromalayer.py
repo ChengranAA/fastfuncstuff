@@ -402,16 +402,23 @@ class ColourSource:
     context_where: Tensor | None = None
     masked: bool = True
     window: int = 1
+    #: Gaussian FWHM in mm applied to each drawn frame, inside the brain mask.
+    #: Drawing only: the fit stays on unblurred single frames, so -- as with
+    #: ``window`` -- noise fades toward grey and broad change keeps its colour.
+    blur: float = 0.0
     _frames: dict[int, Tensor] = field(default_factory=dict, repr=False)
     #: Unique per source, and new on every ``with_look`` (``replace`` runs the
     #: factory again for a field it may not copy): what a consumer caches by.
     #: Not ``id()``, which Python reuses as soon as the old source is freed.
     serial: int = field(default_factory=lambda: next(_SERIALS), init=False)
 
-    def with_look(self, look: Look, *, masked: bool, window: int) -> ColourSource:
-        """The same fit drawn differently. Frames survive unless the window changed."""
-        frames = self._frames if window == self.window and masked == self.masked else {}
-        return replace(self, look=look, masked=masked, window=window, _frames=frames)
+    def with_look(
+        self, look: Look, *, masked: bool, window: int, blur: float = 0.0
+    ) -> ColourSource:
+        """The same fit drawn differently. Frames survive unless what is in them changed."""
+        same = (window, masked, blur) == (self.window, self.masked, self.blur)
+        frames = self._frames if same else {}
+        return replace(self, look=look, masked=masked, window=window, blur=blur, _frames=frames)
 
     @property
     def n_frames(self) -> int:
@@ -432,6 +439,8 @@ class ColourSource:
         chans = transform(
             self.chans.raw(t, self.window), self.spec.signal, eps=self.chans.eps, mean=mean
         )
+        if self.blur > 0:
+            chans = blur_in_mask(chans, self.brain, self.blur, self.chans.affine)
         mask = self.brain if self.masked else torch.ones_like(self.brain)
         out = torch.cat([chans, mask.to(chans.dtype)[None], self.anatomy[None]])
         self._frames.clear()
@@ -580,6 +589,26 @@ class ColourSource:
             else:
                 where += "; TE unknown, echoes taken as evenly spaced"
         return where
+
+
+def blur_in_mask(x: Tensor, mask: Tensor, fwhm_mm: float, affine: np.ndarray) -> Tensor:
+    """``(N, X, Y, Z)`` blurred inside ``mask``, normalised by the blurred mask.
+
+    Normalised so the edge of the brain is an average of brain, not of brain
+    and the zeros (or the noise) outside it -- otherwise every edge would
+    take on a colour of its own.
+    """
+    from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox, gaussian3d_batched
+
+    vox = np.sqrt((np.asarray(affine, dtype=float)[:3, :3] ** 2).sum(0))
+    # Reflect padding needs a kernel narrower than the slab; cap it there.
+    sigma = tuple(
+        min(s, (n - 1) / 4.0)
+        for s, n in zip(fwhm_mm_to_sigma_vox(fwhm_mm, tuple(vox)), x.shape[1:], strict=True)
+    )
+    m = mask.to(x.dtype)
+    num = gaussian3d_batched(torch.cat([x * m, m[None]]), sigma)  # type: ignore[arg-type]
+    return torch.where(mask, num[:-1] / num[-1].clamp(min=1e-6), x)
 
 
 def lightness_from(ref: Tensor, region: Tensor) -> Tensor:

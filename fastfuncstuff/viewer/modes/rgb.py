@@ -103,10 +103,11 @@ ECHO_PRESET: dict[str, object] = {
 }
 #: The controls the echoes view shows: channels, echo times, and the look.
 ECHO_CONTROLS = frozenset(
-    {"view", "files", "live", "go", "te", "hue", "spread", "masked", "chroma", "gamma", "window"}
+    {"view", "files", "siblings", "add_input", "live", "go", "te"}
+    | {"hue", "spread", "masked", "chroma", "gamma", "window", "blur"}
     | {f"{kind}{k}" for kind in ("shift", "stretch") for k in range(3)}
 )
-ECHO_ACTIONS = frozenset({"siblings", "add_input", "reset_look", "keep"})
+ECHO_ACTIONS = frozenset({"reset_look", "keep"})
 
 
 def _ijk(v) -> tuple[int, int, int]:
@@ -190,6 +191,18 @@ class RGBMode(Mode):
                 "echoes, INV1/INV2/UNI, a T1 and a T2. Untick to leave one out. AFNI "
                 "selectors pick sub-bricks: run.nii[1], or run.nii[0..$(3)] for every "
                 "third volume (interleaved echoes).",
+            ),
+            # Beside the list they fill, not at the foot of the panel.
+            ActionControl(
+                name="siblings",
+                label="+ siblings",
+                span=THIRD,
+                newline=True,
+                help="Add the input layer's file and the files beside it whose names differ "
+                "only in one number (_e1, _e2, ...).",
+            ),
+            ActionControl(
+                name="add_input", label="+ input", span=THIRD, help="Add the input layer's file."
             ),
             BoolControl(
                 name="live",
@@ -435,6 +448,20 @@ class RGBMode(Mode):
                 help="Frames averaged around the shown one. One frame of percent change is "
                 "mostly thermal noise; 5-15 frames shows a breath-hold or a block.",
             ),
+            FloatControl(
+                name="blur",
+                label="blur",
+                lo=0.0,
+                hi=12.0,
+                step=0.5,
+                default=0.0,
+                span=THIRD,
+                unit="mm",
+                help="Gaussian FWHM applied to each frame inside the mask, before colour. "
+                "For seeing the shape of an effect through thermal noise: it fades "
+                "toward grey, broad change keeps its colour. Costs the fine detail "
+                "(a thin vein, a sulcus) it averages away.",
+            ),
             # -- regions A and B: the optimiser's two sides ---------------
             FloatControl(
                 name="radius_a",
@@ -589,13 +616,6 @@ class RGBMode(Mode):
 
     def actions(self) -> tuple[ActionControl, ...]:
         return (
-            ActionControl(
-                name="siblings",
-                label="+ siblings",
-                help="Add the input layer's file and the files beside it whose names differ "
-                "only in one number (_e1, _e2, ...).",
-            ),
-            ActionControl(name="add_input", label="+ input", help="Add the input layer's file."),
             ActionControl(
                 name="reset_look",
                 label="reset look",
@@ -878,7 +898,7 @@ class RGBMode(Mode):
                     window=int(p["window"]),
                 )
                 self._fit_key = fit_key
-            drawn = (look, bool(p["masked"]), int(p["window"]))
+            drawn = (look, bool(p["masked"]), int(p["window"]), float(p["blur"]))
             if (
                 self._source is None
                 or self._source.chans is not self._fit.chans
@@ -887,7 +907,9 @@ class RGBMode(Mode):
                 # Only a real change makes a new source: a repeated refresh
                 # (the window's after-the-fact one, a crosshair move) keeps
                 # the same object, so nothing downstream re-uploads.
-                self._source = self._fit.with_look(look, masked=drawn[1], window=drawn[2])
+                self._source = self._fit.with_look(
+                    look, masked=drawn[1], window=drawn[2], blur=drawn[3]
+                )
                 self._source_key = (self._fit.serial, *drawn)
                 self._series_cache.clear()
         except (ValueError, RuntimeError) as exc:

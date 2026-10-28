@@ -733,3 +733,30 @@ def test_add_menu_offers_open_files_then_the_picker():
     menu.actions()[-1].trigger()
     assert browsed == [1]
     del app
+
+
+def test_blur_quiets_a_noisy_frame_without_colouring_the_edge(tmp_path, session):
+    echoes, _ = _head(n_time=6)
+    layer = _enter(session, _write_echoes(tmp_path, echoes), view="echoes")
+    source = session.colour_sources[layer.key]
+    brain = source.brain
+    sharp = source.frame(3)[:3][:, brain]
+    session.do(SetModeParam("blur", "6"))
+    blurred_src = session.colour_sources[_rgb(session).key]
+    assert blurred_src.blur == 6.0 and blurred_src.spec == source.spec, "a look change, no refit"
+    blurred = blurred_src.frame(3)[:3]
+    # Pure noise per frame here: blur takes most of it away.
+    assert blurred[:, brain].std() < 0.5 * sharp.std()
+    # Normalised by the blurred mask: the rim averages brain, not the zeros outside.
+    from fastfuncstuff.viewer.chromalayer import _erode
+
+    rim = brain & ~_erode(brain, 1)
+    assert blurred[:, rim].abs().mean() < 2 * blurred[:, brain].abs().mean()
+
+
+def test_channel_buttons_sit_with_the_channel_list(tmp_path, session):
+    _enter(session, _write_echoes(tmp_path, _head()[0]), view="echoes")
+    names = [c.name for c in session.mode.panel_controls()]
+    assert names.index("siblings") == names.index("files") + 1
+    assert "siblings" not in {a.name for a in session.mode.actions()}
+    session.do(ModeAction("siblings"))  # still an action by name, for scripts

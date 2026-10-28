@@ -244,6 +244,7 @@ class RangeBar(QtWidgets.QWidget):
     fixed_changed = QtCore.Signal(bool)
     threshold_changed = QtCore.Signal(float)
     autorange_requested = QtCore.Signal()
+    negative_tail_requested = QtCore.Signal()
     reverse_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
@@ -270,6 +271,13 @@ class RangeBar(QtWidgets.QWidget):
         self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider.setRange(0, TICKS)
         self.slider.setContentsMargins(0, 0, 0, 0)
+        self.slider.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+        self.slider.sliderPressed.connect(
+            lambda: self.slider.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+        )
+        self.slider.sliderReleased.connect(
+            lambda: self.slider.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+        )
         self.slider.valueChanged.connect(self._threshold_from_slider)
 
         numbers = QtWidgets.QVBoxLayout()
@@ -310,6 +318,19 @@ class RangeBar(QtWidgets.QWidget):
         checks.addWidget(self.fixed_check)
         numbers.addLayout(checks)
         numbers.addStretch(1)
+        self.zero_button = self._small_button("0", "Set min to zero")
+        self.zero_button.clicked.connect(lambda: self.min_spin.setValue(0.0))
+        self.tail_button = self._small_button(
+            "~min",
+            "Set min as far into the negative tail as max is into the positive one\n"
+            "(the same percentile, read from the negative values)",
+        )
+        self.tail_button.clicked.connect(self.negative_tail_requested)
+        quick = QtWidgets.QHBoxLayout()
+        quick.setSpacing(4)
+        quick.addWidget(self.zero_button)
+        quick.addWidget(self.tail_button)
+        numbers.addLayout(quick)
         numbers.addWidget(self._caption("min"))
         numbers.addWidget(self.min_spin)
         h.addLayout(numbers, 1)
@@ -361,6 +382,15 @@ class RangeBar(QtWidgets.QWidget):
         return label
 
     @staticmethod
+    def _small_button(text: str, tip: str) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        button.setToolTip(tip)
+        button.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        return button
+
+    @staticmethod
     def _spin(tip: str) -> QtWidgets.QDoubleSpinBox:
         spin = QtWidgets.QDoubleSpinBox()
         spin.setDecimals(4)
@@ -408,7 +438,8 @@ class RangeBar(QtWidgets.QWidget):
             self.mirror_check.setChecked(bool(layer.range_mirror))
             self.fixed_check.setChecked(bool(layer.range_fixed))
             # Faded rather than hidden: the number is still true, just not yours to set.
-            self.min_spin.setEnabled(not layer.range_mirror)
+            for widget in (self.min_spin, self.zero_button, self.tail_button):
+                widget.setEnabled(not layer.range_mirror)
             self._thresholds_itself = thresholds_itself(layer)
             self.thr_spin.setSingleStep(
                 step if threshold_scale is None else max(threshold_scale / 100.0, 1e-4)

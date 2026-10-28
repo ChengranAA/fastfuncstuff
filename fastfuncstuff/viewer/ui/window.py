@@ -1681,6 +1681,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.rangebar.range_changed.connect(self._range_changed)
         self.rangebar.threshold_changed.connect(self._threshold_changed)
         self.rangebar.autorange_requested.connect(self._autorange)
+        self.rangebar.negative_tail_requested.connect(self._min_to_negative_tail)
         self.rangebar.reverse_requested.connect(self._reverse_colormap)
         self.rangebar.mirror_changed.connect(lambda on: self._apply(SetRangeMirror, on=on))
         self.rangebar.fixed_changed.connect(lambda on: self._apply(SetRangeFixed, on=on))
@@ -2304,6 +2305,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._dispatch(SetRange(key, float(look["range_lo"]), float(look["range_hi"])))
         if look.get("colormap", layer.colormap) != layer.colormap:
             self._dispatch(SetColormap(key, str(look["colormap"])))
+
+    def _min_to_negative_tail(self) -> None:
+        key = self.current_key()
+        if key is None:
+            return
+        layer = self.session.state.layers.get(key)
+        index = 0 if layer.time_linked or layer.is_computed else layer.volume_index
+        lo = self.session.negative_tail(key, index)
+        if lo is not None and layer.range_hi is not None:
+            self._dispatch(SetRange(key, lo, float(layer.range_hi)))
 
     def _opacity_changed(self, value: int) -> None:
         key = self.current_key()

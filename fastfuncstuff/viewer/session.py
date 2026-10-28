@@ -46,13 +46,19 @@ from fastfuncstuff.viewer.vocab import (
 #: readable without anyone reaching for a slider.
 AUTORANGE_PERCENTILES = (2.0, 98.0)
 
-#: Where a freshly-picked overlay starts its threshold. High enough that the
-#: underlay reads through the noise -- a quarter of the brain tinted is not a
-#: view of anything -- and low enough that real structure is already on screen
-#: before anyone touches the slider.
-OVERLAY_START_PERCENTILE = 90.0
 #: Where a statistic's threshold starts, as a p (two-sided for t/z, upper tail for F).
 OVERLAY_START_P = 1e-3
+#: A signed map is mirrored about zero only when each sign holds at least this
+#: share of its non-zero voxels -- real mass on both sides, not a few ringing
+#: voxels, before half the bar goes to one of them ...
+MIRROR_MIN_SHARE = 0.2
+#: ... and the two tails (the autorange percentile within each sign) are
+#: within this ratio of each other.
+MIRROR_BALANCE = 0.5
+#: Values read when judging a map's shape. Percentiles of a strided sample this
+#: size are indistinguishable on screen from the full volume's, at a fraction
+#: of the sort.
+LOOK_SAMPLE = 200_000
 
 #: How long the crosshair must sit still before the place it leaves becomes the
 #: `j` target, seconds. A drag or a run of clicks is one jump, from where it
@@ -77,6 +83,30 @@ def derive_range(
     if hi <= lo:
         hi = lo + 1.0
     return (lo, hi)
+
+
+def is_coefficient(layer: Layer, index: int) -> bool:
+    """Whether a sub-brick is a regression coefficient (``_Coef``, betas): by
+    its label, or by the filename when the dataset carries no labels.
+
+    A coefficient is signed by construction, so it is drawn diverging and
+    mirrored even when this particular map happens to lean one way.
+    """
+    if layer.labels:
+        name = layer.labels[index] if 0 <= index < len(layer.labels) else ""
+    else:
+        name = layer.name
+    lowered = name.lower()
+    return "coef" in lowered or "beta" in lowered
+
+
+def _look_sample(values: np.ndarray) -> np.ndarray:
+    """Finite, non-zero values to read a colour scale from, strided down to
+    :data:`LOOK_SAMPLE`. Zero is excluded because a bucket is zero outside its
+    mask, and counting that puts every percentile near nothing."""
+    flat = values.reshape(-1)
+    flat = flat[:: max(1, flat.size // LOOK_SAMPLE)]
+    return flat[np.isfinite(flat) & (flat != 0)]
 
 
 def infer_time_linked(info: DatasetInfo) -> bool:
@@ -632,41 +662,48 @@ class ViewerSession:
         self.store.close(key)
 
     def apply_overlay_defaults(self, key: str) -> None:
-        """Give a freshly-picked overlay a state you can actually see through.
+        """Give a freshly-picked overlay the colour scale its contents call for.
 
-        A layer loaded with threshold 0 and no alpha is opaque everywhere, so
-        dropping one on an anatomical hides it completely -- which defeats the
-        first thing anyone does, checking that the two line up. Starting at a
-        high percentile means the overlay reads as structure over anatomy from
-        the moment it lands, and the slider takes it from there.
+        Only statistics get a threshold, at p 0.001 -- the cut a stats map is
+        usually read at. Anything else (a mean, a tSNR map, a second
+        anatomical) is a picture, and a percentile cut on a picture just hides
+        part of it. Likewise the colormap: gray for a picture, hot for stats,
+        which :meth:`overlay_look` turns diverging for a coefficient or a
+        balanced signed map. "Statistics" is the signal the file picker uses:
+        stataux, sub-brick labels, or a stats-like filename.
         """
         layer = self.state.layers.find(key)
         if layer is None or layer.is_computed:
             return
-        try:
-            values = self._look_values(key, 0)
-        except (KeyError, FileNotFoundError, ValueError):
-            return
-        finite = values[np.isfinite(values)]
-        if finite.size == 0:
-            return
-        threshold = float(np.percentile(np.abs(finite), OVERLAY_START_PERCENTILE))
-        # A statistic starts at p 0.001, the cut a stats map is usually read at,
-        # rather than at a percentile of its own values. A bucket remembers that
-        # p even when it opens on a coefficient, so its first t gets it.
+        stem = layer.name.lower()
+        stats = bool(layer.stataux or layer.labels) or any(
+            t in stem for t in catalog_mod.STATS_NAME_TOKENS
+        )
+        label = (layer.labels[0] if layer.labels else "").lower()
+        coef = is_coefficient(layer, 0)
+        # A bucket remembers its p even when it opens on a coefficient, so its
+        # first t gets it.
         from fastfuncstuff.viewer.vocab import _threshold_at_p
 
         threshold_p = OVERLAY_START_P if layer.stataux else None
         at_p = _threshold_at_p(layer, threshold_p)
-        if at_p is not None:
-            threshold = at_p
+        if (
+            at_p is None
+            and not layer.stataux
+            and any(t in (label or stem) for t in ("tstat", "zstat", "zscore", "zscr"))
+        ):
+            # A t or z with no dof on record: the normal cut is the large-dof
+            # limit of the t one, slightly lenient on a short run.
+            from scipy.stats import norm
+
+            at_p = float(norm.isf(OVERLAY_START_P / 2))
         # Alpha stays off: a hard threshold is what a stats map is read at, and
         # a fade makes "which voxels survive" something you have to squint at.
         self.state.layers.update(
             key,
-            threshold=threshold,
+            threshold=0.0 if at_p is None else at_p,
             threshold_p=threshold_p,
-            **self.overlay_look(key, 0, colormap="hot"),
+            **self.overlay_look(key, 0, colormap="hot" if stats or coef else "gray"),
         )
 
     def _look_values(self, key: str, index: int) -> np.ndarray:
@@ -682,36 +719,55 @@ class ViewerSession:
     def overlay_look(self, key: str, index: int, *, colormap: str) -> dict[str, object]:
         """Colour scale for one sub-brick of an overlay: range, and hot or red-blue.
 
-        A signed sub-brick gets a symmetric range and a diverging map, so zero
-        sits in the middle of the bar and a negative effect is as visible as a
-        positive one. A one-signed one runs from zero. The colormap is only
-        swapped between the two defaults -- a map someone chose stays.
-
-        Percentiles over the non-zero voxels: a bucket is zero outside the
-        mask, and counting that zero puts the 98th percentile near nothing.
+        Mirrored about zero, with a diverging map, only when the map is signed
+        *and* its two tails are of comparable size (:data:`MIRROR_BALANCE`), or
+        when it is a coefficient. A map with a sliver of negative noise is
+        one-signed for display purposes: it runs from zero to the top
+        percentile, and mirroring it would spend half the bar on nothing. The
+        colormap is only swapped between the two defaults -- a map someone
+        chose, gray included, stays.
         """
         try:
             values = self._look_values(key, index)
         except (KeyError, FileNotFoundError, ValueError):
             return {}
-        finite = values[np.isfinite(values) & (values != 0)]
-        if finite.size == 0:
+        sample = _look_sample(values)
+        if sample.size == 0:
             return {}
-        top = float(np.percentile(np.abs(finite), AUTORANGE_PERCENTILES[1])) or 1.0
-        negative, positive = bool((finite < 0).any()), bool((finite > 0).any())
+        layer = self.state.layers.find(key)
+        coef = layer is not None and is_coefficient(layer, index)
+        pct = AUTORANGE_PERCENTILES[1]
+        negative, positive = -sample[sample < 0], sample[sample > 0]
+        neg_top = float(np.percentile(negative, pct)) if negative.size else 0.0
+        pos_top = float(np.percentile(positive, pct)) if positive.size else 0.0
+        share = negative.size / sample.size
+        balanced = MIRROR_MIN_SHARE <= share <= 1.0 - MIRROR_MIN_SHARE and min(
+            neg_top, pos_top
+        ) >= MIRROR_BALANCE * max(neg_top, pos_top)
         out: dict[str, object] = {}
-        if negative and positive:
+        if coef or balanced:
+            top = float(np.percentile(np.abs(sample), pct)) or 1.0
             out.update(range_lo=-top, range_hi=top)
-            signed = True
-        elif negative:
-            out.update(range_lo=-top, range_hi=0.0)
-            signed = True
+        elif share > 0.5:
+            out.update(range_lo=-(neg_top or 1.0), range_hi=0.0)
         else:
-            out.update(range_lo=0.0, range_hi=top)
-            signed = False
+            out.update(range_lo=0.0, range_hi=pos_top or 1.0)
         if colormap in ("hot", "redblue"):
-            out["colormap"] = "redblue" if signed else "hot"
+            out["colormap"] = "redblue" if out["range_lo"] < 0 else "hot"  # type: ignore[operator]
         return out
+
+    def negative_tail(self, key: str, index: int) -> float | None:
+        """The value at the same percentile into the negative tail that max uses
+        on the positive one, for setting min in one click. ``None`` when the
+        sub-brick has no negative values."""
+        try:
+            sample = _look_sample(self._look_values(key, index))
+        except (KeyError, FileNotFoundError, ValueError):
+            return None
+        negative = sample[sample < 0]
+        if negative.size == 0:
+            return None
+        return float(np.percentile(negative, 100.0 - AUTORANGE_PERCENTILES[1]))
 
     def threshold_scale(self, key: str) -> float:
         """How far a threshold slider on this layer should reach.

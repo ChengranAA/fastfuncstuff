@@ -596,13 +596,67 @@ def test_a_signed_overlay_gets_a_diverging_map(session, datadir):
     assert session.state.layers.overlay.colormap == "redblue"
 
 
-def test_an_all_positive_overlay_gets_a_sequential_map(session, tmp_path):
+def test_an_all_positive_statistic_gets_a_sequential_map(session, tmp_path):
     rng = np.random.default_rng(9)
     _write(tmp_path, "anat.nii.gz", rng.random((8, 8, 6)))
-    _write(tmp_path, "positive.nii.gz", rng.random((8, 8, 6)) + 1.0)
+    _write(tmp_path, "positive_stat.nii.gz", rng.random((8, 8, 6)) + 1.0)
     session.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
-    session.do(SetOverlay(str(tmp_path / "positive.nii.gz")))
+    session.do(SetOverlay(str(tmp_path / "positive_stat.nii.gz")))
     assert session.state.layers.overlay.colormap == "hot"
+
+
+def test_a_picture_overlay_is_gray_uncut_and_runs_from_zero(session, tmp_path):
+    """Not a statistic, so no threshold; a few negative voxels do not mirror it."""
+    rng = np.random.default_rng(9)
+    values = rng.random((8, 8, 6)) * 100 + 1.0
+    values[0, 0, :3] = -5.0  # interpolation ringing
+    _write(tmp_path, "anat.nii.gz", rng.random((8, 8, 6)))
+    _write(tmp_path, "mean_epi.nii.gz", values)
+    session.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+    session.do(SetOverlay(str(tmp_path / "mean_epi.nii.gz")))
+    overlay = session.state.layers.overlay
+    assert overlay.colormap == "gray"
+    assert overlay.threshold == 0.0
+    assert overlay.range_lo == 0.0 and 90.0 < overlay.range_hi <= 101.0
+
+
+def test_a_lopsided_signed_statistic_is_not_mirrored(session, tmp_path):
+    rng = np.random.default_rng(9)
+    values = np.abs(rng.normal(size=(8, 8, 6))) * 4
+    values[:2] *= -0.1  # a quarter of the voxels, but a tenth the size
+    _write(tmp_path, "anat.nii.gz", rng.random((8, 8, 6)))
+    _write(tmp_path, "lean_tstat.nii.gz", values)
+    session.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+    session.do(SetOverlay(str(tmp_path / "lean_tstat.nii.gz")))
+    overlay = session.state.layers.overlay
+    assert overlay.colormap == "hot" and overlay.range_lo == 0.0
+    # No dof on record: cut at the normal p 0.001.
+    assert overlay.threshold == pytest.approx(3.29, abs=0.01)
+
+
+def test_a_coefficient_is_mirrored_even_when_it_leans(session, tmp_path):
+    rng = np.random.default_rng(9)
+    _write(tmp_path, "anat.nii.gz", rng.random((8, 8, 6)))
+    _write(tmp_path, "cond_coef.nii.gz", np.abs(rng.normal(size=(8, 8, 6))) + 0.1)
+    session.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+    session.do(SetOverlay(str(tmp_path / "cond_coef.nii.gz")))
+    overlay = session.state.layers.overlay
+    assert overlay.colormap == "redblue"
+    assert overlay.range_lo == pytest.approx(-overlay.range_hi)
+    assert overlay.threshold == 0.0
+
+
+def test_negative_tail_reads_the_negative_values(session, tmp_path):
+    values = np.linspace(-10.0, 50.0, 8 * 8 * 6).reshape(8, 8, 6)
+    _write(tmp_path, "anat.nii.gz", np.ones((8, 8, 6)))
+    _write(tmp_path, "mixed.nii.gz", values)
+    session.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+    session.do(SetOverlay(str(tmp_path / "mixed.nii.gz")))
+    key = session.state.layers.overlay.key
+    assert -10.0 <= session.negative_tail(key, 0) < -9.0
+    _write(tmp_path, "positive.nii.gz", values + 20.0)
+    session.do(SetOverlay(str(tmp_path / "positive.nii.gz")))
+    assert session.negative_tail(session.state.layers.overlay.key, 0) is None
 
 
 def test_the_underlay_stays_opaque(session, datadir):

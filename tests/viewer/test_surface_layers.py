@@ -232,7 +232,8 @@ def test_a_surface_overlay_gets_the_overlay_look(world):
         _bucket(tmp / f"g.{h}.func.gii", f, len(d), signed)
     s.do(Load(str(tmp / "g.lh.func.gii"), "S"))
     layer = s.state.layers.get("S")
-    assert layer.threshold > 0  # starts see-through over the anatomy
+    # Opens on the coefficient, which has no p: uncut, with p 0.001 held for its t.
+    assert layer.threshold == 0 and layer.threshold_p == pytest.approx(1e-3)
     assert layer.colormap == "redblue" and layer.range_lo == -layer.range_hi == -3.0
     look = s.overlay_look("S", 1, colormap=layer.colormap)  # what AUTO applies
     assert look["range_lo"] == -look["range_hi"] and look["range_hi"] == pytest.approx(6.0)

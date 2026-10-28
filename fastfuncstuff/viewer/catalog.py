@@ -73,6 +73,10 @@ class CatalogEntry:
         return f"{dims}{vols}"
 
 
+#: Filename fragments that mark a dataset as statistics output.
+STATS_NAME_TOKENS = ("stat", "tstat", "zscore", "coef", "fitts", "bucket")
+
+
 def classify(info: DatasetInfo) -> Kind:
     """Guess a dataset's role from its header and name.
 
@@ -85,7 +89,7 @@ def classify(info: DatasetInfo) -> Kind:
     stem = info.path.name.lower()
     if any(t in stem for t in ("mask", "automask", "brainmask")):
         return Kind.MASK
-    if any(t in stem for t in ("stat", "tstat", "zscore", "coef", "fitts", "bucket")):
+    if any(t in stem for t in STATS_NAME_TOKENS):
         return Kind.STATS
     if info.n_volumes > 1:
         return Kind.FUNC

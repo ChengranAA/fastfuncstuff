@@ -247,6 +247,24 @@ def test_opening_a_new_file_clears_its_mark(win, qapp, folder):
     assert not win.data_box.itemText(row).endswith("new")
 
 
+def test_a_new_file_does_not_move_the_open_picker(win, qapp, folder):
+    """Browsing the list while the pipeline writes: the refill must not jump."""
+    box = win.data_box
+    run = next(i for i, t in enumerate(_rows(box)) if "stage02.run" in t)
+    box.setCurrentIndex(run)
+    box.showPopup()
+    box.view().setCurrentIndex(box.model().index(run, 0))
+    qapp.processEvents()
+    # Sorts above the highlighted row, so every row index below it shifts.
+    _write(folder / "stage00.early.nii.gz", np.ones((6, 7, 5)))
+    win._start_rescan(manual=True)
+    assert _wait(qapp, lambda: any("stage00.early" in t for t in _rows(box)))
+    assert box.view().isVisible()
+    assert "stage02.run" in box.currentText()
+    assert "stage02.run" in box.itemText(box.view().currentIndex().row())
+    box.hidePopup()
+
+
 def test_overwriting_the_loaded_underlay_reloads_it(win, qapp, folder):
     key = win.session.state.layers.base.key
     assert float(win.session.volume(key)[1, 1, 1]) != 42.0

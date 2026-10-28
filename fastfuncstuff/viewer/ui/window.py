@@ -1079,6 +1079,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # dimensions and volume count rather than read name by name.
         width = max((len(e.name) for e in entries), default=0)
         for box in (self.data_box,):
+            # A rescan lands whenever the pipeline writes a file, often while
+            # the popup is open on the file about to be picked. Rows are
+            # matched back by path, so the pick, the highlight and the scroll
+            # survive the refill instead of snapping to the top.
+            def path_at(row: int, box=box) -> Path | None:
+                entry = box.itemData(row) if row >= 0 else None
+                return entry.path if entry is not None else None
+
+            view = box.view()
+            popup = view is not None and view.isVisible()
+            picked = path_at(box.currentIndex())
+            lit = top = None
+            if popup and view is not None:
+                lit = path_at(view.currentIndex().row())
+                top = path_at(view.indexAt(QtCore.QPoint(0, 0)).row())
             box.blockSignals(True)
             box.clear()
             # Nothing is loaded until something is picked; an entry showing in
@@ -1096,7 +1111,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     row = box.count() - 1
                     box.setItemData(row, QtGui.QBrush(QtGui.QColor(c.select)), BACKGROUND)
                     box.setItemData(row, QtGui.QBrush(QtGui.QColor(c.accent)), FOREGROUND)
-            box.setCurrentIndex(0)
+            rows = {path_at(r): r for r in range(1, box.count())}
+            box.setCurrentIndex(rows.get(picked, 0))
+            if popup and view is not None:
+                model = box.model()
+                if lit in rows:
+                    view.setCurrentIndex(model.index(rows[lit], 0))
+                if top in rows:
+                    view.scrollTo(
+                        model.index(rows[top], 0),
+                        QtWidgets.QAbstractItemView.ScrollHint.PositionAtTop,
+                    )
             box.blockSignals(False)
             self._fit_picker(box)
 

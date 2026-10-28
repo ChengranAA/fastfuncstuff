@@ -303,12 +303,15 @@ class _HRFApplier:
                 gathered = self.hrfs[:, lag.clamp(0, self.hrfs.shape[1] - 1)]
                 cached = torch.where(valid, gathered, torch.zeros((), device=self.hrfs.device))
             else:
-                toeplitz = self._matrices(n_timepoints)
-                cached = torch.zeros(
-                    (*toeplitz.shape[:2], run.n_frames),
-                    device=toeplitz.device,
-                    dtype=toeplitz.dtype,
-                ).index_add_(2, run.inverse.to(toeplitz.device), toeplitz)
+                # Summed on the CPU: index_add_ with repeated indices is an
+                # atomic float scatter on MPS (and CUDA), whose order -- and so
+                # last bit -- changes run to run, which made whole fits differ.
+                toeplitz = self._matrices(n_timepoints).cpu()
+                cached = (
+                    torch.zeros((*toeplitz.shape[:2], run.n_frames), dtype=toeplitz.dtype)
+                    .index_add_(2, run.inverse.cpu(), toeplitz)
+                    .to(self.hrfs.device)
+                )
             self._matrix_cache[key] = cached
         return cached
 

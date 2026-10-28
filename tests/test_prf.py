@@ -1898,3 +1898,27 @@ def test_hrf_select_defaults_to_a_window_matched_to_the_library(hrf_mode, expect
     # default; main() resolves it against the library actually requested.
     assert parsed.hrf_select is None
     assert _default_hrf_select(parsed.hrf_mode) == expected
+
+
+@pytest.mark.gpu
+def test_frame_composed_hrf_operator_is_reproducible():
+    """The unique-frame HRF operator must be bit-identical every time it is built.
+
+    It sums Toeplitz columns over repeated frames. Built with an on-device
+    index_add_, that sum is an atomic scatter on MPS/CUDA whose order changes
+    between builds, and the last-bit difference sent whole refinements down
+    different paths run to run.
+    """
+    from fastfuncstuff.design.prf import _compress_aperture_runs, _HRFApplier
+    from fastfuncstuff.utils import get_device
+
+    device = get_device()
+    if device.type == "cpu":
+        pytest.skip("needs a GPU backend")
+    generator = torch.Generator().manual_seed(0)
+    distinct = torch.rand((9, 16), generator=generator)
+    stimulus = distinct[torch.randint(0, 9, (300,), generator=generator)].to(device)
+    (run,) = _compress_aperture_runs([stimulus], (4, 4))
+    hrf = torch.rand(30, generator=generator).to(device)
+    builds = [_HRFApplier(hrf)._matrices(run.n_timepoints, run) for _ in range(10)]
+    assert all(torch.equal(builds[0], other) for other in builds[1:])

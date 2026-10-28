@@ -1026,7 +1026,8 @@ def test_an_image_window_sheds_its_header_as_it_narrows(win, qapp):
     """The header's own width was the floor under the whole window."""
     image = image_of(win, Plane.AXIAL)
     image.show()
-    image.resize(420, 420)
+    # Wide enough for every view-row label in full (~480 px with [X]HAIR).
+    image.resize(500, 500)
     qapp.processEvents()
     assert image.header.isVisible()
     assert image.solo_button.text() == "[S]OLO"

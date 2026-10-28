@@ -159,6 +159,42 @@ def test_window_shows_the_strip_and_a_click_goes_to_that_slice(session):
         win.close()
 
 
+def test_crosshair_style_cycles_in_every_pane_and_off_draws_nothing(session):
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+    from fastfuncstuff.viewer.vocab import OpenView, SetXYZ
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    session.do(OpenView("A1", "image", "axial"))
+    session.do(SetXYZ(0.0, 0.0, 0.0))
+
+    def dispatch(cmd):
+        session.do(cmd)
+        win.apply(session.state.viewports.get("A1"))
+        win.redraw()
+
+    win = ImageWindow("A1", session, dispatch)
+    try:
+        win.show()
+        win.redraw()
+        app.processEvents()
+        lines = win.pane.grab().toImage()
+        win._cycle_cross()
+        app.processEvents()
+        assert win.pane.cross_style == "off" and win.cross_button.isChecked()
+        assert win.pane.grab().toImage() != lines
+        # Cells built after the switch take the window's style, not the default.
+        win._toggle_strip()
+        app.processEvents()
+        assert win.strip.cells and all(c.cross_style == "off" for c in win.strip.cells)
+        win._cycle_cross()
+        win._cycle_cross()
+        assert win.pane.cross_style == "lines" and not win.cross_button.isChecked()
+        assert all(c.cross_style == "lines" for c in win.strip.cells)
+    finally:
+        win.close()
+
+
 def test_while_editing_the_strip_spans_the_brush_and_draws_outlines(tmp_path):
     """The default that makes the strip an editing aid: the outer cells sit at
     the brush's reach, and each cell carries the surface outlines."""

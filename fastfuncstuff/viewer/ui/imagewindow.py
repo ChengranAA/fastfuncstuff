@@ -158,6 +158,15 @@ class ImageWindow(QtWidgets.QWidget):
         self.lock_button.clicked.connect(self._toggle_lock)
         bar.addWidget(self.lock_button)
 
+        self.cross_button = self._button(
+            "XHAIR",
+            "x",
+            "Crosshair: lines with a gap, off, or a ring around the voxel. Lit while it "
+            "is not the full lines. Clicks still move it.",
+        )
+        self.cross_button.clicked.connect(lambda _=False: self._cycle_cross())
+        bar.addWidget(self.cross_button)
+
         self.edit_button = self._button(
             "EDIT",
             "g",
@@ -434,6 +443,7 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("right-drag", "zoom (up = in)", None, group="view"),
                 Binding("middle-drag", "pan (or shift+drag)", None, group="view"),
                 Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
+                Binding("x", "crosshair: lines / off / ring", self._cycle_cross, group="view"),
                 Binding("scroll", "step through slices", None, group="view"),
                 Binding(".", "next volume", lambda: self._step_time(1), group="time"),
                 Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
@@ -881,6 +891,7 @@ class ImageWindow(QtWidgets.QWidget):
         any tile acts on the window, so every tile follows. The editing tools stay
         with the single view."""
         pane = ImagePane(plane)
+        pane.set_cross_style(self.pane.cross_style)
         pane.picked.connect(lambda r, c: self._pick(r, c, seed=False))
         pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
         pane.stepped.connect(self._step)
@@ -1249,6 +1260,7 @@ class ImageWindow(QtWidgets.QWidget):
             pane.set_pane(cell.image)
             row, col = cell.view.to_image(state.crosshair)
             pane.set_crosshair(row, col)
+            pane.set_cross_style(self.pane.cross_style)
         self._strip_outlines(None)
 
     def _strip_outlines(self, only: set[tuple[str, str]] | None) -> None:
@@ -1976,6 +1988,14 @@ class ImageWindow(QtWidgets.QWidget):
     def _toggle_value_box(self) -> None:
         self.value_box = not self.value_box
         self.redraw_crosshair()
+
+    def _cycle_cross(self) -> None:
+        styles = ImagePane.CROSS_STYLES
+        style = styles[(styles.index(self.pane.cross_style) + 1) % len(styles)]
+        for pane in (self.pane, *self._tiles, *self.strip.cells):
+            pane.set_cross_style(style)
+        self.cross_button.setChecked(style != "lines")
+        self._toast(f"crosshair: {'ring' if style == 'dot' else style}")
 
     def _graph_coverage(self, plane: Plane, row: int, col: int) -> list[tuple[int, int, int, int]]:
         """Footprints of the graphs reading this plane, in image indices.

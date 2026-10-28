@@ -104,6 +104,8 @@ class ImagePane(QtWidgets.QWidget):
     #: and how close to it (widget pixels) a press counts as grabbing it.
     RING = 0.32
     GRAB = 9.0
+    #: Crosshair styles in the order ``x`` cycles them, as in the 3-D window.
+    CROSS_STYLES = ("lines", "off", "dot")
 
     def __init__(self, plane: Plane, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -111,6 +113,9 @@ class ImagePane(QtWidgets.QWidget):
         self._image: QtGui.QImage | None = None
         self._pane: PaneImage | None = None
         self._cross: tuple[int, int] | None = None
+        #: One of CROSS_STYLES. "dot" and "off" are for looking at -- or taking
+        #: a picture of -- the image without lines across it.
+        self.cross_style = "lines"
         self._drag_from: QtCore.QPointF | None = None
         #: What the drag from ``_drag_from`` does: "pan" or "zoom".
         self._drag_kind = ""
@@ -235,6 +240,13 @@ class ImagePane(QtWidgets.QWidget):
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
         self.update()
+
+    def set_cross_style(self, style: str) -> None:
+        if style not in self.CROSS_STYLES:
+            raise ValueError(f"crosshair style must be one of {self.CROSS_STYLES}, not {style!r}")
+        if style != self.cross_style:
+            self.cross_style = style
+            self.update()
 
     def set_outline_width(self, width: float) -> None:
         if width != self._outline_width:
@@ -385,7 +397,7 @@ class ImagePane(QtWidgets.QWidget):
         if self._outlines:
             self._paint_outlines(p, rect)
 
-        if self._cross is not None:
+        if self._cross is not None and self.cross_style != "off":
             self._paint_crosshair(p, rect)
         if self._brush is not None and self._hover is not None:
             self._paint_brush(p)
@@ -701,6 +713,12 @@ class ImagePane(QtWidgets.QWidget):
             gap_x = max(gap_x, max(x - box.left(), box.right() - x))
             gap_y = max(gap_y, max(y - box.top(), box.bottom() - y))
         p.setPen(pen)
+
+        if self.cross_style == "dot":
+            # A ring, not a filled dot, for the same reason as the lines' gap.
+            p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QtCore.QPointF(x, y), gap_x, gap_y)
+            return
 
         # A gap at the centre so the voxel -- or the block of voxels a graph is
         # reading -- stays visible. AFNI's xhair gap, and the reason it exists.

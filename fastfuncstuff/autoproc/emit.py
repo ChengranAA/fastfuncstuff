@@ -2212,6 +2212,9 @@ def _stage_blip(plan: Plan, script_stem: str) -> str:
                 f"-pe_dir {pe}",
                 ro,
                 *_split_flags(config.DEFAULT_OPTS["blip"]),
+                # The pair as the estimator saw it (collapsed, on blip_up's grid): the
+                # QC answer to "what went into the fit", see _qc_distortion.
+                "-save_pad_phase",
                 f'-prefix "{st}.nii$FMT"',
             ]
         )
@@ -2258,6 +2261,14 @@ def _qc_distortion(prs: list[PlanRun]) -> str:
                 [(before, "uncorrected"), (after, "corrected")],
             )
         )
+        if not pr.fmap.is_b0:
+            pair = f"{st}_padphase.nii$FMT"
+            calls.append(
+                _qc_call(
+                    _qc_stem("blip", session=pr.bold.session, fmap=pr.fmap.fmap_id) + "_inputs",
+                    [(f"{pair}[0]", "blip_up"), (f"{pair}[1]", "blip_down")],
+                )
+            )
     return "\n".join(lines) + "\n" + _qc_block("distortion (before / after)", calls)
 
 

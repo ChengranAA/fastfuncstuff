@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -670,3 +671,30 @@ def test_cuda_graphed_cg_matches_eager():
     eager, graphed = run(False), run(True)
     assert [lv.iters for lv in eager.levels] == [lv.iters for lv in graphed.levels]
     assert torch.equal(eager.field_hz, graphed.field_hz)
+
+
+def test_blip_down_on_a_shifted_fov_is_regridded_onto_blip_up():
+    # HiHiFaces ses-fine: the reverse-PE sbref was acquired with its FOV 4.3 mm off along
+    # readout, headers correct. Comparing raw voxel arrays fed the fit a 5-voxel shift the
+    # PE-only field cannot explain, and the "corrected" EPI came out worse than the input.
+    from fastfuncstuff.cli import blipflip as B
+
+    torch.manual_seed(0)
+    world = torch.rand(4, 12, 10)  # (nz, ny, nx)
+    ref_aff = np.diag([0.8, 0.8, 0.8, 1.0])
+    shifted_aff = ref_aff.copy()
+    shifted_aff[1, 3] += 3 * 0.8  # origin 3 voxels further along j
+    shifted = torch.zeros_like(world)
+    shifted[:, :-3] = world[:, 3:]  # the same anatomy, seen through the shifted FOV
+
+    out = B._onto_first_grid(shifted, shifted_aff, tuple(world.shape), ref_aff, "down", 0)
+    assert torch.equal(out[:, 3:], world[:, 3:])
+    assert not out[:, :3].any()  # outside the shifted FOV: no data, not wrapped tissue
+
+    same = B._onto_first_grid(world, ref_aff, tuple(world.shape), ref_aff, "down", 0)
+    assert same is world
+
+    rotated = ref_aff.copy()
+    rotated[:3, :3] = np.array([[0, -0.8, 0], [0.8, 0, 0], [0, 0, 0.8]])
+    with pytest.raises(SystemExit, match="rotated grid"):
+        B._onto_first_grid(world, rotated, tuple(world.shape), ref_aff, "down", 0)

@@ -388,6 +388,43 @@ def _load_volume(path: str, collapse: str) -> tuple[torch.Tensor, np.ndarray, ob
     return t, np.asarray(img.affine), img.header
 
 
+def _onto_first_grid(
+    data: torch.Tensor,
+    aff: np.ndarray,
+    shape_zyx: tuple[int, ...],
+    ref_affine: np.ndarray,
+    path: str,
+    verb: int,
+) -> torch.Tensor:
+    """Put a later scan on the first scan's grid when their headers disagree.
+
+    The estimator compares voxel arrays, so a reverse-PE scan acquired with a shifted
+    FOV (HiHiFaces ses-fine: 4.3 mm along the readout axis, headers correct) looks like
+    a misregistration the PE-only field cannot explain, and the fit comes out worse than
+    no correction at all.
+    """
+    if data.shape == shape_zyx and np.allclose(aff, ref_affine, atol=1e-3):
+        return data
+    from fastfuncstuff.processing.grid import resample_to_grid
+
+    r_ref = ref_affine[:3, :3] / np.linalg.norm(ref_affine[:3, :3], axis=0)
+    r_src = aff[:3, :3] / np.linalg.norm(aff[:3, :3], axis=0)
+    if not np.allclose(r_ref, r_src, atol=1e-3):
+        # A rotated grid has its PE axis pointing elsewhere: resampling would smear the
+        # distortion across axes, so this is a registration problem, not a regrid.
+        raise SystemExit(
+            f"ffs_blipflip: {path} is on a rotated grid relative to the first scan; "
+            "register it first (its phase-encode axis no longer lines up)"
+        )
+    if verb >= 1:
+        off = np.linalg.solve(ref_affine, aff)[:3, 3]
+        print(
+            f"  {path}: header differs from the first scan (origin at its voxel i,j,k = "
+            f"{', '.join(f'{v:+.2f}' for v in off)}); resampling onto its grid"
+        )
+    return resample_to_grid(data, aff, tuple(int(s) for s in shape_zyx), ref_affine, "cubic")
+
+
 def _voxel_sizes_zyx(affine: np.ndarray) -> tuple[float, float, float]:
     vx, vy, vz = (float(np.linalg.norm(affine[:3, i])) for i in range(3))
     return (vz, vy, vx)  # (vz, vy, vx) to match (nz, ny, nx) data
@@ -683,6 +720,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         data, aff, hdr = _load_volume(p, args.collapse)
         if affine is None:
             affine, header = aff, hdr
+        else:
+            data = _onto_first_grid(data, aff, tuple(scans[0].data.shape), affine, p, args.verb)
         sign = -1.0 if pe.endswith("-") else 1.0
         scans.append(
             T.ScanSpec(data=data.to(device), pe_axis=PE_AXIS_MAP[pe], sign=sign, readout=float(ro))

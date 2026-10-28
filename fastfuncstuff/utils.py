@@ -283,6 +283,32 @@ def cpu_if_mps(device: torch.device, op: str) -> torch.device:
     return torch.device("cpu")
 
 
+def shape_bucket(n: int, device: torch.device, limit: int | None = None) -> int:
+    """Round a working-set size up so a shrinking batch reuses compiled kernels.
+
+    Metal compiles a graph per distinct tensor shape and caches it, so a loop
+    whose batch shrinks by a few rows each step pays a compile on every op of
+    every step. torch 2.14, M4 Max, a matmul + bmm + pow + sum step:
+
+        same shape every step     0.73 ms
+        a new shape every step    3.04 ms   (4.2x)
+        those shapes, repeated    0.83 ms
+
+    On MPS this returns the next of four geometric steps per octave (at most
+    25% padding, ~64 shapes across the whole size range, each compiled once
+    per process). CUDA and the CPU have no per-shape cost, so they get ``n``
+    back unchanged and callers keep their exact unpadded behaviour.
+    ``limit`` caps the result, e.g. at the size of the set being drawn from.
+    """
+    if device.type != "mps" or n <= 0:
+        return n
+    bucket = 64
+    while bucket < n:
+        octave = 1 << (bucket.bit_length() - 1)
+        bucket += octave // 4
+    return bucket if limit is None else min(bucket, limit)
+
+
 def mps_is_good_for(op: str) -> bool:
     """True when *op* should stay on Metal. The inverse view of :data:`_MPS_CPU_OPS`.
 

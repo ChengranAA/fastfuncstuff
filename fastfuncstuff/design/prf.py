@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from fastfuncstuff.glm.core import orthogonalize_design
-from fastfuncstuff.utils import cpu_if_mps, linalg_device, widest_float_dtype
+from fastfuncstuff.utils import cpu_if_mps, linalg_device, shape_bucket, widest_float_dtype
 
 
 @dataclass(frozen=True)
@@ -336,12 +336,19 @@ class _HRFApplier:
             if self.bounds is None:
                 return matrices[0] @ values
             convolved = values.new_empty((matrices.shape[1], values.shape[1]))
+            n_columns = values.shape[1]
             for index, (start, end) in enumerate(
                 zip(self.bounds[:-1], self.bounds[1:], strict=True)
             ):
                 if end > start:
-                    columns = slice(start * block, end * block)
-                    convolved[:, columns] = matrices[index] @ values[:, columns]
+                    first, last = start * block, end * block
+                    # Every group's width is data-dependent, so on MPS each would
+                    # be a fresh kernel compile. Convolve a shape-bucketed window
+                    # around the group instead and keep only its own columns.
+                    width = shape_bucket(last - first, values.device, limit=n_columns)
+                    window = min(first, n_columns - width)
+                    result = matrices[index] @ values[:, window : window + width]
+                    convolved[:, first:last] = result[:, first - window : last - window]
             return convolved
         finally:
             torch.backends.cuda.matmul.allow_tf32 = allow_tf32
@@ -950,6 +957,28 @@ def _variable_projection_terms(
     return gain, residual, jacobian, residual.square().sum(dim=0)
 
 
+def _padded_rows(mask: torch.Tensor) -> tuple[torch.Tensor | None, torch.Tensor, int]:
+    """Rows to compute for ``mask``: all of its rows, padded to a shape bucket.
+
+    Returns ``(rows, real, count)``: ascending row indices (``None`` meaning
+    every row), which of them ``mask`` actually selected, and how many it
+    selected. Padding rows are other, distinct rows -- never duplicates, whose
+    scattered writes would race -- and the caller masks their results with
+    ``real``. Off MPS the bucket is the count itself, so this is exactly
+    ``nonzero(mask)``. Ascending order keeps HRF groups contiguous.
+    """
+    count = int(mask.sum())
+    total = mask.numel()
+    size = shape_bucket(count, mask.device, limit=total)
+    if size == total:
+        return None, mask, count
+    # A stable sort puts the selected rows first, then the padding rows, at a
+    # fixed (total,) shape; nonzero would hand Metal a new shape every call.
+    order = torch.argsort((~mask).to(torch.int8), stable=True)[:size]
+    rows = torch.sort(order).values
+    return rows, mask[rows], count
+
+
 def _refine_css_batch(
     data: torch.Tensor,
     stimulus_runs: Sequence[torch.Tensor],
@@ -1008,8 +1037,13 @@ def _refine_css_batch(
     n_iters = torch.full((n_voxels,), config.max_iter, device=current.device, dtype=torch.int32)
     converged = torch.zeros(n_voxels, device=current.device, dtype=torch.bool)
 
-    # `live` maps working rows back to voxel rows; every live voxel is active.
+    # `live` maps working rows back to voxel rows. On MPS the working set is
+    # padded to a shape bucket (see shape_bucket) instead of shrinking by a few
+    # rows every iteration, so it can hold voxels that have already finished:
+    # `active` marks the rows still iterating, and nothing an inactive row
+    # computes is ever written back. Off MPS every working row is active.
     live = torch.arange(n_voxels, device=current.device)
+    active = torch.ones(n_voxels, device=current.device, dtype=torch.bool)
     damping = torch.full((n_voxels,), config.damping, device=current.device, dtype=current.dtype)
     jtj = torch.zeros((n_voxels, n_free, n_free), device=current.device, dtype=solve_dtype)
     rhs = torch.zeros((n_voxels, n_free), device=current.device, dtype=solve_dtype)
@@ -1017,33 +1051,42 @@ def _refine_css_batch(
     stale = torch.ones(n_voxels, device=current.device, dtype=torch.bool)
     identity = torch.eye(n_free, device=current.device, dtype=solve_dtype)
 
+    def subset_applier(rows: torch.Tensor | None) -> _HRFApplier:
+        # `rows` is ascending, so the HRF groups stay contiguous within the
+        # gathered subset -- only the boundaries move.
+        if group is None or rows is None:
+            return applier
+        return applier.with_bounds(_group_bounds(group[rows], n_groups))
+
     for iteration in range(config.max_iter):
-        refresh = torch.nonzero(stale, as_tuple=False).squeeze(1)
-        if refresh.numel():
-            # `refresh` keeps ascending order, so the HRF groups stay contiguous
-            # within the gathered subset -- only the boundaries move.
-            refresh_applier = (
-                applier
-                if group is None
-                else applier.with_bounds(_group_bounds(group[refresh], n_groups))
-            )
+        refresh, refresh_real, n_refresh = _padded_rows(stale & active)
+        if n_refresh:
+            selected = slice(None) if refresh is None else refresh
             prediction, derivatives = _css_prediction_and_derivatives(
                 stimulus_runs,
-                current[refresh],
-                refresh_applier,
+                current[selected],
+                subset_applier(refresh),
                 stimulus_shape,
                 n_derivatives=n_free,
             )
             prediction = _project_per_run(prediction, nuisance_per_run, run_starts)
             derivatives = _project_prf_derivatives(derivatives, nuisance_per_run, run_starts)
             _, residual, jacobian, refreshed_ss = _variable_projection_terms(
-                projected_data[:, refresh], prediction, derivatives
+                projected_data[:, selected], prediction, derivatives
             )
             # The Jacobian is already only the free parameters: the fixed-exponent
             # model never forms the exponent column.
-            jtj[refresh] = torch.einsum("tbp,tbq->bpq", jacobian, jacobian).to(solve_dtype)
-            rhs[refresh] = (-torch.einsum("tbp,tb->bp", jacobian, residual)).to(solve_dtype)
-            current_ss[refresh] = refreshed_ss
+            jtj[selected] = torch.where(
+                refresh_real.view(-1, 1, 1),
+                torch.einsum("tbp,tbq->bpq", jacobian, jacobian).to(solve_dtype),
+                jtj[selected],
+            )
+            rhs[selected] = torch.where(
+                refresh_real.view(-1, 1),
+                (-torch.einsum("tbp,tb->bp", jacobian, residual)).to(solve_dtype),
+                rhs[selected],
+            )
+            current_ss[selected] = torch.where(refresh_real, refreshed_ss, current_ss[selected])
             del prediction, derivatives, jacobian, residual
 
         diagonal_scale = jtj.diagonal(dim1=1, dim2=2).mean(dim=1).clamp_min(1e-12)
@@ -1057,27 +1100,34 @@ def _refine_css_batch(
         step = torch.zeros_like(current)
         step[:, :n_free] = free_step
 
-        accepted = torch.zeros_like(converged[live])
-        trial_scale = torch.ones_like(damping)
-        best_parameters = current
-        for _ in range(config.max_line_search):
+        accepted = torch.zeros_like(active)
+        best_parameters = current.clone()
+        # Halving h tries step * 0.5**h, and only for voxels with no accepted
+        # trial yet: each keeps its FIRST improvement, so re-predicting a voxel
+        # that already has one is pure waste. Trials outnumbered Jacobian
+        # evaluations ~10x, so this is most of the refinement's work. Per-voxel
+        # predictions do not depend on which other voxels share the batch.
+        trial_rows, trial_real = None, active
+        for halving in range(config.max_line_search):
+            selected = slice(None) if trial_rows is None else trial_rows
             trial = _bounded_css_parameters(
-                current + step * trial_scale.unsqueeze(1), stimulus_shape, config
+                current[selected] + step[selected] * (0.5**halving), stimulus_shape, config
             )
             trial_prediction = _project_per_run(
-                _css_prediction(stimulus_runs, trial, applier, stimulus_shape),
+                _css_prediction(stimulus_runs, trial, subset_applier(trial_rows), stimulus_shape),
                 nuisance_per_run,
                 run_starts,
             )
-            trial_ss = _variable_projection_sse(projected_data, trial_prediction)
-            improved = ~accepted & torch.isfinite(trial_ss) & (trial_ss < current_ss)
-            best_parameters = torch.where(improved.unsqueeze(1), trial, best_parameters)
-            accepted = accepted | improved
-            # Each voxel keeps its FIRST accepted trial, so once every live voxel
-            # has one, the remaining halvings only re-predict. Exiting is exact.
-            if bool(accepted.all()):
+            trial_ss = _variable_projection_sse(projected_data[:, selected], trial_prediction)
+            improved = trial_real & torch.isfinite(trial_ss) & (trial_ss < current_ss[selected])
+            best_parameters[selected] = torch.where(
+                improved.unsqueeze(1), trial, best_parameters[selected]
+            )
+            accepted[selected] = accepted[selected] | improved
+            # Exiting once every live voxel has an accepted trial is exact.
+            if halving + 1 == config.max_line_search or bool((accepted | ~active).all()):
                 break
-            trial_scale = torch.where(accepted, trial_scale, trial_scale * 0.5)
+            trial_rows, trial_real, _ = _padded_rows(~accepted & active)
 
         effective_step = (best_parameters - current).abs().amax(dim=1)
         current = torch.where(accepted.unsqueeze(1), best_parameters, current)
@@ -1087,20 +1137,24 @@ def _refine_css_batch(
         damping = torch.where(
             accepted, (damping * 0.5).clamp_min(1e-8), (damping * 10.0).clamp_max(1e8)
         )
-        newly_converged = accepted & (effective_step < config.step_tolerance)
-        exhausted = ~accepted & (damping >= 1e8)
+        newly_converged = active & accepted & (effective_step < config.step_tolerance)
+        exhausted = active & ~accepted & (damping >= 1e8)
 
-        final_parameters[live] = current
-        n_iters[live[newly_converged]] = iteration + 1
-        converged[live[newly_converged]] = True
+        final_parameters[live] = torch.where(active.unsqueeze(1), current, final_parameters[live])
+        n_iters[live] = torch.where(
+            newly_converged, torch.full_like(n_iters[live], iteration + 1), n_iters[live]
+        )
+        converged[live] = converged[live] | newly_converged
 
         # Only voxels whose parameters actually moved need a new Jacobian.
         stale = accepted
-        keep = torch.nonzero(~(newly_converged | exhausted), as_tuple=False).squeeze(1)
-        if keep.numel() == 0:
+        active = active & ~(newly_converged | exhausted)
+        keep, _, n_active = _padded_rows(active)
+        if n_active == 0:
             break
-        if keep.numel() != live.numel():
+        if keep is not None:
             live = live[keep]
+            active = active[keep]
             current = current[keep].contiguous()
             projected_data = projected_data[:, keep].contiguous()
             damping = damping[keep]

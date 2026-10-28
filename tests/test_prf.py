@@ -1922,3 +1922,87 @@ def test_frame_composed_hrf_operator_is_reproducible():
     hrf = torch.rand(30, generator=generator).to(device)
     builds = [_HRFApplier(hrf)._matrices(run.n_timepoints, run) for _ in range(10)]
     assert all(torch.equal(builds[0], other) for other in builds[1:])
+
+
+def test_shape_bucket_padding_leaves_the_refinement_unchanged(monkeypatch):
+    """Padded working sets (the MPS path) must give the unpadded answer exactly.
+
+    On MPS the refinement pads every subset -- Jacobian refreshes, line-search
+    trials, the shrinking live set, each HRF group's convolution window -- to a
+    shape bucket, so finished voxels ride along as inactive rows. A leak from
+    one of those rows (a write-back, a convergence flag, a neighbour's HRF
+    columns) would look plausible and only ever happen on a Mac. Forcing the
+    padding on the CPU makes it testable; float64 keeps rounding from batch
+    shape out of the comparison.
+    """
+    import fastfuncstuff.design.prf as prf_module
+
+    generator = torch.Generator().manual_seed(8)
+    stimulus_shape = (6, 6)
+    distinct = torch.randint(0, 2, (7, 36), generator=generator).double()
+    stimulus_runs = [
+        distinct[torch.randint(0, 7, (28,), generator=generator)],
+        distinct[torch.randint(0, 7, (22,), generator=generator)],
+    ]
+    run_starts = [0, 28]
+    library = torch.tensor(
+        [[1.0, 0.30, 0.05], [0.10, 1.00, 0.20], [0.05, 0.25, 1.00]], dtype=torch.float64
+    )
+    n_voxels = 30
+    truth = torch.stack(
+        [
+            torch.rand(n_voxels, generator=generator, dtype=torch.float64) * 3 + 2,
+            torch.rand(n_voxels, generator=generator, dtype=torch.float64) * 3 + 2,
+            torch.rand(n_voxels, generator=generator, dtype=torch.float64) + 0.8,
+            torch.rand(n_voxels, generator=generator, dtype=torch.float64) * 0.5 + 0.3,
+        ],
+        dim=1,
+    )
+    hrf_index = torch.arange(n_voxels) % 3
+    clean = torch.stack(
+        [
+            _css_prediction(stimulus_runs, truth[v : v + 1], library[hrf_index[v]], stimulus_shape)[
+                :, 0
+            ]
+            for v in range(n_voxels)
+        ]
+    )
+    # Graded noise spreads convergence over many iterations, so the live set
+    # shrinks repeatedly and the line search leaves different voxels pending.
+    noise = torch.randn(clean.shape, generator=generator, dtype=torch.float64)
+    data = clean + noise * torch.linspace(0.0, 0.1, n_voxels, dtype=torch.float64).view(-1, 1)
+    # Seeds stay well-posed: an exponent pushed to its bound flattens the
+    # prediction, every trial then ties the current fit, and which side of
+    # `trial_ss < current_ss` a tie lands on is rounding -- a fair difference in
+    # the iteration count, but not the leak this test is looking for.
+    jitter = torch.tensor([0.3, 0.3, 0.1, 0.05], dtype=torch.float64)
+    seeds = truth + torch.randn(truth.shape, generator=generator, dtype=torch.float64) * jitter
+    grid_fit = PRFGridFit(
+        candidate_index=torch.zeros(n_voxels, dtype=torch.long),
+        hrf_index=hrf_index,
+        parameters=seeds,
+        gain=torch.ones(n_voxels, dtype=torch.float64),
+        correlation=torch.zeros(n_voxels, dtype=torch.float64),
+        r2=torch.zeros(n_voxels, dtype=torch.float64),
+    )
+    config = PRFRefinementConfig(max_iter=30, stagewise_exponent=True)
+
+    def fit():
+        return refine_prf_supergrid(
+            data, stimulus_runs, stimulus_shape, grid_fit, library, run_starts, config=config
+        )
+
+    unpadded = fit()
+    monkeypatch.setattr(
+        prf_module,
+        "shape_bucket",
+        lambda n, device, limit=None: n if limit is None else min(limit, n + 5),
+    )
+    padded = fit()
+
+    assert unpadded.n_iters.float().std() > 0, "convergence must be staggered to exercise padding"
+    # A leak would be O(1); what remains is float64 rounding from batch shape.
+    torch.testing.assert_close(padded.parameters, unpadded.parameters, rtol=1e-9, atol=1e-9)
+    torch.testing.assert_close(padded.r2, unpadded.r2, rtol=1e-9, atol=1e-9)
+    assert torch.equal(padded.n_iters, unpadded.n_iters)
+    assert torch.equal(padded.converged, unpadded.converged)

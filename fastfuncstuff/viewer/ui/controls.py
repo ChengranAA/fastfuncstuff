@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.modes.base import (
     ROW_UNITS,
@@ -72,8 +72,34 @@ def _shape(spec: Control) -> Control:
     if isinstance(spec, ChoiceControl) and spec.style != "radio":
         return replace(spec, choices=(), default="")
     if isinstance(spec, PathListControl):
-        return replace(spec, sample_interval=0.0)
+        return replace(spec, sample_interval=0.0, offer=())
     return spec
+
+
+def add_menu(
+    parent: QtWidgets.QWidget | None,
+    offer: tuple[tuple[str, str], ...],
+    have: set[str],
+    append: Callable[[list[str]], None],
+    browse: Callable[[], None],
+) -> QtWidgets.QMenu:
+    """A path list's ``+``: the open files, every one of them at once, then the picker.
+
+    A file already listed stays in the menu, greyed, so the menu still shows
+    what is open rather than shrinking as the list grows.
+    """
+    menu = QtWidgets.QMenu(parent)
+    for label, path in offer:
+        act = menu.addAction(label)
+        act.setToolTip(path)
+        act.setEnabled(path not in have)
+        act.triggered.connect(lambda _=False, p=path: append([p]))
+    fresh = [p for _, p in offer if p not in have]
+    if len(fresh) > 1:
+        menu.addAction("all open files").triggered.connect(lambda _=False: append(fresh))
+    menu.addSeparator()
+    menu.addAction("from disk\u2026 (not opened)").triggered.connect(lambda _=False: browse())
+    return menu
 
 
 def _decimals(step: float) -> int:
@@ -459,13 +485,25 @@ class ControlPanel(QtWidgets.QWidget):
                 return
             self._queue(spec.name, PathListControl.encode(entries()), now=True)
 
-        def add(_=False) -> None:
-            paths, _flt = QtWidgets.QFileDialog.getOpenFileNames(self, spec.label, "", spec.filter)
-            if not paths:
-                return
+        def append(paths) -> None:
             have = {p for p, _ in entries()}
             fill(entries() + [(p, True) for p in paths if p not in have])
             commit()
+
+        def browse() -> None:
+            paths, _flt = QtWidgets.QFileDialog.getOpenFileNames(self, spec.label, "", spec.filter)
+            if paths:
+                append(paths)
+
+        def add(_=False) -> None:
+            # Read now, not at build: the open files change without a rebuild.
+            live = self.spec(spec.name)
+            offer = live.offer if isinstance(live, PathListControl) else ()
+            if not offer:
+                browse()
+                return
+            have = {p for p, _ in entries()}
+            add_menu(self, offer, have, append, browse).exec(QtGui.QCursor.pos())
 
         def drop(_=False) -> None:
             chosen = {listing.row(i) for i in listing.selectedItems()}
@@ -522,7 +560,7 @@ class ControlPanel(QtWidgets.QWidget):
         buttons.setContentsMargins(0, 0, 0, 0)
         buttons.setSpacing(2)
         tools = [
-            ("+", add, "Add one or more files."),
+            ("+", add, "Add files: the open ones, or any from disk."),
             ("−", drop, "Remove the selected files. Untick instead to keep them handy."),
         ]
         if spec.transforms:
@@ -791,6 +829,6 @@ class ControlPanel(QtWidgets.QWidget):
 def build_mode_panel(mode, on_change: Callable[[str, str], None]) -> ControlPanel:
     """Convenience: a panel wired to one mode."""
     panel = ControlPanel()
-    panel.rebuild(mode.controls(), mode.params, mode.actions())
+    panel.rebuild(mode.panel_controls(), mode.params, mode.panel_actions())
     panel.changed.connect(on_change)
     return panel

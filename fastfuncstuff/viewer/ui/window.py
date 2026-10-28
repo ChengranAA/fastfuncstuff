@@ -2717,8 +2717,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _sync_mode_panel(self) -> None:
         mode = self.session.mode
-        self.mode_panel.rebuild(mode.controls(), mode.params, mode.actions())
-        has = bool(mode.controls()) or bool(mode.actions())
+        self.mode_panel.rebuild(mode.panel_controls(), mode.params, mode.panel_actions())
+        has = bool(mode.panel_controls()) or bool(mode.panel_actions())
         self.mode_head.setVisible(has)
         self.mode_panel.setVisible(has)
         self._sync_input_box()

@@ -202,6 +202,8 @@ def _rgb(session):
 def _enter(session, paths, **params):
     session.do(SetMode("rgb"))
     session.do(SetModeParam("live", "1"))
+    # The contrast view: what these tests set is pinned in the echoes view.
+    session.do(SetModeParam("view", str(params.pop("view", "contrast"))))
     session.do(SetModeParam("files", _files(paths)))
     for k, v in params.items():
         session.do(SetModeParam(k, str(v)))
@@ -668,3 +670,63 @@ def test_the_graphed_optimiser_step_is_the_eager_one():
         contrast.USE_CUDA_GRAPHS = True
     np.testing.assert_allclose(runs[0].weights, runs[1].weights, atol=1e-4)
     np.testing.assert_allclose(runs[0].stretch, runs[1].stretch, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# the echoes view and adding open files
+# ---------------------------------------------------------------------------
+
+
+def test_echoes_view_pins_s0_and_r2_and_hides_the_contrast_tools(tmp_path, session):
+    echoes, _ = _head(n_time=6)
+    paths = _write_echoes(tmp_path, echoes)
+    layer = _enter(session, paths, view="echoes", basis="dstretch", signal="raw")
+    source = session.colour_sources[layer.key]
+    # Whatever the contrast view was left at: te on percent change, for a run.
+    assert (source.spec.basis, source.spec.signal) == ("te", "psc")
+    assert source.look.space == "oklab" and source.coordinate_names()[:2] == ("S0", "R2*")
+    shown = {c.name for c in session.mode.panel_controls()}
+    assert {"files", "te", "window", "stretch1"} <= shown
+    assert not shown & {"basis", "signal", "stats", "radius_a", "tolerance"}
+    te = next(c for c in session.mode.panel_controls() if c.name == "te")
+    assert te.visible_when is None, "TE is the point of this view, not a te-basis extra"
+    assert "optimise" not in {a.name for a in session.mode.panel_actions()}
+    # Hidden is not gone: the contrast view comes back with what was set there.
+    session.do(SetModeParam("view", "contrast"))
+    source = session.colour_sources[_rgb(session).key]
+    assert (source.spec.basis, source.spec.signal) == ("dstretch", "raw")
+    assert "basis" in {c.name for c in session.mode.panel_controls()}
+
+
+def test_echoes_view_on_single_volumes_fits_log_signal(tmp_path, session):
+    layer = _enter(session, _write_echoes(tmp_path, _head()[0]), view="echoes")
+    source = session.colour_sources[layer.key]
+    assert (source.spec.basis, source.spec.signal) == ("te", "log")
+
+
+def test_open_files_are_offered_to_the_channel_list(tmp_path, session):
+    paths = _write_echoes(tmp_path, _head()[0])
+    for p in paths[:2]:
+        session.load(p)
+    session.do(SetMode("rgb"))
+    files = next(c for c in session.mode.controls() if c.name == "files")
+    assert [path for _, path in files.offer] == [str(p) for p in paths[:2]]
+
+
+def test_add_menu_offers_open_files_then_the_picker():
+    QtWidgets = pytest.importorskip("PySide6.QtWidgets")
+    from fastfuncstuff.viewer.ui.controls import add_menu
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    added, browsed = [], []
+    offer = (("e1", "/d/e1.nii"), ("e2", "/d/e2.nii"), ("e3", "/d/e3.nii"))
+    menu = add_menu(None, offer, {"/d/e1.nii"}, added.append, lambda: browsed.append(1))
+    acts = {a.text(): a for a in menu.actions() if a.text()}
+    assert not acts["e1"].isEnabled(), "already listed: shown, greyed"
+    acts["e2"].trigger()
+    acts["all open files"].trigger()
+    assert added == [["/d/e2.nii"], ["/d/e2.nii", "/d/e3.nii"]]
+    assert [a.text() for a in menu.actions()][-1].startswith("from disk")
+    menu.actions()[-1].trigger()
+    assert browsed == [1]
+    del app

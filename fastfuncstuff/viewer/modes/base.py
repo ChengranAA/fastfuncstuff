@@ -202,6 +202,10 @@ class PathListControl(Control):
     #: Seconds per row of those files, for the band splitter's Hz axis. Zero
     #: when the run has no TR, and the splitter says so rather than guessing.
     sample_interval: float = 0.0
+    #: Files already open, as ``(label, path)``. When there are any, ``+``
+    #: offers them first and the file picker last: what is wanted in the list
+    #: is usually what is already on screen.
+    offer: tuple[tuple[str, str], ...] = ()
 
     @staticmethod
     def parse(value: object) -> list[tuple[str, bool]]:
@@ -463,6 +467,19 @@ class Mode(ABC):
                 "to compare the next one against.",
             ),
         )
+
+    def panel_controls(self) -> Sequence[Control]:
+        """The controls the panel shows now: all of them, unless a mode has views.
+
+        :meth:`controls` stays the whole declaration -- what a script may set and
+        what the defaults are seeded from -- so a parameter hidden by a view is
+        still settable, and takes effect when its view comes back.
+        """
+        return self.controls()
+
+    def panel_actions(self) -> Sequence[ActionControl]:
+        """The buttons the panel shows now; see :meth:`panel_controls`."""
+        return self.actions()
 
     def dialog_for(self, action: str) -> DialogSpec | None:
         """The form this action opens, or ``None`` if it acts immediately.

@@ -6,7 +6,13 @@ drawn as one colour per voxel. The arithmetic is :mod:`viewer.chroma` (why
 three echoes in R, G, B is grey, and the bases that fix it); the plumbing is
 :mod:`viewer.chromalayer`.
 
-The panel is three groups by cost, which is what makes it a contrast
+Two views. **echoes** is multi-echo data at a glance: the te basis on percent
+change, pinned, so a frame shows S0 change as lightness and apparent R2* change
+as hue -- BOLD sits in grey matter, while a field-driven stretch that grows
+with echo time shades whole regions regardless of tissue. **contrast** is the
+whole panel below, for any set of images.
+
+The contrast panel is three groups by cost, which is what makes it a contrast
 manipulator rather than a render setting:
 
 * **channels** -- which files. Read once, on the worker.
@@ -23,6 +29,7 @@ the stretches you set counting in what "near" means.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -81,6 +88,25 @@ GATED = frozenset(
 )
 STATS_FIXED = ("core", "brain", "slice", "crosshair")
 LIGHT_FIXED = ("basis", "channel 1")
+VIEWS = ("echoes", "contrast")
+#: What ``view=echoes`` pins, whatever the contrast view was left at: S0 and
+#: R2* per frame over the anatomy. Pinned in :attr:`RGBMode._p` rather than
+#: written into the parameters, so the contrast view keeps its own settings.
+#: ``signal`` is decided there too -- psc for runs, log for single volumes.
+ECHO_PRESET: dict[str, object] = {
+    "basis": "te",
+    "fit_on": "auto",
+    "stats": "core",
+    "mask_from": "auto",
+    "space": "oklab",
+    "lightness": "channel 1",
+}
+#: The controls the echoes view shows: channels, echo times, and the look.
+ECHO_CONTROLS = frozenset(
+    {"view", "files", "live", "go", "te", "hue", "spread", "masked", "chroma", "gamma", "window"}
+    | {f"{kind}{k}" for kind in ("shift", "stretch") for k in range(3)}
+)
+ECHO_ACTIONS = frozenset({"siblings", "add_input", "reset_look", "keep"})
 
 
 def _ijk(v) -> tuple[int, int, int]:
@@ -121,6 +147,17 @@ class RGBMode(Mode):
         self._applied: dict[str, object] = {k: self.params[k] for k in GATED}
 
     # -- declaration -----------------------------------------------------
+    def panel_controls(self) -> tuple[Control, ...]:
+        every = self.controls()
+        if self.params.get("view") != "echoes":
+            return every
+        # TE is shown under the te basis only, which the echoes view always is.
+        return tuple(
+            replace(c, visible_when=None) if c.name == "te" else c
+            for c in every
+            if c.name in ECHO_CONTROLS
+        )
+
     def controls(self) -> tuple[Control, ...]:
         names = self._chans.names if self._chans is not None else ()
         n = len(names)
@@ -133,10 +170,22 @@ class RGBMode(Mode):
         )
         rgb_visible = ("basis", ("pick", "dstretch"))
         return (
+            ChoiceControl(
+                name="view",
+                label="view",
+                choices=VIEWS,
+                default="echoes",
+                style="radio",
+                help="echoes: multi-echo data at a glance -- S0 change as lightness, "
+                "apparent R2* change and curvature as hue, per frame, over the first "
+                "echo. contrast: every basis, the stats region, A\u2260B and select, for "
+                "any set of images (MP2RAGE, a T1 and a T2, betas).",
+            ),
             PathListControl(
                 name="files",
                 label="channels",
                 filter=IMAGE_FILTER,
+                offer=self._open_files(),
                 help="The images to combine, in channel order. Any files on one grid -- "
                 "echoes, INV1/INV2/UNI, a T1 and a T2. Untick to leave one out. AFNI "
                 "selectors pick sub-bricks: run.nii[1], or run.nii[0..$(3)] for every "
@@ -532,6 +581,12 @@ class RGBMode(Mode):
             )
         return out
 
+    def panel_actions(self) -> tuple[ActionControl, ...]:
+        every = self.actions()
+        if self.params.get("view") != "echoes":
+            return every
+        return tuple(a for a in every if a.name in ECHO_ACTIONS)
+
     def actions(self) -> tuple[ActionControl, ...]:
         return (
             ActionControl(
@@ -573,13 +628,30 @@ class RGBMode(Mode):
             return None
         return self.session.state.layers.find(str(choice).split(" ", 1)[0])
 
+    def _open_files(self) -> tuple[tuple[str, str], ...]:
+        """Loaded layers that are files, for the channel list's ``+``."""
+        if self.session is None:
+            return ()
+        return tuple(
+            (ly.name, str(ly.path))
+            for ly in self.session.state.layers
+            if ly.path and not str(ly.path).startswith("<") and not ly.colour
+        )
+
     def _entries(self) -> list[str]:
         return PathListControl.enabled(self._p.get("files"))
 
     @property
     def _p(self) -> dict[str, object]:
-        """The parameters in force: the look as set, the gated ones as last applied."""
-        return {**self.params, **self._applied}
+        """The parameters in force: the look as set, the gated ones as last applied.
+
+        The echoes view's preset over both.
+        """
+        p = {**self.params, **self._applied}
+        if p.get("view") == "echoes":
+            static = self._chans is not None and self._chans.n_frames < 2
+            p.update(ECHO_PRESET, signal="log" if static else "psc")
+        return p
 
     @property
     def pending(self) -> bool:
@@ -839,6 +911,9 @@ class RGBMode(Mode):
             return Aspect.SLICES  # the circles; nothing to refit
         if name == "live":
             return self._apply() if value else Aspect.GRAPH
+        if name == "view":
+            # LAYERS: the panel is rebuilt with the other view's controls.
+            return self.refresh() | Aspect.GRAPH | Aspect.LAYERS
         if name in GATED and not self.params["live"]:
             return Aspect.GRAPH  # held for GO; the status line says so
         if name in GATED:

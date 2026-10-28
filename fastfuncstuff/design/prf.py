@@ -285,21 +285,45 @@ class _HRFApplier:
         applier._matrix_cache = self._matrix_cache
         return applier
 
-    def _matrices(self, n_timepoints: int) -> torch.Tensor:
-        """Banded lower-triangular Toeplitz operators, one per HRF, cached per run length."""
-        cached = self._matrix_cache.get(n_timepoints)
+    def _matrices(self, n_timepoints: int, run: _ApertureRun | None = None) -> torch.Tensor:
+        """Banded lower-triangular Toeplitz operators, one per HRF, cached per run length.
+
+        With ``run``, the operator is composed with that run's frame expansion:
+        ``(n_hrfs, time, unique_frames)``, columns of the Toeplitz matrix summed
+        over the timepoints that show the same frame. Convolving the unique-frame
+        drive with it is exactly expand-then-convolve, at ``unique / time`` the cost.
+        """
+        key = (n_timepoints, None if run is None else run.key)
+        cached = self._matrix_cache.get(key)
         if cached is None:
-            positions = torch.arange(n_timepoints, device=self.hrfs.device)
-            lag = positions.view(-1, 1) - positions.view(1, -1)
-            valid = (lag >= 0) & (lag < self.hrfs.shape[1])
-            gathered = self.hrfs[:, lag.clamp(0, self.hrfs.shape[1] - 1)]
-            cached = torch.where(valid, gathered, torch.zeros((), device=self.hrfs.device))
-            self._matrix_cache[n_timepoints] = cached
+            if run is None:
+                positions = torch.arange(n_timepoints, device=self.hrfs.device)
+                lag = positions.view(-1, 1) - positions.view(1, -1)
+                valid = (lag >= 0) & (lag < self.hrfs.shape[1])
+                gathered = self.hrfs[:, lag.clamp(0, self.hrfs.shape[1] - 1)]
+                cached = torch.where(valid, gathered, torch.zeros((), device=self.hrfs.device))
+            else:
+                toeplitz = self._matrices(n_timepoints)
+                cached = torch.zeros(
+                    (*toeplitz.shape[:2], run.n_frames),
+                    device=toeplitz.device,
+                    dtype=toeplitz.dtype,
+                ).index_add_(2, run.inverse.to(toeplitz.device), toeplitz)
+            self._matrix_cache[key] = cached
         return cached
 
-    def apply(self, values: torch.Tensor, block: int = 1) -> torch.Tensor:
-        """Convolve ``(time, voxels * block)`` columns, ``block`` adjacent per voxel."""
-        matrices = self._matrices(values.shape[0])
+    def apply(
+        self, values: torch.Tensor, block: int = 1, run: _ApertureRun | None = None
+    ) -> torch.Tensor:
+        """Convolve ``(time, voxels * block)`` columns, ``block`` adjacent per voxel.
+
+        With ``run``, ``values`` holds one row per *unique frame* of that run and
+        the result has one row per timepoint (see :meth:`_matrices`).
+        """
+        if run is None:
+            matrices = self._matrices(values.shape[0])
+        else:
+            matrices = self._matrices(run.n_timepoints, run)
         # TF32 would perturb the prediction by ~2e-4 relative, enough to push
         # ill-conditioned voxels into a different local optimum of the flat
         # sigma/exponent valley. See _hrf_convolve_columns.
@@ -308,7 +332,7 @@ class _HRFApplier:
         try:
             if self.bounds is None:
                 return matrices[0] @ values
-            convolved = torch.empty_like(values)
+            convolved = values.new_empty((matrices.shape[1], values.shape[1]))
             for index, (start, end) in enumerate(
                 zip(self.bounds[:-1], self.bounds[1:], strict=True)
             ):
@@ -591,8 +615,122 @@ def _project_prf_derivatives(
     )
 
 
+@dataclass(frozen=True)
+class _ApertureRun:
+    """One stimulus run reduced to its distinct frames, laid out for separable contraction.
+
+    Retinotopy stimuli repeat themselves: blank periods, and the same bar or
+    wedge position shown on every sweep. A 306-TR bar run measured 27 distinct
+    frames. The CSS drive of a repeated frame is identical, so it is computed
+    once per distinct frame and expanded only by the HRF convolution, which is
+    linear and absorbs the expansion exactly (``_HRFApplier._matrices``).
+
+    ``frames`` is ``(n_frames * rows, columns)``: each frame's rows stacked, so
+    one GEMM against per-voxel column profiles contracts every frame at once.
+    """
+
+    frames: torch.Tensor
+    inverse: torch.Tensor  # (n_timepoints,) index of each timepoint's frame
+    n_frames: int
+    n_timepoints: int
+    rows: int
+    key: tuple[int, ...]
+
+
+def _compress_aperture_runs(
+    stimulus_runs: Sequence[torch.Tensor] | Sequence[_ApertureRun],
+    stimulus_shape: tuple[int, int],
+) -> list[_ApertureRun]:
+    """Deduplicate each run's frames; already-compressed runs pass through."""
+    rows, columns = stimulus_shape
+    compressed = []
+    for run_index, stimulus in enumerate(stimulus_runs):
+        if isinstance(stimulus, _ApertureRun):
+            compressed.append(stimulus)
+            continue
+        if stimulus.ndim != 2 or stimulus.shape[1] != rows * columns:
+            raise ValueError(
+                f"stimulus run {run_index} must have shape (time, {rows * columns}), "
+                f"got {tuple(stimulus.shape)}"
+            )
+        frames, inverse = torch.unique(stimulus, dim=0, return_inverse=True)
+        compressed.append(
+            _ApertureRun(
+                frames=frames.reshape(-1, columns).contiguous(),
+                inverse=inverse,
+                n_frames=frames.shape[0],
+                n_timepoints=stimulus.shape[0],
+                rows=rows,
+                # Identifies the expansion for the applier's operator cache; one
+                # host read per run, at construction rather than per iteration.
+                key=tuple(inverse.tolist()),
+            )
+        )
+    return compressed
+
+
+def _frame_blocks(run: _ApertureRun, columns: int) -> list[slice]:
+    """Frame ranges whose ``(frames * rows, voxels)`` contraction is at most one aperture.
+
+    Keeps the separable intermediate no larger per voxel than the dense
+    receptive field it replaces, so a stimulus with few repeats (a natural
+    movie) costs the memory model nothing extra.
+    """
+    step = max(1, columns)
+    return [slice(start, min(start + step, run.n_frames)) for start in range(0, run.n_frames, step)]
+
+
+def _separable_drives(
+    run: _ApertureRun,
+    column_profiles: torch.Tensor,
+    row_weights: Sequence[tuple[torch.Tensor, int]],
+) -> list[torch.Tensor]:
+    """Contract a run's distinct frames against separable per-voxel fields.
+
+    A field that factors as ``row_weight[v, r] * column_profile[v, c]`` meets a
+    frame as ``row_weight[v] . (frame @ column_profile[v])``. ``column_profiles``
+    is ``(k, voxels, columns)``; each ``(row_weight, j)`` pair reduces against
+    the contraction with column profile ``j``. Returns ``(n_frames, voxels)``
+    drives in ``row_weights`` order.
+
+    This never forms a ``(voxels, pixels)`` field: the Gaussian costs
+    ``rows + columns`` exponentials per voxel rather than ``rows * columns``,
+    and the GEMM runs on distinct frames only.
+    """
+    n_profiles, n_voxels, n_columns = column_profiles.shape
+    flat_profiles = column_profiles.reshape(n_profiles * n_voxels, n_columns).T
+    outputs = [column_profiles.new_empty((run.n_frames, n_voxels)) for _ in row_weights]
+    for frames in _frame_blocks(run, n_columns):
+        block = run.frames[frames.start * run.rows : frames.stop * run.rows]
+        contracted = (block @ flat_profiles).view(-1, run.rows, n_profiles, n_voxels)
+        for output, (row_weight, profile_index) in zip(outputs, row_weights, strict=True):
+            output[frames] = torch.einsum("frv,vr->fv", contracted[:, :, profile_index], row_weight)
+        del contracted
+    return outputs
+
+
+def _separable_gaussian(
+    parameters: torch.Tensor, stimulus_shape: tuple[int, int]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Row/column factors of the unit-mass Gaussian of :func:`gaussian_receptive_fields`.
+
+    Returns ``(row_delta, column_delta, row_profile, column_profile, sigma,
+    normalization)`` with ``field = normalization * row_profile (x) column_profile``.
+    """
+    dtype, device = parameters.dtype, parameters.device
+    row_axis, column_axis = stimulus_pixel_axes(stimulus_shape, device=device, dtype=dtype)
+    sigma = parameters[:, 2:3].abs().clamp_min(torch.finfo(dtype).eps)
+    two_variance = 2 * sigma.square()
+    row_delta = row_axis.view(1, -1) - parameters[:, 0:1]
+    column_delta = column_axis.view(1, -1) - parameters[:, 1:2]
+    row_profile = torch.exp(-row_delta.square() / two_variance)
+    column_profile = torch.exp(-column_delta.square() / two_variance)
+    normalization = (torch.pi * two_variance).reciprocal()
+    return row_delta, column_delta, row_profile, column_profile, sigma, normalization
+
+
 def _css_prediction_and_derivatives(
-    stimulus_runs: Sequence[torch.Tensor],
+    stimulus_runs: Sequence[torch.Tensor] | Sequence[_ApertureRun],
     parameters: torch.Tensor,
     hrf: torch.Tensor | _HRFApplier,
     stimulus_shape: tuple[int, int],
@@ -608,82 +746,97 @@ def _css_prediction_and_derivatives(
     (linear pRF) model, which never uses it. That drops a log over the whole
     time-by-voxel block and a quarter of the derivative convolution and of the
     derivative buffer, every iteration.
+
+    Every spatial derivative of the separable Gaussian is itself a sum of
+    separable terms, so all of them come out of one contraction against three
+    column profiles (see :func:`_separable_drives`):
+
+        d/d row    = norm/sigma^2 * (row_delta * row) (x) column
+        d/d column = norm/sigma^2 * row (x) (column_delta * column)
+        d/d sigma  = norm/sigma^3 * [(row_delta^2 * row) (x) column
+                                     + row (x) (column_delta^2 * column)]
+                     - 2/sigma * field
     """
     if n_derivatives not in (3, 4):
         raise ValueError(f"n_derivatives must be 3 or 4, got {n_derivatives}")
+    runs = _compress_aperture_runs(stimulus_runs, stimulus_shape)
     n_voxels = parameters.shape[0]
     applier = _as_applier(hrf)
     dtype, device = parameters.dtype, parameters.device
-    row_axis, column_axis = stimulus_pixel_axes(stimulus_shape, device=device, dtype=dtype)
-    row_grid, column_grid = torch.meshgrid(row_axis, column_axis, indexing="ij")
-    row_grid = row_grid.reshape(1, -1)
-    column_grid = column_grid.reshape(1, -1)
-
-    center_row = parameters[:, 0:1]
-    center_column = parameters[:, 1:2]
-    sigma = parameters[:, 2:3].clamp_min(torch.finfo(dtype).eps)
+    row_delta, column_delta, row_profile, column_profile, sigma, normalization = (
+        _separable_gaussian(parameters, stimulus_shape)
+    )
     exponent = parameters[:, 3:4].clamp_min(torch.finfo(dtype).eps)
-    row_delta = row_grid - center_row
-    column_delta = column_grid - center_column
-    squared_distance = row_delta.square() + column_delta.square()
-    fields = torch.exp(-squared_distance / (2 * sigma.square())) / (2 * torch.pi * sigma.square())
-    # Each spatial derivative is a (voxel, pixel) field as large as `fields`
-    # itself, so they are formed and consumed one at a time: stacking all three
-    # is what makes the aperture term dominate the refinement's memory model.
-    del squared_distance
+    column_profiles = torch.stack(
+        [column_profile, column_profile * column_delta, column_profile * column_delta.square()]
+    )
+    row_weights = [
+        (row_profile, 0),
+        (row_profile * row_delta, 0),
+        (row_profile, 1),
+        (row_profile * row_delta.square(), 0),
+        (row_profile, 2),
+    ]
+    norm_t = normalization.T
+    inverse_variance = sigma.square().reciprocal().T
 
     predictions: list[torch.Tensor] = []
     derivatives: list[torch.Tensor] = []
     eps = torch.finfo(dtype).eps
-    for stimulus in stimulus_runs:
-        n_timepoints = stimulus.shape[0]
-        drive = stimulus @ fields.T
+    for run in runs:
+        field, row_moment, column_moment, row_square, column_square = _separable_drives(
+            run, column_profiles, row_weights
+        )
+        drive = field * norm_t
         # The value must match `_css_prediction` exactly (the line search compares
         # the two objectives), so only the chain rule and the log use the eps floor.
         neural = drive.clamp_min(0).pow(exponent.T)
         positive_drive = drive.clamp_min(eps)
         # d(drive^n)/d(drive), shared by all three spatial derivatives.
         drive_chain = exponent.T * positive_drive.pow(exponent.T - 1)
+        spatial_scale = drive_chain * norm_t * inverse_variance
 
         neural_derivatives = torch.empty(
-            (n_timepoints, n_voxels, n_derivatives), device=device, dtype=dtype
+            (run.n_frames, n_voxels, n_derivatives), device=device, dtype=dtype
         )
-        inverse_variance = sigma.square().reciprocal()
-        neural_derivatives[:, :, 0] = drive_chain * (
-            stimulus @ (fields * row_delta * inverse_variance).T
-        )
-        neural_derivatives[:, :, 1] = drive_chain * (
-            stimulus @ (fields * column_delta * inverse_variance).T
-        )
+        neural_derivatives[:, :, 0] = spatial_scale * row_moment
+        neural_derivatives[:, :, 1] = spatial_scale * column_moment
         neural_derivatives[:, :, 2] = drive_chain * (
-            stimulus
-            @ (
-                fields * ((row_delta.square() + column_delta.square()) / sigma.pow(3) - 2.0 / sigma)
-            ).T
+            norm_t * (row_square + column_square) / sigma.pow(3).T - 2.0 * drive / sigma.T
         )
         if n_derivatives == 4:
             neural_derivatives[:, :, 3] = neural * positive_drive.log()
 
-        predictions.append(applier.apply(neural))
+        predictions.append(applier.apply(neural, run=run))
         derivatives.append(
             applier.apply(
-                neural_derivatives.reshape(n_timepoints, n_voxels * n_derivatives),
+                neural_derivatives.reshape(run.n_frames, n_voxels * n_derivatives),
                 block=n_derivatives,
-            ).view(n_timepoints, n_voxels, n_derivatives)
+                run=run,
+            ).view(run.n_timepoints, n_voxels, n_derivatives)
         )
     return torch.cat(predictions, dim=0), torch.cat(derivatives, dim=0)
 
 
 def _css_prediction(
-    stimulus_runs: Sequence[torch.Tensor],
+    stimulus_runs: Sequence[torch.Tensor] | Sequence[_ApertureRun],
     parameters: torch.Tensor,
     hrf: torch.Tensor | _HRFApplier,
     stimulus_shape: tuple[int, int],
 ) -> torch.Tensor:
     """Predict CSS responses without the derivatives the line search never uses."""
-    fields = gaussian_receptive_fields(parameters, stimulus_shape)
+    runs = _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    applier = _as_applier(hrf)
+    _, _, row_profile, column_profile, _, normalization = _separable_gaussian(
+        parameters, stimulus_shape
+    )
     exponent = parameters[:, 3].clamp_min(torch.finfo(parameters.dtype).eps)
-    return predict_prf_runwise(stimulus_runs, fields, exponent, hrf)
+    predictions = []
+    for run in runs:
+        (field,) = _separable_drives(run, column_profile.unsqueeze(0), [(row_profile, 0)])
+        neural = (field * normalization.T).clamp_min(0).pow(exponent)
+        predictions.append(applier.apply(neural, run=run))
+    return torch.cat(predictions, dim=0)
 
 
 def _bounded_css_parameters(
@@ -779,6 +932,7 @@ def _refine_css_batch(
     so the next sweep's Jacobian would be recomputed identically. Since ~65% of
     steps are rejected here, that recomputation was most of the Jacobian cost.
     """
+    stimulus_runs = _compress_aperture_runs(stimulus_runs, stimulus_shape)
     projected_data = _project_per_run(data.T, nuisance_per_run, run_starts)
     current = _bounded_css_parameters(parameters, stimulus_shape, config)
     n_voxels = current.shape[0]

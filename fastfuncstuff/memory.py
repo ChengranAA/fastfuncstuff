@@ -602,10 +602,12 @@ def bytes_per_voxel_prf(
     -----
     Memory model: (6 * n_pixels + 30 * n_timepoints) * 4 bytes.
 
-    Unlike the GLM operations, the aperture term dominates: every voxel carries
-    its own Gaussian receptive field over ``n_pixels`` (typically 100x100), and
-    the spatial derivative is formed one field at a time (~3 live fields, x2 for
-    the line search trial evaluated alongside the current parameters). The
+    The aperture term is a worst case. Refinement never forms a per-voxel
+    Gaussian field: it contracts each run's distinct frames against separable
+    row/column profiles (``design/prf.py:_separable_drives``), in frame blocks
+    capped at one aperture per profile -- three profiles plus an einsum
+    temporary on the derivative pass. A stimulus that repeats frames (bars,
+    wedges, blanks) uses a fraction of that; one that never repeats reaches it. The
     temporal term covers the prediction, the four parameter derivatives, and the
     variable-projection Jacobian, again doubled for the line search.
     """

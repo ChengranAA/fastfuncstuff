@@ -260,6 +260,55 @@ def test_analytic_derivatives_match_finite_differences():
         torch.testing.assert_close(derivatives[:, :, index], numeric, atol=1e-6, rtol=1e-5)
 
 
+@pytest.mark.parametrize("stimulus_shape", [(9, 7), (4, 3)])
+def test_separable_prediction_matches_dense_fields_with_repeated_frames(stimulus_shape):
+    """Deduplicated frames and the separable Gaussian must reproduce the dense model.
+
+    The refinement predicts from each run's *distinct* frames and folds the
+    expansion into the HRF operator, and never forms a (voxel, pixel) field.
+    Blank and repeated frames, two runs, per-voxel HRF groups, and (at 4x3) more
+    distinct frames than one contraction block holds must all agree with the
+    dense ``gaussian_receptive_fields`` route to float64 precision.
+    """
+    from fastfuncstuff.design.prf import _group_bounds, _HRFApplier, predict_prf_runwise
+
+    generator = torch.Generator().manual_seed(3)
+    n_pixels = stimulus_shape[0] * stimulus_shape[1]
+    distinct = torch.randint(0, 2, (6, n_pixels), generator=generator).double()
+    distinct[0] = 0.0
+    stimulus_runs = [
+        distinct[torch.randint(0, 6, (19,), generator=generator)],
+        torch.rand((11, n_pixels), generator=generator, dtype=torch.float64),
+    ]
+    parameters = torch.tensor(
+        [[3.4, 5.1, 1.7, 0.42], [6.0, 4.0, 2.3, 0.60], [2.2, 2.9, 0.8, 1.0], [5.5, 1.5, 3.1, 0.25]],
+        dtype=torch.float64,
+    )
+    library = torch.tensor([[1.0, 0.5, 0.2, 0.05], [0.3, 1.0, 0.4, 0.1]], dtype=torch.float64)
+    group = torch.tensor([0, 0, 1, 1])
+    applier = _HRFApplier(library, _group_bounds(group, 2))
+
+    separable = _css_prediction(stimulus_runs, parameters, applier, stimulus_shape)
+    with_derivatives, _ = _css_prediction_and_derivatives(
+        stimulus_runs, parameters, applier, stimulus_shape
+    )
+    fields = gaussian_receptive_fields(parameters, stimulus_shape)
+    dense = torch.cat(
+        [
+            predict_prf_runwise(
+                stimulus_runs,
+                fields[voxel : voxel + 1],
+                parameters[voxel, 3:],
+                library[group[voxel]],
+            )
+            for voxel in range(parameters.shape[0])
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(separable, dense, rtol=1e-12, atol=1e-14)
+    torch.testing.assert_close(with_derivatives, dense, rtol=1e-12, atol=1e-14)
+
+
 def test_prediction_only_path_matches_the_derivative_path():
     """The line search and the Jacobian step must optimize the identical objective."""
     data, stimulus_runs, parameters, hrf = _synthetic_css_data()

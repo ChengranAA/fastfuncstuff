@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from fastfuncstuff.glm.core import orthogonalize_design
-from fastfuncstuff.utils import widest_float_dtype
+from fastfuncstuff.utils import linalg_device, widest_float_dtype
 
 
 @dataclass(frozen=True)
@@ -2078,10 +2078,20 @@ def screen_voxels_ridge(
             train_design = orthogonalize_design(train_design, nuisance[train_index])
             test_design = orthogonalize_design(test_design, nuisance[test_index])
 
-        gram = train_design.T @ train_design
+        # The design is shared by every voxel, so the whole ridge fit collapses to
+        # one (test, train) hat matrix: built once per fold in float64 where
+        # float64 exists (the CPU, on a Mac), then applied to every voxel chunk as
+        # a single float32 GEMM on the compute device. Device before dtype: torch
+        # 2.14 turns a combined MPS -> (cpu, float64) cast into silent zeros.
+        solve_device = linalg_device(device)
+        train_f64 = train_design.to(solve_device).double()
+        gram = train_f64.T @ train_f64
         penalty = ridge * gram.diagonal().mean().clamp_min(eps)
-        normal = gram + torch.eye(n_tiles, device=device, dtype=gram.dtype) * penalty
-        factor = torch.linalg.cholesky(normal.double())
+        normal = gram + torch.eye(n_tiles, device=solve_device, dtype=gram.dtype) * penalty
+        hat = (
+            test_design.to(solve_device).double()
+            @ torch.cholesky_solve(train_f64.T, torch.linalg.cholesky(normal))
+        ).to(device=device, dtype=data.dtype)
 
         for start in range(0, n_voxels, voxel_chunk_size):
             stop = min(start + voxel_chunk_size, n_voxels)
@@ -2091,16 +2101,13 @@ def screen_voxels_ridge(
             if nuisance_per_run is not None:
                 train_data = orthogonalize_design(train_data, nuisance[train_index])
                 test_data = orthogonalize_design(test_data, nuisance[test_index])
-            weights = torch.cholesky_solve((train_design.T @ train_data).double(), factor).to(
-                data.dtype
-            )
-            prediction = test_design @ weights
+            prediction = hat @ train_data
             residual_ss[start:stop] += (
                 (test_data - prediction).square().sum(dim=0).to(output_device)
             )
             centered = test_data - test_data.mean(dim=0, keepdim=True)
             total_ss[start:stop] += centered.square().sum(dim=0).to(output_device)
-            del chunk, train_data, test_data, weights, prediction, centered
+            del chunk, train_data, test_data, prediction, centered
 
     # A voxel with no variance to explain (all-zero, or constant) would score a
     # perfect 1.0 from 0/0 and sail to the top of any ranking. This is the same

@@ -599,3 +599,19 @@ def test_configure_torch_backends_keeps_cudnn_convolutions_out_of_tf32():
     finally:
         torch.backends.cudnn.allow_tf32 = prev_tf32
         torch.backends.cudnn.benchmark = prev_bench
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_pinv_f64_survives_the_mps_float64_cast():
+    """torch 2.14 turns ``mps_tensor.to(cpu, float64)`` into silent zeros.
+
+    The combined cast used to raise; now it returns a zero matrix of the right
+    shape, so a pinv built on it is the pinv of zero. Device must move first.
+    """
+    from fastfuncstuff.utils import pinv_f64
+
+    matrix = torch.tensor([[2.0, 0.0], [0.0, 4.0], [0.0, 0.0]], device="mps")
+    torch.testing.assert_close(
+        pinv_f64(matrix).cpu(), torch.linalg.pinv(matrix.cpu().double()).float()
+    )

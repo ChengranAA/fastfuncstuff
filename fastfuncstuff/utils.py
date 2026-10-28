@@ -403,7 +403,8 @@ def pinv_f64(matrix: torch.Tensor) -> torch.Tensor:
     fraction of the cost.
     """
     work = factor_device(matrix.device)
-    inverse = torch.linalg.pinv(matrix.to(device=work, dtype=torch.float64))
+    # Device before dtype -- see to_linalg_f64.
+    inverse = torch.linalg.pinv(matrix.to(device=work).to(torch.float64))
     return inverse.to(device=matrix.device, dtype=matrix.dtype)
 
 
@@ -465,8 +466,8 @@ def to_linalg_f64(t: torch.Tensor) -> torch.Tensor:
     ``result.to(orig.dtype).to(orig.device)``.
 
     Device is changed *before* dtype: a combined ``.to(cpu, float64)`` on an MPS
-    tensor still attempts the float64 cast on MPS first and raises, so the two
-    steps must be ordered.
+    tensor attempts the float64 cast on MPS first. Older torch raised; torch 2.14
+    silently returns **zeros**, so the two steps must be ordered.
     """
     return t.to(device=linalg_device(t.device)).to(torch.float64)
 

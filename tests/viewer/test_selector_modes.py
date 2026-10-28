@@ -440,6 +440,65 @@ def test_instacorr_correlates_the_shared_signal(corr_session):
     assert abs(vol[8, 10, 6]) < 0.6, "unrelated noise must not"
 
 
+def _corr_ortvec(tmp_path, columns, name="nuis.1D"):
+    path = tmp_path / name
+    np.savetxt(path, np.asarray(columns, dtype=float).reshape(60, -1))
+    return path
+
+
+def test_an_ortvec_of_the_shared_signal_removes_the_blob(corr_session, tmp_path):
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.set_mode_param("live", "1")
+    s.do(SetSeed(3, 4, 2))
+    vol = s.store.get(s.state.layers.find_by_source("mode:instacorr").key).array[..., 0]
+    assert vol[3, 5, 3] > 0.6
+
+    signal = np.sin(2 * np.pi * np.arange(60) / 15.0)
+    s.set_mode_param("ortvec", f"+{_corr_ortvec(tmp_path, signal)}")
+    vol = s.store.get(s.state.layers.find_by_source("mode:instacorr").key).array[..., 0]
+    assert abs(vol[3, 5, 3]) < 0.5, "projecting out the signal must take the blob with it"
+    rows = s.mode._rows()
+    assert torch.abs(rows @ torch.as_tensor(signal, dtype=rows.dtype)).max() < 1e-4
+
+
+def test_under_a_bandpass_the_rows_stay_orthogonal_to_the_raw_ortvec(corr_session, tmp_path):
+    """Regress-then-filter would put the ortvec back; the columns are filtered too."""
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.set_mode_param("live", "1")
+    s.do(SetSeed(3, 4, 2))
+    ort = np.random.default_rng(1).normal(size=(60, 2)).cumsum(0)
+    s.set_mode_param("ortvec", f"+{_corr_ortvec(tmp_path, ort)}")
+    s.set_mode_param("fbot", "0.02")
+    s.set_mode_param("ftop", "0.2")
+    rows = s.mode._rows().double()
+    assert torch.abs(rows @ torch.as_tensor(ort)).max() < 1e-3
+
+
+def test_ortvec_columns_cost_the_p_their_dof(corr_session, tmp_path):
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.set_mode_param("live", "1")
+    s.do(SetSeed(3, 4, 2))
+    nort = s.state.layers.find_by_source("mode:instacorr").stat_spec()[1][2]
+    ort = np.random.default_rng(2).normal(size=(60, 3))
+    s.set_mode_param("ortvec", f"+{_corr_ortvec(tmp_path, ort)}")
+    after = s.state.layers.find_by_source("mode:instacorr").stat_spec()[1][2]
+    assert after == nort + 3
+
+
+def test_an_instacorr_ortvec_of_the_wrong_length_is_reported(corr_session, tmp_path):
+    s = corr_session
+    s.do(SetMode("instacorr"))
+    s.set_mode_param("live", "1")
+    s.do(SetSeed(3, 4, 2))
+    path = tmp_path / "short.1D"
+    np.savetxt(path, np.zeros(40))
+    s.set_mode_param("ortvec", f"+{path}")
+    assert "40 rows" in s.mode.status()
+
+
 def test_instacorr_stays_within_correlation_bounds(corr_session):
     corr_session.do(SetMode("instacorr"))
     corr_session.do(SetSeed(3, 4, 2))
@@ -894,11 +953,11 @@ def test_a_card_too_full_to_prepare_on_falls_back_to_the_cpu(corr_session, monke
     real = InstaCorrMode._prepare_rows
     tried: list[str] = []
 
-    def full_card(self, keep, device, progress):
+    def full_card(self, keep, nuisance, device, progress):
         tried.append(device.type)
         if len(tried) == 1:
             raise torch.OutOfMemoryError("CUDA out of memory")
-        return real(self, keep, device, progress)
+        return real(self, keep, nuisance, device, progress)
 
     monkeypatch.setattr(InstaCorrMode, "_prepare_rows", full_card)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)

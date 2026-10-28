@@ -21,6 +21,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from fastfuncstuff.viewer import ortvec
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.modes.base import (
     BoolControl,
@@ -31,6 +32,7 @@ from fastfuncstuff.viewer.modes.base import (
     Mode,
     OptionalFloatControl,
     OverlayKind,
+    PathListControl,
     ProgressFn,
     Trace,
     correlation_stat,
@@ -95,6 +97,19 @@ class InstaCorrMode(Mode):
                 unit=" mm",
                 help="Spatial smoothing applied before correlating.",
             ),
+            PathListControl(
+                name="ortvec",
+                label="ortvec",
+                filter="1D / xmat (*.1D *.txt);;All (*)",
+                newline=True,
+                transforms=True,
+                sample_interval=self.source_tr() or self._tr,
+                help="Time courses projected out of every voxel before correlating -- a "
+                "motion file, a respiration trace, a white-matter or CSF mean -- together "
+                "with the detrend. Untick one to see what it was removing from the map. "
+                "Under a bandpass they are filtered by the same band before they are "
+                "projected out. d/dt and BANDS work as in InstaGLM.",
+            ),
             BoolControl(
                 name="automask",
                 label="brain only",
@@ -142,7 +157,9 @@ class InstaCorrMode(Mode):
     def preparation_params(self) -> frozenset[str]:
         # seed_radius only affects which columns are averaged at compute time,
         # so changing it must not trigger a multi-second re-preparation.
-        return frozenset({"polort", "fbot", "ftop", "blur", "automask", "drop_first", "drop_last"})
+        return frozenset(
+            {"polort", "fbot", "ftop", "blur", "ortvec", "automask", "drop_first", "drop_last"}
+        )
 
     def __init__(self) -> None:
         #: Prepared rows live in the session's store under this key (RAM, plus a
@@ -157,6 +174,8 @@ class InstaCorrMode(Mode):
         self._source_key: str | None = None
         self._tr = 0.0
         self._window = slice(0, None)
+        #: Ortvec columns projected out, for the p's degrees of freedom.
+        self._n_ort = 0
         self._roi_message = ""
         self._zooms = (1.0, 1.0, 1.0)
         super().__init__()
@@ -255,6 +274,15 @@ class InstaCorrMode(Mode):
             self._roi_message = str(exc)
             self._dirty = False
             return False
+        try:
+            nuisance = self._nuisance(nt_full)
+        except (OSError, ValueError, IndexError) as exc:
+            # Dropped rather than left standing: the map on screen would be the
+            # old model's, and the status line only speaks when there are none.
+            self._release()
+            self._roi_message = str(exc)
+            self._dirty = False
+            return False
 
         if bool(self.params.get("automask", True)):
             from fastfuncstuff.viewer.series import automask_from_series
@@ -272,10 +300,10 @@ class InstaCorrMode(Mode):
         self._release()
         device = self._device()
         try:
-            rows = self._prepare_rows(keep, device, progress)
+            rows = self._prepare_rows(keep, nuisance, device, progress)
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
-            rows = self._prepare_rows(keep, torch.device("cpu"), progress)
+            rows = self._prepare_rows(keep, nuisance, torch.device("cpu"), progress)
 
         assert self.session is not None
         self._hold_key = f"instacorr:{id(self)}"
@@ -295,7 +323,11 @@ class InstaCorrMode(Mode):
         return self.session.store.device if self.session is not None else torch.device("cpu")
 
     def _prepare_rows(
-        self, keep: np.ndarray, device: torch.device, progress: ProgressFn | None
+        self,
+        keep: np.ndarray,
+        nuisance: np.ndarray | None,
+        device: torch.device,
+        progress: ProgressFn | None,
     ) -> torch.Tensor:
         """``(kept voxels, T)`` detrended, filtered, unit-norm rows on ``device``."""
 
@@ -331,10 +363,10 @@ class InstaCorrMode(Mode):
 
         # Time is the last axis from here on, which is also the axis every
         # operation below runs along -- so each one reads contiguously.
-        step(0.45, "detrend")
-        data = self._detrend(data)
-        step(0.65, "filter")
+        step(0.45, "filter")
         data = self._bandpass(data)
+        step(0.65, "detrend")
+        data = self._project_out(data, nuisance)
 
         step(0.85, "normalize")
         data = data - data.mean(-1, keepdim=True)
@@ -345,15 +377,50 @@ class InstaCorrMode(Mode):
         data.div_(norm.clamp_(min=1e-9))
         return data.masked_fill_(~valid, 0.0)
 
-    def _detrend(self, data: torch.Tensor) -> torch.Tensor:
-        """Project out Legendre polynomials -- never raw monomials."""
-        order = int(self.params.get("polort", 2))
-        if order < 0:
-            return data
-        from fastfuncstuff.glm.core import construct_polynomial_matrix
+    def _nuisance(self, nt_full: int) -> np.ndarray | None:
+        """``(T, k)`` float64: the Legendre drift, then every ticked ortvec column.
 
-        poly = construct_polynomial_matrix(data.shape[-1], order, data.device, data.dtype)
-        q, _ = torch.linalg.qr(poly)  # (T, k)
+        Raises what reading an ortvec raises -- a missing file, a row count
+        that is not the run's -- for :meth:`prepare` to report.
+        """
+        n_time = len(range(*self._window.indices(nt_full)))
+        blocks = []
+        order = self._polort()
+        if order >= 0:
+            from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+            poly = construct_polynomial_matrix(n_time, order, torch.device("cpu"), torch.float64)
+            blocks.append(poly.numpy())
+        ort, _labels = ortvec.regressor_block(
+            PathListControl.enabled(self.params.get("ortvec")),
+            tr=self._tr,
+            keep=self._window,
+            n_full=nt_full,
+        )
+        self._n_ort = 0 if ort is None else int(ort.shape[1])
+        if ort is not None:
+            blocks.append(ort)
+        return np.concatenate(blocks, axis=1) if blocks else None
+
+    def _project_out(self, data: torch.Tensor, nuisance: np.ndarray | None) -> torch.Tensor:
+        """Remove the nuisance span, after putting it through the data's band.
+
+        One projection for drift and ortvecs together, so each is removed
+        *given* the others. The columns are filtered first because the data
+        already was: projecting the raw columns out of filtered data leaves the
+        result correlated with them again (Lindquist et al. 2019), where the
+        filtered columns leave it orthogonal to both the band's complement and
+        the originals. SVD rather than QR, because a filtered constant is a
+        zero column and collinear ortvecs are one click away.
+        """
+        if nuisance is None:
+            return data
+        from fastfuncstuff.viewer.derive import orthonormal_basis
+
+        columns = self._bandpass(torch.as_tensor(nuisance.T)).numpy().T
+        if not np.abs(columns).max() > 1e-9:
+            return data  # a mean under a highpass: the filter already took it
+        q = torch.as_tensor(orthonormal_basis(columns), dtype=data.dtype, device=data.device)
         return data - (data @ q) @ q.T
 
     def _bandpass(self, data: torch.Tensor) -> torch.Tensor:
@@ -474,7 +541,9 @@ class InstaCorrMode(Mode):
             colormap="redblue",
             display_range=(-1.0, 1.0),
             threshold=0.3,
-            threshold_stat=correlation_stat(self._effective_samples(), self._polort()),
+            threshold_stat=correlation_stat(
+                self._effective_samples(), self._polort(), n_ort=self._n_ort
+            ),
         )
 
     def _polort(self) -> int:

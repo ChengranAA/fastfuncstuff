@@ -358,16 +358,18 @@ class Trace:
         return self.short or self.label
 
 
-def correlation_stat(n_time: float, polort: int) -> tuple[str, tuple[float, float, float]]:
+def correlation_stat(
+    n_time: float, polort: int, *, n_ort: int = 0
+) -> tuple[str, tuple[float, float, float]]:
     """The ``threshold_stat`` of a map of correlations with one time course.
 
     AFNI's ``Correl(n, nfit, nort)``: one fitted regressor, and ``polort + 1``
-    drift columns projected out first (just the mean when detrending is off), so
-    the p comes from ``n - 2 - polort`` degrees of freedom. Nominal: it assumes
-    independent samples, which fMRI is not, and says nothing about a regressor
-    chosen because it fits the data.
+    drift columns plus ``n_ort`` ortvec columns projected out first (just the
+    mean when detrending is off), so the p comes from ``n - 2 - polort - n_ort``
+    degrees of freedom. Nominal: it assumes independent samples, which fMRI is
+    not, and says nothing about a regressor chosen because it fits the data.
     """
-    return ("fico", (float(n_time), 1.0, float(max(polort, 0) + 1)))
+    return ("fico", (float(n_time), 1.0, float(max(polort, 0) + 1 + n_ort)))
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +627,21 @@ class Mode(ABC):
     def source_layer(self) -> Any | None:
         """The layer this mode reads: the named input, or the best candidate."""
         return None if self.session is None else self.session.input_layer(self)
+
+    def source_tr(self) -> float:
+        """The TR of the run this mode reads, from its header; 0 when unknown.
+
+        Before any preparation, so an ortvec list's band splitter has its Hz
+        axis before the first fit -- choosing the bands is part of deciding
+        what to fit.
+        """
+        layer = self.source_layer()
+        if layer is None or self.session is None:
+            return 0.0
+        try:
+            return float(self.session.store.get(layer.key).info.tr or 0.0)
+        except (KeyError, AttributeError):
+            return 0.0
 
     def input_layer_key(self) -> str | None:
         """The layer this mode consumes, if any.

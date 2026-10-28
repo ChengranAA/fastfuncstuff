@@ -278,6 +278,7 @@ def test_switching_to_a_mode_renders_its_declared_controls(win, qapp):
         "fbot",
         "ftop",
         "blur",
+        "ortvec",
         "automask",
         "seed_radius",
         "seed_roi",

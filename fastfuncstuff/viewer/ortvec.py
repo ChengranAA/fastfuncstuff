@@ -216,6 +216,68 @@ def read_columns(path: str) -> tuple[np.ndarray, list[str]]:
     return np.asarray(columns, dtype=np.float64), list(labels)
 
 
+def short_labels(path: str, labels: Sequence[str], *, distinguish: bool) -> list[str]:
+    """Name a regressor file's columns in something a picker can show.
+
+    ``read_nuisance`` names a plain 1D file's columns after its stem, which for
+    a pipeline output is the whole provenance --
+    ``stage02.moco.ses-01.task-dynaloc.run-01.motion#0``. Forty-five characters
+    of it is the same on every column, and it is the last word that says what
+    the regressor *is*. An xmat's own labels are left alone; they were chosen.
+    """
+    stem = Path(path).name
+    for ext in (".1D", ".txt", ".tsv"):
+        stem = stem.removesuffix(ext)
+    short = stem.rsplit(".", 1)[-1] or stem
+    out = []
+    for label in labels:
+        # Only the names this reader invented, which are exactly the ones that
+        # start with the stem it invented them from.
+        name = f"{short}{label[len(stem) :]}" if label.startswith(stem) else str(label)
+        out.append(f"{short}:{name}" if distinguish and not label.startswith(stem) else name)
+    return out
+
+
+def regressor_block(
+    entries: Sequence[str], *, tr: float, keep: slice, n_full: int
+) -> tuple[np.ndarray | None, list[str]]:
+    """Every entry read, transformed, cut to ``keep`` and laid side by side.
+
+    Concatenated rather than taken one entry at a time, because the whole
+    reason to hold several is to ask what each buys *given* the others. A
+    label carries its file's stem when there is more than one file, so two
+    motion estimates stay tellable apart. A file is read once however many
+    entries derive from it.
+
+    A file made from the cut run (InstaPCA's ortvec) is already the right
+    length; one made from the whole run is cut here.
+    """
+    n_time = len(range(*keep.indices(n_full)))
+    parsed = [parse_entry(e) for e in entries]
+    distinguish = len({path for path, _ in parsed}) > 1
+    files: dict[str, tuple[np.ndarray, list[str]]] = {}
+    blocks, labels = [], []
+    for path, ops in parsed:
+        if path not in files:
+            columns, names = read_columns(path)
+            if columns.shape[0] == n_full:
+                columns = columns[keep]
+            elif columns.shape[0] != n_time:
+                raise ValueError(
+                    f"{path} has {columns.shape[0]} rows but the run has {n_full} volumes"
+                    + (f" ({n_time} after the cut)" if n_time != n_full else "")
+                )
+            files[path] = (columns, short_labels(path, names, distinguish=distinguish))
+        columns, names = apply_ops(*files[path], ops, tr)
+        if columns.size == 0:
+            continue
+        blocks.append(columns)
+        labels += names
+    if not blocks:
+        return None, []
+    return np.concatenate(blocks, axis=1), labels
+
+
 # -- editing a list ----------------------------------------------------------
 def split_entries(
     entry: str, cutoffs: Sequence[float], *, n_columns: int, columns: Sequence[int] | None = None
@@ -251,6 +313,8 @@ __all__ = [
     "describe_entry",
     "parse_entry",
     "read_columns",
+    "regressor_block",
+    "short_labels",
     "split_entries",
     "with_op",
 ]

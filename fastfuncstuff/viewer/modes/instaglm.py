@@ -25,7 +25,6 @@ required its own fit rather than ``glm/core.py:fit_glm``.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import fields, replace
 from pathlib import Path
 
@@ -82,28 +81,6 @@ LINE_HELP = {
     "resid": "what the model did not account for",
     "column": "the selected column's own contribution",
 }
-
-
-def _short_labels(path: str, labels: Sequence[str], *, distinguish: bool) -> list[str]:
-    """Name a regressor file's columns in something a picker can show.
-
-    ``read_nuisance`` names a plain 1D file's columns after its stem, which for
-    a pipeline output is the whole provenance --
-    ``stage02.moco.ses-01.task-dynaloc.run-01.motion#0``. Forty-five characters
-    of it is the same on every column, and it is the last word that says what
-    the regressor *is*. An xmat's own labels are left alone; they were chosen.
-    """
-    stem = Path(path).name
-    for ext in (".1D", ".txt", ".tsv"):
-        stem = stem.removesuffix(ext)
-    short = stem.rsplit(".", 1)[-1] or stem
-    out = []
-    for label in labels:
-        # Only the names this reader invented, which are exactly the ones that
-        # start with the stem it invented them from.
-        name = f"{short}{label[len(stem) :]}" if label.startswith(stem) else str(label)
-        out.append(f"{short}:{name}" if distinguish and not label.startswith(stem) else name)
-    return out
 
 
 @mode
@@ -568,7 +545,9 @@ class InstaGLMMode(Mode):
             task, task_labels = self._task_block(events_path, n_full, tr, device, progress)
             task = task[keep]
 
-        ort, ort_labels = self._ort_block(n_time, tr, keep, n_full)
+        ort, ort_labels = ortvec.regressor_block(
+            PathListControl.enabled(self.params.get("ortvec")), tr=tr, keep=keep, n_full=n_full
+        )
 
         polort = int(self.params.get("polort", 2))
         n_pcs = int(self.params.get("pcs", 0))
@@ -606,58 +585,8 @@ class InstaGLMMode(Mode):
             pcs=pcs,
         )
 
-    def _ort_block(
-        self, n_time: int, tr: float, keep: slice, n_full: int
-    ) -> tuple[np.ndarray | None, list[str]]:
-        """Every ticked ortvec entry, read, transformed and laid side by side.
-
-        Concatenated rather than fitted one entry at a time, because the whole
-        reason to hold several is to ask what each buys *given* the others.
-        A label carries its file's stem when there is more than one file, so
-        two motion estimates in the same model stay tellable apart in the
-        column picker. A file is read once however many entries derive from it.
-        """
-        entries = PathListControl.enabled(self.params.get("ortvec"))
-        parsed = [ortvec.parse_entry(e) for e in entries]
-        distinguish = len({path for path, _ in parsed}) > 1
-        files: dict[str, tuple[np.ndarray, list[str]]] = {}
-        blocks, labels = [], []
-        for path, ops in parsed:
-            if path not in files:
-                columns, names = ortvec.read_columns(path)
-                # A file made from the cut run (InstaPCA's ortvec) is already the
-                # right length; one made from the whole run is cut here.
-                if columns.shape[0] == n_full:
-                    columns = columns[keep]
-                elif columns.shape[0] != n_time:
-                    raise ValueError(
-                        f"{path} has {columns.shape[0]} rows but the run has {n_full} volumes"
-                        + (f" ({n_time} after the cut)" if n_time != n_full else "")
-                    )
-                files[path] = (columns, _short_labels(path, names, distinguish=distinguish))
-            columns, names = ortvec.apply_ops(*files[path], ops, tr)
-            if columns.size == 0:
-                continue
-            blocks.append(columns)
-            labels += names
-        if not blocks:
-            return None, []
-        return np.concatenate(blocks, axis=1), labels
-
     def _run_tr(self) -> float:
-        """The TR of the run that will be fitted, before it is fitted.
-
-        What the band splitter draws its frequency axis in. Read from the header
-        rather than the prepared fit, so the splitter works before the first FIT
-        -- choosing the bands is part of deciding what to fit.
-        """
-        layer = self.source_layer()
-        if layer is None or self.session is None:
-            return self._tr
-        try:
-            return float(self.session.store.get(layer.key).info.tr or 0.0) or self._tr
-        except (KeyError, AttributeError):
-            return self._tr
+        return self.source_tr() or self._tr
 
     def _task_block(
         self,

@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from fastfuncstuff.glm.core import orthogonalize_design
-from fastfuncstuff.utils import linalg_device, widest_float_dtype
+from fastfuncstuff.utils import cpu_if_mps, linalg_device, widest_float_dtype
 
 
 @dataclass(frozen=True)
@@ -564,15 +564,61 @@ def _convolve_prf_drives(
     return torch.cat([applier.apply(drive) for drive in neural_drives], dim=0)
 
 
+@dataclass(frozen=True)
+class _NuisanceBases:
+    """Orthonormal bases of per-run nuisance, factored once for repeated projection.
+
+    ``orthogonalize_design`` factors its nuisance on every call, and on MPS that
+    QR is routed to the CPU, so each projection is a host round trip. The GN loop
+    projects several times per iteration against the same nuisance; this holds
+    the identical ``Q`` that each of those calls would have recomputed.
+    """
+
+    bases: tuple[torch.Tensor | None, ...]
+
+
+def _nuisance_bases(
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> _NuisanceBases | None:
+    """Factor per-run nuisance exactly as :func:`orthogonalize_design` would."""
+    if nuisance_per_run is None or isinstance(nuisance_per_run, _NuisanceBases):
+        return nuisance_per_run
+    bases: list[torch.Tensor | None] = []
+    for nuisance in nuisance_per_run:
+        nuisance = nuisance.to(device=device, dtype=dtype)
+        if nuisance.shape[1] == 0:
+            bases.append(None)
+            continue
+        q, _ = torch.linalg.qr(nuisance.to(cpu_if_mps(device, "qr")))
+        bases.append(q.to(device))
+    return _NuisanceBases(tuple(bases))
+
+
 def _project_per_run(
     values: torch.Tensor,
-    nuisance_per_run: Sequence[torch.Tensor] | None,
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None,
     run_starts: Sequence[int],
 ) -> torch.Tensor:
     """Project time-by-feature values from block-diagonal per-run nuisance."""
     if nuisance_per_run is None:
         return values
     run_ends = [*run_starts[1:], values.shape[0]]
+    if isinstance(nuisance_per_run, _NuisanceBases):
+        if len(nuisance_per_run.bases) != len(run_starts):
+            raise ValueError("nuisance_per_run must contain one matrix per run")
+        projected = []
+        for start, end, basis in zip(run_starts, run_ends, nuisance_per_run.bases, strict=True):
+            run_values = values[start:end]
+            if basis is not None and basis.shape[0] != run_values.shape[0]:
+                raise ValueError(
+                    f"nuisance basis has {basis.shape[0]} rows, expected {run_values.shape[0]}"
+                )
+            projected.append(
+                run_values if basis is None else run_values - basis @ (basis.T @ run_values)
+            )
+        return torch.cat(projected, dim=0)
     if len(nuisance_per_run) != len(run_starts):
         raise ValueError("nuisance_per_run must contain one matrix per run")
 
@@ -592,7 +638,7 @@ def _project_per_run(
 
 def project_nuisance_per_run(
     data: torch.Tensor,
-    nuisance_per_run: Sequence[torch.Tensor] | None,
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None,
     run_starts: Sequence[int],
 ) -> torch.Tensor:
     """Project per-run nuisance out of ``(n_voxels, n_timepoints)`` data.
@@ -607,7 +653,7 @@ def project_nuisance_per_run(
 
 def _project_prf_derivatives(
     derivatives: torch.Tensor,
-    nuisance_per_run: Sequence[torch.Tensor] | None,
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None,
     run_starts: Sequence[int],
 ) -> torch.Tensor:
     """Project ``(time, voxel, parameter)`` derivatives per run."""
@@ -656,11 +702,13 @@ def _compress_aperture_runs(
                 f"stimulus run {run_index} must have shape (time, {rows * columns}), "
                 f"got {tuple(stimulus.shape)}"
             )
-        frames, inverse = torch.unique(stimulus, dim=0, return_inverse=True)
+        # On the CPU whatever the compute device: Metal's unique(dim=0) took
+        # ~360 ms per call on a 306 x 10,000 run, against milliseconds here.
+        frames, inverse = torch.unique(stimulus.cpu(), dim=0, return_inverse=True)
         compressed.append(
             _ApertureRun(
-                frames=frames.reshape(-1, columns).contiguous(),
-                inverse=inverse,
+                frames=frames.reshape(-1, columns).to(stimulus.device).contiguous(),
+                inverse=inverse.to(stimulus.device),
                 n_frames=frames.shape[0],
                 n_timepoints=stimulus.shape[0],
                 rows=rows,
@@ -701,13 +749,18 @@ def _separable_drives(
     and the GEMM runs on distinct frames only.
     """
     n_profiles, n_voxels, n_columns = column_profiles.shape
-    flat_profiles = column_profiles.reshape(n_profiles * n_voxels, n_columns).T
+    flat_profiles = column_profiles.reshape(n_profiles * n_voxels, n_columns)
     outputs = [column_profiles.new_empty((run.n_frames, n_voxels)) for _ in row_weights]
     for frames in _frame_blocks(run, n_columns):
         block = run.frames[frames.start * run.rows : frames.stop * run.rows]
-        contracted = (block @ flat_profiles).view(-1, run.rows, n_profiles, n_voxels)
+        # Voxel-major, so the row reduction is a batched matvec over contiguous
+        # (frame, row) panels. The frame-major einsum it replaces reduced over a
+        # strided view and cost 3-4x the GEMM itself on CPU and MPS alike.
+        contracted = (flat_profiles @ block.T).view(n_profiles, n_voxels, -1, run.rows)
         for output, (row_weight, profile_index) in zip(outputs, row_weights, strict=True):
-            output[frames] = torch.einsum("frv,vr->fv", contracted[:, :, profile_index], row_weight)
+            output[frames] = (
+                torch.bmm(contracted[profile_index], row_weight.unsqueeze(2)).squeeze(2).T
+            )
         del contracted
     return outputs
 
@@ -904,7 +957,7 @@ def _refine_css_batch(
     hrf: torch.Tensor | _HRFApplier,
     stimulus_shape: tuple[int, int],
     run_starts: Sequence[int],
-    nuisance_per_run: Sequence[torch.Tensor] | None,
+    nuisance_per_run: Sequence[torch.Tensor] | _NuisanceBases | None,
     config: PRFRefinementConfig,
     hrf_group: torch.Tensor | None = None,
 ) -> tuple[
@@ -936,6 +989,7 @@ def _refine_css_batch(
     steps are rejected here, that recomputation was most of the Jacobian cost.
     """
     stimulus_runs = _compress_aperture_runs(stimulus_runs, stimulus_shape)
+    nuisance_per_run = _nuisance_bases(nuisance_per_run, data.device, data.dtype)
     projected_data = _project_per_run(data.T, nuisance_per_run, run_starts)
     current = _bounded_css_parameters(parameters, stimulus_shape, config)
     n_voxels = current.shape[0]
@@ -1120,7 +1174,11 @@ def refine_prf_supergrid(
     residual_ss = torch.empty(n_voxels, device=output_device, dtype=data.dtype)
     n_iters = torch.empty(n_voxels, device=output_device, dtype=torch.int32)
     converged = torch.empty(n_voxels, device=output_device, dtype=torch.bool)
-    stimuli = [run.to(device=device, dtype=data.dtype) for run in stimulus_runs]
+    # Factored once for every chunk and stage rather than once per batch call.
+    stimuli = _compress_aperture_runs(
+        [run.to(device=device, dtype=data.dtype) for run in stimulus_runs], stimulus_shape
+    )
+    nuisance_per_run = _nuisance_bases(nuisance_per_run, device, data.dtype)
     hrf_library = hrf_library.to(device=device, dtype=data.dtype)
 
     progress = None

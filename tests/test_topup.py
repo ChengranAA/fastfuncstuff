@@ -257,6 +257,92 @@ def test_analytic_gn_operator_matches_autograd():
     assert (g_an - g_auto).norm() < 1e-10 * g_auto.norm(), "J^T r mismatch"
 
 
+def test_air_rows_operator_matches_autograd():
+    # The air rows ride the barrier's B * D_pe blocks; with both on, the analytic J, J^T J
+    # and the fused normal operator must still be the autodiff operator.
+    torch.manual_seed(5)
+    basis, scans, mask_idx, coeff = _small_gn_setup()
+    w = T.air_stretch_weight(scans, 0.5)
+    assert 0 < float(w.mean()) < 1, "the fixture needs some dark voxels"
+    air = [(w * a, td) for td, a in T._fold_barrier_specs(scans)]
+    lam, bar, air_eff = 1e-3, 5.0, 0.3
+
+    c = coeff.detach().requires_grad_(True)
+    r0 = T._residual_vector(
+        c, basis, scans, mask_idx, 1, lam, "bending", bar, 0.1, air=air, air_eff=air_eff
+    )
+    wv = torch.zeros_like(r0, requires_grad=True)
+    (jtw,) = torch.autograd.grad(r0, c, grad_outputs=wv, create_graph=True, retain_graph=True)
+    v = torch.randn(basis.coeff_shape, dtype=torch.float64)
+    jv_auto = torch.autograd.grad(jtw, wv, grad_outputs=v, retain_graph=True)[0]
+    jtjv_auto = torch.autograd.grad(r0, c, grad_outputs=jv_auto, retain_graph=True)[0].reshape(-1)
+
+    lin = T._linearize(
+        coeff, basis, scans, mask_idx, 1, lam, "bending", bar, 0.1, air=air, air_eff=air_eff
+    )
+    jv_an = T._lin_jv(lin, v)
+    assert (jv_an - jv_auto).norm() < 1e-10 * jv_auto.norm(), "J v mismatch"
+    jtjv_an = T._lin_jtu(lin, jv_an).reshape(-1)
+    assert (jtjv_an - jtjv_auto).norm() < 1e-10 * jtjv_auto.norm(), "J^T J v mismatch"
+    fused = T._NormalOperator(lin, T.reg_gram_terms(basis, "bending"))(v.reshape(-1))
+    ref = jtjv_an + 1e-8 * v.reshape(-1)
+    assert (fused - ref).norm() < 1e-10 * ref.norm(), "fused normal operator mismatch"
+
+
+def test_air_term_flattens_the_field_where_there_is_no_signal():
+    # The data term does not see the dark corners, so a field gradient started there
+    # survives a fit at a tiny bending weight -- unless the air rows ask for a unit
+    # Jacobian. Inside the head the data still decide.
+    torch.manual_seed(9)
+    _, _, scans = _make_synthetic()
+    shape = tuple(scans[0].data.shape)
+    for s in scans:  # dark bands at both PE ends: noise only, like air beside a head
+        noise = 0.01 * s.data.mean() * torch.rand_like(s.data)
+        s.data[:, :6], s.data[:, -6:] = noise[:, :6], noise[:, -6:]
+    w = T.air_stretch_weight(scans, 0.3)
+    assert float((w > 0.5).float().mean()) > 0.05, "fixture needs air"
+    y = torch.linspace(-1, 1, shape[1], dtype=scans[0].data.dtype)
+    start = 40.0 * torch.sin(3 * math.pi * y).view(1, -1, 1).expand(shape).contiguous()
+
+    def stretch_in_air(air_weight):
+        cfg = T.TopupConfig(
+            warpres=[8.0],
+            fwhm=[0.0],
+            lam=[1e-9],
+            miter=[6],
+            subsamp=[1],
+            air_weight=air_weight,
+            air_max_warpres=8.0,
+        )
+        res = T.run_topup(
+            [T.ScanSpec(s.data.clone(), s.pe_axis, s.sign, s.readout) for s in scans],
+            (3.0, 2.5, 2.5),
+            cfg,
+            progress=False,
+            init_field=start,
+            mask_field=False,
+        )
+        g = (T._central_diff_pe(res.field_hz, 1) * scans[0].readout).abs()
+        return float(g[w > 0.5].mean())
+
+    assert stretch_in_air(1e-2) < 0.5 * stretch_in_air(0.0)
+
+
+def test_air_weight_spares_dark_gaps_inside_the_head():
+    # The occipital fissure is dark but enclosed; a brightness-only weight flattened the
+    # field there (ses-fine fissure gap 1.22 -> 1.83 vox). Only exterior dark counts.
+    _, _, scans = _make_synthetic()
+    for s in scans:
+        noise = 0.01 * s.data.mean() * torch.rand_like(s.data)
+        s.data[:, :6], s.data[:, -6:] = noise[:, :6], noise[:, -6:]
+        mid = s.data.shape[2] // 2
+        s.data[:, 12:-12, mid - 1 : mid + 1] = noise[:, 12:-12, mid - 1 : mid + 1]  # a fissure
+    w = T.air_stretch_weight(scans, 0.3)
+    mid = w.shape[2] // 2
+    assert float(w[:, 14:-14, mid - 1 : mid + 1].max()) < 0.05, "the enclosed gap got weight"
+    assert float(w[:, :3].mean()) > 0.5, "the outside air lost its weight"
+
+
 def test_analytic_and_autograd_recover_same_field():
     # End-to-end: the two matvecs recover the same field (very high correlation; CG
     # drift on the ill-conditioned normal equations forbids bit-identity).

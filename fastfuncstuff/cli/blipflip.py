@@ -441,6 +441,41 @@ def create_parser() -> argparse.ArgumentParser:
         "large disagreement is misalignment the fit still has to remove.",
     )
 
+    air = parser.add_argument_group(
+        "Air (EXPERIMENTAL -- cleans the air but costs brain field in proportion; off)"
+    )
+    air.add_argument(
+        "-air_weight",
+        type=float,
+        default=0.0,
+        help="Ask for a unit PE Jacobian where the scans are dark: weight of those rows "
+        "relative to the data SSD (like -lambda). Where there is no signal the fine tiers' "
+        "field keeps whatever the scalp edge pulled it to, and its PE gradient stretches the "
+        "background noise into streaks along PE. 0 (default) disables.",
+    )
+    air.add_argument(
+        "-air_dark",
+        type=float,
+        default=0.2,
+        help="A voxel counts as air below this fraction of bright tissue (98th percentile "
+        "of the scans' mean); the darkest get the full weight.",
+    )
+    air.add_argument(
+        "-air_from",
+        type=float,
+        default=5.0,
+        metavar="MM",
+        help="Use the air rows only on levels whose knot spacing is at most this: a coarser "
+        "knot spans air and brain alike, and flattening one flattens the other.",
+    )
+    air.add_argument(
+        "-air_margin",
+        type=int,
+        default=2,
+        metavar="VOX",
+        help="Voxels beyond the (hole-filled) head before the air weight starts.",
+    )
+
     misc = parser.add_argument_group("Misc")
     misc.add_argument(
         "-precision",
@@ -889,6 +924,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     cfg.jac_floor = args.jac_floor
     cfg.reject_folds = args.reject_folds
     cfg.anat_weight = args.anat_weight
+    cfg.air_weight = args.air_weight
+    cfg.air_dark = args.air_dark
+    cfg.air_max_warpres = args.air_from
+    cfg.air_margin_vox = args.air_margin
     cfg.anat_sigma_mm = args.anat_sigma
     cfg.anat_max_warpres = args.anat_from
     cfg.robust = args.robust

@@ -325,6 +325,22 @@ class TopupConfig:
     """Lowest weight a voxel can get (see :func:`robust_weights`): above zero, a rejected
     voxel still anchors its field instead of leaving it to run away."""
 
+    air_weight: float = 0.0
+    """Weight (relative to the data SSD, like ``lam``) of the air rows: a unit PE Jacobian
+    asked for where the scans are dark (:func:`air_stretch_weight`). 0 disables."""
+
+    air_dark: float = 0.2
+    """Fraction of bright tissue below which a voxel counts as air for ``air_weight``."""
+
+    air_max_warpres: float = 5.0
+    """The air rows join only levels whose knot spacing (mm) is at most this. A coarse knot
+    spans air and brain alike, so flattening the air there flattens the brain: active from
+    the 30 mm level, 1e-3 moved the ses-fine brain field 16 Hz RMS (solver-path noise is
+    3-5 Hz) and widened the occipital fissure gap."""
+
+    air_margin_vox: int = 2
+    """Voxels beyond the hole-filled head before the air weight starts."""
+
     def n_levels(self) -> int:
         return len(self.warpres)
 
@@ -977,6 +993,45 @@ def _barrier_rows_scaled(
     return rows
 
 
+def air_stretch_weight(
+    scans: list[ScanSpec], dark: float, smooth_vox: float = 2.0, margin_vox: int = 2
+) -> Tensor:
+    """Per-voxel weight of the air term: up to 1 in the dark space outside the head, 0 inside.
+
+    Where there is no signal the data term says nothing about the field, and under the
+    fine tiers' negligible bending weight it keeps whatever the scalp edge pulled it to:
+    on a 3T 2 mm pair the PE stretch |J - 1| was 0.46 just outside the head, and the
+    corrected air showed streaks along PE and black wedges where it was squeezed. The air
+    rows ask for a unit PE Jacobian, ``w(x) * d disp / d pe -> 0``, rather than for a zero
+    field, which would only move the stretch to the scalp edge.
+
+    Only EXTERIOR dark counts. Brightness alone also weights the dark gaps inside the head
+    -- the interhemispheric fissure, sinuses, dropout -- and flattened the field exactly
+    where it has to bend: on HiHiFaces ses-fine the occipital fissure gap went 1.22/1.69 ->
+    1.83/2.81 voxels. So the head is the bright mask closed and hole-filled slice by slice
+    along tensor dim 0 (those gaps are enclosed in-plane, the outside air is not), and only
+    voxels 2 beyond it get weight.
+
+    ``w = clip(1 - m / (dark * ref), 0, 1)`` outside the head, ``m`` the scans' mean,
+    ``ref`` its 98th percentile; lightly smoothed so the weight cuts no step into the field.
+    The hole fill runs on the CPU (scipy), once per level.
+    """
+    import numpy as np
+    from scipy.ndimage import binary_closing, binary_dilation, binary_fill_holes
+
+    m = torch.stack([sc.data.abs() for sc in scans], dim=0).mean(dim=0).float()
+    ref = float(torch.quantile(m.reshape(-1)[:: max(1, m.numel() // 1_000_000)], 0.98))
+    if ref <= 0 or dark <= 0:
+        return torch.zeros_like(m).to(scans[0].data.dtype)
+    bright = (_separable_smooth_3d(m, 1.0) > dark * ref).cpu().numpy()
+    head = np.stack([binary_fill_holes(binary_closing(sl, iterations=3)) for sl in bright], axis=0)
+    exterior = torch.from_numpy(~binary_dilation(head, iterations=margin_vox)).to(m.device)
+    w = (1.0 - m / (dark * ref)).clamp(0.0, 1.0) * exterior
+    if smooth_vox > 0:
+        w = _separable_smooth_3d(w, smooth_vox).clamp(0.0, 1.0)
+    return w.to(scans[0].data.dtype)
+
+
 def _min_jacobian(field_hz: Tensor, specs: list[tuple[int, float]]) -> float:
     """Worst (most negative) PE Jacobian ``1 - max|readout * d field/d pe|`` over axes."""
     m = 1.0
@@ -1059,10 +1114,12 @@ def _residual_vector(
     anat: _AnatTerm | None = None,
     anat_eff: float = 0.0,
     sqrt_w: Tensor | None = None,
+    air: list[tuple[Tensor, int]] | None = None,
+    air_eff: float = 0.0,
 ) -> Tensor:
     """Full residual: masked data rows, then sqrt(lam) reg rows, then anti-fold rows,
-    then the anatomical rows. ``sqrt_w`` (a volume, see :func:`robust_weights`) weights
-    each voxel's data rows."""
+    then the air rows (:func:`air_stretch_weight`), then the anatomical rows. ``sqrt_w``
+    (a volume, see :func:`robust_weights`) weights each voxel's data rows."""
     return _residual_rows(
         coeff,
         basis,
@@ -1076,6 +1133,8 @@ def _residual_vector(
         anat if anat_eff > 0 else None,
         math.sqrt(anat_eff) if anat_eff > 0 else None,
         sqrt_w,
+        air if air_eff > 0 else None,
+        math.sqrt(air_eff) if air_eff > 0 else None,
     )
 
 
@@ -1092,6 +1151,8 @@ def _residual_rows(
     anat: _AnatTerm | None = None,
     sqrt_anat: float | Tensor | None = None,
     sqrt_w: Tensor | None = None,
+    air: list[tuple[Tensor, int]] | None = None,
+    sqrt_air: float | Tensor | None = None,
 ) -> Tensor:
     """:func:`_residual_vector` with the square-rooted weights given (``None`` = term off)."""
     field_hz = basis.field(coeff)
@@ -1113,6 +1174,8 @@ def _residual_rows(
         rows = rows + [sqrt_lam * reg_residual(field_hz, reg_mode)]
     if sqrt_barrier is not None:
         rows = rows + _barrier_rows_scaled(field_hz, scans, sqrt_barrier, jac_floor)
+    if air is not None and sqrt_air is not None:
+        rows = rows + [(sqrt_air * W * _central_diff_pe(field_hz, td)).reshape(-1) for W, td in air]
     if anat is not None and sqrt_anat is not None:
         rows = rows + [
             (m - anat.target).reshape(-1)[mask_idx] * (sqrt_anat * scale) for m in modulated
@@ -1273,6 +1336,8 @@ def _linearize(
     jac_floor: float = 0.1,
     anat_eff: float = 0.0,
     sqrt_w: Tensor | None = None,
+    air: list[tuple[Tensor, int]] | None = None,
+    air_eff: float = 0.0,
 ) -> _Linearization:
     """Precompute the per-scan slope/Jacobian maps for the analytic GN matvec."""
     field0 = basis.field(coeff)
@@ -1302,6 +1367,13 @@ def _linearize(
         for td, a_ax in _fold_barrier_specs(scans):
             g = a_ax * _central_diff_pe(field0, td)
             barrier_b.append((sm * a_ax) * (g.abs() > c).to(field0.dtype) * g.sign())
+            barrier_tdim.append(td)
+    # The air rows are already linear, r = sqrt(air_eff) W D_pe(field), so they ride the
+    # barrier's B * D_pe(dfield) blocks with a fixed B -- after the barrier's, as in the
+    # residual -- and every J / J^T / normal operator handles them unchanged.
+    if air is not None and air_eff > 0:
+        for W, td in air:
+            barrier_b.append(math.sqrt(air_eff) * W)
             barrier_tdim.append(td)
     return _Linearization(
         basis=basis,
@@ -1476,8 +1548,10 @@ class _LevelResidual:
         use_graph: bool,
         anat: _AnatTerm | None = None,
         sqrt_w: Tensor | None = None,
+        air: list[tuple[Tensor, int]] | None = None,
     ):
         self.args = (basis, scans, mask_idx, n_sm1)
+        self.air = air
         self.reg_mode = reg_mode
         self.jac_floor = jac_floor
         self.use_graph = use_graph
@@ -1485,14 +1559,20 @@ class _LevelResidual:
         # Robust data weights: one buffer per level, rewritten in place each step so a
         # captured graph reads the current weights.
         self.sqrt_w = sqrt_w
-        self.graphs: dict[tuple[bool, bool, bool], dict] = {}
+        self.graphs: dict[tuple[bool, bool, bool, bool], dict] = {}
 
     def residual(
-        self, c: Tensor, lam_eff: float, barrier_eff: float, anat_eff: float = 0.0
+        self,
+        c: Tensor,
+        lam_eff: float,
+        barrier_eff: float,
+        anat_eff: float = 0.0,
+        air_eff: float = 0.0,
     ) -> tuple[Tensor, float]:
         """``(residual vector, cost)``. On the graphed path the vector is a buffer the next
         call overwrites -- use it before evaluating again."""
         anat_eff = anat_eff if self.anat is not None else 0.0
+        air_eff = air_eff if self.air is not None else 0.0
         if not self.use_graph:
             r = _residual_vector(
                 c,
@@ -1504,9 +1584,11 @@ class _LevelResidual:
                 self.anat,
                 anat_eff,
                 self.sqrt_w,
+                self.air,
+                air_eff,
             )
             return r, float(_dot64(r, r))
-        st = self._state(c, lam_eff > 0, barrier_eff > 0, anat_eff > 0)
+        st = self._state(c, lam_eff > 0, barrier_eff > 0, anat_eff > 0, air_eff > 0)
         st["c"].copy_(c)
         if lam_eff > 0:
             st["sqrt_lam"].fill_(math.sqrt(lam_eff))
@@ -1514,14 +1596,25 @@ class _LevelResidual:
             st["sqrt_bar"].fill_(math.sqrt(barrier_eff))
         if anat_eff > 0:
             st["sqrt_anat"].fill_(math.sqrt(anat_eff))
+        if air_eff > 0:
+            st["sqrt_air"].fill_(math.sqrt(air_eff))
         st["graph"].replay()
         return st["r"], float(st["cost"])
 
-    def cost(self, c: Tensor, lam_eff: float, barrier_eff: float, anat_eff: float = 0.0) -> float:
-        return self.residual(c, lam_eff, barrier_eff, anat_eff)[1]
+    def cost(
+        self,
+        c: Tensor,
+        lam_eff: float,
+        barrier_eff: float,
+        anat_eff: float = 0.0,
+        air_eff: float = 0.0,
+    ) -> float:
+        return self.residual(c, lam_eff, barrier_eff, anat_eff, air_eff)[1]
 
-    def _state(self, c: Tensor, with_reg: bool, with_bar: bool, with_anat: bool) -> dict:
-        key = (with_reg, with_bar, with_anat)
+    def _state(
+        self, c: Tensor, with_reg: bool, with_bar: bool, with_anat: bool, with_air: bool = False
+    ) -> dict:
+        key = (with_reg, with_bar, with_anat, with_air)
         if key in self.graphs:
             return self.graphs[key]
         st: dict = {
@@ -1529,6 +1622,7 @@ class _LevelResidual:
             "sqrt_lam": torch.ones((), device=c.device, dtype=c.dtype),
             "sqrt_bar": torch.ones((), device=c.device, dtype=c.dtype),
             "sqrt_anat": torch.ones((), device=c.device, dtype=c.dtype),
+            "sqrt_air": torch.ones((), device=c.device, dtype=c.dtype),
         }
 
         def step() -> None:
@@ -1543,6 +1637,8 @@ class _LevelResidual:
                 self.anat if with_anat else None,
                 st["sqrt_anat"] if with_anat else None,
                 self.sqrt_w,
+                self.air if with_air else None,
+                st["sqrt_air"] if with_air else None,
             )
             st["r"], st["cost"] = r, _dot64(r, r)
 
@@ -1750,6 +1846,7 @@ def _gn_direction_analytic(
     solver: _LevelCG | None = None,
     level_residual: _LevelResidual | None = None,
     anat_eff: float = 0.0,
+    air_eff: float = 0.0,
 ) -> tuple[Tensor, float]:
     """Analytic Gauss-Newton step: same math as :func:`_gn_direction`, no autograd.
 
@@ -1764,9 +1861,11 @@ def _gn_direction_analytic(
         level_residual = _LevelResidual(basis, scans, mask_idx, n_sm1, reg_mode, jac_floor, False)
     if level_residual.anat is None:
         anat_eff = 0.0
+    if level_residual.air is None:
+        air_eff = 0.0
     # On the graphed path r0 is a buffer the next evaluation overwrites; J^T r0 below is
     # queued before any.
-    r0, cost = level_residual.residual(coeff, lam_eff, barrier_eff, anat_eff)
+    r0, cost = level_residual.residual(coeff, lam_eff, barrier_eff, anat_eff, air_eff)
     lin = _linearize(
         coeff,
         basis,
@@ -1779,6 +1878,8 @@ def _gn_direction_analytic(
         jac_floor,
         anat_eff,
         level_residual.sqrt_w,
+        level_residual.air,
+        air_eff,
     )
 
     if solver is None:
@@ -1827,6 +1928,8 @@ def gn_solve_level(
     robust: bool = False,
     robust_c: float = 4.685,
     robust_floor: float = 0.0,
+    air_w: Tensor | None = None,
+    air_weight: float = 0.0,
 ) -> tuple[Tensor, float, LevelReport]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
@@ -1845,7 +1948,9 @@ def gn_solve_level(
     the anatomical rows (:class:`_AnatTerm`), its target refit at the start of every step;
     the reported data cost and the ``ssqlambda`` scaling stay pair-only. ``robust``
     reweights the pair's data rows by :func:`robust_weights` (Tukey constant ``robust_c``),
-    recomputed at the start of every step and held fixed through it (IRLS).
+    recomputed at the start of every step and held fixed through it (IRLS). ``air_w``
+    with ``air_weight > 0`` adds the air rows (:func:`air_stretch_weight`), weighted
+    relative to the data SSD like the barrier.
     Returns ``(coefficients, cost, report)``.
     """
     mask_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
@@ -1856,6 +1961,12 @@ def gn_solve_level(
     if anat is None or anat_weight <= 0:
         anat, anat_weight = None, 0.0
     sqrt_w = torch.ones(mask.shape, device=coeff.device, dtype=coeff.dtype) if robust else None
+    air = None
+    if air_w is not None and air_weight > 0:
+        air = [(air_w.to(coeff.dtype) * a_ax, td) for td, a_ax in _fold_barrier_specs(scans)]
+    else:
+        air_weight = 0.0
+    air_eff = 0.0
 
     def residual(c: Tensor, lam_eff: float, barrier_eff: float = 0.0) -> Tensor:
         return _residual_vector(
@@ -1871,6 +1982,8 @@ def gn_solve_level(
             anat,
             anat_weight,
             sqrt_w,
+            air,
+            air_eff,
         )
 
     def refit_anat(c: Tensor) -> None:
@@ -1893,6 +2006,7 @@ def gn_solve_level(
         analytic and use_graph and coeff.device.type == "cuda",
         anat,
         sqrt_w,
+        air,
     )
 
     def data_ssd(c: Tensor) -> float:
@@ -1936,9 +2050,14 @@ def gn_solve_level(
             )
         # ssq-scale both the smoothness (lam) and anti-fold (jac_penalty) weights by the
         # current data SSD so they are invariant to intensity scale and image size.
-        dssd = data_ssd(coeff) if (ssqlambda and (lam > 0 or jac_penalty > 0)) else 1.0
+        dssd = (
+            data_ssd(coeff)
+            if (ssqlambda and (lam > 0 or jac_penalty > 0 or air_weight > 0))
+            else 1.0
+        )
         lam_eff = lam * dssd if ssqlambda else lam
         barrier_eff = (jac_penalty * dssd if ssqlambda else jac_penalty) if jac_penalty > 0 else 0.0
+        air_eff = air_weight * dssd if ssqlambda else air_weight
         refit_anat(coeff)
         if analytic:
             delta, cost = _gn_direction_analytic(
@@ -1956,6 +2075,7 @@ def gn_solve_level(
                 solver,
                 level_residual,
                 anat_weight,
+                air_eff,
             )
         else:
             delta, cost = _gn_direction(
@@ -1974,7 +2094,7 @@ def gn_solve_level(
         new_cost = cost
         for _ in range(12):
             trial = coeff + (step * delta).reshape(coeff.shape)
-            new_cost = level_residual.cost(trial, lam_eff, barrier_eff, anat_weight)
+            new_cost = level_residual.cost(trial, lam_eff, barrier_eff, anat_weight, air_eff)
             folds = guard and _min_jacobian(basis.field(trial), barrier_specs) < min(
                 0.0, cur_min_jac
             )
@@ -2438,6 +2558,11 @@ def run_topup(
             level_anat = _AnatTerm.build(
                 smoothed, anat_sigma_vox / ss, _NIFTI_AXIS_TO_TDIM[work[0].pe_axis]
             )
+        level_air = (
+            air_stretch_weight(level_scans, config.air_dark, margin_vox=config.air_margin_vox)
+            if config.air_weight > 0 and wr <= config.air_max_warpres
+            else None
+        )
         on_step = None
         if recorder is not None:
             recorder.set_context(f"L{lvl + 1}/{n_lev} {wr}mm")
@@ -2469,6 +2594,8 @@ def run_topup(
             robust=config.robust and wr <= config.robust_max_warpres,
             robust_c=config.robust_c,
             robust_floor=config.robust_floor,
+            air_w=level_air,
+            air_weight=config.air_weight,
         )
         reports.append(report)
         if recorder is not None:

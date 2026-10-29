@@ -1496,6 +1496,7 @@ class SetThresholdFollow(Command):
 
     ``same`` thresholds on the shown sub-brick; ``next`` on the one after it,
     so stepping through ``Faces#0_Coef`` keeps thresholding on ``Faces#0_Tstat``;
+    ``next2`` on the one two after (a Coef / Tstat / Zstat triplet, cut on the z);
     ``fixed`` keeps the current threshold sub-brick while the overlay changes.
     """
 
@@ -1680,12 +1681,31 @@ def _carry_to_grid(st: ViewerState, old: DisplayGrid | None, was: tuple[int, int
 RESAMPLE_MODES = ("auto", "nearest", "linear", "cubic")
 
 #: Values SET_THRESHOLD_FOLLOW takes.
-THRESHOLD_FOLLOW = ("same", "next", "fixed")
+THRESHOLD_FOLLOW = ("same", "next", "next2", "fixed")
+
+#: How far after the shown sub-brick a following threshold reads: ``next`` is a
+#: 3dDeconvolve-style ``_Coef`` / ``_Tstat`` pair, ``next2`` a triplet with a
+#: third map between (``_Coef`` / ``_Tstat`` / ``_Zstat`` from the NORDIC
+#: autoproc path, cut on the z).
+FOLLOW_OFFSET = {"next": 1, "next2": 2}
 
 
-def _next_brick(layer: Layer, index: int) -> int:
-    """The sub-brick after ``index``: a coefficient's t in a 3dDeconvolve-style bucket."""
-    return min(index + 1, layer.n_volumes - 1)
+def _next_brick(layer: Layer, index: int, offset: int = 1) -> int:
+    """The sub-brick ``offset`` after ``index``: a coefficient's statistic in a bucket."""
+    return min(index + offset, layer.n_volumes - 1)
+
+
+def brick_stops(layer: Layer) -> list[int]:
+    """The sub-bricks `,` and `.` visit on a layer that does not follow time.
+
+    Every one, unless the threshold follows the shown brick at an offset: then
+    one per group -- each ``_Coef`` of a Coef/Tstat bucket -- keeping the phase
+    the layer is on (a leading Full_Fstat stays out of step), and only where
+    the statistic it cuts on exists.
+    """
+    offset = FOLLOW_OFFSET.get(layer.threshold_follow, 0)
+    stride = offset + 1
+    return list(range(layer.volume_index % stride, layer.n_volumes - offset, stride))
 
 
 def _p_of_threshold(layer: Layer, value: float) -> float | None:
@@ -2753,8 +2773,10 @@ def install(
         if layer.volume_index == value:
             return Aspect.NOTHING
         changes: dict[str, object] = {"volume_index": value}
-        if layer.threshold_follow == "next":
-            changes["threshold_index"] = _next_brick(layer, value)
+        if layer.threshold_follow in FOLLOW_OFFSET:
+            changes["threshold_index"] = _next_brick(
+                layer, value, FOLLOW_OFFSET[layer.threshold_follow]
+            )
         _hold_p(layer, changes)
         if (
             session is not None
@@ -2828,7 +2850,8 @@ def install(
         layer = st.layers.get(cmd.key)
         index = {
             "same": None,
-            "next": _next_brick(layer, layer.volume_index),
+            "next": _next_brick(layer, layer.volume_index, 1),
+            "next2": _next_brick(layer, layer.volume_index, 2),
             "fixed": layer.threshold_brick,
         }[cmd.mode]
         if (layer.threshold_index, layer.threshold_follow) == (index, cmd.mode):

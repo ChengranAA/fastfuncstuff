@@ -38,6 +38,7 @@ from fastfuncstuff.viewer.vocab import (
     ReloadLayer,
     RemoveLayer,
     SetIJK,
+    SetIndex,
     SetVolume,
     SetXYZ,
     install,
@@ -549,6 +550,48 @@ class ViewerSession:
         chosen = key or self.state.layers.mint_key()
         self.do(AddLayer(str(path), chosen))
         return chosen
+
+    # -- stepping ------------------------------------------------------
+    def frame_step(self, delta: int) -> Command | None:
+        """What `,` and `.` move: time, or the selected layer's own sub-bricks.
+
+        A selected 4-D layer that does not follow time -- a stats bucket, a QC
+        stack -- is what is being looked at, so the keys step it rather than
+        scrub every other layer while it sits still. With a threshold that
+        follows at an offset, one step is one group (Coef to Coef, the t
+        following). Anything else steps the shared time index. ``None`` when
+        there is nothing to move.
+        """
+        from fastfuncstuff.viewer.vocab import brick_stops
+
+        st = self.state
+        layer = st.selected_layer()
+        if layer is not None and layer.n_volumes > 1 and not layer.time_linked:
+            stops = brick_stops(layer)
+            if not stops:
+                return None
+            at = layer.volume_index
+            if delta > 0:
+                nxt = next((i for i in stops if i > at), stops[0])
+            else:
+                nxt = next((i for i in reversed(stops) if i < at), stops[-1])
+            return None if nxt == at else SetVolume(layer.key, nxt)
+        hi = st.max_time_index()
+        if hi <= 0:
+            return None
+        return SetIndex((st.time_index + delta) % (hi + 1))
+
+    def brick_caption(self, key: str) -> str:
+        """``name: label`` of the sub-brick a layer shows, and what it is cut on."""
+        layer = self.state.layers.get(key)
+
+        def label(i: int) -> str:
+            return layer.labels[i] if i < len(layer.labels) else f"#{i}"
+
+        text = f"{layer.name}: {label(layer.volume_index)}"
+        if layer.threshold_index is not None and layer.threshold_brick != layer.volume_index:
+            text += f"  (cut on {label(layer.threshold_brick)})"
+        return text
 
     # -- previewing ----------------------------------------------------
     @property

@@ -720,16 +720,19 @@ def test_stepping_sub_bricks_wraps(win, qapp):
     assert w.session.state.layers.get(key).volume_index == 0
 
 
-def test_the_time_keys_say_so_when_they_cannot_move_this_layer(win, qapp):
-    """Otherwise the key reads as broken rather than as aimed elsewhere."""
+def test_the_time_keys_step_a_layer_that_does_not_follow_time(win, qapp):
+    """It used to sit still while `.` scrubbed everything else; now it steps itself."""
     w, d = win
     key = w.session.load(d / "run1.nii.gz")
     w.session.state.layers.update(key, time_linked=False)
+    w.session.state.selected = key
     w._sync_layer_list()
     qapp.processEvents()
 
     w._step_time(1)
-    assert "< and >" in w.statusBar().currentMessage()
+    assert w.session.state.layers.get(key).volume_index == 1
+    assert w.session.state.time_index == 0
+    assert w.statusBar().currentMessage() == "run1.nii.gz: #1"
 
 
 def test_no_hint_for_a_layer_the_time_keys_do_move(win, qapp):

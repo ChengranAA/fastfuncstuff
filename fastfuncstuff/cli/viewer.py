@@ -50,6 +50,8 @@ keys (main window)
   d                    dark / light palette
   arrows / PgUp PgDn   move the crosshair
   , .                  step time            v  play / pause (a in a 3-D window)
+                       (a selected layer that does not follow time steps its own
+                       sub-bricks; with THR ON +1 / +2, one Coef group at a time)
   [ ]                  select layer       o  show / hide the overlay (space too)
   O                    flip the overlay against the layer under it (again: back)
   { }  u  Del          lower / raise layer, make underlay, remove

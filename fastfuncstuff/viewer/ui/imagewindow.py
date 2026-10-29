@@ -466,8 +466,18 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding("x", "crosshair: lines / off / ring", self._cycle_cross, group="view"),
                 Binding("scroll", "step through slices", None, group="view"),
-                Binding(".", "next volume", lambda: self._step_time(1), group="time"),
-                Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
+                Binding(
+                    ".",
+                    "next volume, or the selected non-time layer's next sub-brick (group)",
+                    lambda: self._step_time(1),
+                    group="time",
+                ),
+                Binding(
+                    ",",
+                    "previous volume, or the selected non-time layer's sub-brick (group)",
+                    lambda: self._step_time(-1),
+                    group="time",
+                ),
                 Binding("click", "move the crosshair", None, group="view"),
                 Binding("ctrl+click", "set the InstaCorr seed", None, group="view"),
                 Binding("e", "draw the selected layer as edges", self._toggle_edges, group="layer"),
@@ -879,13 +889,15 @@ class ImageWindow(QtWidgets.QWidget):
         self._dispatch(SetIJK(*ijk))
 
     def _step_time(self, delta: int) -> None:
-        """Step the shared volume index, wrapping -- the controller's , and . here too."""
-        from fastfuncstuff.viewer.vocab import SetIndex
+        """The controller's , and . here too: time, or the selected layer's sub-bricks."""
+        from fastfuncstuff.viewer.vocab import SetVolume
 
-        st = self.session.state
-        hi = st.max_time_index()
-        if hi > 0:
-            self._dispatch(SetIndex((st.time_index + delta) % (hi + 1)))
+        cmd = self.session.frame_step(delta)
+        if cmd is None:
+            return
+        self._dispatch(cmd)
+        if isinstance(cmd, SetVolume):
+            self._toast(self.session.brick_caption(cmd.key))
 
     def _zoom_by(self, factor: float) -> None:
         vp = self._viewport()

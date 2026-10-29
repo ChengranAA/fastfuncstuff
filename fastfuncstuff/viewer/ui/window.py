@@ -1624,9 +1624,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.thr_next_check = QtWidgets.QCheckBox("+1")
         self.thr_next_check.setToolTip(
             "Threshold on the sub-brick after OLAY, following it as it changes:\n"
-            "stepping through the _Coef sub-bricks keeps cutting on each one's _Tstat."
+            "stepping through the _Coef sub-bricks keeps cutting on each one's _Tstat.\n"
+            ", and . then step one pair at a time."
         )
-        for check, mode in ((self.thr_same_check, "same"), (self.thr_next_check, "next")):
+        self.thr_next2_check = QtWidgets.QCheckBox("+2")
+        self.thr_next2_check.setToolTip(
+            "Threshold on the sub-brick two after OLAY, following it as it changes:\n"
+            "a _Coef / _Tstat / _Zstat bucket cut on each _Zstat.\n"
+            ", and . then step one triplet at a time."
+        )
+        for check, mode in self._follow_checks():
             check.clicked.connect(
                 lambda on, m=mode: self._apply(SetThresholdFollow, mode=m if on else "fixed")
             )
@@ -1637,6 +1644,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         thr_row.addWidget(self.thrbrick_box, 1)
         thr_row.addWidget(self.thr_same_check)
         thr_row.addWidget(self.thr_next_check)
+        thr_row.addWidget(self.thr_next2_check)
         form.addRow(self.thrbrick_head, self.thrbrick_row)
 
         self.cmap_box = QtWidgets.QComboBox()
@@ -1987,8 +1995,19 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("shift+f", "stagger every window", self._cascade, group="windows"),
                 Binding("r", "raise every window", self._raise_all, group="windows"),
                 Binding("d", "dark / light palette", self._toggle_theme, group="windows"),
-                Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
-                Binding(".", "next volume", lambda: self._step_time(1), group="time"),
+                Binding(
+                    ",",
+                    "previous volume (a selected layer that does not follow time: its sub-brick)",
+                    lambda: self._step_time(-1),
+                    group="time",
+                ),
+                Binding(
+                    ".",
+                    "next volume (a selected layer that does not follow time: its sub-brick; "
+                    "with THR +1 / +2, one Coef group)",
+                    lambda: self._step_time(1),
+                    group="time",
+                ),
                 Binding(
                     "<",
                     "previous sub-brick of this layer",
@@ -2237,31 +2256,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._dispatch(SetIJK(*ijk))
 
     def _step_time(self, delta: int) -> None:
-        hi = self.session.state.max_time_index()
-        if hi <= 0:
+        """`,` / `.`: time, or the selected layer's sub-bricks (see ``frame_step``)."""
+        cmd = self.session.frame_step(delta)
+        if cmd is None:
             return
-        nxt = (self.session.state.time_index + delta) % (hi + 1)
-        self._dispatch(SetIndex(nxt))
-        self._hint_if_unmoved()
-
-    def _hint_if_unmoved(self) -> None:
-        """Say so when the time keys cannot move the layer being looked at.
-
-        A QC stack of first and last is 4-D and selected and does not follow the
-        time slider, by design -- its sub-bricks are named states, not time
-        points. Pressing `.` on it therefore scrubs everything *else*, which
-        reads as the key being broken rather than as aimed somewhere else.
-        """
-        key = self.current_key()
-        if key is None:
-            return
-        layer = self.session.state.layers.find(key)
-        if layer is None or layer.time_linked or layer.n_volumes <= 1:
-            return
-        self.statusBar().showMessage(
-            f"{layer.name} does not follow the time slider — use < and > to step its sub-bricks",
-            6000,
-        )
+        self._dispatch(cmd)
+        if isinstance(cmd, SetVolume):
+            self.statusBar().showMessage(self.session.brick_caption(cmd.key), 4000)
+            self._sync_layer_controls()
 
     def _step_brick(self, delta: int) -> None:
         """Step the selected layer's own sub-brick, whatever time is doing."""
@@ -2273,8 +2275,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         nxt = (layer.volume_index + delta) % layer.n_volumes
         self._dispatch(SetVolume(key=key, index=nxt))
-        name = layer.labels[nxt] if nxt < len(layer.labels) else f"#{nxt}"
-        self.statusBar().showMessage(f"{layer.name}: {name}", 4000)
+        self.statusBar().showMessage(self.session.brick_caption(key), 4000)
         self._sync_layer_controls()
 
     def _time_spin_changed(self, value: int) -> None:
@@ -2922,10 +2923,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # Always the sub-brick actually cut on, whichever rule chose it.
         self.thrbrick_box.setCurrentIndex(min(layer.threshold_brick, layer.n_volumes - 1))
         self.thrbrick_box.blockSignals(False)
-        for check, mode in ((self.thr_same_check, "same"), (self.thr_next_check, "next")):
+        for check, mode in self._follow_checks():
             check.blockSignals(True)
             check.setChecked(layer.threshold_follow == mode)
             check.blockSignals(False)
+
+    def _follow_checks(self) -> tuple[tuple[QtWidgets.QCheckBox, str], ...]:
+        return (
+            (self.thr_same_check, "same"),
+            (self.thr_next_check, "next"),
+            (self.thr_next2_check, "next2"),
+        )
 
     def _sync_readout(self) -> None:
         st = self.session.state

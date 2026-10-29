@@ -195,19 +195,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "    anat): in_template_initial (affine only) and in_template (affine + warp) —\n"
             "    the input cast into template space, a before/after pair like ffs_rbr's\n"
             "    initial_epi_in_anat / epi_in_anat.\n"
-            "  warp: the input-space deformation, composable mm for ffs_nwarp. It is a\n"
-            "    SOURCE-SIDE (EPI-space) warp like MEDIC/RBR — it corrects the EPI in its\n"
-            "    own space, THEN the affine(s) normalise. In an ffs_nwarp chain it goes\n"
-            "    with the other EPI-space corrections (fieldmap, moco), to the RIGHT of\n"
-            "    the epi->anat affines (applied before them), NOT as the final warp:\n"
+            "  invwarp: THE CORRECTION — the warp to give ffs_nwarp. A SOURCE-SIDE\n"
+            "    (EPI-space) pull warp like MEDIC/RBR: it undistorts the EPI in its own\n"
+            "    space (ffs_nwarp -nwarp invwarp reproduces _undistorted), THEN the\n"
+            "    affine(s) normalise. In a chain it goes with the other EPI-space\n"
+            "    corrections (fieldmap, moco), to the RIGHT of the epi->anat affines\n"
+            "    (applied before them), NOT as the final warp:\n"
             "      ffs_nwarp -source raw_ts -master anat -prefix ts_in_anat \\\n"
-            "        -nwarp 'ref2anat.aff12.1D epi2ref.aff12.1D epi_seg_warp.nii.gz \\\n"
+            "        -nwarp 'ref2anat.aff12.1D epi2ref.aff12.1D epi_seg_invwarp.nii.gz \\\n"
             "                fieldmap_warp.nii moco.aff12.1D'\n"
             "    (segment the fieldmap-corrected epi_mean so the PE warp is a residual and\n"
-            "    doesn't double-correct with the fieldmap). Skipped with -no_warp.\n"
-            "  invwarp: the fixed-point inverse of warp (same mm/composable format), for\n"
-            "    pulling undistorted/template-space data back into the input's own\n"
-            "    (distorted/EPI) frame. Written by default; skip with -no_invwarp.\n"
+            "    doesn't double-correct with the fieldmap). This is what ffs_autoproc\n"
+            "    chains. Written by default; skip with -no_invwarp.\n"
+            "  warp: the fitted deformation itself, which places the TEMPLATE on the\n"
+            "    input (prior(p) = TPM(affine(p + warp(p)))) — so it is minus the\n"
+            "    correction. Given to ffs_nwarp as a pull warp it applies the distortion\n"
+            "    a second time. Use it to pull undistorted/template-space data into the\n"
+            "    input's own (distorted/EPI) frame. Skipped with -no_warp.\n"
             "\n"
             "Anatomical -> MNI:\n"
             "  ffs_allineate -base MNI_T1.nii -source T1.nii -1Dmatrix_save t1_to_mni.aff12.1D\n"
@@ -607,10 +611,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-no_invwarp",
         dest="invwarp",
         action="store_false",
-        help="Skip writing the inverse deformation. By default, alongside _warp a "
-        "_invwarp.nii.gz is written -- the fixed-point inverse of the fitted "
-        "deformation, so undistorted/template-space data can be pulled back into the "
-        "input's own (distorted/EPI) frame. No effect with -no_warp.",
+        help="Skip writing _invwarp, the fixed-point inverse of the fitted deformation. "
+        "That inverse is the CORRECTION -- the warp an ffs_nwarp chain needs to undistort "
+        "the input (_warp is the deformation that places the template on the input, and "
+        "re-distorts it). No effect with -no_warp.",
     )
     knobs.add_argument(
         "-no_warp_anneal",
@@ -1084,8 +1088,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.invwarp:
             # Fixed-point inverse of the SAME voxel-displacement field, inverted on
             # the ref grid the forward was fit on (then embedded identically), so the
-            # mm-save x/y round-trip flip lands on both fields the same way. The
-            # inverse pulls undistorted/template data back into the input's frame.
+            # mm-save x/y round-trip flip lands on both fields the same way. The fit's
+            # disp places the TPM on the input, so the correction is volume(p - disp):
+            # this inverse, not the forward, is the pull warp that undistorts.
             fwd = torch.stack([warp[..., 0], warp[..., 1], warp[..., 2]], dim=0)  # (3,nz,ny,nx)
             inv = invert_displacement_field(fwd)
             ix, iy, iz = inv[0], inv[1], inv[2]

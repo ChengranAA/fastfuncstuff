@@ -3853,3 +3853,88 @@ def test_nlanat_segment_is_told_which_grid_the_anat_matrix_was_fitted_on():
         bids_root="/bids",
     )
     assert "-matrix_base" not in s
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
+def test_hrftdv_stage_fits_pairs_from_the_design_toml_into_its_folder(tmp_path: Path):
+    """-hrftdv: post-preprocessing, so everything lands in hrftdv_NN/ (no stageNN
+    files). ffs_hrftdv reads the task's design TOML and the FreeSurfer subject, and
+    the same spec is fit with its pairs; -hrftdv_model pooled_late swaps in the early
+    library and the per-run late -dsort columns."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+
+    _bids_with_events(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    opt = Options(run_glm=True, hrftdv=True, fs_subject="/fs/sub-ME1")
+    s = write_script(build_plan(subj, opt), str(tmp_path / "wd"), bids_root=str(tmp_path))
+    assert (
+        subprocess.run(  # noqa: S603
+            ["bash", "-n", str(_write(tmp_path / "p.sh", s))], capture_output=True
+        ).returncode
+        == 0
+    )
+    stage = s.split("hrftdv: temporal deveining")[1]
+    spec = "stage11.design.task-floc.toml"
+    assert spec in s.split("stage12: GLM")[1].split("hrftdv:")[0]  # stage12's own spec
+    assert "select_hrftdv_dir" in stage and "hrftdv_[0-9][0-9]" in stage
+    # the TOML's content is part of the settings, read when the script runs
+    assert f'HRFTDV_SETTINGS+=$\'\\n\\n== {spec} ==\\n\'"$(cat "{spec}")"' in stage
+    tdv = stage.split("ffs_hrftdv")[2]
+    assert f"-spec {spec}" in tdv and "-fs_subj /fs/sub-ME1" in tdv
+    assert '-prefix "$HRFTDV_DIR/task-floc"' in tdv and '-tile_mask "stage10.mask_brain' in tdv
+    glm = stage.split("ffs_reml")[1]
+    assert f"-spec {spec}" in glm and '-hrf_opt "$HRFTDV_DIR/task-floc"' in glm
+    assert '-Rbuck "$HRFTDV_DIR/stats-reml.task-floc.nii$GLM_FMT"' in glm
+    written = re.findall(r'-(?:prefix|Rbuck|Obuck) "([^"]+)"', stage)
+    written += re.findall(r'qc_tcat "([^"]+)"', stage)
+    assert written and all(w.startswith("$HRFTDV_DIR/") for w in written)
+
+    opt.hrftdv_model = "pooled_late"
+    s = write_script(build_plan(subj, opt), str(tmp_path / "wd2"), bids_root=str(tmp_path))
+    glm = s.split("hrftdv: temporal deveining")[1].split("ffs_reml")[1]
+    assert '-hrf_opt "$HRFTDV_DIR/task-floc_early"' in glm and "-dsort_betas yes" in glm
+    assert '-dsort "$HRFTDV_DIR/task-floc_late_dsort.run-01.nii.gz" "$HRFTDV_DIR/' in glm
+
+
+def test_hrftdv_preflight_needs_the_anat_space_and_no_trim(tmp_path: Path):
+    """The surfaces sit on the anat, so an MNI (or EPI) final space is refused; so is a
+    GLM trim, which ffs_hrftdv could not follow."""
+    from fastfuncstuff.cli.autoproc import _hrftdv_errors
+
+    (tmp_path / "surf").mkdir()
+    ok = Options(go_to_anat=True, hrftdv=True, fs_subject=str(tmp_path))
+    assert _hrftdv_errors(ok) == []
+    assert _hrftdv_errors(Options(go_to_anat=True)) == []
+    for bad, words in [
+        (dict(do_mni=True), "-do_mni"),
+        (dict(go_to_anat=False), "-no_anat"),
+        (dict(fs_subject=None), "FreeSurfer subject"),
+        (dict(fs_subject=str(tmp_path / "nope")), "surf/"),
+        (dict(glm_drop_first=4), "-glm_drop_first"),
+    ]:
+        opt = Options(**{**ok.__dict__, **bad})
+        assert any(words in e for e in _hrftdv_errors(opt)), bad
+
+
+def test_numbered_folder_moves_on_when_a_settings_file_is_edited(tmp_path: Path):
+    """hrftdv_NN keys on the design TOML's content as well as the commands: pairs fit to
+    an old model must not be resumed under an edited one. Runs the bash block itself."""
+    from fastfuncstuff.autoproc.emit import _numbered_dir_block
+
+    def run() -> str:
+        block = _numbered_dir_block("hrftdv", "ffs_hrftdv", "cmd", content_files=["d.toml"])
+        r = subprocess.run(  # noqa: S603
+            ["bash", "-c", "\n".join(block) + '\necho "DIR=$HRFTDV_DIR"'],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip().splitlines()[-1].removeprefix("DIR=")
+
+    (tmp_path / "d.toml").write_text("[meta]\ntr = 2\n")
+    assert run() == "hrftdv_01"
+    assert run() == "hrftdv_01"
+    (tmp_path / "d.toml").write_text("[meta]\ntr = 2\n# a contrast added\n")
+    assert run() == "hrftdv_02"
+    assert "# a contrast added" in (tmp_path / "hrftdv_02" / "settings.txt").read_text()

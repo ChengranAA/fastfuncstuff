@@ -62,6 +62,13 @@ class Options:
     phasereg_me: str = "per_echo"
     # "auto": sPR restricted to ffs_veinmask's candidates when tissue maps exist.
     phasereg_veins: str = "off"
+    # Temporal deveining after stage10, into hrftdv_NN/: per-column early/late HRF
+    # pairs (ffs_hrftdv) from each task's design TOML, and that model fit with them.
+    # "pair": {cond}_early + {cond}_late; "pooled_late": early per condition + one
+    # late -dsort column per voxel.
+    hrftdv: bool = False
+    hrftdv_model: str = "pair"
+    hrftdv_opts: str = ""
     tissue: list[str] | None = None  # GM/WM/CSF fractions in anat space
     # 3-D (slab/partition-encoded) vs 2-D multi-slice EPI. Decides whether
     # anything per-slice (ffs_phasedrift) has acquired slices to work on.

@@ -592,6 +592,37 @@ def build_parser() -> argparse.ArgumentParser:
         "-presurf: presurfer's own UNI classes; with -suma: GM/WM/CSF from aseg.auto.",
     )
     g.add_argument(
+        "-hrftdv",
+        action="store_true",
+        help="temporal deveining (EXPERIMENTAL), after stage10, into hrftdv_NN/: "
+        "ffs_hrftdv finds an early and a late HRF per cortical column of the "
+        "FreeSurfer subject (-fs_subject or -suma; its surfaces must sit on the anat) "
+        "from each task's design TOML, then that model is fit with them "
+        "(hrftdv_NN/stats-*.task-X, NAME_early / NAME_late per contrast), so the "
+        "late column takes the delayed venous part. A few minutes per task on the "
+        "GPU, plus one more GLM. Runs with the GLM (FFS_RUN_GLM). Each setting "
+        "(-hrftdv_model, -hrftdv_opts, the design TOMLs) gets its own numbered folder, "
+        "as -phasereg's do. Beat one HRF on held-out R2 in 69%% of voxels on an event "
+        "design, 34%% on 10 s blocks.",
+    )
+    g.add_argument(
+        "-hrftdv_model",
+        choices=["pair", "pooled_late"],
+        default="pair",
+        help="pair (default): two columns per condition, {cond}_early and {cond}_late. "
+        "pooled_late: one early column per condition and one late column per voxel "
+        "(its column's late curve x the column's condition pattern, via -dsort): the "
+        "early and late betas fight less (VIF ~16 -> ~4 on an event design), but the "
+        "column's shared selectivity is called late.",
+    )
+    g.add_argument(
+        "-hrftdv_opts",
+        default="",
+        metavar="'FLAGS'",
+        help='extra ffs_hrftdv flags (quoted), e.g. "-patch_mm 3 -max_lag 3"; part of the '
+        "folder's settings",
+    )
+    g.add_argument(
         "-nordic_save_resid",
         "-nordic-save-resid",
         action="store_true",
@@ -1445,6 +1476,31 @@ def _phasereg_me_errors(opt: Options) -> list[str]:
     return []
 
 
+def _hrftdv_errors(opt: Options) -> list[str]:
+    """-hrftdv reads the cortical ribbon off the FreeSurfer surfaces in the anat's
+    scanner space, so the final data must be in that space; and ffs_hrftdv has no
+    -drop_first, so its fit would not see the window the GLM fits."""
+    if not opt.hrftdv:
+        return []
+    errs = []
+    if not opt.go_to_anat or opt.grand_reference or opt.ref_file or opt.do_mni:
+        errs.append(
+            "-hrftdv finds its columns on the FreeSurfer surfaces, which sit on THIS "
+            "pipeline's anat: the final space must be that anat (not -no_anat, "
+            "-grand_reference, -ref_file or -do_mni)."
+        )
+    if opt.fs_subject is None:
+        errs.append("-hrftdv needs the FreeSurfer subject: -fs_subject DIR or -suma.")
+    elif not (Path(opt.fs_subject) / "surf").is_dir():
+        errs.append(f"-hrftdv: -fs_subject has no surf/ folder: {opt.fs_subject}")
+    if opt.glm_drop_first or opt.glm_drop_last:
+        errs.append(
+            "-hrftdv cannot take -glm_drop_first / -glm_drop_last: ffs_hrftdv has no trim, "
+            "so its pairs would come from other volumes than the GLM fits."
+        )
+    return errs
+
+
 def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[str], list[str]]:
     """Return (errors, warnings). Non-empty errors ⇒ do not write the script."""
     errors: list[str] = []
@@ -1666,6 +1722,9 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             )
     if opt.phasereg and not opt.phase_proc:
         errors.append("-phasereg needs -phase_proc: it regresses the phase that carries.")
+    errors += _hrftdv_errors(opt)
+    if opt.hrftdv and not opt.run_glm:
+        warnings.append("-hrftdv runs with the GLM: set FFS_RUN_GLM=1 when running the script.")
     if opt.tissue:
         if len(opt.tissue) not in (1, 3):
             errors.append("-tissue takes one 4-D file (GM, WM, CSF) or three files.")
@@ -2777,6 +2836,9 @@ def main(argv: list[str] | None = None) -> int:
         phasereg_opts=args.phasereg_opts,
         phasereg_me=args.phasereg_me,
         phasereg_veins=args.phasereg_veins,
+        hrftdv=args.hrftdv,
+        hrftdv_model=args.hrftdv_model,
+        hrftdv_opts=args.hrftdv_opts,
         tissue=[str(Path(t).resolve()) for t in args.tissue] if args.tissue else None,
         acq_3d=acq_3d,
         noise_vols=args.noise_vols,

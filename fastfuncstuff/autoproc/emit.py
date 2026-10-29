@@ -4871,32 +4871,48 @@ def _veinmask_on(plan: Plan) -> bool:
 
 
 def _phasereg_dir_block(settings: str) -> list[str]:
-    """Bash that sets $PHASEREG_DIR: the phasereg_NN whose settings.txt holds exactly
-    ``settings``, else the next free number. settings.txt is written once, when the
-    folder is made; history.txt gets a line every time a run uses the folder."""
-    return [
-        "# Which phasereg_NN: the one made with exactly these settings (resume), else a",
+    """Bash that sets $PHASEREG_DIR (see :func:`_numbered_dir_block`)."""
+    return _numbered_dir_block("phasereg", "ffs_phasereg", settings)
+
+
+def _numbered_dir_block(
+    name: str, tool: str, settings: str, content_files: list[str] | None = None
+) -> list[str]:
+    """Bash that sets ``$<NAME>_DIR``: the ``<name>_NN`` whose settings.txt holds
+    exactly ``settings``, else the next free number. settings.txt is written once,
+    when the folder is made; history.txt gets a line every time a run uses the folder.
+
+    ``content_files`` are read when the script runs and become part of the settings,
+    so a file edited since (a design TOML) picks a new folder instead of resuming
+    in one whose outputs came from the old version."""
+    var = name.upper()
+    out = [
+        f"# Which {name}_NN: the one made with exactly these settings (resume), else a",
         "# new number. settings.txt says what was run; history.txt when.",
-        "read -r -d '' PHASEREG_SETTINGS <<'FFS_PHASEREG_SETTINGS' || true",
+        f"read -r -d '' {var}_SETTINGS <<'FFS_{var}_SETTINGS' || true",
         settings.rstrip("\n"),
-        "FFS_PHASEREG_SETTINGS",
-        "select_phasereg_dir() {",
+        f"FFS_{var}_SETTINGS",
+    ]
+    for f in content_files or []:
+        out.append(f'{var}_SETTINGS+=$\'\\n\\n== {f} ==\\n\'"$(cat "{f}")"')
+    return out + [
+        f"select_{name}_dir() {{",
         "  local d n=1",
-        "  PHASEREG_DIR=",
-        "  for d in phasereg_[0-9][0-9]; do",
+        f"  {var}_DIR=",
+        f"  for d in {name}_[0-9][0-9]; do",
         '    [ -f "$d/settings.txt" ] || continue',
-        '    if [ "$(cat "$d/settings.txt")" = "$PHASEREG_SETTINGS" ]; then PHASEREG_DIR=$d; break; fi',
+        f'    if [ "$(cat "$d/settings.txt")" = "${var}_SETTINGS" ]; then {var}_DIR=$d; break; fi',
         "  done",
-        '  if [ -z "$PHASEREG_DIR" ]; then',
-        '    while [ -e "$(printf \'phasereg_%02d\' "$n")" ]; do n=$((n + 1)); done',
-        "    PHASEREG_DIR=$(printf 'phasereg_%02d' \"$n\")",
-        '    mkdir -p "$PHASEREG_DIR"',
-        '    printf \'%s\\n\' "$PHASEREG_SETTINGS" > "$PHASEREG_DIR/settings.txt"',
+        f'  if [ -z "${var}_DIR" ]; then',
+        f'    while [ -e "$(printf \'{name}_%02d\' "$n")" ]; do n=$((n + 1)); done',
+        f"    {var}_DIR=$(printf '{name}_%02d' \"$n\")",
+        f'    mkdir -p "${var}_DIR"',
+        f'    printf \'%s\\n\' "${var}_SETTINGS" > "${var}_DIR/settings.txt"',
         "  fi",
-        '  echo "$(date \'+%F %T\') $(command -v ffs_phasereg)" >> "$PHASEREG_DIR/history.txt"',
-        '  echo "phasereg: outputs in $PHASEREG_DIR/ (settings: $PHASEREG_DIR/settings.txt)"',
+        f'  echo "$(date \'+%F %T\') $(command -v {tool})" >> "${var}_DIR/history.txt"',
+        f'  echo "{name}: outputs in ${var}_DIR/ (settings: ${var}_DIR/settings.txt)"',
         "}",
-        '[ -n "${PHASEREG_DIR:-}" ] || select_phasereg_dir',
+        f'[ -n "${{{var}_DIR:-}}" ] || select_{name}_dir',
     ]
 
 
@@ -5256,6 +5272,140 @@ def _phasereg_glm(
     ]
 
 
+# One folder per deveining setting, chosen when the script runs, as for phasereg_NN.
+HRFTDV_DIR = "$HRFTDV_DIR"
+
+
+def _stage_hrftdv(plan: Plan, bids_root: str | None) -> str:
+    """Temporal deveining on the final data, into hrftdv_NN/: each task's early/late
+    HRF pair per cortical column (ffs_hrftdv, from the task's design TOML), then that
+    model fit with them. A folder of its own, like phasereg's, because it is an
+    analysis of stage10 rather than another step of it."""
+    from fastfuncstuff.autoproc.glm import runs_by_task, spec_path
+    from fastfuncstuff.autoproc.naming import glm_tag
+
+    opt = plan.options
+    if not opt.hrftdv:
+        return ""
+    assert opt.fs_subject is not None
+    d = HRFTDV_DIR
+    gate = "1" if opt.run_glm else "0"
+    pooled = opt.hrftdv_model == "pooled_late"
+    extra = _split_flags(opt.hrftdv_opts) if opt.hrftdv_opts else []
+    body: list[str] = []
+    commands: list[str] = []
+    specs: list[str] = []
+    qc: list[str] = []
+    for task, prs in runs_by_task(plan).items():
+        if not events_for_task(task, prs, bids_root, opt):
+            body.append(f"# task-{task}: no events, so no design to devein -- skipped.")
+            continue
+        spec = spec_path(task, opt)
+        specs.append(spec)
+        finals = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
+        stem = f"{d}/task-{task}"
+        cmd = _ffs(
+            "ffs_hrftdv",
+            [
+                f"-input {finals}",
+                f"-spec {spec}",
+                f"-fs_subj {shlex.quote(opt.fs_subject)}",
+                *_design_timing_flags(opt, tr_flag="-tr"),
+                # Tiles (the brain off the ribbon) inside the brain this data has,
+                # not an automask of a mean that is bright in the eyes and neck.
+                f'-tile_mask "{_mask_brain()}"',
+                *(["-pooled_late"] if pooled else []),
+                f'-prefix "{stem}"',
+                *extra,
+                '-device "$DEVICE"',
+            ],
+        )
+        commands.append(cmd)
+        lib = f"{stem}_early" if pooled else stem
+        # The last file ffs_hrftdv writes, so a fit killed part way is redone.
+        last = f"{stem}_late_dsort.run-{len(prs):02d}.nii.gz" if pooled else f"{stem}_metadata.json"
+        body += [
+            f"# task-{task}: column pairs from {spec}, then the same model fit with them.",
+            f'[ -f "{last}" ] || \\',
+            cmd,
+        ]
+        blur = _task_blur(opt, task)
+        tag = glm_tag(blur, opt.glm_label, smooth=_volume_smooth_tag(opt))
+        bstem = f"{d}/{tag}." if tag else f"{d}/"
+        rbuck = f"{bstem}stats-reml.task-{task}.nii$GLM_FMT"
+        model = [f'-hrf_opt "{lib}"']
+        if pooled:
+            late = " ".join(
+                f'"{stem}_late_dsort.run-{i:02d}.nii.gz"' for i in range(1, len(prs) + 1)
+            )
+            model += [f"-dsort {late}", "-dsort_betas yes"]
+        body += [
+            f'if [ "$skip_stats" -ne 1 ] || [ ! -f "{rbuck}" ]; then',
+            _ffs(
+                "ffs_reml",
+                [
+                    f"-input {finals}",
+                    f"-spec {spec}",
+                    *model,
+                    *_glm_common(plan, task, bstem, blur),
+                ],
+                indent="",
+            ),
+            _stats_guard_close(task),
+        ]
+        tdv = f"{stem}_tdv.nii.gz"
+        qc.append(
+            f'qc_tcat "{d}/QC.task-{task}.nii.gz" "mean rel_lag lag_r2 late_lag depth" '
+            f'"{_final_mean(_frag(prs[0]))}" "{tdv}[1]" "{tdv}[3]" "{tdv}[8]" "{tdv}[9]"'
+        )
+    if not commands:
+        return "\n# hrftdv: no task has events, so there is nothing to devein.\n"
+    settings = "\n".join(
+        [
+            "ffs_autoproc temporal deveining settings",
+            f"-hrftdv_model {opt.hrftdv_model}",
+            f"-hrftdv_opts {opt.hrftdv_opts or '(none)'}",
+            f"-fs_subject {opt.fs_subject}",
+            "",
+            *commands,
+        ]
+    )
+    out = [
+        "",
+        "# ============================ hrftdv: temporal deveining ====================",
+        "# Veins deliver the response later than the capillaries they drain. Per",
+        "# cortical column, an early and a late HRF (ffs_hrftdv) fit together, so the",
+        "# late one takes the venous part; buckets in hrftdv_NN/, stage10 untouched.",
+        "# The design TOMLs are part of the folder's settings: edit one and the next",
+        "# run makes a new folder rather than reusing pairs fit to the old model.",
+        f'if [ "${{FFS_RUN_GLM:-{gate}}}" = "1" ]; then',
+        "echo '== hrftdv =='",
+        *_numbered_dir_block("hrftdv", "ffs_hrftdv", settings, content_files=specs),
+        *body,
+    ]
+    if _qc_on(plan):
+        out.append(_qc_block("hrftdv", qc))
+    out.append("fi")
+    return "\n".join(out) + "\n"
+
+
+def _design_timing_flags(opt, tr_flag: str = "-TR") -> list[str]:
+    """The TR and time origin a design is sampled at, for every tool that builds one."""
+    return [
+        # -TR only when the user gave one: a 3D acquisition's header TR is the
+        # per-partition time, not the volume TR the design is sampled at.
+        *([f"{tr_flag} {opt.tr:g}"] if opt.tr is not None else []),
+        # The slice timing above aligned every slice to tzero; sample the
+        # model there too (explicit: the final resample's header may not
+        # carry the time origin through).
+        *(
+            [f"-microtime_offset {opt.tzero:g}"]
+            if opt.slicetiming_method != "none" and opt.tzero
+            else []
+        ),
+    ]
+
+
 def _reml_shared(opt, task: str) -> list[str]:
     """ffs_reml flags the voxel (stage12) and surface (stage12s) fits share: the
     statistics, scaling, timing, trims, censoring and -glm_opts. Space-specific
@@ -5265,17 +5415,7 @@ def _reml_shared(opt, task: str) -> list[str]:
         "-tout",
         "-fout",
         "-do_scale",
-        # -TR only when the user gave one: a 3D acquisition's header TR is the
-        # per-partition time, not the volume TR the design is sampled at.
-        *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),
-        # The slice timing above aligned every slice to tzero; sample the
-        # model there too (explicit: the final resample's header may not
-        # carry the time origin through).
-        *(
-            [f"-microtime_offset {opt.tzero:g}"]
-            if opt.slicetiming_method != "none" and opt.tzero
-            else []
-        ),
+        *_design_timing_flags(opt),
         *([f"-drop_first {opt.glm_drop_first}"] if opt.glm_drop_first else []),
         *([f"-drop_last {opt.glm_drop_last}"] if opt.glm_drop_last else []),
         # Events past a deliberate -cut_task_vols end are expected, not the
@@ -5635,6 +5775,7 @@ def _pipeline_body(plan: Plan, bids_root: str | None, script_stem: str, header: 
         _stage_masks(plan),
         _stage_phasereg(plan, bids_root),
         _stage_stats(plan, bids_root),
+        _stage_hrftdv(plan, bids_root),
         _stage_surface_stats(plan, bids_root),
     ]
     return "\n".join(p for p in parts if p).rstrip() + "\n"

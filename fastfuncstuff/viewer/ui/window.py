@@ -296,6 +296,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         manager.painted.connect(lambda d, c=ctl: self._on(c, self.refresh, Aspect(d)))
         manager.play_requested.connect(lambda c=ctl: self._on(c, self._toggle_play))
+        manager.graph_requested.connect(
+            lambda plane, c=ctl: self._on(c, self._new_graph, Plane(plane))
+        )
         manager.rows_selected.connect(
             lambda vid, a, b, c=ctl: self._on(c, self._carpet_rows_to_layer, vid, a, b)
         )
@@ -1189,8 +1192,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.manager.open(ViewKind.IMAGE, self._next_plane())
         self.refresh(Aspect.VIEWPORTS | Aspect.SLICES)
 
-    def _new_graph(self) -> None:
-        self.manager.open(ViewKind.GRAPH, self._next_plane())
+    def _new_graph(self, plane: Plane | None = None) -> None:
+        self.manager.open(ViewKind.GRAPH, plane or self._next_plane())
         self.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
 
     def _new_surface(self) -> None:

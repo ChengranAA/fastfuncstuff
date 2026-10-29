@@ -107,6 +107,8 @@ class ImageWindow(QtWidgets.QWidget):
     centre_all_requested = QtCore.Signal()
     #: `\`: tile (True) or untile every image window, not just this one.
     tiles_all_requested = QtCore.Signal(bool)
+    #: shift+n: a graph window on this window's plane.
+    graph_requested = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -614,6 +616,12 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding("click a cell", "go to that slice, there", None, group="strip"),
                 Binding("right-drag a cell", "strip zoom", None, group="strip"),
+                Binding(
+                    "shift+n",
+                    "open a graph window (time series) on this plane",
+                    self._request_graph,
+                    group="window",
+                ),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("ctrl+w", "close this window", self.close, group="window"),
             ]
@@ -883,6 +891,11 @@ class ImageWindow(QtWidgets.QWidget):
         vp = self._viewport()
         if vp is not None:
             self._dispatch(SetZoom(self.vid, max(1.0, min(vp.zoom * factor, 16.0))))
+
+    def _request_graph(self) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self.graph_requested.emit(vp.plane.value)
 
     def _request_tiles(self) -> None:
         vp = self._viewport()

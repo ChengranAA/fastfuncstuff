@@ -86,6 +86,8 @@ class WindowManager(QtCore.QObject):
     painted = QtCore.Signal(int)
     #: A 3-D window's ANIMATE: play / pause time (the controller owns the player).
     play_requested = QtCore.Signal()
+    #: An image window's shift+n: open a graph window on this plane.
+    graph_requested = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -155,6 +157,7 @@ class WindowManager(QtCore.QObject):
             win.surfaces_previewed.connect(self._redraw_outlines)
             win.centre_all_requested.connect(self.centre_on_crosshair)
             win.tiles_all_requested.connect(self.set_tiles)
+            win.graph_requested.connect(self.graph_requested)
         elif viewport.is_chedi:
             win = ChediWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.centre_requested.connect(self.centre_on_crosshair)

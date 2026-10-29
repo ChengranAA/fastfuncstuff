@@ -171,3 +171,17 @@ def test_closing_the_picker_takes_the_preview_away(win, qapp):
     picker.reject()
     qapp.processEvents()
     assert [ly.name for ly in win.session.state.layers] == ["a.anat.nii.gz"]
+
+
+def test_shift_n_in_an_image_window_opens_a_graph_on_its_plane(win, qapp):
+    """Not strictly the picker, but the same window fixture: the quick way to a time series."""
+    from fastfuncstuff.viewer.state import Plane
+    from fastfuncstuff.viewer.viewports import ViewKind
+
+    win.manager.open(ViewKind.IMAGE, Plane.SAGITTAL)
+    sagittal = next(v.id for v in win.session.state.viewports.images if v.plane is Plane.SAGITTAL)
+    image = win.manager.windows[sagittal]
+    image._request_graph()
+    qapp.processEvents()
+    graphs = [v for v in win.session.state.viewports if v.is_graph]
+    assert [g.plane for g in graphs] == [Plane.SAGITTAL]

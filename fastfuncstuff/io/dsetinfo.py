@@ -17,6 +17,10 @@ why the conversion lives in exactly one place.
 
 from __future__ import annotations
 
+import os
+import subprocess
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -617,6 +621,117 @@ def read_volume(path: str | Path, index: int = 0) -> tuple[np.ndarray, DatasetIn
     if info.scl_slope != 1.0 or info.scl_inter != 0.0:
         vol = vol * info.scl_slope + info.scl_inter
     return vol, info
+
+
+@contextmanager
+def _payload_stream(path: Path, zstd_threads: int | None) -> Generator[Any]:
+    """The uncompressed byte stream of a NIfTI file, decoded as it is read.
+
+    Same decoders as a full load: zstd through the command ``load_nifti`` uses
+    (pzstd decodes a multi-frame file on every core, and either way the work
+    is in another process, not under this one's GIL), gzip through rapidgzip
+    when it is installed.
+    """
+    sp = str(path)
+    if sp.endswith(".zst"):
+        from fastfuncstuff.io.afni import _zstd_decode_command
+
+        proc = subprocess.Popen(
+            _zstd_decode_command(sp, zstd_threads),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+        try:
+            yield proc.stdout
+        finally:
+            assert proc.stdout is not None
+            proc.stdout.close()
+            proc.kill()
+            proc.wait()
+        return
+    if sp.endswith(".gz"):
+        try:
+            import rapidgzip  # ty: ignore[unresolved-import]  # compiled, no stubs
+        except ImportError:
+            import gzip
+
+            with gzip.open(sp, "rb") as fh:
+                yield fh
+            return
+        fh = rapidgzip.open(sp, parallelization=os.cpu_count() or 1)
+        try:
+            yield fh
+        finally:
+            fh.close()  # an open rapidgzip file aborts the interpreter at exit
+        return
+    with open(sp, "rb") as fh:
+        yield fh
+
+
+def _read_into(stream: Any, view: memoryview) -> int:
+    """Fill ``view`` from ``stream``; fewer bytes only at the end of the stream."""
+    got = 0
+    while got < len(view):
+        n = stream.readinto(view[got:])
+        if not n:
+            break
+        got += n
+    return got
+
+
+def iter_volumes(
+    path: str | Path, *, into: np.ndarray | None = None, zstd_threads: int | None = None
+) -> Iterator[np.ndarray]:
+    """Every volume of a NIfTI in file order, each yielded as soon as it is decoded.
+
+    One pass through the file, as a full load makes, but a consumer can use
+    volume 0 while volume 300 is still compressed. Each volume is float32
+    ``(i, j, k)`` with the header's scaling applied. Without ``into`` it is a
+    buffer reused for the next volume -- copy what you keep. ``into``, a
+    float32 ``(t, k, j, i)`` array, receives every volume in place (a native
+    float32 file is decoded straight into it) and each yield is a view of it.
+    Raises ``ValueError`` on a dataset that is not a single NIfTI file, and on
+    a truncated one.
+    """
+    info = read_info(path)
+    if not info.exists:
+        raise FileNotFoundError(f"File not found: {path}")
+    if not info.is_nifti or info.selector is not None:
+        raise ValueError(f"not a whole NIfTI file: {path}")
+    p = Path(parse_subbrick_selector(str(path))[0])
+    hdr = _read_nifti_header_with_ext(p)
+    dtype = np.dtype(hdr.get_data_dtype())
+    nx, ny, nz, nv = info.shape
+    if into is not None and (into.shape != (nv, nz, ny, nx) or into.dtype != np.float32):
+        raise ValueError(f"into must be float32 {(nv, nz, ny, nx)}, not {into.dtype} {into.shape}")
+    scaled = info.scl_slope != 1.0 or info.scl_inter != 0.0
+    # A float32 file in this machine's byte order needs no conversion, so its
+    # bytes can land where the volume will live: one copy fewer per volume.
+    direct = into is not None and dtype == np.dtype(np.float32) and dtype.isnative
+    raw = None if direct else bytearray(nx * ny * nz * dtype.itemsize)
+    scratch = np.empty((nz, ny, nx), np.float32) if into is None else None
+    with _payload_stream(p, zstd_threads) as stream:
+        skip = int(hdr["vox_offset"])
+        while skip:
+            chunk = stream.read(min(skip, 1 << 20))
+            if not chunk:
+                raise ValueError(f"Truncated read: {p} header")
+            skip -= len(chunk)
+        for index in range(nv):
+            out = into[index] if into is not None else scratch
+            assert out is not None
+            target = memoryview(out).cast("B") if direct else memoryview(raw)
+            if _read_into(stream, target) < len(target):
+                raise ValueError(f"Truncated read: {p} volume {index}")
+            if not direct:
+                # The file is (k, j, i)-major per volume, so this is a straight copy.
+                src = np.frombuffer(raw, dtype=dtype).reshape(nz, ny, nx)  # type: ignore[arg-type]
+                np.copyto(out, src, casting="unsafe")
+            if scaled:
+                out *= info.scl_slope
+                out += info.scl_inter
+            yield out.T
 
 
 def data_range(path: str | Path, volume: int | None = None) -> tuple[float, float]:

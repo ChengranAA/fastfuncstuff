@@ -169,6 +169,49 @@ class TestReadVolume:
         assert np.allclose(read_volume(epi, 99)[0], last)
 
 
+class TestIterVolumes:
+    """The progressive reader the viewer inflates through: same voxels as a full load."""
+
+    @pytest.mark.parametrize("suffix", ["", ".gz", ".zst"])
+    @pytest.mark.parametrize("into", [False, True])
+    def test_matches_a_full_load(self, epi, suffix, into):
+        from fastfuncstuff.io.dsetinfo import iter_volumes
+
+        path = epi
+        if suffix:
+            path = epi.with_suffix(f".nii{suffix}")
+            tool = ["gzip", "-kc"] if suffix == ".gz" else ["zstd", "-qc"]
+            with open(path, "wb") as fh:
+                if subprocess.run([*tool, str(epi)], stdout=fh).returncode:
+                    pytest.skip(f"{tool[0]} unavailable")
+        expected = np.asanyarray(nib.load(str(epi)).dataobj)
+        buf = np.empty(expected.shape[::-1], np.float32) if into else None
+        got = [np.array(v) for v in iter_volumes(path, into=buf)]
+        assert np.allclose(np.stack(got, axis=3), expected)
+        if into:
+            assert np.allclose(buf.transpose(3, 2, 1, 0), expected)
+
+    def test_scaled_integers_are_scaled(self, tmp_path):
+        from fastfuncstuff.io.dsetinfo import iter_volumes
+
+        data = np.arange(4 * 3 * 2 * 3, dtype=np.int16).reshape(4, 3, 2, 3)
+        img = nib.Nifti1Image(data, np.eye(4))
+        img.header.set_slope_inter(0.5, 10.0)
+        path = tmp_path / "scaled.nii"
+        img.to_filename(str(path))
+        buf = np.empty((3, 2, 3, 4), np.float32)
+        got = np.stack([np.array(v) for v in iter_volumes(path, into=buf)], axis=3)
+        assert np.allclose(got, data * 0.5 + 10.0)
+
+    def test_a_truncated_file_raises(self, epi, tmp_path):
+        from fastfuncstuff.io.dsetinfo import iter_volumes
+
+        cut = tmp_path / "cut.nii"
+        cut.write_bytes(epi.read_bytes()[:-100])
+        with pytest.raises(ValueError, match="Truncated"):
+            list(iter_volumes(cut))
+
+
 class TestCLI:
     def test_value_flags_print_in_command_line_order(self, epi, capsys):
         assert main(["-nk", "-ni", "-tr", str(epi)]) == 0

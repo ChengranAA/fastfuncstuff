@@ -88,6 +88,44 @@ def test_ensure_ram_promotes_to_the_ram_tier(store, dataset):
     assert store.get(key).tier is Tier.RAM
 
 
+def test_a_volume_asked_for_mid_load_comes_from_the_loader(store, dataset, monkeypatch):
+    """A time step during the inflate must not decode the file a second time.
+
+    The loader is held after volume 3; asking for volume 5 has to wait for it
+    rather than reading the file itself -- read_volume is made to fail to prove
+    it -- and asking for volume 1 has to answer at once from what has landed.
+    """
+    import threading
+
+    from fastfuncstuff.viewer import residency
+
+    path, data = dataset
+    gate, reached = threading.Event(), threading.Event()
+    real = residency.iter_volumes
+
+    def held(*args, **kwargs):
+        for i, vol in enumerate(real(*args, **kwargs)):
+            yield vol
+            if i == 3:
+                reached.set()
+                gate.wait(10)
+
+    def no_rereads(*_a, **_k):
+        raise AssertionError("decoded the file again instead of using the inflate")
+
+    monkeypatch.setattr(residency, "iter_volumes", held)
+    monkeypatch.setattr(residency, "read_volume", no_rereads)
+    store.open(path, key="s")
+    fut = store.load_async("s")
+    assert reached.wait(10)
+    assert store.get("s").pending
+    assert np.allclose(store.preview("s", 1), data[..., 1])
+    threading.Timer(0.2, gate.set).start()
+    assert np.allclose(store.preview("s", 5), data[..., 5])
+    fut.result(10)
+    assert np.allclose(fut.result(10), data)
+
+
 def test_concurrent_loads_share_one_inflate(store, dataset):
     """Two repaints asking at once must not inflate the file twice."""
     path, _ = dataset

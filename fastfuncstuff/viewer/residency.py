@@ -48,7 +48,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.io.dsetinfo import DatasetInfo, read_info, read_volume
+from fastfuncstuff.io.dsetinfo import DatasetInfo, iter_volumes, read_info, read_volume
 from fastfuncstuff.memory import get_available_memory
 
 
@@ -101,6 +101,11 @@ class Resident:
     #: series costs one painted volume, not a 4-D copy on the grid.
     provider: Callable[[int], np.ndarray] | None = field(default=None, repr=False)
     _future: Future[np.ndarray] | None = field(default=None, repr=False)
+    #: While a NIfTI inflates: the volumes so far, ``(t, k, j, i)``, of which
+    #: the first ``ready`` are complete. Lets a time step read a volume the
+    #: loader has already decoded instead of decoding the file again.
+    partial: np.ndarray | None = field(default=None, repr=False)
+    ready: int = 0
     #: Unique per record. A mode re-adopts new values under the same key on
     #: every click, so a consumer caching by key alone draws the first map
     #: forever; keyed on this, it sees each adopt as new data.
@@ -256,6 +261,8 @@ class VolumeStore:
         self._items: dict[str, Resident] = {}
         self._work: dict[str, Working] = {}
         self._lock = threading.RLock()
+        #: Signalled each time an inflating dataset gains a volume, and when it ends.
+        self._progress = threading.Condition(self._lock)
         # Made on first spill, not on construction: a session that never runs
         # short of RAM should leave nothing behind in the temp directory. A
         # caller-supplied directory is used as-is and never removed.
@@ -455,13 +462,16 @@ class VolumeStore:
                 with self._lock:
                     res.preview = vol
             return vol
-        if res.spill is not None:
+        vol = None
+        if res.partial is not None and 0 <= index < res.info.n_volumes:
+            vol = self._from_inflate(res, int(index))
+        if vol is None and res.spill is not None:
             # Memory-mapped, so stepping through a spilled run touches one
             # volume's worth of pages rather than reading the whole array back
             # in to throw all but one slab away.
             mapped = np.load(res.spill, mmap_mode="r", allow_pickle=False)
             vol = np.ascontiguousarray(mapped[..., index], dtype=np.float32)
-        else:
+        elif vol is None:
             vol, _ = read_volume(res.path, index)
         if index == 0:
             with self._lock:
@@ -513,10 +523,13 @@ class VolumeStore:
                 self._enforce_ram_budget(protect=key)
                 return arr
 
-            from fastfuncstuff.io.afni import load_nifti
+            if res.info.is_nifti and res.info.selector is None:
+                arr = self._inflate_progressively(res)
+            else:
+                from fastfuncstuff.io.afni import load_nifti
 
-            img = load_nifti(res.path, zstd_threads=self._zstd_threads)
-            arr = np.asanyarray(img.dataobj, dtype=np.float32)
+                img = load_nifti(res.path, zstd_threads=self._zstd_threads)
+                arr = np.asanyarray(img.dataobj, dtype=np.float32)
             if arr.ndim == 3:
                 arr = arr[..., None]
             # NIfTI arrives Fortran-ordered. Normalizing to C order once here
@@ -527,16 +540,56 @@ class VolumeStore:
             # 1.4 GB dataset, for data that was already resident.
             arr = _c_order(arr)
         except BaseException as exc:  # surfaced via Resident.error, not swallowed
-            with self._lock:
+            with self._progress:
                 res.error = exc
                 res._future = None
+                res.partial = None
+                self._progress.notify_all()
             raise
-        with self._lock:
+        with self._progress:
             res.array = arr
             res._future = None
+            res.partial = None
             self._touch(res)
+            self._progress.notify_all()
         self._enforce_ram_budget(protect=key)
         return arr
+
+    def _inflate_progressively(self, res: Resident) -> np.ndarray:
+        """Decode a NIfTI volume by volume, publishing each as it lands.
+
+        The same one pass over the file as a whole-file load, and the same
+        speed, but a time step during the load no longer decodes the file a
+        second time on the GUI thread to reach its volume -- 400-600 ms a step
+        on a 250 MB run, during which nothing could be clicked.
+        """
+        nx, ny, nz, nv = res.info.shape
+        buf = np.empty((nv, nz, ny, nx), np.float32)
+        with self._lock:
+            res.partial, res.ready = buf, 0
+        volumes = iter_volumes(res.path, into=buf, zstd_threads=self._zstd_threads)
+        for i, _ in enumerate(volumes):
+            with self._progress:
+                res.ready = i + 1
+                self._progress.notify_all()
+        return buf.transpose(3, 2, 1, 0)
+
+    def _from_inflate(self, res: Resident, index: int) -> np.ndarray | None:
+        """Volume ``index`` from an inflate under way, waiting for the loader if needed.
+
+        Waiting is never slower than reading it ourselves: the loader is
+        decoding the same stream from the same start, and is already ahead.
+        ``None`` when no progressive inflate is running (or it failed).
+        """
+        with self._progress:
+            while res.partial is not None and res.ready <= index:
+                self._progress.wait()
+            if res.partial is not None:
+                return np.array(res.partial[index].T)
+            array = res.array
+        if array is not None and res.error is None:
+            return np.ascontiguousarray(array[..., index])
+        return None
 
     def ensure_ram(self, key: str) -> np.ndarray:
         """Block until the dataset is fully resident in RAM."""

@@ -933,3 +933,18 @@ def test_blip_down_on_a_shifted_fov_is_regridded_onto_blip_up():
     rotated[:3, :3] = np.array([[0, -0.8, 0], [0.8, 0, 0], [0, 0, 0.8]])
     with pytest.raises(SystemExit, match="rotated grid"):
         B._onto_first_grid(world, rotated, tuple(world.shape), ref_aff, "down", 0)
+
+
+def test_fine_tiers_estimate_movement_unless_told_not_to():
+    from fastfuncstuff.cli import blipflip as B
+
+    base = ["-pe_dir", "j", "-prefix", "x"]
+    for argv, want in (
+        (["-superhard"], True),
+        (["-workhard"], True),
+        ([], False),
+        (["-superhard", "-no_estmov"], False),
+        (["-estmov"], True),
+    ):
+        args = B.create_parser().parse_args(argv + base)
+        assert B._estmov_for(args.config, args.estmov) is want, argv

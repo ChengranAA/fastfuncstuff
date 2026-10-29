@@ -293,13 +293,24 @@ def create_parser() -> argparse.ArgumentParser:
     mot.add_argument(
         "-estmov",
         "-motion",
-        action="store_true",
+        action="store_const",
+        const=True,
+        default=None,
         help="Jointly estimate rigid head movement between the scans. "
         "Movement is estimated block-coordinate with the field at the COARSE levels only "
         "(knot spacing >= 10 mm, reproducing topup's --estmov schedule) and frozen for the "
         "fine levels; the first scan is the fixed reference and the PE-axis translation "
-        "(degenerate with the field) is excluded. Reuses ffs_moco's GPU rigid registration "
-        "on the field-corrected images. Off by default (assumes the pair is aligned).",
+        "(degenerate with the field) is excluded, so the pair cannot slide along PE. "
+        "Reuses ffs_moco's GPU rigid registration on the field-corrected images; voxels "
+        "a moved scan never imaged are left out of the cost and shown empty. On by default "
+        "with -workhard / -superhard, off with standard / quick.",
+    )
+    mot.add_argument(
+        "-no_estmov",
+        action="store_const",
+        const=False,
+        dest="estmov",
+        help="Do not estimate movement (assume the pair is aligned), whatever the tier.",
     )
     mot.add_argument(
         "-motion_ref",
@@ -616,6 +627,17 @@ def _build_config(name: str, voxel_mm: float = 1.0):
     )
 
 
+def _estmov_for(config: str, flag: bool | None) -> bool:
+    """-estmov / -no_estmov if given, else on for the fine tiers.
+
+    The blips are often separate series: the HiHiFaces ses-fast and 3T
+    ImaginationStimulation pairs moved 1.5-2.7 deg between them, and without movement the
+    fine tiers fit that rotation as distortion (held-out run-2 pair r 0.808 -> 0.845 and
+    0.712 -> 0.775 with it, level with or above topup). standard keeps it off, as before.
+    """
+    return flag if flag is not None else config in ("workhard", "superhard")
+
+
 def _resolve_device(device_spec) -> torch.device:
     """Device for a blipflip run: auto falls back to CPU without CUDA, and MPS is
     refused outright (the CG reductions are float64)."""
@@ -889,6 +911,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         if no_readout:
             print("  no -readout given: field map (Hz) disabled; warp is unaffected.")
 
+    args.estmov = _estmov_for(args.config, args.estmov)
     if args.estmov and not (0 <= args.motion_ref < len(scans)):
         print(f"ffs_blipflip: -motion_ref {args.motion_ref} out of range.", file=sys.stderr)
         return 2

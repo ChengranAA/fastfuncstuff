@@ -2228,25 +2228,40 @@ def _stage_blip(plan: Plan, script_stem: str) -> str:
 
 
 def _qc_distortion(prs: list[PlanRun]) -> str:
-    """Before/after stacks for each fieldmap group: the EPI it corrected, as
-    acquired and as corrected, on the same grid. A field with the wrong sign or
-    scale shows as the brain stretching instead of settling between the two.
+    """QC stacks for each fieldmap group. A reverse-PE pair gets the pair blipflip
+    fitted (``_inputs``); its corrected counterpart is blipflip's own
+    ``_unwarped``. A GRE fieldmap gets a before/after stack of the EPI it
+    corrected, on the same grid: a field with the wrong sign or scale shows as
+    the brain stretching instead of settling.
 
     The "before" image is the anchor through an identity matrix with -save_mean,
     the same ffs_nwarp read that makes the corrected one, so the pair differs only
     by the warp. A 3-D anchor is its own before image."""
-    lines = [
-        'ident="stage04.identity.aff12.1D"',
-        '[ -f "$ident" ] || printf \'1 0 0 0 0 1 0 0 0 0 1 0\\n\' > "$ident"',
-    ]
+    lines: list[str] = []
     calls = []
     for pr in prs:
         assert pr.fmap is not None
         st = _fmap_stem(pr, "blip")
+        qc = _qc_stem("blip", session=pr.bold.session, fmap=pr.fmap.fmap_id)
+        if not pr.fmap.is_b0:
+            # The pair as the estimator saw it (collapsed, on blip_up's grid). Its
+            # blip_up volume is the uncorrected anchor, and {st}_unwarped already
+            # holds both directions corrected, so a before/after stack would
+            # only duplicate them.
+            pair = f"{st}_padphase.nii$FMT"
+            calls.append(
+                _qc_call(qc + "_inputs", [(f"{pair}[0]", "blip_up"), (f"{pair}[1]", "blip_down")])
+            )
+            continue
         src = str(pr.fmap_forward or pr.bold.rep)  # what stage04 corrected, either lane
         before = f"{st}_before.nii$FMT"
         if _n_volumes(src) > 1:
             tmp = f"{st}_before_tmp.nii$FMT"
+            if not lines:
+                lines += [
+                    'ident="stage04.identity.aff12.1D"',
+                    '[ -f "$ident" ] || printf \'1 0 0 0 0 1 0 0 0 0 1 0\\n\' > "$ident"',
+                ]
             lines.append(
                 f'[ -f "{before}" ] || {{ ffs_nwarp -source {shlex.quote(src)} '
                 f'-master {shlex.quote(src)} -nwarp "$ident" -save_mean "{before}" '
@@ -2254,22 +2269,9 @@ def _qc_distortion(prs: list[PlanRun]) -> str:
             )
         else:
             before = src
-        after = _fmap_forward(pr)
-        calls.append(
-            _qc_call(
-                _qc_stem("blip", session=pr.bold.session, fmap=pr.fmap.fmap_id),
-                [(before, "uncorrected"), (after, "corrected")],
-            )
-        )
-        if not pr.fmap.is_b0:
-            pair = f"{st}_padphase.nii$FMT"
-            calls.append(
-                _qc_call(
-                    _qc_stem("blip", session=pr.bold.session, fmap=pr.fmap.fmap_id) + "_inputs",
-                    [(f"{pair}[0]", "blip_up"), (f"{pair}[1]", "blip_down")],
-                )
-            )
-    return "\n".join(lines) + "\n" + _qc_block("distortion (before / after)", calls)
+        calls.append(_qc_call(qc, [(before, "uncorrected"), (_fmap_forward(pr), "corrected")]))
+    head = "\n".join(lines) + "\n" if lines else ""
+    return head + _qc_block("distortion", calls)
 
 
 def _blip_b0(pr: PlanRun, st: str) -> str:

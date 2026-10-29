@@ -3240,6 +3240,17 @@ def test_stage04_writes_a_before_after_distortion_stack(tmp_path):
     )
 
 
+def test_stage04_pepolar_qc_is_the_fitted_pair_only():
+    """A before/after stack for a reverse-PE pair duplicated volumes: its
+    "uncorrected" is _padphase[0], its "corrected" is _unwarped[0]."""
+    fmap = FmapGroup("01", "f", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.06}, [("foo", "1")])
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")], [fmap])])
+    st4 = _stage04(write_script(build_plan(subj, Options()), "wd", bids_root="/bids"))
+    assert 'qc_tcat "stage04.QC.blip.ses-01.fmap-f_inputs.nii.gz" "blip_up blip_down"' in st4
+    assert "stage04.QC.blip.ses-01.fmap-f.nii.gz" not in st4
+    assert "identity.aff12" not in st4 and "_before" not in st4
+
+
 def test_anat_nonlin_register_refines_along_pe_in_the_anchor_frame():
     """-anat_nonlin_method register: a thin-slab GRE anat has no tissue contrast a
     template can drive, so the anchor is registered to the anat instead. It is

@@ -558,6 +558,16 @@ def test_pad_phase_wrap_sign_is_anatomical_not_index_order():
         assert beyond_anterior == posterior
 
 
+def test_mask_frames_only_the_phase_encode_axis():
+    # The frame keeps the clamped PE resample out of the cost. Framing the slice axis
+    # too left a thin slab's end slices with no data term, and their field ran away.
+    _, _, scans = _make_synthetic()  # PE = j (tensor dim 1)
+    m = T.compute_mask(scans)
+    assert not m[:, 0, :].any() and not m[:, -1, :].any()
+    assert m[0].any() and m[-1].any(), "end slices must stay in the cost"
+    assert m[:, :, 0].any() and m[:, :, -1].any(), "readout edges must stay in the cost"
+
+
 def test_padding_skips_all_zero_edge_planes():
     """A reversed-PE recon's empty edge line must not be dragged into the image."""
     v = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.float32).reshape(1, 6, 1)  # empty last plane

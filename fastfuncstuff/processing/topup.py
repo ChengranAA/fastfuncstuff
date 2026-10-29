@@ -2122,6 +2122,7 @@ def run_topup(
     unwrap: Sequence[int] | None = None,
     empty_as_zero: bool = True,
     anat: Tensor | None = None,
+    init_field: Tensor | None = None,
 ) -> TopupResult:
     """Estimate the off-resonance field from opposing-PE scans.
 
@@ -2157,9 +2158,20 @@ def run_topup(
     :class:`_AnatTerm` at ``config.anat_weight``, smoothed with each level's FWHM like
     the scans. Keep the tissue outside the brain in it: an edge that is stuck to the
     cortex in one blip and spaced off it in the other is exactly what it can referee.
+
+    ``init_field`` (Hz, the scans' grid) starts the first level from that field instead
+    of zero -- e.g. one derived from anatomy, to find out whether the pair cost has a
+    better basin than the one a zero start reaches. Pass a schedule that starts no
+    coarser than the field's own detail, or the first levels smooth it away.
     """
     config.validate()
     shape = tuple(scans[0].data.shape)  # type: ignore[assignment]
+    if init_field is not None and tuple(init_field.shape) != shape:
+        raise ValueError(
+            f"init_field grid {tuple(init_field.shape)} differs from the scans' {shape}"
+        )
+    if init_field is not None and (wrap_pad or unwrap is not None):
+        raise ValueError("an init_field cannot yet be combined with phase-encode wrap handling")
     if anat is not None:
         if tuple(anat.shape) != shape:
             raise ValueError(f"anat grid {tuple(anat.shape)} differs from the scans' {shape}")
@@ -2258,7 +2270,10 @@ def run_topup(
         level_vox = tuple(v * ss for v in voxel_sizes)
 
         new_basis = build_spline_basis(level_shape, level_vox, wr, device, solve_dtype)
-        if coeff is None or basis is None:
+        if (coeff is None or basis is None) and init_field is not None:
+            start = _resize_field(init_field.to(device=device, dtype=solve_dtype), level_shape)
+            coeff = refit_coeff(start, new_basis)
+        elif coeff is None or basis is None:
             coeff = torch.zeros(new_basis.coeff_shape, device=device, dtype=solve_dtype)
         else:
             # Warm-start: refit the previous field onto the new (level) grid + knots.

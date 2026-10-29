@@ -376,6 +376,15 @@ def create_parser() -> argparse.ArgumentParser:
         help="Use the anat only on levels whose knot spacing is at most this. Earlier, the "
         "corrected blips are still far apart and their mean is no image to fit an anat to.",
     )
+    anat.add_argument(
+        "-init_field",
+        metavar="IMG",
+        help="Start the first level from this off-resonance field (Hz, on blip_up's grid, "
+        "the convention of this tool's _field output) instead of zero: e.g. one derived "
+        "from anatomy, to learn whether the pair has a better minimum than a zero start "
+        "finds. Pair it with a schedule that does not start coarser than the field's detail "
+        "(-warpres etc.), or the first levels smooth it away.",
+    )
 
     misc = parser.add_argument_group("Misc")
     misc.add_argument(
@@ -801,6 +810,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         anat = _onto_first_grid(
             adata, aaff, tuple(scans[0].data.shape), affine, args.anat, args.verb
         ).to(device)
+    init_field = None
+    if args.init_field:
+        fdata, faff, _ = _load_volume(args.init_field, args.collapse)
+        init_field = _onto_first_grid(
+            fdata, faff, tuple(scans[0].data.shape), affine, args.init_field, args.verb
+        ).to(device)
 
     if args.verb >= 1:
         print(
@@ -883,6 +898,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         motion_interp=args.motion_interp,
         recorder=recorder,
         anat=anat,
+        init_field=init_field,
     )
 
     # ---- outputs ----

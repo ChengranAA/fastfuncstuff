@@ -754,6 +754,19 @@ def test_inverted_contrast_anat_does_not_hurt_recovery():
     assert _field_rms_error(with_anat, field) <= 1.05 * _field_rms_error(plain, field)
 
 
+def test_init_field_starts_the_first_level_from_it():
+    # One Gauss-Newton step: from zero it cannot get far, from the true field it is
+    # already there. (Run to convergence both end near the pair's own optimum, which on
+    # this pair is ~0.3 Hz off the truth either way.)
+    _, field, scans = _make_exact_pair()
+    kw = dict(warpres=[8], fwhm=[0], lam=[1e-4], miter=[1], subsamp=[1])
+    cold = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(**kw), progress=False)
+    warm = T.run_topup(
+        scans, (3.0, 2.5, 2.5), T.TopupConfig(**kw), progress=False, init_field=field
+    )
+    assert _field_rms_error(warm, field) < 0.5 * _field_rms_error(cold, field)
+
+
 def test_anat_misaligned_along_pe_does_not_drag_the_field():
     # A shift common to both blips (here the anat is 1.5 voxels off along PE, as a rigid
     # alignment error or a scanner-to-scanner scaling would be) needs both undistorted

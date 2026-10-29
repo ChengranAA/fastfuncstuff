@@ -157,6 +157,10 @@ class ViewerState:
     #: to live here rather than on the state, because none of them mean
     #: anything once there is more than one window.
     viewports: ViewportSet = field(default_factory=ViewportSet)
+    #: The point every zoom-linked (LOCK) image window is centred on, scanner
+    #: mm so it survives a change of grid. Each window moves the two
+    #: coordinates in its own plane; ``None`` until one has joined.
+    lock_centre_mm: tuple[float, float, float] | None = None
     #: Which layer the controls act on, and the one a soloed viewport draws.
     #: In state rather than in a list widget so that `[` and `]` are commands
     #: a script can replay, and so solo has something to be solo *of*.

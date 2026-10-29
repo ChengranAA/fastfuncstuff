@@ -221,12 +221,17 @@ class SetViewTiles(Command):
 @command
 @dataclass(frozen=True)
 class SetViewLocked(Command):
-    """Whether this window follows the shared crosshair and time index."""
+    """Whether this window follows the shared crosshair and time index.
+
+    ``zoom`` (with ``on``) is LOCK: the window also takes the zoom of every
+    other zoom-linked image window, centred on the point they share.
+    """
 
     name = "SET_VIEW_LOCKED"
-    aspects = Aspect.VIEWPORTS
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
     view: str
     on: bool
+    zoom: bool = False
 
 
 @command
@@ -1592,6 +1597,46 @@ class SetSeed(Command):
 OpenLayer = Callable[[str, str], Layer]
 
 
+def _zoom_linked(st: ViewerState) -> list:
+    """The image windows on LOCK: locked, and sharing zoom and a centre."""
+    return [v for v in st.viewports if v.is_image and v.locked and v.zoom_linked]
+
+
+def _sync_zoom_links(st: ViewerState, source: str) -> Aspect:
+    """Carry one LOCK window's zoom and centre to every other LOCK window.
+
+    The centre is shared as a point, not as a pan: a pan is counted along a
+    window's own rows and columns, so an axial pan copied onto a sagittal
+    window would move it along the wrong axes. The source sets the two
+    coordinates in its plane and keeps the third; each other window is panned
+    to put the point at its middle -- exactly, for windows on the same plane.
+    """
+    from fastfuncstuff.viewer.compose import plane_view
+
+    vp = st.viewports.find(source)
+    if vp is None or not (vp.is_image and vp.locked and vp.zoom_linked) or st.grid is None:
+        return Aspect.NOTHING
+    view = plane_view(st, vp)
+    assert view is not None
+    if st.lock_centre_mm is not None:
+        point = list(st.grid.mm_to_ijk(st.lock_centre_mm))
+    else:
+        point = [float(c) for c in st.crosshair]
+    point[view.layout.row], point[view.layout.col] = view.centre()
+    st.lock_centre_mm = st.grid.ijk_to_mm((point[0], point[1], point[2]))
+    dirty = Aspect.NOTHING
+    for other in _zoom_linked(st):
+        if other.id == vp.id:
+            continue
+        theirs = plane_view(st, other.with_(zoom=vp.zoom))
+        assert theirs is not None
+        pan = theirs.pan_for(point)
+        if other.zoom != vp.zoom or other.pan != pan:
+            st.viewports.update(other.id, zoom=vp.zoom, pan=pan)
+            dirty = Aspect.VIEWPORTS | Aspect.SLICES
+    return dirty
+
+
 def _carry_to_grid(st: ViewerState, old: DisplayGrid | None, was: tuple[int, int, int]) -> None:
     """Re-express everything held in display-grid indices after the grid changed.
 
@@ -2477,7 +2522,16 @@ def install(
     @bus.handle(SetViewLocked.name)
     def _set_view_locked(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetViewLocked)
-        return _set_view(st, cmd.view, SetViewLocked.aspects, locked=bool(cmd.on))
+        linked = bool(cmd.on) and bool(cmd.zoom)
+        dirty = _set_view(
+            st, cmd.view, SetViewLocked.aspects, locked=bool(cmd.on), zoom_linked=linked
+        )
+        if dirty and linked:
+            # Joining takes the group's zoom and centre; the first to join
+            # brings its own, which every later one then takes.
+            others = [v for v in _zoom_linked(st) if v.id != cmd.view]
+            dirty |= _sync_zoom_links(st, others[0].id if others else cmd.view)
+        return dirty
 
     @bus.handle(SetViewPosition.name)
     def _set_view_position(cmd: Command, st: ViewerState) -> Aspect:
@@ -2572,12 +2626,14 @@ def install(
     @bus.handle(SetZoom.name)
     def _set_zoom(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetZoom)
-        return _set_view(st, cmd.view, SetZoom.aspects, zoom=max(0.05, float(cmd.zoom)))
+        dirty = _set_view(st, cmd.view, SetZoom.aspects, zoom=max(0.05, float(cmd.zoom)))
+        return dirty | (_sync_zoom_links(st, cmd.view) if dirty else Aspect.NOTHING)
 
     @bus.handle(SetPan.name)
     def _set_pan(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetPan)
-        return _set_view(st, cmd.view, SetPan.aspects, pan=(float(cmd.x), float(cmd.y)))
+        dirty = _set_view(st, cmd.view, SetPan.aspects, pan=(float(cmd.x), float(cmd.y)))
+        return dirty | (_sync_zoom_links(st, cmd.view) if dirty else Aspect.NOTHING)
 
     @bus.handle(SelectLayer.name)
     def _select_layer(cmd: Command, st: ViewerState) -> Aspect:

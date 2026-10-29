@@ -89,6 +89,10 @@ class Viewport:
     #: was parked on, which is how you leave a reference view up while
     #: navigating somewhere else.
     locked: bool = True
+    #: LOCK, the second step past locked: also share zoom with every other
+    #: zoom-linked image window, each centred on one shared point
+    #: (:attr:`ViewerState.lock_centre_mm`). Only meaningful while locked.
+    zoom_linked: bool = False
     #: The parked slice, set when a viewport is unlocked. ``None`` means it is
     #: following the crosshair and has no slice of its own -- which is why it
     #: is a separate field rather than a number that is sometimes ignored.

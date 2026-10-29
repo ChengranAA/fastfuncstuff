@@ -159,6 +159,44 @@ class PlaneView:
         # origin = (extent - span) / 2 + pan, and the middle is origin + span / 2.
         return (row + 0.5 - h / 2.0, col + 0.5 - w / 2.0)
 
+    def centre(self) -> tuple[float, float]:
+        """The display-grid point at the middle of the drawn window, continuous.
+
+        As (coordinate along ``layout.row``, along ``layout.col``), from the
+        pan before it is clamped: the inverse of :meth:`pan_for`, so a point
+        handed between windows comes back where it was.
+        """
+        h, w = self.extent
+        return (
+            self._pixel_to_grid(
+                h / 2.0 + float(self.pan[0]), self.layout.row, self.layout.row_flip
+            ),
+            self._pixel_to_grid(
+                w / 2.0 + float(self.pan[1]), self.layout.col, self.layout.col_flip
+            ),
+        )
+
+    def pan_for(self, point) -> tuple[float, float]:
+        """The pan that puts a continuous display-grid point at the window's middle.
+
+        :meth:`pan_centring` for a point that need not be a voxel centre --
+        what windows sharing one centre across planes hand each other.
+        """
+        h, w = self.extent
+        lay = self.layout
+        return (
+            self._grid_to_pixel(float(point[lay.row]), lay.row, lay.row_flip) - h / 2.0,
+            self._grid_to_pixel(float(point[lay.col]), lay.col, lay.col_flip) - w / 2.0,
+        )
+
+    # Pixel r spans [r, r + 1) and is voxel r's centre at r + 0.5; a flipped
+    # axis counts its voxels from the far end.
+    def _pixel_to_grid(self, u: float, axis: int, flip: bool) -> float:
+        return self.shape[axis] - 0.5 - u if flip else u - 0.5
+
+    def _grid_to_pixel(self, g: float, axis: int, flip: bool) -> float:
+        return self.shape[axis] - 0.5 - g if flip else g + 0.5
+
     def to_image(self, ijk: tuple[int, int, int]) -> tuple[int, int]:
         """Display-grid indices to (row, col) in the drawn image.
 

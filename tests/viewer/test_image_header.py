@@ -57,3 +57,24 @@ def test_each_row_keeps_its_full_labels_while_they_fit(window):
     win.resize(250, 400)
     app.processEvents()
     assert win.solo_button.text() == "[S]" and win.edit_button.text() == "[g]"
+
+
+def test_the_lock_button_cycles_lock_then_shared_zoom_then_off(window):
+    """One press from the default (Lock) is LOCK; the next unlocks and parks."""
+    session, win, _ = window
+
+    def press():
+        win.lock_button.click()
+        vp = session.state.viewports.get("A1")
+        win.apply(vp)
+        return vp
+
+    assert win.lock_button.text() == "[l]" and win.lock_button.isChecked()  # narrow
+    vp = press()
+    assert (vp.locked, vp.zoom_linked) == (True, True)
+    assert win.lock_button.text() == "[L]" and win.lock_button.isChecked()
+    vp = press()
+    assert (vp.locked, vp.zoom_linked) == (False, False)
+    assert not win.lock_button.isChecked()
+    vp = press()
+    assert (vp.locked, vp.zoom_linked) == (True, False)

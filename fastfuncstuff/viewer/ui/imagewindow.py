@@ -67,6 +67,22 @@ from fastfuncstuff.viewer.vocab import (
 
 PLANE_KEYS = {Plane.AXIAL: "1", Plane.SAGITTAL: "2", Plane.CORONAL: "3"}
 
+#: The lock button's three steps, by :func:`lock_state`.
+LOCK_LABELS = ("lock", "Lock", "LOCK")
+LOCK_TIPS = (
+    "Unlocked: parked on its own slice. Press for Lock.",
+    "Lock: follows the shared crosshair. Press for LOCK.",
+    "LOCK: follows the crosshair and shares zoom with every LOCK window, all centred "
+    "on one point. Press to unlock.",
+)
+LOCK_TOAST = "LOCK: zoom shared with every LOCK window"
+
+
+def lock_state(viewport: Viewport) -> int:
+    """0 unlocked, 1 Lock (follow the crosshair), 2 LOCK (and share zoom)."""
+    return 0 if not viewport.locked else 2 if viewport.zoom_linked else 1
+
+
 #: Header widths. Below the first the buttons keep only their key, below the
 #: second the header goes away entirely -- the keys still work, so nothing is
 #: lost but the reminder, and a nine-window wall of small images is worth more
@@ -152,10 +168,8 @@ class ImageWindow(QtWidgets.QWidget):
         self.solo_button.clicked.connect(lambda on: self._dispatch(SetViewSolo(self.vid, bool(on))))
         bar.addWidget(self.solo_button)
 
-        self.lock_button = self._button(
-            "LOCK", "l", "Follow the shared crosshair. Unlock to park a slice."
-        )
-        self.lock_button.clicked.connect(self._toggle_lock)
+        self.lock_button = self._button("Lock", "l", LOCK_TIPS[1])
+        self.lock_button.clicked.connect(lambda _=False: self._cycle_lock())
         bar.addWidget(self.lock_button)
 
         self.cross_button = self._button(
@@ -442,7 +456,12 @@ class ImageWindow(QtWidgets.QWidget):
                 ),
                 Binding("right-drag", "zoom (up = in)", None, group="view"),
                 Binding("middle-drag", "pan (or shift+drag)", None, group="view"),
-                Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
+                Binding(
+                    "l",
+                    "lock: off (park the slice) / Lock (follow) / LOCK (follow + shared zoom)",
+                    self._cycle_lock,
+                    group="view",
+                ),
                 Binding("x", "crosshair: lines / off / ring", self._cycle_cross, group="view"),
                 Binding("scroll", "step through slices", None, group="view"),
                 Binding(".", "next volume", lambda: self._step_time(1), group="time"),
@@ -641,15 +660,34 @@ class ImageWindow(QtWidgets.QWidget):
     def _set_plane(self, plane: Plane) -> None:
         self._dispatch(SetViewPlane(self.vid, str(plane)))
 
-    def _toggle_lock(self, on: bool) -> None:
-        # Unlocking parks the window on the slice it is showing. Without that
-        # it would keep following until something else moved, which reads as
-        # the button not working.
-        if not on:
+    def _cycle_lock(self) -> None:
+        """off -> Lock -> LOCK -> off. Lock is the default, so one press is LOCK."""
+        vp = self._viewport()
+        if vp is None:
+            return
+        state = lock_state(vp)
+        nxt = (state + 1) % 3
+        if nxt == 0:
+            # Unlocking parks the window on the slice it is showing. Without
+            # that it would keep following until something else moved, which
+            # reads as the button not working.
             pane_pos = self.pane.position
             if pane_pos is not None:
                 self._dispatch(SetViewPosition(self.vid, int(pane_pos)))
-        self._dispatch(SetViewLocked(self.vid, bool(on)))
+        self._dispatch(SetViewLocked(self.vid, nxt > 0, zoom=nxt == 2))
+        self._toast(("unlocked: slice parked", "Lock: follows the crosshair", LOCK_TOAST)[nxt])
+
+    def _sync_lock_button(self, viewport: Viewport) -> None:
+        state = lock_state(viewport)
+        b = self.lock_button
+        # Narrow windows show only the key, so the key's case carries LOCK.
+        full = theme.key_label(LOCK_LABELS[state], "l")
+        bare = "[L]" if state == 2 else "[l]"
+        was_full = b.text() == next(f for w, f, _ in self._labels if w is b)
+        self._labels = [(w, *((full, bare) if w is b else (f, k))) for w, f, k in self._labels]
+        b.setChecked(state > 0)
+        b.setText(full if was_full else bare)
+        b.setToolTip(f"{LOCK_TIPS[state]}  (l)")
 
     def _selected(self):
         return self.session.state.selected_layer()
@@ -1047,7 +1085,7 @@ class ImageWindow(QtWidgets.QWidget):
             button.setChecked(plane is viewport.plane)
         self.edit_row.setVisible(bool(self.session.surfaces.hemis))
         self.solo_button.setChecked(viewport.solo)
-        self.lock_button.setChecked(viewport.locked)
+        self._sync_lock_button(viewport)
         self.strip_button.setChecked(viewport.strip > 0)
         self.edit_button.setChecked(self.session.state.surface_editing)
         self.pane.plane = viewport.plane

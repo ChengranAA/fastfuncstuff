@@ -70,7 +70,8 @@ keys (image window)
   1 2 3                axial / sagittal / coronal
   o  O                 show / hide the overlay, or flip it against the one below
   S                    solo the selected layer (flip between layers with [ ])
-  l                    follow the crosshair, or unlock to park a slice
+  l                    lock: Lock (follow the crosshair) -> LOCK (also share zoom
+                       with every LOCK window, centred on one point) -> off (park)
   + -  0               zoom in / out, fit the whole plane
   right-drag           pan            ctrl+click  set the InstaCorr seed
   w                    close

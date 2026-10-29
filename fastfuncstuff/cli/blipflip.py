@@ -342,6 +342,41 @@ def create_parser() -> argparse.ArgumentParser:
         "it perturbs the field far more than the barrier for no extra fold removal.",
     )
 
+    anat = parser.add_argument_group("Anatomical guide (EXPERIMENTAL)")
+    anat.add_argument(
+        "-anat",
+        metavar="IMG",
+        help="An anatomical image of any contrast, already aligned to the undistorted "
+        "anatomy of blip_up (or of -motion_ref) and on blip_up's grid. Each corrected blip "
+        "is also scored against it, mapped to EPI contrast by a local linear fit that "
+        "absorbs contrast inversion and a smooth shift common to both blips, so only the "
+        "arrangement of tissue is refereed, not where the head sits. Keep the skull and "
+        "scalp in it: an edge stuck to cortex in one blip and spaced off it in the other "
+        "is what it can settle and the pair alone cannot.",
+    )
+    anat.add_argument(
+        "-anat_weight",
+        type=float,
+        default=1.0,
+        help="Weight of the anatomical rows relative to the pair's.",
+    )
+    anat.add_argument(
+        "-anat_sigma",
+        type=float,
+        default=8.0,
+        metavar="MM",
+        help="Gaussian sigma (mm) of the local anat-to-EPI map; it must be wider than the "
+        "misplacement to be corrected.",
+    )
+    anat.add_argument(
+        "-anat_from",
+        type=float,
+        default=5.0,
+        metavar="MM",
+        help="Use the anat only on levels whose knot spacing is at most this. Earlier, the "
+        "corrected blips are still far apart and their mean is no image to fit an anat to.",
+    )
+
     misc = parser.add_argument_group("Misc")
     misc.add_argument(
         "-precision",
@@ -757,6 +792,15 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     cfg.jac_penalty = 0.0 if args.no_antifold else args.jac_penalty
     cfg.jac_floor = args.jac_floor
     cfg.reject_folds = args.reject_folds
+    cfg.anat_weight = args.anat_weight
+    cfg.anat_sigma_mm = args.anat_sigma
+    cfg.anat_max_warpres = args.anat_from
+    anat = None
+    if args.anat:
+        adata, aaff, _ = _load_volume(args.anat, args.collapse)
+        anat = _onto_first_grid(
+            adata, aaff, tuple(scans[0].data.shape), affine, args.anat, args.verb
+        ).to(device)
 
     if args.verb >= 1:
         print(
@@ -838,6 +882,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         motion_ref=args.motion_ref,
         motion_interp=args.motion_interp,
         recorder=recorder,
+        anat=anat,
     )
 
     # ---- outputs ----

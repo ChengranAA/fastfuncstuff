@@ -279,6 +279,27 @@ class TopupConfig:
     good Gauss-Newton steps into worse minima — a blunt instrument next to the local
     barrier. Kept only as a hard belt-and-suspenders guarantee for pathological cases."""
 
+    anat_weight: float = 1.0
+    """Weight of the anatomical rows when :func:`run_topup` is given an ``anat`` image,
+    relative to the pair rows (both are in the same rescaled intensity units, so no
+    ``ssqlambda`` scaling: the pair SSD shrinks as the blips converge, the anat residual
+    does not, and tying one to the other would fade the anatomy out exactly where the
+    pair has stopped being informative). Ignored without an anat."""
+
+    anat_sigma_mm: float = 8.0
+    """Gaussian sigma (mm) of the local linear map from anat to EPI intensity. It must be
+    wider than the misplacement it is meant to correct: a window narrower than the shift
+    lets the map reproduce the corrected mean's own misplaced edges and the term goes
+    blind."""
+
+    anat_max_warpres: float = 5.0
+    """The anat rows join only levels whose knot spacing (mm) is at most this. Before the
+    pair has roughly converged the corrected mean is two brains several mm apart, a target
+    fitted to it is meaningless, and the PE-gradient regressor only absorbs small shifts:
+    on HiHiFaces ses-fine (7T, LR PE) an anat active from the 30 mm level added 45 voxels
+    of displacement at level 2 where the pair alone added 18, and the field came out
+    ~40 Hz RMS off in the brain."""
+
     def n_levels(self) -> int:
         return len(self.warpres)
 
@@ -933,6 +954,63 @@ def _min_jacobian(field_hz: Tensor, specs: list[tuple[int, float]]) -> float:
 # ----------------------------------------------------------------------------
 # Gauss-Newton least-squares solver (one level)
 # ----------------------------------------------------------------------------
+@dataclass
+class _AnatTerm:
+    """An anatomical image on the scans' grid and the EPI it predicts there.
+
+    Each undistorted scan gets rows ``sqrt(w) * (m_s - target)``. ``target`` is the anat
+    mapped onto the current corrected mean ``M`` by a local linear fit (:meth:`update`),
+    held fixed within a Gauss-Newton step the way the linearisation is, and rewritten in
+    place so a captured CUDA graph sees the new values.
+
+    The rows sum to ``2||M - target||^2 + 1/2||m_up - m_dn||^2``. To first order ``M``
+    does not depend on the field where the blips agree, so the anat only has a say where
+    they do not. To second order it does: a field error ``d`` spreads the blips apart and
+    blurs the mean, ``M + d^2 M''/2``, and a blurred mean fits a *misaligned* target
+    better than a sharp one -- so with a plain intensity map, an anat that is off along
+    PE (rigid-only alignment, a 7T-vs-3T scaling) rewards fields that smear the pair.
+    The anat's PE gradient is therefore a second regressor: ``target = alpha + beta*A +
+    gamma*dA/dpe`` absorbs a smooth local shift common to both blips (a first-order
+    Taylor term), leaving the anat to referee only the *shape* -- which tissue layers
+    sit against which -- not where the head is.
+    """
+
+    anat: Tensor  # level-smoothed, rescaled anat (nz, ny, nx)
+    grad: Tensor  # its central difference along PE
+    target: Tensor  # anat in EPI contrast, same shape
+    sigma_vox: float
+
+    @classmethod
+    def build(cls, anat: Tensor, sigma_vox: float, pe_tdim: int) -> _AnatTerm:
+        grad = _central_diff_pe(anat, pe_tdim)
+        return cls(anat=anat, grad=grad, target=anat.clone(), sigma_vox=sigma_vox)
+
+    def update(self, corrected_mean: Tensor, mask: Tensor) -> None:
+        """Refit ``target = alpha + beta * anat + gamma * d(anat)/d(pe)`` to
+        ``corrected_mean`` inside ``mask`` by Gaussian-weighted local least squares. A
+        free local slope covers contrast inversion (T1 against T2*), and anything outside
+        the brain -- skull, fat, dura -- gets whatever local map the data supports."""
+        w = mask.to(torch.float32)
+        a, g, m = self.anat.float(), self.grad.float(), corrected_mean.float()
+        sm = lambda x: _separable_smooth_3d(x, self.sigma_vox)  # noqa: E731
+        ws = sm(w).clamp_min(1e-6)
+        e = lambda x: sm(w * x) / ws  # noqa: E731
+        ea, eg, em = e(a), e(g), e(m)
+        vaa = (e(a * a) - ea * ea).clamp_min(0.0)
+        vgg = (e(g * g) - eg * eg).clamp_min(0.0)
+        vag = e(a * g) - ea * eg
+        cam, cgm = e(a * m) - ea * em, e(g * m) - eg * em
+        # A flat anat window (inside white matter, in air) has no slope to estimate; the
+        # floors make its target the local EPI mean rather than an amplified noise ratio.
+        inside = bool(mask.any())
+        vaa = vaa + (1e-3 * float(vaa[mask].mean()) if inside else 1e-6)
+        vgg = vgg + (1e-3 * float(vgg[mask].mean()) if inside else 1e-6)
+        det = (vaa * vgg - vag * vag).clamp_min(1e-12)
+        beta = (vgg * cam - vag * cgm) / det
+        gamma = (vaa * cgm - vag * cam) / det
+        self.target.copy_((em + beta * (a - ea) + gamma * (g - eg)).to(self.target.dtype))
+
+
 def _residual_vector(
     coeff: Tensor,
     basis: SplineFieldBasis,
@@ -943,8 +1021,11 @@ def _residual_vector(
     reg_mode: str,
     barrier_eff: float = 0.0,
     jac_floor: float = 0.1,
+    anat: _AnatTerm | None = None,
+    anat_eff: float = 0.0,
 ) -> Tensor:
-    """Full residual: masked data rows, then sqrt(lam) reg rows, then anti-fold rows."""
+    """Full residual: masked data rows, then sqrt(lam) reg rows, then anti-fold rows,
+    then the anatomical rows."""
     return _residual_rows(
         coeff,
         basis,
@@ -955,6 +1036,8 @@ def _residual_vector(
         reg_mode,
         math.sqrt(barrier_eff) if barrier_eff > 0 else None,
         jac_floor,
+        anat if anat_eff > 0 else None,
+        math.sqrt(anat_eff) if anat_eff > 0 else None,
     )
 
 
@@ -968,6 +1051,8 @@ def _residual_rows(
     reg_mode: str,
     sqrt_barrier: float | Tensor | None,
     jac_floor: float,
+    anat: _AnatTerm | None = None,
+    sqrt_anat: float | Tensor | None = None,
 ) -> Tensor:
     """:func:`_residual_vector` with the square-rooted weights given (``None`` = term off)."""
     field_hz = basis.field(coeff)
@@ -986,6 +1071,10 @@ def _residual_rows(
         rows = rows + [sqrt_lam * reg_residual(field_hz, reg_mode)]
     if sqrt_barrier is not None:
         rows = rows + _barrier_rows_scaled(field_hz, scans, sqrt_barrier, jac_floor)
+    if anat is not None and sqrt_anat is not None:
+        rows = rows + [
+            (m - anat.target).reshape(-1)[mask_idx] * (sqrt_anat * scale) for m in modulated
+        ]
     return torch.cat(rows)
 
 
@@ -1082,6 +1171,9 @@ class _Linearization:
     # dim such that ``d r_barrier = B * D_pe(dfield)`` (empty when the barrier is off).
     barrier_b: list[Tensor] = _dc_field(default_factory=list)
     barrier_tdim: list[int] = _dc_field(default_factory=list)
+    # sqrt of the anatomical rows' weight (0 = off). Their target is fixed within a
+    # step, so d r_anat_s = sqrt_anat * scale * dm_s, uncentred.
+    anat_sqrt: float = 0.0
 
 
 def _linearize(
@@ -1094,6 +1186,7 @@ def _linearize(
     reg_mode: str,
     barrier_eff: float = 0.0,
     jac_floor: float = 0.1,
+    anat_eff: float = 0.0,
 ) -> _Linearization:
     """Precompute the per-scan slope/Jacobian maps for the analytic GN matvec."""
     field0 = basis.field(coeff)
@@ -1137,6 +1230,7 @@ def _linearize(
         Q=Q,
         barrier_b=barrier_b,
         barrier_tdim=barrier_tdim,
+        anat_sqrt=math.sqrt(anat_eff) if anat_eff > 0 else 0.0,
     )
 
 
@@ -1153,6 +1247,8 @@ def _lin_jv(lin: _Linearization, dc: Tensor) -> Tensor:
         rows.append(math.sqrt(lin.lam_eff) * reg_residual(dfield, lin.reg_mode))
     for B, td in zip(lin.barrier_b, lin.barrier_tdim, strict=True):
         rows.append((B * _central_diff_pe(dfield, td)).reshape(-1))
+    if lin.anat_sqrt > 0:
+        rows += [dm.reshape(-1)[lin.mask_idx] * (lin.anat_sqrt * lin.scale) for dm in dms]
     return torch.cat(rows)
 
 
@@ -1188,6 +1284,17 @@ def _lin_jtu(lin: _Linearization, u: Tensor) -> Tensor:
     for i, (B, td) in enumerate(zip(lin.barrier_b, lin.barrier_tdim, strict=True)):
         ub = u[off + i * numel : off + (i + 1) * numel].reshape(lin.shape)
         gfield = gfield + _central_diff_pe_adjoint(B * ub, td)
+    off += len(lin.barrier_b) * numel
+    if lin.anat_sqrt > 0:
+        for s in range(n_scans):
+            full = torch.zeros(numel, device=u.device, dtype=u.dtype)
+            full[lin.mask_idx] = u[off + s * nmask : off + (s + 1) * nmask] * (
+                lin.anat_sqrt * lin.scale
+            )
+            w = full.reshape(lin.shape)
+            gfield = gfield + lin.a[s] * (
+                lin.P[s] * w + _central_diff_pe_adjoint(lin.Q[s] * w, lin.pe_tdim[s])
+            )
     return lin.basis.field_adjoint(gfield).reshape(-1)
 
 
@@ -1276,42 +1383,60 @@ class _LevelResidual:
         reg_mode: str,
         jac_floor: float,
         use_graph: bool,
+        anat: _AnatTerm | None = None,
     ):
         self.args = (basis, scans, mask_idx, n_sm1)
         self.reg_mode = reg_mode
         self.jac_floor = jac_floor
         self.use_graph = use_graph
-        self.graphs: dict[tuple[bool, bool], dict] = {}
+        self.anat = anat
+        self.graphs: dict[tuple[bool, bool, bool], dict] = {}
 
-    def residual(self, c: Tensor, lam_eff: float, barrier_eff: float) -> tuple[Tensor, float]:
+    def residual(
+        self, c: Tensor, lam_eff: float, barrier_eff: float, anat_eff: float = 0.0
+    ) -> tuple[Tensor, float]:
         """``(residual vector, cost)``. On the graphed path the vector is a buffer the next
         call overwrites -- use it before evaluating again."""
+        anat_eff = anat_eff if self.anat is not None else 0.0
         if not self.use_graph:
-            r = _residual_vector(c, *self.args, lam_eff, self.reg_mode, barrier_eff, self.jac_floor)
+            r = _residual_vector(
+                c,
+                *self.args,
+                lam_eff,
+                self.reg_mode,
+                barrier_eff,
+                self.jac_floor,
+                self.anat,
+                anat_eff,
+            )
             return r, float(_dot64(r, r))
-        st = self._state(c, lam_eff > 0, barrier_eff > 0)
+        st = self._state(c, lam_eff > 0, barrier_eff > 0, anat_eff > 0)
         st["c"].copy_(c)
         if lam_eff > 0:
             st["sqrt_lam"].fill_(math.sqrt(lam_eff))
         if barrier_eff > 0:
             st["sqrt_bar"].fill_(math.sqrt(barrier_eff))
+        if anat_eff > 0:
+            st["sqrt_anat"].fill_(math.sqrt(anat_eff))
         st["graph"].replay()
         return st["r"], float(st["cost"])
 
-    def cost(self, c: Tensor, lam_eff: float, barrier_eff: float) -> float:
-        return self.residual(c, lam_eff, barrier_eff)[1]
+    def cost(self, c: Tensor, lam_eff: float, barrier_eff: float, anat_eff: float = 0.0) -> float:
+        return self.residual(c, lam_eff, barrier_eff, anat_eff)[1]
 
-    def _state(self, c: Tensor, with_reg: bool, with_bar: bool) -> dict:
-        key = (with_reg, with_bar)
+    def _state(self, c: Tensor, with_reg: bool, with_bar: bool, with_anat: bool) -> dict:
+        key = (with_reg, with_bar, with_anat)
         if key in self.graphs:
             return self.graphs[key]
         st: dict = {
             "c": c.detach().clone(),
             "sqrt_lam": torch.ones((), device=c.device, dtype=c.dtype),
             "sqrt_bar": torch.ones((), device=c.device, dtype=c.dtype),
+            "sqrt_anat": torch.ones((), device=c.device, dtype=c.dtype),
         }
 
         def step() -> None:
+            # The anat target is read in place, so a replay sees each step's refit.
             r = _residual_rows(
                 st["c"],
                 *self.args,
@@ -1319,6 +1444,8 @@ class _LevelResidual:
                 self.reg_mode,
                 st["sqrt_bar"] if with_bar else None,
                 self.jac_floor,
+                self.anat if with_anat else None,
+                st["sqrt_anat"] if with_anat else None,
             )
             st["r"], st["cost"] = r, _dot64(r, r)
 
@@ -1357,6 +1484,7 @@ class _NormalOperator:
         self.pe_tdim = list(lin.pe_tdim)
         self.tdims = sorted(set(lin.pe_tdim))
         self.barrier_tdim = list(lin.barrier_tdim)
+        self.has_anat = lin.anat_sqrt > 0
         self.own = own_buffers
         self._bind(*self._derive(lin))
 
@@ -1372,21 +1500,24 @@ class _NormalOperator:
         aQ = [a * Q for a, Q in zip(lin.a, lin.Q, strict=True)]
         b2 = [B * B for B in lin.barrier_b]
         lam = torch.tensor(lin.lam_eff, device=ref.device, dtype=ref.dtype)
-        return mask_f.reshape(shape), aP, aQ, b2, lam
+        anat = torch.tensor(lin.anat_sqrt**2, device=ref.device, dtype=ref.dtype)
+        return mask_f.reshape(shape), aP, aQ, b2, lam, anat
 
-    def _bind(self, mask_f, aP, aQ, b2, lam):
+    def _bind(self, mask_f, aP, aQ, b2, lam, anat):
         if self.own:
-            mask_f, lam = mask_f.clone(), lam.clone()
+            mask_f, lam, anat = mask_f.clone(), lam.clone(), anat.clone()
             aP, aQ, b2 = ([t.clone() for t in ts] for ts in (aP, aQ, b2))
         self.mask_f, self.aP, self.aQ, self.b2, self.lam = mask_f, aP, aQ, b2, lam
+        self.anat = anat
 
     def load(self, lin: _Linearization) -> None:
-        mask_f, aP, aQ, b2, lam = self._derive(lin)
+        mask_f, aP, aQ, b2, lam, anat = self._derive(lin)
         if not self.own:
-            self._bind(mask_f, aP, aQ, b2, lam)
+            self._bind(mask_f, aP, aQ, b2, lam, anat)
             return
         self.mask_f.copy_(mask_f)
         self.lam.copy_(lam)
+        self.anat.copy_(anat)
         for dst, src in zip([*self.aP, *self.aQ, *self.b2], [*aP, *aQ, *b2], strict=True):
             dst.copy_(src)
 
@@ -1401,6 +1532,8 @@ class _NormalOperator:
         back = {td: torch.zeros_like(dfield) for td in self.tdims}
         for s in range(n_scans):
             w = self.mask_f * (dms[s] - dmean)
+            if self.has_anat:  # uncentred: the anat target does not move with the field
+                w = w + (self.anat * self.mask_f) * dms[s]
             g = g + self.aP[s] * w
             back[self.pe_tdim[s]] = back[self.pe_tdim[s]] + self.aQ[s] * w
         for B2, td in zip(self.b2, self.barrier_tdim, strict=True):
@@ -1512,6 +1645,7 @@ def _gn_direction_analytic(
     jac_floor: float = 0.1,
     solver: _LevelCG | None = None,
     level_residual: _LevelResidual | None = None,
+    anat_eff: float = 0.0,
 ) -> tuple[Tensor, float]:
     """Analytic Gauss-Newton step: same math as :func:`_gn_direction`, no autograd.
 
@@ -1520,14 +1654,17 @@ def _gn_direction_analytic(
     :func:`_lin_jtu`) — einsum + elementwise +
     finite-difference adjoints — eliminating the gather-backward that dominated the
     autograd path. Precision-neutral: it evaluates the identical ``J^T J`` operator.
+    ``anat_eff`` weights the anatomical rows of ``level_residual``'s anat term, if any.
     """
     if level_residual is None:
         level_residual = _LevelResidual(basis, scans, mask_idx, n_sm1, reg_mode, jac_floor, False)
+    if level_residual.anat is None:
+        anat_eff = 0.0
     # On the graphed path r0 is a buffer the next evaluation overwrites; J^T r0 below is
     # queued before any.
-    r0, cost = level_residual.residual(coeff, lam_eff, barrier_eff)
+    r0, cost = level_residual.residual(coeff, lam_eff, barrier_eff, anat_eff)
     lin = _linearize(
-        coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
+        coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor, anat_eff
     )
 
     if solver is None:
@@ -1571,6 +1708,8 @@ def gn_solve_level(
     on_step: Callable[[Tensor, int, float], None] | None = None,
     min_update_vox: float = 0.0,
     use_graph: bool = True,
+    anat: _AnatTerm | None = None,
+    anat_weight: float = 0.0,
 ) -> tuple[Tensor, float, LevelReport]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
@@ -1585,7 +1724,9 @@ def gn_solve_level(
     vetoes any accepted step that introduces/worsens a negative Jacobian. ``on_step``
     is called with ``(coefficients, iteration, cost)`` after every accepted step.
     ``min_update_vox > 0`` ends the level once a step moves the displacement less than
-    that (see :attr:`TopupConfig.min_update_vox`).
+    that (see :attr:`TopupConfig.min_update_vox`). ``anat`` with ``anat_weight > 0`` adds
+    the anatomical rows (:class:`_AnatTerm`), its target refit at the start of every step;
+    the reported data cost and the ``ssqlambda`` scaling stay pair-only.
     Returns ``(coefficients, cost, report)``.
     """
     mask_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
@@ -1593,11 +1734,33 @@ def gn_solve_level(
     coeff = coeff.clone()
     barrier_specs = _fold_barrier_specs(scans) if jac_penalty > 0 else []
     guard = reject_folds and jac_penalty > 0
+    if anat is None or anat_weight <= 0:
+        anat, anat_weight = None, 0.0
 
     def residual(c: Tensor, lam_eff: float, barrier_eff: float = 0.0) -> Tensor:
         return _residual_vector(
-            c, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
+            c,
+            basis,
+            scans,
+            mask_idx,
+            n_sm1,
+            lam_eff,
+            reg_mode,
+            barrier_eff,
+            jac_floor,
+            anat,
+            anat_weight,
         )
+
+    def refit_anat(c: Tensor) -> None:
+        if anat is None:
+            return
+        field_hz = basis.field(c)
+        und = [
+            _undistort_scan(sc.data, field_hz, sc.readout, sc.sign, _NIFTI_AXIS_TO_TDIM[sc.pe_axis])
+            for sc in scans
+        ]
+        anat.update(torch.stack(und, dim=0).mean(dim=0), mask)
 
     level_residual = _LevelResidual(
         basis,
@@ -1607,6 +1770,7 @@ def gn_solve_level(
         reg_mode,
         jac_floor,
         analytic and use_graph and coeff.device.type == "cuda",
+        anat,
     )
 
     def data_ssd(c: Tensor) -> float:
@@ -1649,6 +1813,7 @@ def gn_solve_level(
         dssd = data_ssd(coeff) if (ssqlambda and (lam > 0 or jac_penalty > 0)) else 1.0
         lam_eff = lam * dssd if ssqlambda else lam
         barrier_eff = (jac_penalty * dssd if ssqlambda else jac_penalty) if jac_penalty > 0 else 0.0
+        refit_anat(coeff)
         if analytic:
             delta, cost = _gn_direction_analytic(
                 coeff,
@@ -1664,6 +1829,7 @@ def gn_solve_level(
                 jac_floor,
                 solver,
                 level_residual,
+                anat_weight,
             )
         else:
             delta, cost = _gn_direction(
@@ -1682,7 +1848,7 @@ def gn_solve_level(
         new_cost = cost
         for _ in range(12):
             trial = coeff + (step * delta).reshape(coeff.shape)
-            new_cost = level_residual.cost(trial, lam_eff, barrier_eff)
+            new_cost = level_residual.cost(trial, lam_eff, barrier_eff, anat_weight)
             folds = guard and _min_jacobian(basis.field(trial), barrier_specs) < min(
                 0.0, cur_min_jac
             )
@@ -1955,6 +2121,7 @@ def run_topup(
     wrap_pad: int = 0,
     unwrap: Sequence[int] | None = None,
     empty_as_zero: bool = True,
+    anat: Tensor | None = None,
 ) -> TopupResult:
     """Estimate the off-resonance field from opposing-PE scans.
 
@@ -1984,9 +2151,20 @@ def run_topup(
     ``recorder`` (a :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder` with one
     row per scan) captures every scan undistorted by the running field after each
     accepted Gauss-Newton step, with each level's result pinned.
+
+    ``anat`` is an anatomical image of any contrast on the scans' grid, aligned to the
+    undistorted anatomy of the motion reference scan. It adds the anatomical rows of
+    :class:`_AnatTerm` at ``config.anat_weight``, smoothed with each level's FWHM like
+    the scans. Keep the tissue outside the brain in it: an edge that is stuck to the
+    cortex in one blip and spaced off it in the other is exactly what it can referee.
     """
     config.validate()
     shape = tuple(scans[0].data.shape)  # type: ignore[assignment]
+    if anat is not None:
+        if tuple(anat.shape) != shape:
+            raise ValueError(f"anat grid {tuple(anat.shape)} differs from the scans' {shape}")
+        if wrap_pad or unwrap is not None:
+            raise ValueError("an anat cannot yet be combined with phase-encode wrap handling")
     device = scans[0].data.device
     dtype = scans[0].data.dtype
 
@@ -2008,6 +2186,11 @@ def run_topup(
                 readout=sc.readout,
             )
         )
+    anat_work = None
+    if anat is not None:
+        m = float(anat.mean())
+        anat_work = (anat * (100.0 / m if m != 0 else 1.0)).to(device=device, dtype=solve_dtype)
+    anat_sigma_vox = config.anat_sigma_mm / (sum(voxel_sizes) / 3.0)
 
     orig_shape = shape
     padded, pad_tdims, front, declared_empty = pad_scans_pe(work, wrap_pad, unwrap)
@@ -2086,6 +2269,17 @@ def run_topup(
 
         level_empty = None if declared_empty is None else [e[::ss] for e in declared_empty]
         mask = compute_mask(level_scans, level_empty, pad_tdims[0] if pad_tdims else 1)
+        level_anat = None
+        if anat_work is not None and wr <= config.anat_max_warpres:
+            smoothed = _prepare_level_scans(
+                [ScanSpec(data=anat_work, pe_axis=work[0].pe_axis, sign=1.0, readout=0.0)],
+                voxel_sizes,
+                fwhm,
+                ss,
+            )[0].data
+            level_anat = _AnatTerm.build(
+                smoothed, anat_sigma_vox / ss, _NIFTI_AXIS_TO_TDIM[work[0].pe_axis]
+            )
         on_step = None
         if recorder is not None:
             recorder.set_context(f"L{lvl + 1}/{n_lev} {wr}mm")
@@ -2112,6 +2306,8 @@ def run_topup(
             on_step=on_step,
             min_update_vox=config.min_update_vox,
             use_graph=config.cuda_graphs,
+            anat=level_anat,
+            anat_weight=config.anat_weight,
         )
         reports.append(report)
         if recorder is not None:

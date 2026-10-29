@@ -651,22 +651,144 @@ def test_fused_normal_matvec_equals_jt_j():
         assert (got - ref).norm() < 1e-10 * ref.norm(), reg_mode
 
 
+def _anat_term_for(basis, scans, mask_idx, coeff):
+    """An anat term whose target is refit to the scans undistorted by ``coeff``."""
+    torch.manual_seed(11)
+    shape = tuple(scans[0].data.shape)
+    anat = T._AnatTerm.build(
+        200.0 - scans[0].data + torch.randn(shape, dtype=scans[0].data.dtype), 2.0, 1
+    )
+    field = basis.field(coeff)
+    und = [T._undistort_scan(s.data, field, s.readout, s.sign, 1) for s in scans]
+    mask = torch.zeros(shape, dtype=torch.bool).reshape(-1)
+    mask[mask_idx] = True
+    anat.update(torch.stack(und).mean(0), mask.reshape(shape))
+    return anat
+
+
+def test_anat_rows_match_autograd_and_the_fused_matvec():
+    # The anat rows' target is held fixed within a step, so their analytic J is the
+    # uncentred per-scan map; J v, J^T r and the fused CG matvec must all agree with
+    # autograd / J^T J to machine precision, with the barrier on as well.
+    torch.manual_seed(13)
+    basis, scans, mask_idx, coeff = _small_gn_setup()
+    anat = _anat_term_for(basis, scans, mask_idx, coeff)
+    lam, be, ae = 1e-3, 5.0, 0.7
+
+    c = coeff.detach().requires_grad_(True)
+    r0 = T._residual_vector(c, basis, scans, mask_idx, 1, lam, "bending", be, 0.1, anat, ae)
+    w = torch.zeros_like(r0, requires_grad=True)
+    (jtw,) = torch.autograd.grad(r0, c, grad_outputs=w, create_graph=True, retain_graph=True)
+    v = torch.randn(basis.coeff_shape, dtype=torch.float64)
+    jv_auto = torch.autograd.grad(jtw, w, grad_outputs=v, retain_graph=True)[0]
+
+    lin = T._linearize(coeff, basis, scans, mask_idx, 1, lam, "bending", be, 0.1, ae)
+    jv = T._lin_jv(lin, v)
+    assert jv.shape == r0.shape
+    assert (jv - jv_auto).norm() < 1e-10 * jv_auto.norm(), "J v mismatch (anat)"
+    g_auto = torch.autograd.grad(r0, c, grad_outputs=r0.detach(), retain_graph=True)[0]
+    g_an = T._lin_jtu(lin, r0)
+    assert (g_an - g_auto.reshape(-1)).norm() < 1e-10 * g_auto.norm(), "J^T r mismatch (anat)"
+
+    matvec = T._NormalOperator(lin, T.reg_gram_terms(basis, "bending"))
+    ref = T._lin_jtu(lin, jv) + 1e-8 * v.reshape(-1)
+    assert (matvec(v.reshape(-1)) - ref).norm() < 1e-10 * ref.norm(), "fused matvec (anat)"
+
+
+# The synthetic schedule is coarser than the real-data anat threshold; switch it on throughout.
+_ANAT_KW = dict(
+    warpres=[16, 10],
+    fwhm=[5, 2],
+    lam=[1e-3, 1e-4],
+    miter=[8, 8],
+    subsamp=[1, 1],
+    anat_max_warpres=100.0,
+)
+
+
+def _field_rms_error(res, field):
+    m = torch.zeros_like(field, dtype=torch.bool)
+    m[3:-3, 4:-4, 4:-4] = True
+    return float((res.field_hz - field)[m].pow(2).mean().sqrt())
+
+
+def _make_exact_pair(readout=0.5):
+    """:func:`_make_synthetic`'s anatomy and field, but each blip made with the exact
+    inverse of the correction, so the true field undistorts both back to ``true``.
+
+    ``_make_synthetic`` resamples ``true`` at ``-d``, which only approximately inverts
+    ``resample(., +d)`` when ``d`` varies: with 3.5-voxel shifts on 4-6-voxel blobs the
+    true field leaves the pair visibly apart, so an anat of ``true`` is not what the
+    corrected blips look like and cannot referee them."""
+    from fastfuncstuff.processing.medic import invert_displacement_pe
+
+    true, field, _ = _make_synthetic(readout=readout)
+    scans = []
+    for sign in (+1.0, -1.0):
+        d = field * (readout * sign)
+        h = invert_displacement_pe(d, 1, iters=200)
+        obs = T._resample_pe(true / T._jacobian_pe(d, 1), h, 1)
+        scans.append(T.ScanSpec(obs, pe_axis=1, sign=sign, readout=readout))
+    return true, field, scans
+
+
+def test_exact_pair_is_undistorted_by_its_true_field():
+    # Measured: RMS 1.0 and 0.16 against a std of 19.3 (the approximate generator: 17.6
+    # and 10.8). Not a max bound: two linear interpolations leave single-voxel errors of
+    # ~9 at the steepest edge.
+    true, field, scans = _make_exact_pair()
+    m = torch.zeros_like(true, dtype=torch.bool)
+    m[3:-3, 4:-4, 4:-4] = True
+    for sc in scans:
+        und = T._undistort_scan(sc.data, field, sc.readout, sc.sign, 1)
+        assert float((und - true)[m].pow(2).mean().sqrt()) < 0.1 * float(true[m].std())
+
+
+def test_inverted_contrast_anat_does_not_hurt_recovery():
+    # A T1 against a T2*-weighted EPI is roughly an inverted contrast: the local linear
+    # map must absorb that (a negative slope), not fight the pair.
+    true, field, scans = _make_exact_pair()
+    plain = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(**_ANAT_KW), progress=False)
+    cfg = T.TopupConfig(**_ANAT_KW, anat_weight=1.0, anat_sigma_mm=8.0)
+    with_anat = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=300.0 - true)
+    assert _field_rms_error(with_anat, field) <= 1.05 * _field_rms_error(plain, field)
+
+
+def test_anat_misaligned_along_pe_does_not_drag_the_field():
+    # A shift common to both blips (here the anat is 1.5 voxels off along PE, as a rigid
+    # alignment error or a scanner-to-scanner scaling would be) needs both undistorted
+    # blips to move the same way. A field moves them oppositely, so it must stay put.
+    true, field, scans = _make_exact_pair()
+    plain = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(**_ANAT_KW), progress=False)
+    off = T._resample_pe(300.0 - true, torch.full_like(true, 1.5), 1)
+    cfg = T.TopupConfig(**_ANAT_KW, anat_weight=1.0, anat_sigma_mm=8.0)
+    shifted = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=off)
+    m = torch.zeros_like(field, dtype=torch.bool)
+    m[3:-3, 4:-4, 4:-4] = True
+    moved = float((shifted.field_hz - plain.field_hz)[m].pow(2).mean().sqrt())
+    assert moved < 0.1 * float(field[m].std()), f"common-mode anat offset moved the field {moved}"
+
+
 @pytest.mark.gpu
-def test_cuda_graphed_cg_matches_eager():
+@pytest.mark.parametrize("with_anat", [False, True])
+def test_cuda_graphed_cg_matches_eager(with_anat):
     # The per-level CG replays one captured iteration against buffers the linearisation is
     # copied into; across several Gauss-Newton steps it must give exactly the eager result.
+    # With an anat, the residual graphs also read a target rewritten in place every step.
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    _, _, scans = _make_synthetic()
+    true, _, scans = _make_exact_pair()
     dev = torch.device("cuda")
     scans = [T.ScanSpec(s.data.to(dev), s.pe_axis, s.sign, s.readout) for s in scans]
+    anat = (300.0 - true).to(dev) if with_anat else None
 
     def run(graphs):
         cfg = T.TopupConfig(
             warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[6, 6], subsamp=[1, 1]
         )
         cfg.cuda_graphs = graphs
-        return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
+        cfg.anat_max_warpres = 100.0
+        return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=anat)
 
     eager, graphed = run(False), run(True)
     assert [lv.iters for lv in eager.levels] == [lv.iters for lv in graphed.levels]

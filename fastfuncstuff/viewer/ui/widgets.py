@@ -124,6 +124,26 @@ class ValueColumnDelegate(QtWidgets.QStyledItemDelegate):
         painter.restore()
 
 
+class PreviewCombo(QtWidgets.QComboBox):
+    """A dropdown whose picker shows a row before choosing it.
+
+    ``preview_row(i)`` is called as the picker's highlight moves, and
+    ``preview_row(None)`` when it closes without a choice. For pickers whose
+    choice is expensive and whose rows are hard to tell apart by name -- a
+    directory of 600 datasets -- so looking costs a glance, not a commitment.
+    """
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.preview_row: Callable[[int | None], None] | None = None
+
+
+#: How long the highlight must rest before a preview is drawn. Arrowing down a
+#: list emits a row per keypress; drawing each would queue work behind a key
+#: that has already moved on.
+PREVIEW_DEBOUNCE_MS = 60
+
+
 class ComboPicker(QtWidgets.QDialog):
     """A dropdown's items as a filterable list in a small window of its own.
 
@@ -132,11 +152,15 @@ class ComboPicker(QtWidgets.QDialog):
     goes back through the combo -- ``setCurrentIndex`` and then ``activated``,
     as a click in its own popup would -- so whatever the combo is wired to
     cannot tell the difference, and nothing has to be connected twice.
+
+    On a :class:`PreviewCombo` a click only previews; a double-click or Enter
+    chooses, and closing without choosing withdraws the preview.
     """
 
     def __init__(self, combo: QtWidgets.QComboBox) -> None:
         super().__init__(combo.window())
         self._combo = combo
+        self._preview = combo.preview_row if isinstance(combo, PreviewCombo) else None
         self.setWindowTitle(_combo_title(combo))
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
 
@@ -165,9 +189,27 @@ class ComboPicker(QtWidgets.QDialog):
                 item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEnabled)
             self.list.addItem(item)
         self.list.setCurrentRow(max(combo.currentIndex(), 0))
-        self.list.itemActivated.connect(self._choose)
-        self.list.itemClicked.connect(self._choose)
+        if self._preview is None:
+            self.list.itemActivated.connect(self._choose)
+            self.list.itemClicked.connect(self._choose)
+        else:
+            # Not itemActivated: under a single-click-activates style (KDE's
+            # default) that fires on the click meant only to look.
+            self.list.itemDoubleClicked.connect(self._choose)
+            self.list.installEventFilter(self)
+            self._preview_timer = QtCore.QTimer(self)
+            self._preview_timer.setSingleShot(True)
+            self._preview_timer.setInterval(PREVIEW_DEBOUNCE_MS)
+            self._preview_timer.timeout.connect(self._show_preview)
+            # Connected after the initial row is set: opening the picker on
+            # what is already chosen should not preview it a second time.
+            self.list.currentRowChanged.connect(lambda _: self._preview_timer.start())
+            self.rejected.connect(self._withdraw_preview)
         layout.addWidget(self.list)
+        if self._preview is not None:
+            hint = QtWidgets.QLabel("click to look  ·  double-click or Enter to load")
+            hint.setObjectName("hint")
+            layout.addWidget(hint)
 
         rows = min(combo.count(), 24)
         step = max(self.list.sizeHintForRow(0), 18) if combo.count() else 18
@@ -175,12 +217,28 @@ class ComboPicker(QtWidgets.QDialog):
         self.resize(width, rows * step + self.filter.sizeHint().height() + 30)
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
-        if obj is self.filter and event.type() == QtCore.QEvent.Type.KeyPress:
+        if event.type() == QtCore.QEvent.Type.KeyPress:
             key = event.key()  # type: ignore[attr-defined]
-            if key in (QtCore.Qt.Key.Key_Up, QtCore.Qt.Key.Key_Down):
+            if obj is self.filter and key in (QtCore.Qt.Key.Key_Up, QtCore.Qt.Key.Key_Down):
                 self._step(-1 if key == QtCore.Qt.Key.Key_Up else 1)
                 return True
+            if obj is self.list and key in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+                self._choose_current()
+                return True
         return super().eventFilter(obj, event)
+
+    def _show_preview(self) -> None:
+        item = self.list.currentItem()
+        if self._preview is None or item is None or item.isHidden():
+            return
+        if not item.flags() & QtCore.Qt.ItemFlag.ItemIsEnabled:
+            return
+        self._preview(int(item.data(QtCore.Qt.ItemDataRole.UserRole)))
+
+    def _withdraw_preview(self) -> None:
+        self._preview_timer.stop()
+        if self._preview is not None:
+            self._preview(None)
 
     def _visible_rows(self) -> list[int]:
         return [r for r in range(self.list.count()) if not self.list.item(r).isHidden()]
@@ -212,6 +270,8 @@ class ComboPicker(QtWidgets.QDialog):
             return
         index = int(item.data(QtCore.Qt.ItemDataRole.UserRole))
         combo = self._combo
+        if self._preview is not None:
+            self._preview_timer.stop()
         self.accept()
         combo.setCurrentIndex(index)
         combo.activated.emit(index)
@@ -272,4 +332,10 @@ def install_combo_pickers(app: QtCore.QCoreApplication) -> None:
     app.installEventFilter(_ComboPickerFilter(app))
 
 
-__all__ = ["ComboPicker", "RowSizedList", "install_combo_pickers", "open_combo_picker"]
+__all__ = [
+    "ComboPicker",
+    "PreviewCombo",
+    "RowSizedList",
+    "install_combo_pickers",
+    "open_combo_picker",
+]

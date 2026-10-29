@@ -69,6 +69,7 @@ from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.tooldialog import ToolDialog
 from fastfuncstuff.viewer.ui.widgets import (
     VALUE_ROLE,
+    PreviewCombo,
     RowSizedList,
     ValueColumnDelegate,
     install_combo_pickers,
@@ -659,7 +660,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         row.setSpacing(5)
 
         row.addWidget(self._head("DATA"))
-        self.data_box = QtWidgets.QComboBox()
+        self.data_box = PreviewCombo()
+        self.data_box.preview_row = self._preview_row
         self.data_box.setFont(QtGui.QFont(MONO))
         self.data_box.addItem(NONE_LABEL, userData=None)
         # Picking is loading: the extra click on LOAD would be a confirmation
@@ -835,12 +837,39 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _pick(self, box: QtWidgets.QComboBox, cls) -> None:
         entry: CatalogEntry | None = box.currentData()
-        if entry is None:
-            return
-        self._dispatch(cls(str(entry.path)))
+        path = str(entry.path) if entry is not None else None
+        if path is not None and cls is Load and self.session.preview_path == path:
+            # Already on screen from the picker: keep it rather than open it twice.
+            self.session.commit_preview()
+        else:
+            self._preview_path(None)
+            if entry is None:
+                return
+            self._dispatch(cls(path))
+        assert entry is not None
         if self.session.catalog_fresh.pop(entry.path, None) is not None:
             self._sync_catalog()
         self._sync_layer_list()
+
+    def _preview_row(self, row: int | None) -> None:
+        """The DATA picker's highlight: show that dataset's first volume, uncommitted."""
+        entry = self.data_box.itemData(row) if row is not None else None
+        self._preview_path(str(entry.path) if entry is not None else None)
+
+    def _preview_path(self, path: str | None) -> None:
+        if path is None and self.session.preview_path is None:
+            return
+        if path is not None and path == self.session.preview_path:
+            return
+        try:
+            dirty = self.session.preview(path)
+        except (OSError, ValueError) as exc:  # a half-written file, a bad header
+            self.statusBar().showMessage(f"cannot preview {Path(path or '').name}: {exc}", 5000)
+            # The previous preview is already gone; the stack changed either way.
+            dirty = Aspect.LAYERS | Aspect.SLICES
+        self.refresh(dirty)
+        if path is not None:
+            self.statusBar().showMessage(f"previewing {Path(path).name}  (volume 0)", 3000)
 
     def _sync_directories(self, *, reread: bool = False) -> None:
         session = self.session

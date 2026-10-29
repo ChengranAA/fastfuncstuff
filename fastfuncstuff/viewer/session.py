@@ -33,8 +33,10 @@ from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
     AddLayer,
     CloseView,
+    Load,
     OpenView,
     ReloadLayer,
+    RemoveLayer,
     SetIJK,
     SetVolume,
     SetXYZ,
@@ -309,6 +311,10 @@ class ViewerSession:
         #: FreeSurfer meshes. Beside the layer stack, not in it: see
         #: :mod:`viewer.surfaces` for why a surface is not a layer.
         self.surfaces = SurfaceStore(device=self.display_device)
+        #: A picker's preview layer: (key, path, the selection before it).
+        self._preview: tuple[str, str, str | None] | None = None
+        #: Set while a preview opens its layer, so no full inflate starts.
+        self._previewing = False
         self.catalog: list[CatalogEntry] = []
         self.catalog_dir: Path | None = None
         self.catalog_recursive = False
@@ -395,7 +401,7 @@ class ViewerSession:
         # asked.
         if looks_like_labels(preview):
             layer = layer.with_(integer_labels=True, roi=layer.n_volumes == 1)
-        if layer.n_volumes > 1:
+        if layer.n_volumes > 1 and not self._previewing:
             self.store.load_async(key, on_done=self._on_loaded)
         return layer
 
@@ -541,6 +547,68 @@ class ViewerSession:
         chosen = key or self.state.layers.mint_key()
         self.do(AddLayer(str(path), chosen))
         return chosen
+
+    # -- previewing ----------------------------------------------------
+    @property
+    def preview_path(self) -> str | None:
+        """The file on show as a preview layer, if one is."""
+        return self._preview[1] if self._preview else None
+
+    def preview(self, path: str | Path | None) -> Aspect:
+        """Show a file's first volume on top of the stack, without committing to it.
+
+        For hunting through a long directory: each look costs the header and
+        volume 0 (milliseconds even for a 250 MB run), never the background
+        inflate a real LOAD starts, and nothing is recorded -- a script of a
+        session should not replay forty files glanced at on the way to one.
+        ``None`` withdraws the preview. :meth:`commit_preview` keeps it.
+        """
+        dirty = Aspect.NOTHING
+        if self._preview is not None:
+            key, _, selected = self._preview
+            self._preview = None
+            if self.state.layers.find(key) is not None:
+                dirty |= self._unrecorded(RemoveLayer(key))
+            if selected is None or self.state.layers.find(selected) is not None:
+                self.state.selected = selected
+        if path is None:
+            return dirty
+        selected = self.state.selected
+        key = self.state.layers.mint_key("L")
+        self._previewing = True
+        try:
+            dirty |= self._unrecorded(Load(str(path), key))
+        finally:
+            self._previewing = False
+        self._preview = (key, str(path), selected)
+        return dirty
+
+    def commit_preview(self) -> str | None:
+        """Keep the preview layer as an ordinary LOAD; returns its key.
+
+        Recorded with its key: the previews before it consumed keys, so a
+        replay minting afresh would name it differently from every command
+        after it that refers to it.
+        """
+        if self._preview is None:
+            return None
+        key, path, _ = self._preview
+        self._preview = None
+        layer = self.state.layers.find(key)
+        if layer is None:
+            return None
+        self.bus.record(Load(path, key))
+        if layer.n_volumes > 1:
+            self.store.load_async(key, on_done=self._on_loaded)
+        return key
+
+    def _unrecorded(self, cmd: Command) -> Aspect:
+        was = self.bus.recording
+        self.bus.recording = False
+        try:
+            return self.do(cmd)
+        finally:
+            self.bus.recording = was
 
     # -- dispatch ------------------------------------------------------
     def _on_command(self, cmd: Command, dirty: Aspect) -> None:

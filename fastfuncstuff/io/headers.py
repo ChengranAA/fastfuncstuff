@@ -244,6 +244,15 @@ def _read_leading_bytes(filepath: Path, n: int) -> bytes:
     """
     sp = str(filepath)
     if sp.endswith(".nii.zst"):
+        try:
+            from compression import zstd  # stdlib from 3.14
+        except ImportError:
+            pass
+        else:
+            # In-process: ~0.2 ms a header against ~6 ms to spawn zstd, which
+            # is what made reading a 650-file results directory take 8 s.
+            with zstd.ZstdFile(sp) as fh:
+                return fh.read(n)
         # Stream zstd and stop as soon as we have enough. Closing the pipe early
         # sends SIGPIPE to zstd, so it never decompresses past the first block.
         proc = subprocess.Popen(
@@ -267,13 +276,20 @@ def _read_leading_bytes(filepath: Path, n: int) -> bytes:
         return fh.read(n)
 
 
+#: Bytes read on the first look at a header. AFNI extensions (history, labels,
+#: stat tables) are a few KB; a second read is a second zstd spawn where the
+#: stdlib module is missing, so the first one asks for plenty.
+_HEADER_PEEK = 1 << 16
+
+
 def _read_nifti_header_with_ext(path: Path) -> nib.Nifti1Header | nib.Nifti2Header:
     """Header *plus* extensions, reading only as far as the image data starts.
 
-    Two peeks: 544 bytes to learn ``vox_offset``, then that many bytes so
-    nibabel's own extension parser sees the whole AFNI blob and nothing else.
+    One peek generous enough to hold the extensions of nearly every file, and a
+    second only when ``vox_offset`` says they run past it; nibabel's own
+    extension parser then sees the whole AFNI blob and nothing else.
     """
-    lead = _read_leading_bytes(path, 544)
+    lead = _read_leading_bytes(path, _HEADER_PEEK)
     for endian in ("<", ">"):
         (sizeof_hdr,) = struct.unpack(endian + "i", lead[:4])
         if sizeof_hdr in (348, 540):
@@ -286,7 +302,7 @@ def _read_nifti_header_with_ext(path: Path) -> nib.Nifti1Header | nib.Nifti2Head
     vox_offset = int(stub["vox_offset"]) or sizeof_hdr + 4
     # Cap the extension read: a corrupt vox_offset should not pull the payload in.
     raw = lead if vox_offset <= len(lead) else _read_leading_bytes(path, min(vox_offset, 1 << 22))
-    return klass.from_fileobj(BytesIO(raw), check=False)
+    return klass.from_fileobj(BytesIO(raw[:vox_offset]), check=False)
 
 
 def read_nifti_header(

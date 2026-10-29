@@ -110,6 +110,30 @@ class TestReadInfo:
         assert comp.extent == pytest.approx(plain.extent)
         assert comp.compression == ("gzip" if suffix == ".gz" else "zstd")
 
+    @pytest.mark.parametrize("suffix", ["", ".gz", ".zst"])
+    def test_extensions_past_the_first_read(self, tmp_path, suffix):
+        """Labels beyond the first 64 KB peek still come back whole.
+
+        A long bucket's AFNI extension can outrun the first read, and the
+        second one that fetches the rest is the path a short header never takes.
+        """
+        from fastfuncstuff.io.afni import _set_afni_brick_labels
+
+        labels = [f"cond{i:03d}_" + "x" * 300 + "#0_Coef" for i in range(250)]
+        img = nib.Nifti1Image(np.zeros((4, 4, 4, len(labels)), np.float32), np.eye(4))
+        _set_afni_brick_labels(img.header, labels)
+        plain = tmp_path / "bucket.nii"
+        img.to_filename(str(plain))
+        assert nib.load(str(plain)).dataobj.offset > 1 << 16
+        path = plain
+        if suffix:
+            path = plain.with_suffix(f".nii{suffix}")
+            tool = ["gzip", "-kc"] if suffix == ".gz" else ["zstd", "-qc"]
+            with open(path, "wb") as fh:
+                if subprocess.run([*tool, str(plain)], stdout=fh).returncode:
+                    pytest.skip(f"{tool[0]} unavailable")
+        assert read_info(path).labels == labels
+
     def test_same_grid(self, epi, tmp_path):
         other = tmp_path / "shifted.nii"
         aff = _oblique_affine(origin=(0.0, 0.0, 0.0))

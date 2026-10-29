@@ -757,9 +757,16 @@ def compute_mask(
     scans: list[ScanSpec],
     declared_empty: Sequence[Tensor] | None = None,
     pe_tdim: int = 1,
+    valid: Sequence[Tensor] | None = None,
 ) -> Tensor:
     """Intersection mask of finite/positive data, with the edge planes of each scan's
     phase-encode axis zeroed.
+
+    ``valid`` (one bool volume per scan) marks where a scan still holds measured data
+    after -estmov moved it; elsewhere the rigid resample border-clamped, replicating the
+    edge slice into space the scan never imaged. Counting that copy as data broke the
+    end slice of a thin slab: on HiHiFaces ses-fine (62 slices) a 0.5 deg pitch moved
+    part of the last slice out of the slab and its corrected pair r fell 0.94 -> 0.52.
 
     The frame keeps the clamped PE resample at the FOV edge out of the SSD. It is
     zeroed on the PE axes only: topup's frame on every axis also drops the first and
@@ -781,6 +788,8 @@ def compute_mask(
             view = [1, 1, 1]
             view[pe_tdim] = -1
             ok |= declared_empty[i].view(view)
+        if valid is not None:
+            ok &= valid[i]
         m &= ok
     for td in {_NIFTI_AXIS_TO_TDIM[sc.pe_axis] for sc in scans}:
         m.select(td, 0).fill_(False)
@@ -2131,6 +2140,7 @@ def estimate_motion_pass(
     interp: str = "cubic",
     max_iter: int = 23,
     verbose: bool = False,
+    valid: list[Tensor] | None = None,
 ) -> None:
     """One block-coordinate rigid-motion update (topup ``--estmov`` at one level).
 
@@ -2142,7 +2152,8 @@ def estimate_motion_pass(
     translation (degenerate with the field, :func:`_drop_pe_center_translation`) is removed;
     the resulting rigid transform is baked into that scan's *distorted* data with a single
     resample, so the next field fit sees motion-compensated inputs. ``work`` is mutated in
-    place and the transform composed into ``motion_mats``.
+    place and the transform composed into ``motion_mats``; ``valid`` (per scan, mutated)
+    is moved the same way and loses every voxel whose source left the imaged volume.
     """
     from .affine import (
         _build_homo_coords,
@@ -2199,7 +2210,16 @@ def estimate_motion_pass(
         sc.data = resample_affine_fast(sc.data.to(rdt), matrix, coords, interp, shape).to(
             sc.data.dtype
         )
-        motion_mats[s] = matrix @ motion_mats[s]
+        # Each pass samples out(x) = in(M x), so the total map back to the scan as
+        # acquired is the earlier map applied after this one.
+        motion_mats[s] = motion_mats[s] @ matrix
+        if valid is not None:
+            # From the cumulative map, not by resampling the previous mask: a mask moved
+            # once per level erodes a voxel each time, and over the coarse levels that
+            # emptied a thin slab's last slices of data term altogether.
+            src = (motion_mats[s].to(rdt) @ coords)[:3]
+            lim = torch.tensor(shape[::-1], device=device, dtype=rdt)[:, None] - 0.5
+            valid[s] = ((src >= -0.5) & (src <= lim)).all(0).reshape(shape)
         if verbose:
             p = params[:6].tolist()
             print(
@@ -2347,6 +2367,9 @@ def run_topup(
         estmov = config.estmov if config.estmov is not None else _default_estmov(config.warpres)
     else:
         estmov = [False] * config.n_levels()  # off, or no second scan to move against
+    valid = (
+        [torch.ones(shape, dtype=torch.bool, device=device) for _ in work] if any(estmov) else None
+    )
 
     def _movie_chains(field_hz: Tensor) -> list[list[tuple[Tensor, Tensor, Tensor]]]:
         # Each scan moves along its own PE axis by field * readout * sign voxels.
@@ -2400,7 +2423,10 @@ def run_topup(
         basis = new_basis
 
         level_empty = None if declared_empty is None else [e[::ss] for e in declared_empty]
-        mask = compute_mask(level_scans, level_empty, pad_tdims[0] if pad_tdims else 1)
+        level_valid = None if valid is None else [v[::ss, ::ss, ::ss] for v in valid]
+        mask = compute_mask(
+            level_scans, level_empty, pad_tdims[0] if pad_tdims else 1, valid=level_valid
+        )
         level_anat = None
         if anat_work is not None and wr <= config.anat_max_warpres:
             smoothed = _prepare_level_scans(
@@ -2466,6 +2492,7 @@ def run_topup(
                 motion_mats,
                 interp=motion_interp,
                 verbose=progress,
+                valid=valid,
             )
             if recorder is not None:
                 recorder.set_images([sc.data for sc in work], offset=offset)  # type: ignore[arg-type]
@@ -2500,9 +2527,22 @@ def run_topup(
         # Jacobian-modulated undistorted images, un-scaled back to native intensity.
         modulated, _ = forward_scans(full_coeff, full_basis, work)
         unwarped = [(m / s).to(dtype) for m, s in zip(modulated, scales, strict=True)]
+    if valid is not None:
+        # Where a moved scan was never imaged its data is a border-clamped copy; show it
+        # as empty and average the mean over the scans that were imaged there.
+        seen = []
+        for sc, u, v in zip(work, unwarped, valid, strict=True):
+            pe_tdim = _NIFTI_AXIS_TO_TDIM[sc.pe_axis]
+            disp = field_hz.to(solve_dtype) * (sc.readout * sc.sign)
+            seen.append(_resample_pe(v.to(solve_dtype), disp, pe_tdim) > 0.5)
+            u.mul_(seen[-1])
+        n_seen = torch.stack(seen).sum(0)[crop].to(dtype)
     field_hz = field_hz[crop]
     unwarped = [u[crop] for u in unwarped]
-    mean_unwarped = torch.stack(unwarped, dim=0).mean(dim=0)
+    mean_unwarped = torch.stack(unwarped, dim=0).sum(dim=0)
+    mean_unwarped = (
+        mean_unwarped / len(unwarped) if valid is None else mean_unwarped / n_seen.clamp(min=1)
+    )
     return TopupResult(
         field_hz=field_hz,
         coeff=full_coeff,

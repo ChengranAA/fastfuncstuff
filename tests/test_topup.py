@@ -568,6 +568,33 @@ def test_mask_frames_only_the_phase_encode_axis():
     assert m[:, :, 0].any() and m[:, :, -1].any(), "readout edges must stay in the cost"
 
 
+def test_estmov_takes_moved_out_of_slab_voxels_out_of_the_cost():
+    # A through-plane move leaves one end of the moved scan with no measured data; the
+    # border-clamped resample fills it with a copy of the edge slice, which must not
+    # count as data (a thin slab's end slice broke on HiHiFaces ses-fine).
+    true, _, readout = _make_textured()
+    moved = _apply_rigid(true, [0.0, 0.0, 2.0, 0.0, 0.0, 0.0])
+    work = [
+        T.ScanSpec(true.clone(), pe_axis=1, sign=+1.0, readout=readout),
+        T.ScanSpec(moved, pe_axis=1, sign=-1.0, readout=readout),
+    ]
+    mats = [torch.eye(4) for _ in work]
+    valid = [torch.ones(true.shape, dtype=torch.bool) for _ in work]
+    T.estimate_motion_pass(work, torch.zeros_like(true), 0, mats, valid=valid)
+    first = valid[1].clone()
+    # The next level's pass finds ~no further motion; the mask must not erode with it
+    # (moving the mask itself each pass lost a voxel per level).
+    T.estimate_motion_pass(work, torch.zeros_like(true), 0, mats, valid=valid)
+
+    assert valid[0].all(), "the reference scan never moves"
+    lost = ~valid[1]
+    assert lost[:1].all() or lost[-1:].all(), "the vacated end slice must be invalid"
+    assert not lost[3:-3].any(), "interior slices keep their data"
+    assert (first ^ valid[1]).float().mean() < 0.01
+    m = T.compute_mask(work, valid=valid)
+    assert not (m & lost).any()
+
+
 def test_padding_skips_all_zero_edge_planes():
     """A reversed-PE recon's empty edge line must not be dragged into the image."""
     v = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.float32).reshape(1, 6, 1)  # empty last plane

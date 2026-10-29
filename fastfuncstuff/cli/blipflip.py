@@ -28,7 +28,7 @@ possible between back-to-back scans.
     #
     # -readout is optional (the warp is insensitive to a common factor); omit it and the
     # Hz field map is simply not written. Precision tiers: default 9-level standard, or
-    # -workhard (12 levels), or -superhard (14 levels, knots to 2 mm).
+    # -workhard (12 levels), or -superhard (14 levels, unsmoothed, knots to 2 voxels).
 
     # apply to the matching timeseries in one resample:
     ffs_nwarp -source epi.nii.gz -master epi.nii.gz \\
@@ -173,8 +173,8 @@ def create_parser() -> argparse.ArgumentParser:
         "'workhard' (12 levels — coarser start, longer descent, 1e7x lower lambda and twice "
         "the iterations, for large fields: sharper in well-imaged cortex, rougher where the "
         "data are weak), "
-        "'superhard' (14 levels, as workhard but knots down to 2 mm, extra low-lambda "
-        "refinement). Higher tiers are slower. Each tier's per-level lists are printed "
+        "'superhard' (14 levels, as workhard but knots down to two voxels and no data "
+        "smoothing at any level; the most precise tier on high-resolution data). Higher tiers are slower. Each tier's per-level lists are printed "
         "under SCHEDULE PRESETS at the end of -help, ready to copy.",
     )
     sched.add_argument(
@@ -533,13 +533,22 @@ _PRESETS: dict[str, dict] = {
         lam_final=1e-14,
         miter_scale=2,
     ),
-    # As above but pushed to 2 mm knots -- only meaningful for sub-2 mm voxels, and the
-    # low final lambda leans on the fold barrier to stay diffeomorphic. Same low lambda
-    # (1e7 below standard) and doubled iterations as workhard, so the two tiers compare.
+    # Workhard's low lambda with knots down to two voxels and NO data smoothing at any
+    # level. With a penalty this weak the smoothing is not harmless: blurred coarse
+    # levels commit the field to wherever the bulk tissue pulls it, and the sharp fine
+    # levels cannot bring it back. On HiHiFaces ses-fine (0.8 mm) the blurred ladder put
+    # the falx at -57 Hz (topup -20) and moved the occipital fissure between the
+    # corrected blips by more than the raw pair did; unblurred with 1.6 mm knots: -24 Hz,
+    # fissure gap halved, pair r 0.890 -> 0.918, lateral cortex 0.965 -> 0.973.
+    # Blurring only across PE or a 3x3x3 median did not help, and with this smoothing
+    # off lambda x0.1..x1000 changed nothing. Knots finer than two voxels would be
+    # sub-Nyquist for the data; on coarse voxels the tier simply stops coarser.
+    # (FSL's b02b0_7T blurs *more*, which is safe only under its ~1e6 stronger lambda.)
     "superhard": dict(
         n_levels=14,
         res_start=30.0,
-        res_final=2.0,
+        res_final_vox=2.0,
+        fwhm_ratio=0.0,
         lam_start=5e-7,
         lam_final=1e-16,
         miter_final=30,
@@ -571,7 +580,8 @@ def _schedule_epilog() -> str:
         "  Every schedule flag takes one value per level; copy a line, edit an element. A",
         "  single value applies to every level (-miter 30). A list you pass replaces that",
         "  list of the chosen -config tier, so its length must match the tier's level count.",
-        "  -subsamp is 1 at every level in every tier.",
+        "  -subsamp is 1 at every level in every tier. superhard's final knot spacing is",
+        "  two voxels, so its -warpres tail depends on the data; it is shown for 1 mm voxels.",
     ]
     for name in _PRESETS:
         cfg = _build_config(name)
@@ -584,11 +594,17 @@ def _schedule_epilog() -> str:
     return "\n".join(lines)
 
 
-def _build_config(name: str):
-    """Return the TopupConfig for a preset name (see ``_PRESETS``)."""
+def _build_config(name: str, voxel_mm: float = 1.0):
+    """Return the TopupConfig for a preset name (see ``_PRESETS``).
+
+    ``voxel_mm`` (mean voxel size) resolves a preset's ``res_final_vox``, a final knot
+    spacing stated in voxels rather than mm."""
     from fastfuncstuff.processing.topup import TopupConfig, make_ladder
 
-    lad = make_ladder(**_PRESETS.get(name, _PRESETS["standard"]))
+    kw = dict(_PRESETS.get(name, _PRESETS["standard"]))
+    if "res_final_vox" in kw:
+        kw["res_final"] = kw.pop("res_final_vox") * voxel_mm
+    lad = make_ladder(**kw)
     return TopupConfig(
         warpres=lad.warpres,
         fwhm=lad.fwhm,
@@ -812,7 +828,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     vox = _voxel_sizes_zyx(affine)
 
     # ---- schedule ----
-    cfg = _build_config(args.config)
+    cfg = _build_config(args.config, sum(vox) / 3.0)
     # -warpres first: a full knot list sets the level count the other lists broadcast to.
     for name in ("warpres", "fwhm", "lam", "miter", "subsamp"):
         vals = getattr(args, name)

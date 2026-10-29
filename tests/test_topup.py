@@ -645,6 +645,19 @@ def test_help_schedule_lines_round_trip_to_the_preset():
         assert all(math.isclose(a, b, rel_tol=0.01) for a, b in zip(args.lam, cfg.lam, strict=True))
 
 
+def test_superhard_is_unsmoothed_down_to_two_voxel_knots():
+    # Smoothing under superhard's weak penalty set the falx field from the bulk tissue at
+    # the coarse levels, and the sharp fine levels could not undo it (HiHiFaces ses-fine,
+    # 2026-10-29). The knot floor follows the data: two voxels, not a fixed 2 mm.
+    from fastfuncstuff.cli import blipflip as B
+
+    for vox in (0.8, 2.0):
+        cfg = B._build_config("superhard", vox)
+        assert set(cfg.fwhm) == {0.0}
+        assert cfg.warpres[-1] == pytest.approx(2 * vox, abs=0.05)
+        assert cfg.warpres == sorted(cfg.warpres, reverse=True)
+
+
 def test_fused_normal_matvec_equals_jt_j():
     # The CG matvec skips the masked gather/scatter and applies the penalty through
     # coefficient-space Kronecker Grams; it must still be exactly J^T J (+ the 1e-8 ridge),

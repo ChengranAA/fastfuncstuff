@@ -75,6 +75,34 @@ def test_files_are_numbered_by_the_directory_they_came_from(tmp_path):
         s.close()
 
 
+def test_going_back_to_a_directory_reads_only_what_changed(tmp_path, monkeypatch):
+    from fastfuncstuff.viewer import catalog
+    from fastfuncstuff.viewer.session import ViewerSession
+
+    _vol(tmp_path / "one" / "a.nii.gz")
+    _vol(tmp_path / "one" / "b.nii.gz")
+    _vol(tmp_path / "two" / "c.nii.gz")
+    s = ViewerSession(device=CPU)
+    try:
+        s.read_directory(tmp_path / "one")
+        s.read_directory(tmp_path / "two")
+        _vol(tmp_path / "one" / "new.nii.gz")
+        described = []
+        real = catalog.describe
+
+        def counting(paths):
+            paths = list(paths)
+            described.extend(paths)
+            return real(paths)
+
+        monkeypatch.setattr(catalog, "describe", counting)
+        s.read_directory(tmp_path / "one")
+        assert [p.name for p in described] == ["new.nii.gz"]
+        assert [e.name for e in s.catalog] == ["a.nii.gz", "b.nii.gz", "new.nii.gz"]
+    finally:
+        s.close()
+
+
 def test_the_window_lists_directories_switches_and_tags_layers(tmp_path, config):
     pytest.importorskip("PySide6")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

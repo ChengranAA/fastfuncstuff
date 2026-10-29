@@ -645,16 +645,19 @@ def test_help_schedule_lines_round_trip_to_the_preset():
         assert all(math.isclose(a, b, rel_tol=0.01) for a, b in zip(args.lam, cfg.lam, strict=True))
 
 
-def test_superhard_is_unsmoothed_down_to_two_voxel_knots():
-    # Smoothing under superhard's weak penalty set the falx field from the bulk tissue at
+@pytest.mark.parametrize("tier", ["workhard", "superhard"])
+def test_high_tiers_are_unsmoothed_down_to_two_voxel_knots(tier):
+    # Smoothing under these tiers' weak penalty set the falx field from the bulk tissue at
     # the coarse levels, and the sharp fine levels could not undo it (HiHiFaces ses-fine,
-    # 2026-10-29). The knot floor follows the data: two voxels, not a fixed 2 mm.
+    # 2026-10-29). The knot floor follows the data: two voxels, not a fixed 2 mm, which
+    # was a 1-voxel floor on 2 mm data and overfit there.
     from fastfuncstuff.cli import blipflip as B
 
     for vox in (0.8, 2.0):
-        cfg = B._build_config("superhard", vox)
+        cfg = B._build_config(tier, vox)
         assert set(cfg.fwhm) == {0.0}
         assert cfg.warpres[-1] == pytest.approx(2 * vox, abs=0.05)
+        assert cfg.warpres[0] == 30.0
         assert cfg.warpres == sorted(cfg.warpres, reverse=True)
 
 

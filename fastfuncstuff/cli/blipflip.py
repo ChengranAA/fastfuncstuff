@@ -28,7 +28,7 @@ possible between back-to-back scans.
     #
     # -readout is optional (the warp is insensitive to a common factor); omit it and the
     # Hz field map is simply not written. Precision tiers: default 9-level standard, or
-    # -workhard (12 levels), or -superhard (14 levels, unsmoothed, knots to 2 voxels).
+    # -workhard (12 levels) or -superhard (14 levels): unsmoothed, knots down to 2 voxels.
 
     # apply to the matching timeseries in one resample:
     ffs_nwarp -source epi.nii.gz -master epi.nii.gz \\
@@ -170,11 +170,11 @@ def create_parser() -> argparse.ArgumentParser:
         default="standard",
         help="Preset schedule: 'quick' (3 levels), 'standard' (9 levels, default; smoothness "
         "on FSL topup b02b0's effective scale), "
-        "'workhard' (12 levels — coarser start, longer descent, 1e7x lower lambda and twice "
-        "the iterations, for large fields: sharper in well-imaged cortex, rougher where the "
-        "data are weak), "
-        "'superhard' (14 levels, as workhard but knots down to two voxels and no data "
-        "smoothing at any level; the most precise tier on high-resolution data). Higher tiers are slower. Each tier's per-level lists are printed "
+        "'workhard' (12 levels) and 'superhard' (14 levels, more iterations, lower final "
+        "lambda): a 1e7x lower penalty than standard, no data smoothing, and knots from 30 mm "
+        "down to two voxels, so the ladder follows the data's resolution -- sharper in "
+        "well-imaged cortex, rougher where the data are weak. Higher tiers are slower. Each "
+        "tier's per-level lists are printed "
         "under SCHEDULE PRESETS at the end of -help, ready to copy.",
     )
     sched.add_argument(
@@ -518,32 +518,34 @@ _PRESETS: dict[str, dict] = {
     # Three levels, stopping at 8 mm knots: enough for a smooth whole-head field,
     # not enough to resolve frontal/temporal detail. For a quick look.
     "quick": dict(n_levels=3, res_final=8.0, n_refine=0, lam_final=0.1, miter_final=10),
-    # Coarser start and a longer descent for high-field data, where the field is both
-    # larger in amplitude and richer in structure. Twice the iterations and a far lower
-    # penalty: chosen (2026-09) when standard was 1e4 weaker than it is now, as 1000x
-    # below that -- so 1e7 below today's standard, which is topup-equivalent. On HiHiFaces
-    # ses-fine that buys lateral accuracy (cortex match 0.97 vs topup's 0.89) and costs
-    # the weakly constrained places: the air around the head (|field| 13x topup's), the
-    # slab ends, and the falx wedge between the occipital poles (-60 Hz vs topup's -20).
-    # Values kept so existing pipelines do not change silently.
+    # The two high tiers share one shape and differ only in effort. Both start at
+    # whole-head 30 mm knots (the field's coarse shape is physical, so that end is in mm)
+    # and descend to TWO VOXELS (the finest the data can support, so that end is in
+    # voxels), with NO data smoothing at any level. Under their weak penalty -- 1e7 below
+    # standard, which is topup-equivalent -- smoothing is not harmless: blurred coarse
+    # levels commit the field to wherever the bulk tissue pulls it and the sharp fine
+    # levels cannot bring it back. On HiHiFaces ses-fine (0.8 mm, 7T) the blurred ladder
+    # put the falx at -57 Hz (topup -20) and moved the occipital fissure between the
+    # corrected blips further apart than in the raw pair; unblurred to 1.6 mm: -24 Hz,
+    # fissure gap halved, lateral cortex kept. Blurring only across PE, a 3x3x3 median,
+    # and lambda x0.1..x1000 with the smoothing off all changed nothing useful.
+    # Two voxels, not one: 1-voxel knots let the PE warp plus its Jacobian reshape each
+    # row until the pair matches (fitted pair r 0.996) and did not transfer to a second
+    # run -- on 2 mm 3T no better than no correction, while 2-voxel knots were the best
+    # held-out on both 1.6 mm 7T and 2 mm 3T. A fixed 2 mm floor was 1 voxel there.
+    # (FSL's b02b0_7T blurs *more*, which is safe only under its ~1e6 stronger lambda.)
+    # workhard: 12 levels, twice the standard iterations.
     "workhard": dict(
         n_levels=12,
         res_start=30.0,
+        res_final_vox=2.0,
+        fwhm_ratio=0.0,
         lam_start=5e-7,
         lam_final=1e-14,
         miter_scale=2,
     ),
-    # Workhard's low lambda with knots down to two voxels and NO data smoothing at any
-    # level. With a penalty this weak the smoothing is not harmless: blurred coarse
-    # levels commit the field to wherever the bulk tissue pulls it, and the sharp fine
-    # levels cannot bring it back. On HiHiFaces ses-fine (0.8 mm) the blurred ladder put
-    # the falx at -57 Hz (topup -20) and moved the occipital fissure between the
-    # corrected blips by more than the raw pair did; unblurred with 1.6 mm knots: -24 Hz,
-    # fissure gap halved, pair r 0.890 -> 0.918, lateral cortex 0.965 -> 0.973.
-    # Blurring only across PE or a 3x3x3 median did not help, and with this smoothing
-    # off lambda x0.1..x1000 changed nothing. Knots finer than two voxels would be
-    # sub-Nyquist for the data; on coarse voxels the tier simply stops coarser.
-    # (FSL's b02b0_7T blurs *more*, which is safe only under its ~1e6 stronger lambda.)
+    # superhard: everything extra -- 14 levels, more iterations at the fine end, and the
+    # penalty relaxed two decades further.
     "superhard": dict(
         n_levels=14,
         res_start=30.0,
@@ -580,8 +582,8 @@ def _schedule_epilog() -> str:
         "  Every schedule flag takes one value per level; copy a line, edit an element. A",
         "  single value applies to every level (-miter 30). A list you pass replaces that",
         "  list of the chosen -config tier, so its length must match the tier's level count.",
-        "  -subsamp is 1 at every level in every tier. superhard's final knot spacing is",
-        "  two voxels, so its -warpres tail depends on the data; it is shown for 1 mm voxels.",
+        "  -subsamp is 1 at every level in every tier. workhard and superhard end at knots of",
+        "  two voxels, so their -warpres lists depend on the data; shown here for 1 mm voxels.",
     ]
     for name in _PRESETS:
         cfg = _build_config(name)

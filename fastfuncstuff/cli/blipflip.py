@@ -168,9 +168,11 @@ def create_parser() -> argparse.ArgumentParser:
         "-config",
         choices=("standard", "quick", "workhard", "superhard"),
         default="standard",
-        help="Preset schedule: 'quick' (3 levels), 'standard' (9 levels, default), "
-        "'workhard' (12 levels — coarser start, longer descent, 1000x lower lambda and twice "
-        "the iterations, for large fields), "
+        help="Preset schedule: 'quick' (3 levels), 'standard' (9 levels, default; smoothness "
+        "on FSL topup b02b0's effective scale), "
+        "'workhard' (12 levels — coarser start, longer descent, 1e7x lower lambda and twice "
+        "the iterations, for large fields: sharper in well-imaged cortex, rougher where the "
+        "data are weak), "
         "'superhard' (14 levels, as workhard but knots down to 2 mm, extra low-lambda "
         "refinement). Higher tiers are slower. Each tier's per-level lists are printed "
         "under SCHEDULE PRESETS at the end of -help, ready to copy.",
@@ -515,12 +517,15 @@ _PRESETS: dict[str, dict] = {
     "standard": dict(n_levels=9),
     # Three levels, stopping at 8 mm knots: enough for a smooth whole-head field,
     # not enough to resolve frontal/temporal detail. For a quick look.
-    "quick": dict(n_levels=3, res_final=8.0, n_refine=0, lam_final=1e-5, miter_final=10),
+    "quick": dict(n_levels=3, res_final=8.0, n_refine=0, lam_final=0.1, miter_final=10),
     # Coarser start and a longer descent for high-field data, where the field is both
-    # larger in amplitude and richer in structure. Penalty 1000x lower at every level and
-    # twice the iterations: at standard's lambda the coarse levels settle on a nearly flat
-    # field and cannot make the large shifts, which is what they exist for (on a real
-    # pair, lowering lambda fixed what more iterations had not).
+    # larger in amplitude and richer in structure. Twice the iterations and a far lower
+    # penalty: chosen (2026-09) when standard was 1e4 weaker than it is now, as 1000x
+    # below that -- so 1e7 below today's standard, which is topup-equivalent. On HiHiFaces
+    # ses-fine that buys lateral accuracy (cortex match 0.97 vs topup's 0.89) and costs
+    # the weakly constrained places: the air around the head (|field| 13x topup's), the
+    # slab ends, and the falx wedge between the occipital poles (-60 Hz vs topup's -20).
+    # Values kept so existing pipelines do not change silently.
     "workhard": dict(
         n_levels=12,
         res_start=30.0,
@@ -529,8 +534,8 @@ _PRESETS: dict[str, dict] = {
         miter_scale=2,
     ),
     # As above but pushed to 2 mm knots -- only meaningful for sub-2 mm voxels, and the
-    # low final lambda leans on the fold barrier to stay diffeomorphic. Same 1000x lower
-    # lambda and doubled iterations as workhard, so the two tiers stay comparable.
+    # low final lambda leans on the fold barrier to stay diffeomorphic. Same low lambda
+    # (1e7 below standard) and doubled iterations as workhard, so the two tiers compare.
     "superhard": dict(
         n_levels=14,
         res_start=30.0,

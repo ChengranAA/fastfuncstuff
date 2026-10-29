@@ -109,8 +109,8 @@ def make_ladder(
     res_start: float = 20.0,
     res_final: float = 4.0,
     n_refine: int = 2,
-    lam_start: float = 5e-4,
-    lam_final: float = 1e-11,
+    lam_start: float = 5.0,
+    lam_final: float = 1e-7,
     fwhm_ratio: float = 0.4,
     miter_start: int = 5,
     miter_final: int = 20,
@@ -145,6 +145,11 @@ def make_ladder(
     allowed to determine the field. The span is wide because those two regimes are
     genuinely orders of magnitude apart; with ``ssqlambda`` the weight is additionally
     rescaled by the current SSD each iteration, so only the relative ladder matters.
+    The default endpoints (5 → 1e-7) are FSL b02b0's numbers (5e-4 → 1e-11) times 1e4,
+    because the numbers do not transfer: our penalty is a voxel-unit SUM over the volume
+    while the data term is a MEAN. With b02b0's raw numbers the field was rougher than
+    topup's on the same pair; ×1e4 reproduced topup's field (r 0.925, HiHiFaces ses-fine,
+    2026-10-29).
 
     **Iteration count** ramps from ``miter_start`` to ``miter_final``. Coarse levels have
     few coefficients and converge in a handful of Gauss-Newton steps; fine levels have

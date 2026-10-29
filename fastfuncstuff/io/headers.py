@@ -245,7 +245,7 @@ def _read_leading_bytes(filepath: Path, n: int) -> bytes:
     sp = str(filepath)
     if sp.endswith(".nii.zst"):
         try:
-            from compression import zstd  # stdlib from 3.14
+            from compression import zstd  # ty: ignore[unresolved-import]  # stdlib, 3.14+
         except ImportError:
             pass
         else:

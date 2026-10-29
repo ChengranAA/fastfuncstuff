@@ -355,7 +355,9 @@ def create_parser() -> argparse.ArgumentParser:
         "it perturbs the field far more than the barrier for no extra fold removal.",
     )
 
-    anat = parser.add_argument_group("Anatomical guide (EXPERIMENTAL)")
+    anat = parser.add_argument_group(
+        "Anatomical guide (EXPERIMENTAL -- tested 2026-10-29, did not improve real data)"
+    )
     anat.add_argument(
         "-anat",
         metavar="IMG",
@@ -365,7 +367,9 @@ def create_parser() -> argparse.ArgumentParser:
         "absorbs contrast inversion and a smooth shift common to both blips, so only the "
         "arrangement of tissue is refereed, not where the head sits. Keep the skull and "
         "scalp in it: an edge stuck to cortex in one blip and spaced off it in the other "
-        "is what it can settle and the pair alone cannot.",
+        "is what it can settle and the pair alone cannot. Result: it helps on exact "
+        "synthetic pairs but not on HiHiFaces ses-fine (pair r 0.870 -> 0.853, the midline "
+        "defect unchanged); that defect turned out to be the data smoothing, now removed.",
     )
     anat.add_argument(
         "-anat_weight",
@@ -396,10 +400,13 @@ def create_parser() -> argparse.ArgumentParser:
         "the convention of this tool's _field output) instead of zero: e.g. one derived "
         "from anatomy, to learn whether the pair has a better minimum than a zero start "
         "finds. Pair it with a schedule that does not start coarser than the field's detail "
-        "(-warpres etc.), or the first levels smooth it away.",
+        "(-warpres etc.), or the first levels smooth it away. Result: from a segment-derived "
+        "start the fit returned to the zero-start field.",
     )
 
-    rob = parser.add_argument_group("Robust data term (EXPERIMENTAL)")
+    rob = parser.add_argument_group(
+        "Robust data term (EXPERIMENTAL -- tested 2026-10-29, did not improve real data)"
+    )
     rob.add_argument(
         "-robust",
         action="store_true",
@@ -407,7 +414,9 @@ def create_parser() -> argparse.ArgumentParser:
         "(Tukey bisquare on a robust scale, recomputed every Gauss-Newton step), on the fine "
         "levels only. Signal the shared field cannot reconcile -- vessels, the falx, anything "
         "that differs between the two acquisitions -- then stops steering the field locally, "
-        "instead of a global smoothness weight that also costs accuracy everywhere else.",
+        "instead of a global smoothness weight that also costs accuracy everywhere else. "
+        "Result: with -robust_floor 0 the zero-weight regions ran away (pair r 0.67); with "
+        "any floor >= 0.1 it had no effect.",
     )
     rob.add_argument(
         "-robust_c",

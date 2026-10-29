@@ -1064,6 +1064,16 @@ def hrf_library_path(prefix: str) -> Path:
     return Path(f"{parse_prefix(prefix).stem}_hrf_library.pt")
 
 
+def is_pair_library(prefix: str) -> bool:
+    """Whether *prefix*'s saved library is an ffs_hrftdv early/late pair set
+    (``(E, 2, n_t)``). A missing sidecar is not one; the loader reports it."""
+    sidecar = hrf_library_path(prefix)
+    if not sidecar.exists():
+        return False
+    saved = torch.load(sidecar, weights_only=False, map_location="cpu")
+    return saved["hrf_library"].ndim == 3
+
+
 def _resample_hrf_curves(curves: torch.Tensor, src_dt: float, dst_dt: float) -> torch.Tensor:
     """(n, n_t) curves sampled every ``src_dt`` -> the same span every ``dst_dt``.
 

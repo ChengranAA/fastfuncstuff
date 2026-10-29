@@ -20,6 +20,7 @@ import argparse
 import csv
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -399,10 +400,10 @@ def _expand_event_to_stims(
     trim=None,
     run_lengths_sec: list[float] | None = None,
     event_filters: list[EventFilter] | None = None,
-) -> list[tuple[Path, str, str, bool]]:
+) -> list[tuple[Path, str, str, bool, float]]:
     """
-    Expand one EventSpec into one or more (timing_file, label, hrf, im_flag)
-    tuples. ``from_events`` with multiple distinct rounded durations splits
+    Expand one EventSpec into one or more (timing_file, label, hrf, im_flag,
+    duration) tuples. ``from_events`` with multiple distinct rounded durations splits
     into per-duration regressors named ``{trial_type}_dur{d}``.
     """
     if event.hrf.startswith("hrfopt:"):
@@ -459,7 +460,7 @@ def _expand_event_to_stims(
             timing_path = tmpdir / f"{event.trial_type}.1D"
             _write_afni_timing(timing_path, [[o for o, _ in run] for run in per_run])
             hrf = _inject_duration(event.hrf, dur_value)
-            return [(timing_path, event.trial_type, hrf, event.mode == "im")]
+            return [(timing_path, event.trial_type, hrf, event.mode == "im", dur_value)]
 
         # condition mode + multiple durations -> split per duration.
         # Loud, because a split nobody asked for (frame-timing jitter) looks like
@@ -473,7 +474,7 @@ def _expand_event_to_stims(
             "in its [[events]] block.",
             flush=True,
         )
-        out: list[tuple[Path, str, str, bool]] = []
+        out: list[tuple[Path, str, str, bool, float]] = []
         digits = _unique_dur_digits(unique_durs)
         for d in unique_durs:
             per_run_onsets = [[o for o, dd in run if dd == d] for run in per_run]
@@ -481,7 +482,7 @@ def _expand_event_to_stims(
             timing_path = tmpdir / f"{label}.1D"
             _write_afni_timing(timing_path, per_run_onsets)
             hrf = _inject_duration(event.hrf, d)
-            out.append((timing_path, label, hrf, False))
+            out.append((timing_path, label, hrf, False, d))
         return out
 
     # Explicit numeric duration.
@@ -489,7 +490,7 @@ def _expand_event_to_stims(
     timing_path = tmpdir / f"{event.trial_type}.1D"
     _write_afni_timing(timing_path, [[o for o, _ in run] for run in per_run])
     hrf = _inject_duration(event.hrf, dur_value)
-    return [(timing_path, event.trial_type, hrf, event.mode == "im")]
+    return [(timing_path, event.trial_type, hrf, event.mode == "im", dur_value)]
 
 
 def _inject_duration(hrf: str, duration: float) -> str:
@@ -849,6 +850,136 @@ def _read_censor(path: Path) -> np.ndarray:
     return np.array(values, dtype=int)
 
 
+@dataclass
+class SpecTiming:
+    """A design TOML resolved into the inputs of an ``-onsets`` fit.
+
+    For tools that build their own design from the timing, because a compiled
+    xmat fixes the HRF: ``ffs_reml -spec`` with an ``-hrf_opt`` library, and
+    ``ffs_hrftdv -spec``. The events are NOT trimmed and the nuisance files keep
+    their length -- the tool's own -drop_first applies to both.
+    """
+
+    onset_files: list[str]
+    labels: list[str]
+    durations: list[float]
+    hrf_models: list[str]
+    ortvec: list[tuple[str, str]]
+    ortvec_run: list[tuple[str, str, str]]
+    polort: int | list[int] | None  # None = the automatic per-run rule
+    censor: str | None
+    tmpdir: Path
+    contrasts_file: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+def resolve_spec_timing(
+    spec_path: str | Path,
+    event_filters: list[EventFilter] | None = None,
+    basis_split: tuple[str, ...] | None = None,
+) -> SpecTiming:
+    """Resolve ``spec_path``'s events, nuisance, drift, censor and contrasts.
+
+    ``basis_split`` names the columns each condition expands to in the fit
+    (``("early", "late")`` for an ffs_hrftdv pair library): every t-contrast is
+    then written once per column, ``{label}_{name}`` on that column alone, since
+    a contrast summed over early and late is the venous-weighted one the pair
+    exists to separate. Raises ValueError on what an -onsets fit cannot carry.
+    """
+    spec_path = Path(spec_path)
+    spec = load_spec(spec_path)
+    if spec.stim_vec:
+        raise ValueError(
+            f"{spec_path}: [[stim_vec]] blocks need the compiled design (ffs_reml -spec "
+            "without -hrf_opt)."
+        )
+    im = [ev.trial_type for ev in spec.events if ev.mode == "im"]
+    if im:
+        raise ValueError(f"{spec_path}: mode = 'im' events ({', '.join(im)}) need -single_trials.")
+    events_files = [Path(r.events) if r.events else None for r in spec.meta.runs]
+    if any(ef is None for ef in events_files):
+        raise ValueError(f"{spec_path}: every [meta].runs entry needs an 'events' field.")
+    files = [ef for ef in events_files if ef is not None]
+    filters = list(spec.meta.event_filters) + list(event_filters or [])
+    cols = (
+        spec.meta.events_columns.onset,
+        spec.meta.events_columns.duration,
+        spec.meta.events_columns.trial_type,
+    )
+    tmpdir = Path(tempfile.mkdtemp(prefix="ffs_spec_timing_"))
+    onset_files, labels, durations, hrfs = [], [], [], []
+    for ev in spec.events:
+        for path, label, hrf, _im, dur in _expand_event_to_stims(
+            ev, files, cols, spec.meta.tr, tmpdir, event_filters=filters
+        ):
+            onset_files.append(str(path))
+            labels.append(label)
+            durations.append(float(dur))
+            hrfs.append(hrf)
+    ortvec_files, padortvec_files = _resolve_nuisance_for_compile(
+        spec.nuisance,
+        n_runs=len(spec.meta.runs),
+        n_timepoints_per_run=spec.meta.n_timepoints_per_run,
+        tmpdir=tmpdir,
+    )
+    polort = spec.meta.polort
+    out = SpecTiming(
+        onset_files=onset_files,
+        labels=labels,
+        durations=durations,
+        hrf_models=hrfs,
+        ortvec=[(str(p), lbl) for p, lbl in ortvec_files],
+        ortvec_run=[(str(p), lbl, str(r)) for p, lbl, r in padortvec_files],
+        polort=None if polort == "auto" else polort,
+        censor=spec.meta.censor,
+        tmpdir=tmpdir,
+    )
+    if spec.contrasts:
+        out.contrasts_file = _write_contrasts(spec, labels, basis_split, tmpdir, out.notes)
+    if spec.conjunctions and basis_split:
+        out.notes.append(
+            f"{len(spec.conjunctions)} [[conjunctions]] skipped: their components name "
+            "conditions, which the basis split renamed."
+        )
+    return out
+
+
+def _write_contrasts(
+    spec, labels: list[str], basis_split, tmpdir: Path, notes: list[str]
+) -> str | None:
+    """The spec's t-contrasts as a ``-contrasts`` fragment (one per basis column
+    when ``basis_split``), resolved against the expanded stim labels."""
+    lines = []
+    for c in spec.contrasts:
+        rows = resolve_contrast(c, labels)
+        if len(rows) > 1:
+            notes.append(f"contrast '{c.label}' skipped: an F-test (-contrasts is t-tests only).")
+            continue
+        if not basis_split:
+            variants = [(c.label, rows[0])]
+        else:
+            variants = [
+                (f"{c.label}_{name}", {k: (w, rng or (j, j)) for k, (w, rng) in rows[0].items()})
+                for j, name in enumerate(basis_split)
+            ]
+        for label, row in variants:
+            lines += [
+                "[[contrasts]]",
+                f"label = {_toml_str(label)}",
+                f"sym = {_toml_str(_resolved_row_to_sym(row))}",
+                "",
+            ]
+    if not lines:
+        return None
+    path = tmpdir / "contrasts.toml"
+    path.write_text("\n".join(lines))
+    return str(path)
+
+
+def _toml_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _do_compile(args: argparse.Namespace) -> int:
     spec_path = _resolve_spec_path(args.spec)
     spec = load_spec(spec_path)
@@ -915,7 +1046,7 @@ def _do_compile(args: argparse.Namespace) -> int:
     hrf_models: list[str] = []
     im_modes: list[bool] = []
     for ev in spec.events:
-        for path, label, hrf, im_flag in _expand_event_to_stims(
+        for path, label, hrf, im_flag, _dur in _expand_event_to_stims(
             ev, events_files, cols, spec.meta.tr, tmpdir, trim, run_lengths_sec, event_filters
         ):
             timing_files.append(path)

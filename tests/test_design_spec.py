@@ -917,3 +917,54 @@ def test_parse_and_check_contrasts_text():
     ):
         with pytest.raises(ValueError):
             parse_contrasts_text(bad)
+
+
+def test_resolve_spec_timing_gives_onsets_nuisance_and_split_contrasts(tmp_path):
+    """The -onsets form of a spec (ffs_reml -spec -hrf_opt, ffs_hrftdv -spec): one
+    timing file per stim label with its duration, the nuisance files, the spec's
+    polort, and each t-contrast once per pair column on that column alone."""
+    from fastfuncstuff.cli.design_spec import resolve_spec_timing
+    from fastfuncstuff.design.builder import parse_afni_timing_file
+    from fastfuncstuff.design.spec import parse_contrasts_text
+
+    ev = [tmp_path / "r01_events.tsv", tmp_path / "r02_events.tsv"]
+    _write_events_tsv(ev[0], [(10.0, 3.0, "face"), (20.0, 2.0, "house"), (40.0, 3.0, "face")])
+    _write_events_tsv(ev[1], [(30.0, 2.0, "house")])
+    np.savetxt(tmp_path / "motion.1D", np.random.default_rng(0).normal(size=(120, 2)))
+    spec = Spec(
+        meta=MetaSpec(
+            runs=[RunSpec(bold="a.nii.gz", events=str(e)) for e in ev],
+            tr=2.0,
+            n_timepoints_per_run=[60, 60],
+            polort=[1, 2],
+        ),
+        events=[EventSpec(trial_type="face"), EventSpec(trial_type="house")],
+        nuisance=[NuisanceSpec(file=str(tmp_path / "motion.1D"), label="mot", transform="deriv")],
+        contrasts=[
+            ContrastSpec(label="FvH", sym="SYM: +1*face -1*house"),
+            ContrastSpec(label="F", sym=["SYM: +1*face", "SYM: +1*house"]),
+        ],
+    )
+    path = tmp_path / "design.toml"
+    write_spec(spec, path)
+
+    st = resolve_spec_timing(path, basis_split=("early", "late"))
+    assert st.labels == ["face", "house"]
+    assert st.durations == [3.0, 2.0]
+    assert [list(r) for r in parse_afni_timing_file(st.onset_files[0])] == [[10.0, 40.0], []]
+    assert st.polort == [1, 2]
+    (mot,) = st.ortvec
+    assert mot[1] == "mot" and np.loadtxt(mot[0]).shape == (120, 2)
+    assert any("F-test" in n for n in st.notes)
+    assert st.contrasts_file is not None
+    cons = parse_contrasts_text(Path(st.contrasts_file).read_text())
+    assert [c.label for c in cons] == ["FvH_early", "FvH_late"]
+    assert resolve_contrast(cons[1], st.labels)[0] == {
+        "face": (1.0, (1, 1)),
+        "house": (-1.0, (1, 1)),
+    }
+    # Without a split the contrast stays as written.
+    plain = resolve_spec_timing(path)
+    assert [c.label for c in parse_contrasts_text(Path(plain.contrasts_file).read_text())] == [
+        "FvH"
+    ]

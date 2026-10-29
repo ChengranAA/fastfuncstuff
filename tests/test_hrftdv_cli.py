@@ -162,3 +162,66 @@ def test_pooled_late_writes_an_early_library_and_dsort_runs_reml_fits(tmp_path):
     )
     deep, sup = resp & (frac < 0.3), resp & (frac > 0.7)
     assert np.median(late[sup]) > np.median(late[deep])
+
+
+@pytest.mark.slow  # 23s
+def test_spec_gives_the_events_fit_and_splits_its_contrasts(tmp_path):
+    """-spec reaches both tools as the same model -events gives (ffs_autoproc fits
+    the design TOML this way), and the spec's contrast comes out per pair column."""
+    from fastfuncstuff.cli.util_concalc import _read_brick_labels
+    from fastfuncstuff.design.spec import (
+        ContrastSpec,
+        EventSpec,
+        MetaSpec,
+        RunSpec,
+        Spec,
+        write_spec,
+    )
+
+    _write(tmp_path)
+    subj = _subject(tmp_path)
+    write_spec(
+        Spec(
+            meta=MetaSpec(
+                runs=[RunSpec(bold=f"run{r}.nii.gz", events=f"ev{r}.tsv") for r in (1, 2)],
+                tr=TR,
+                n_timepoints_per_run=[NT, NT],
+            ),
+            events=[EventSpec(trial_type="a"), EventSpec(trial_type="b")],
+            contrasts=[ContrastSpec(label="AvB", sym="SYM: +1*a -1*b")],
+        ),
+        tmp_path / "design.toml",
+    )
+    inputs = ["-input", "run1.nii.gz", "run2.nii.gz"]
+    by = {"events": ["-events", "ev1.tsv", "ev2.tsv"], "spec": ["-spec", "design.toml"]}
+
+    def run(tool, *args):
+        res = subprocess.run(  # noqa: S603
+            [sys.executable, "-m", f"fastfuncstuff.cli.{tool}", *inputs, *args, "-device", "cpu"],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=tmp_path,
+        )
+        assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-2000:]
+
+    for how, timing in by.items():
+        run("hrftdv", *timing, "-fs_subj", str(subj), "-hemi", "lh", "-tr", "1", "-patch_mm", "6",
+            "-prefix", f"tdv_{how}")  # fmt: skip
+    assert (tmp_path / "tdv_spec_pairs.tsv").read_text() == (
+        tmp_path / "tdv_events_pairs.tsv"
+    ).read_text()
+
+    for how, timing in by.items():
+        run("reml", *timing, "-TR", "1", "-hrf_opt", "tdv_events", "-Obuck", f"o_{how}")
+    ev, sp = (nib.load(tmp_path / f"o_{how}.nii.gz") for how in by)
+    names_ev, names_sp = _read_brick_labels(ev), _read_brick_labels(sp)
+    assert {"AvB_early#0_Coef", "AvB_late#0_Coef"} <= set(names_sp)
+    vev, vsp = np.asanyarray(ev.dataobj), np.asanyarray(sp.dataobj)
+    for name in ("a_early#0_Coef", "b_late#0_Coef"):
+        np.testing.assert_allclose(
+            vsp[..., names_sp.index(name)], vev[..., names_ev.index(name)], atol=1e-4
+        )
+    con = vsp[..., names_sp.index("AvB_early#0_Coef")]
+    a = vsp[..., names_sp.index("a_early#0_Coef")] - vsp[..., names_sp.index("b_early#0_Coef")]
+    np.testing.assert_allclose(con, a, atol=1e-4)

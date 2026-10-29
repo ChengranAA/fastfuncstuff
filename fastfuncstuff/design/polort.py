@@ -110,7 +110,7 @@ def polort_summary(polort: int | Sequence[int]) -> str:
 
 
 def resolve_polort(
-    polort_arg: int | None,
+    polort_arg: int | Sequence[int] | None,
     run_lengths: Sequence[int],
     tr: float,
     verbose: bool = True,
@@ -119,8 +119,15 @@ def resolve_polort(
     """``-polort`` as given, or the automatic per-run degrees when it is not.
 
     An explicit degree stays a single int for every run; the automatic rule
-    returns a list, one degree per run. Logs the choice once when verbose.
+    returns a list, one degree per run, as does a list given per run (a design
+    spec's). Logs the choice once when verbose.
     """
+    if isinstance(polort_arg, (list, tuple)):  # a design spec's per-run degrees
+        if len(polort_arg) != len(run_lengths):
+            raise ValueError(f"polort lists {len(polort_arg)} degrees for {len(run_lengths)} runs")
+        if verbose:
+            print(f"{indent}Polort per run: {polort_summary(list(polort_arg))}")
+        return [int(p) for p in polort_arg]
     if polort_arg is not None:
         if verbose:
             print(f"{indent}Polort: {int(polort_arg)}")

@@ -95,6 +95,14 @@ def create_parser() -> FfsArgumentParser:
     req.add_argument("-prefix", required=True, help="Output prefix")
     req.add_argument("-onsets", nargs="+", default=None, help="AFNI onset files, one per condition")
     req.add_argument("-durations", nargs="+", default=None, help="Durations for -onsets (s)")
+    req.add_argument(
+        "-spec",
+        default=None,
+        metavar="TOML",
+        help="Design TOML (ffs_design_spec): its conditions, durations, nuisance blocks "
+        "and polort, the same model ffs_reml -spec ... -hrf_opt fits. Its HRFs and "
+        "censor are not used here: the pairs come from the library curves, fit uncensored",
+    )
     add_bids_events_args(req, events_help="BIDS *_events.tsv files, one per run")
     add_round_onsets_arguments(req, hyphen=False)
     req.add_argument(
@@ -251,8 +259,25 @@ def main(argv: list[str] | None = None) -> None:
     ext = ".nii.gz" if pfx.nifti_ext.endswith(".gii") else pfx.nifti_ext
     Path(pfx.stem).parent.mkdir(parents=True, exist_ok=True)
 
-    if bool(args.onsets) == bool(args.events):
-        sys.exit("ERROR: give exactly one of -onsets/-durations or -events")
+    if sum(map(bool, (args.onsets, args.events, args.spec))) != 1:
+        sys.exit("ERROR: give exactly one of -onsets/-durations, -events or -spec")
+    if args.spec:
+        from fastfuncstuff.cli.design_spec import resolve_spec_timing
+        from fastfuncstuff.cli_utils import resolve_event_filters
+
+        try:
+            # Row filters stack on the spec's own, as with ffs_reml -spec.
+            st = resolve_spec_timing(args.spec, event_filters=resolve_event_filters(args))
+        except (FileNotFoundError, ValueError) as exc:
+            sys.exit(f"ERROR: -spec: {exc}")
+        args.event_filter_in = args.event_filter_out = None
+        args.onsets, args.durations = st.onset_files, [f"{d:g}" for d in st.durations]
+        args.ortvec = (args.ortvec or []) + [list(x) for x in st.ortvec]
+        args.ortvec_run = (args.ortvec_run or []) + [list(x) for x in st.ortvec_run]
+        if args.polort is None:
+            args.polort = st.polort
+        if verbose:
+            print(f"  Spec {args.spec}: {', '.join(st.labels)}")
     check_bids_event_args(args, has_events=bool(args.events))
     if args.onsets and args.durations is None:
         sys.exit("ERROR: -durations is required with -onsets")
@@ -490,6 +515,7 @@ def main(argv: list[str] | None = None) -> None:
         "hrf_mode": args.hrf_mode,
         "input_files": [str(f) for f in input_files],
         "event_files": args.events,
+        "spec": args.spec,
         "condition_labels": timing.condition_labels,
         "durations": durations,
         "max_lag": args.max_lag,

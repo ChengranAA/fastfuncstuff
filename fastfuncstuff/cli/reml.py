@@ -1187,7 +1187,9 @@ Examples:
             "and {PREFIX}_hrf_library.pt. Each voxel is fit with its assigned HRF. "
             "A PREFIX from ffs_hrftdv assigns an early/late PAIR instead, fit together as "
             "two columns per condition ({cond}_early, {cond}_late). "
-            "Requires -events or -onsets; mutually exclusive with -matrix."
+            "Requires -events, -onsets or -spec (the spec's events, nuisance, drift and "
+            "contrasts, built against the library's curves; a pair library splits each "
+            "t-contrast into NAME_early / NAME_late); mutually exclusive with -matrix."
         ),
     )
 
@@ -2201,6 +2203,42 @@ def main():
     # We do this early so a syntax error or missing event file fails fast
     # instead of after the slow input load. The compiled xmat becomes the
     # input for the rest of the pipeline (treated as -matrix from here on).
+    if args.spec and args.hrfopt_prefix:
+        # A compiled xmat fixes the HRF, and -hrf_opt replaces it per voxel, so
+        # the spec becomes -onsets inputs instead: same events, durations,
+        # nuisance, drift and contrasts, built against the library's curves.
+        from fastfuncstuff.cli.design_spec import resolve_spec_timing
+        from fastfuncstuff.cli_utils import is_pair_library
+
+        hrfopt_pairs = is_pair_library(args.hrfopt_prefix)
+        try:
+            st = resolve_spec_timing(
+                args.spec,
+                event_filters=event_filters,
+                basis_split=("early", "late") if hrfopt_pairs else None,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            sys.exit(f"ERROR: -spec with -hrf_opt: {exc}")
+        print(
+            f"📐 Spec {args.spec} → {len(st.labels)} conditions as -onsets "
+            f"(-hrf_opt replaces the HRF: {', '.join(sorted(set(st.hrf_models)))})",
+            flush=True,
+        )
+        for note in st.notes:
+            print(f"   {note}")
+        if args.contrasts and st.contrasts_file:
+            sys.exit("ERROR: -contrasts with -spec: put the contrasts in the spec.")
+        args.onsets, args.durations = st.onset_files, [f"{d:g}" for d in st.durations]
+        args.ortvec = (args.ortvec or []) + [list(x) for x in st.ortvec]
+        args.ortvec_run = (args.ortvec_run or []) + [list(x) for x in st.ortvec_run]
+        if args.polort is None:
+            args.polort = st.polort
+        if args.censor is None:
+            args.censor = st.censor
+        if st.contrasts_file:
+            args.contrasts = [st.contrasts_file]
+        args.spec = None
+        event_filters = []  # applied by the resolver; -onsets carry none
     if args.spec:
         from fastfuncstuff.cli.design_spec import (
             _do_compile as _design_spec_compile,

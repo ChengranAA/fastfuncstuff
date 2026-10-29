@@ -33,7 +33,7 @@ DEFAULT_OPTS: dict[str, str] = {
     # partition wiggle; the later refine passes moved the estimate < 0.01 voxel. The
     # median reference made no measurable difference and is the safer one to outliers.
     "locomoco": "-backend flow -refine 1 -iters 8 -ref median -no_movie -want_pcs 3",
-    # fieldmap distortion (blipflip); the 9-level "standard" ladder by default.
+    # fieldmap distortion (blipflip). workhard: unsmoothed, knots to two voxels, -estmov.
     "blip": "-workhard",
     # measured GRE fieldmap (b0fmap). Defaults are the tool's own — the field
     # conditioning was tuned there against real sinus gradients, so overriding it

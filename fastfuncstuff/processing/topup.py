@@ -733,10 +733,15 @@ def compute_mask(
     declared_empty: Sequence[Tensor] | None = None,
     pe_tdim: int = 1,
 ) -> Tensor:
-    """Intersection mask of finite/positive data, with PE-axis edge planes zeroed.
+    """Intersection mask of finite/positive data, with the edge planes of each scan's
+    phase-encode axis zeroed.
 
-    Mirrors topup's trick of excluding a one-voxel frame in the non-PE and PE
-    directions so small edge effects don't dominate the SSD.
+    The frame keeps the clamped PE resample at the FOV edge out of the SSD. It is
+    zeroed on the PE axes only: topup's frame on every axis also drops the first and
+    last slice of a thin slab, whose field then has no data term and, with the fine
+    levels' negligible bending weight, runs away -- on HiHiFaces ses-fine (7T, 62
+    slices) the corrected blips disagreed MORE than the raw ones on both end slices,
+    and the field jumped 18 Hz between the last two slices against ~3 Hz inside.
 
     ``declared_empty`` (one 1-D bool along ``pe_tdim`` per scan) marks positions an
     unwrap emptied on purpose. They count as measured zeros rather than missing data:
@@ -752,13 +757,9 @@ def compute_mask(
             view[pe_tdim] = -1
             ok |= declared_empty[i].view(view)
         m &= ok
-    # Zero the outer plane on every axis (cheap, symmetric version of topup's frame).
-    m[0, :, :] = False
-    m[-1, :, :] = False
-    m[:, 0, :] = False
-    m[:, -1, :] = False
-    m[:, :, 0] = False
-    m[:, :, -1] = False
+    for td in {_NIFTI_AXIS_TO_TDIM[sc.pe_axis] for sc in scans}:
+        m.select(td, 0).fill_(False)
+        m.select(td, -1).fill_(False)
     return m
 
 

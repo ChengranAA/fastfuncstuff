@@ -764,6 +764,51 @@ def test_inverted_contrast_anat_does_not_hurt_recovery():
     assert _field_rms_error(with_anat, field) <= 1.05 * _field_rms_error(plain, field)
 
 
+def test_robust_weighted_rows_match_autograd_and_the_fused_matvec():
+    # With per-voxel weights on the data rows, the analytic J v / J^T r and the fused CG
+    # operator (which folds the weights into the data mask) must still equal autograd / J^T J.
+    torch.manual_seed(17)
+    basis, scans, mask_idx, coeff = _small_gn_setup()
+    shape = tuple(scans[0].data.shape)
+    sqrt_w = torch.rand(shape, dtype=torch.float64) * 0.9 + 0.1
+    lam, be = 1e-3, 5.0
+
+    c = coeff.detach().requires_grad_(True)
+    r0 = T._residual_vector(
+        c, basis, scans, mask_idx, 1, lam, "bending", be, 0.1, None, 0.0, sqrt_w
+    )
+    w = torch.zeros_like(r0, requires_grad=True)
+    (jtw,) = torch.autograd.grad(r0, c, grad_outputs=w, create_graph=True, retain_graph=True)
+    v = torch.randn(basis.coeff_shape, dtype=torch.float64)
+    jv_auto = torch.autograd.grad(jtw, w, grad_outputs=v, retain_graph=True)[0]
+
+    lin = T._linearize(coeff, basis, scans, mask_idx, 1, lam, "bending", be, 0.1, 0.0, sqrt_w)
+    jv = T._lin_jv(lin, v)
+    assert (jv - jv_auto).norm() < 1e-10 * jv_auto.norm(), "J v mismatch (robust)"
+    g_auto = torch.autograd.grad(r0, c, grad_outputs=r0.detach(), retain_graph=True)[0]
+    assert (T._lin_jtu(lin, r0) - g_auto.reshape(-1)).norm() < 1e-10 * g_auto.norm()
+
+    matvec = T._NormalOperator(lin, T.reg_gram_terms(basis, "bending"))
+    ref = T._lin_jtu(lin, jv) + 1e-8 * v.reshape(-1)
+    assert (matvec(v.reshape(-1)) - ref).norm() < 1e-10 * ref.norm(), "fused matvec (robust)"
+
+
+def test_robust_weights_zero_one_sided_signal_and_spare_the_rest():
+    # At the true field the exact pair agrees everywhere except where only one blip has
+    # signal: the weights must be ~1 on the agreeing tissue and ~0 on the one-sided blob,
+    # or the reweighting would either do nothing or throw away good data.
+    true, field, scans = _make_exact_pair()
+    zz, yy, xx = torch.meshgrid(*(torch.arange(n).float() for n in true.shape), indexing="ij")
+    blob = 120.0 * torch.exp(-(((zz - 10) / 2) ** 2 + ((yy - 20) / 2) ** 2 + ((xx - 12) / 2) ** 2))
+    scans = [T.ScanSpec(scans[0].data + blob, 1, scans[0].sign, scans[0].readout), scans[1]]
+    mask = T.compute_mask(scans)
+    w = T.robust_weights(scans, field, mask)
+    core = blob > 60.0
+    far = (blob < 1e-3) & mask
+    assert float(w[core].max()) < 0.05, "one-sided signal kept weight"
+    assert float(w[far].median()) > 0.8, "agreeing tissue was down-weighted"
+
+
 def test_init_field_starts_the_first_level_from_it():
     # One Gauss-Newton step: from zero it cannot get far, from the true field it is
     # already there. (Run to convergence both end near the pair's own optimum, which on

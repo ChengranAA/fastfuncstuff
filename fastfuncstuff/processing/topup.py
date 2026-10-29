@@ -300,6 +300,26 @@ class TopupConfig:
     of displacement at level 2 where the pair alone added 18, and the field came out
     ~40 Hz RMS off in the brain."""
 
+    robust: bool = False
+    """Reweight the pair's data rows by :func:`robust_weights` (IRLS, Tukey bisquare) on
+    levels whose knot spacing is at most :attr:`robust_max_warpres`. Motivation: on
+    HiHiFaces ses-fine the fine levels dug a ~40 Hz dip into the falx/sinus wedge between
+    the occipital poles, pulling the fissure apart in the two blips; only a global bending
+    weight high enough to cost lateral accuracy kept it out. Down-weighting the voxels the
+    shared field cannot reconcile is the local version of that."""
+
+    robust_c: float = 4.685
+    """Tukey constant in robust-scale units (4.685 = 95% efficiency for Gaussian residuals);
+    lower rejects more."""
+
+    robust_max_warpres: float = 5.0
+    """Knot spacing (mm) at and below which ``robust`` applies. Coarser, a large residual is
+    still misalignment the fit has to remove, and down-weighting it would stall the fit."""
+
+    robust_floor: float = 0.0
+    """Lowest weight a voxel can get (see :func:`robust_weights`): above zero, a rejected
+    voxel still anchors its field instead of leaving it to run away."""
+
     def n_levels(self) -> int:
         return len(self.warpres)
 
@@ -1024,9 +1044,11 @@ def _residual_vector(
     jac_floor: float = 0.1,
     anat: _AnatTerm | None = None,
     anat_eff: float = 0.0,
+    sqrt_w: Tensor | None = None,
 ) -> Tensor:
     """Full residual: masked data rows, then sqrt(lam) reg rows, then anti-fold rows,
-    then the anatomical rows."""
+    then the anatomical rows. ``sqrt_w`` (a volume, see :func:`robust_weights`) weights
+    each voxel's data rows."""
     return _residual_rows(
         coeff,
         basis,
@@ -1039,6 +1061,7 @@ def _residual_vector(
         jac_floor,
         anat if anat_eff > 0 else None,
         math.sqrt(anat_eff) if anat_eff > 0 else None,
+        sqrt_w,
     )
 
 
@@ -1054,6 +1077,7 @@ def _residual_rows(
     jac_floor: float,
     anat: _AnatTerm | None = None,
     sqrt_anat: float | Tensor | None = None,
+    sqrt_w: Tensor | None = None,
 ) -> Tensor:
     """:func:`_residual_vector` with the square-rooted weights given (``None`` = term off)."""
     field_hz = basis.field(coeff)
@@ -1067,6 +1091,9 @@ def _residual_rows(
     mean = torch.stack(modulated, dim=0).mean(dim=0)
     scale = 1.0 / math.sqrt(max(1, mask_idx.numel()) * max(1, n_scans_minus_1))
     data_rows = [(m - mean).reshape(-1)[mask_idx] * scale for m in modulated]
+    if sqrt_w is not None:
+        wm = sqrt_w.reshape(-1)[mask_idx]
+        data_rows = [r * wm for r in data_rows]
     rows = data_rows
     if sqrt_lam is not None:
         rows = rows + [sqrt_lam * reg_residual(field_hz, reg_mode)]
@@ -1077,6 +1104,47 @@ def _residual_rows(
             (m - anat.target).reshape(-1)[mask_idx] * (sqrt_anat * scale) for m in modulated
         ]
     return torch.cat(rows)
+
+
+def robust_weights(
+    scans: list[ScanSpec],
+    field_hz: Tensor,
+    mask: Tensor,
+    c: float = 4.685,
+    smooth_vox: float = 1.0,
+    floor: float = 0.0,
+) -> Tensor:
+    """Tukey-bisquare data weights from how badly the blips disagree at each voxel.
+
+    ``e`` is the RMS deviation of the undistorted scans from their mean, lightly smoothed
+    so one noisy voxel cannot zero itself; ``s = median(e) / 0.6745`` over the mask is a
+    robust scale, and ``w = (1 - (e / (c s))^2)^2`` below ``c s``, 0 above. Returned as a
+    volume (1 outside the mask). Meant for the fine levels, once the pair is roughly
+    aligned: there a large residual is signal the shared field cannot explain (a vessel,
+    the falx, signal that differs between the acquisitions) and should stop steering the
+    field; at coarse levels it is just misalignment the fit still has to remove.
+
+    ``floor`` keeps every weight at or above it. A zero-weight voxel has no data term,
+    and at the fine levels' negligible bending weight its field is then unconstrained:
+    on HiHiFaces ses-fine pure Tukey fixed the occipital fissure (pole −20 Hz, as topup)
+    but pair r fell 0.89 → 0.67 as down-weighted regions ran away.
+    """
+    und = [
+        _undistort_scan(sc.data, field_hz, sc.readout, sc.sign, _NIFTI_AXIS_TO_TDIM[sc.pe_axis])
+        for sc in scans
+    ]
+    stack = torch.stack(und, dim=0)
+    e = (stack - stack.mean(dim=0)).pow(2).mean(dim=0).sqrt()
+    if smooth_vox > 0:
+        e = _separable_smooth_3d(e.float(), smooth_vox).to(e.dtype)
+    if not bool(mask.any()):
+        return torch.ones_like(e)
+    s = float(e[mask].median()) / 0.6745
+    if s <= 0:
+        return torch.ones_like(e)
+    t = (e / (c * s)).clamp(max=1.0)
+    w = ((1.0 - t * t) ** 2).clamp(min=floor)
+    return torch.where(mask, w, torch.ones_like(w))
 
 
 def _dot64(a: Tensor, b: Tensor) -> Tensor:
@@ -1175,6 +1243,8 @@ class _Linearization:
     # sqrt of the anatomical rows' weight (0 = off). Their target is fixed within a
     # step, so d r_anat_s = sqrt_anat * scale * dm_s, uncentred.
     anat_sqrt: float = 0.0
+    # Per-voxel sqrt robust weights on the data rows, masked (None = unweighted).
+    sqrt_w: Tensor | None = None
 
 
 def _linearize(
@@ -1188,6 +1258,7 @@ def _linearize(
     barrier_eff: float = 0.0,
     jac_floor: float = 0.1,
     anat_eff: float = 0.0,
+    sqrt_w: Tensor | None = None,
 ) -> _Linearization:
     """Precompute the per-scan slope/Jacobian maps for the analytic GN matvec."""
     field0 = basis.field(coeff)
@@ -1232,6 +1303,7 @@ def _linearize(
         barrier_b=barrier_b,
         barrier_tdim=barrier_tdim,
         anat_sqrt=math.sqrt(anat_eff) if anat_eff > 0 else 0.0,
+        sqrt_w=None if sqrt_w is None else sqrt_w.reshape(-1)[mask_idx],
     )
 
 
@@ -1244,6 +1316,8 @@ def _lin_jv(lin: _Linearization, dc: Tensor) -> Tensor:
     ]
     dmean = torch.stack(dms, dim=0).mean(dim=0)
     rows = [(dm - dmean).reshape(-1)[lin.mask_idx] * lin.scale for dm in dms]
+    if lin.sqrt_w is not None:
+        rows = [r * lin.sqrt_w for r in rows]
     if lin.lam_eff > 0:
         rows.append(math.sqrt(lin.lam_eff) * reg_residual(dfield, lin.reg_mode))
     for B, td in zip(lin.barrier_b, lin.barrier_tdim, strict=True):
@@ -1262,6 +1336,8 @@ def _lin_jtu(lin: _Linearization, u: Tensor) -> Tensor:
     us: list[Tensor] = []
     for s in range(n_scans):
         chunk = u[s * nmask : (s + 1) * nmask]
+        if lin.sqrt_w is not None:
+            chunk = chunk * lin.sqrt_w
         full = torch.zeros(numel, device=u.device, dtype=u.dtype)
         full[lin.mask_idx] = chunk * lin.scale
         us.append(full.reshape(lin.shape))
@@ -1385,12 +1461,16 @@ class _LevelResidual:
         jac_floor: float,
         use_graph: bool,
         anat: _AnatTerm | None = None,
+        sqrt_w: Tensor | None = None,
     ):
         self.args = (basis, scans, mask_idx, n_sm1)
         self.reg_mode = reg_mode
         self.jac_floor = jac_floor
         self.use_graph = use_graph
         self.anat = anat
+        # Robust data weights: one buffer per level, rewritten in place each step so a
+        # captured graph reads the current weights.
+        self.sqrt_w = sqrt_w
         self.graphs: dict[tuple[bool, bool, bool], dict] = {}
 
     def residual(
@@ -1409,6 +1489,7 @@ class _LevelResidual:
                 self.jac_floor,
                 self.anat,
                 anat_eff,
+                self.sqrt_w,
             )
             return r, float(_dot64(r, r))
         st = self._state(c, lam_eff > 0, barrier_eff > 0, anat_eff > 0)
@@ -1447,6 +1528,7 @@ class _LevelResidual:
                 self.jac_floor,
                 self.anat if with_anat else None,
                 st["sqrt_anat"] if with_anat else None,
+                self.sqrt_w,
             )
             st["r"], st["cost"] = r, _dot64(r, r)
 
@@ -1497,26 +1579,33 @@ class _NormalOperator:
             int(shape[0] * shape[1] * shape[2]), device=ref.device, dtype=ref.dtype
         )
         mask_f[lin.mask_idx] = lin.scale * lin.scale
+        # The data block's weight: the robust weights, when on, folded into the mask. The
+        # weighted rows sqrt(w)(dm_s - dmean) still average to zero over scans after the
+        # adjoint's sqrt(w), so the centering adjoint stays a no-op.
+        data_f = mask_f.clone()
+        if lin.sqrt_w is not None:
+            data_f[lin.mask_idx] = lin.scale * lin.scale * lin.sqrt_w * lin.sqrt_w
         aP = [a * P for a, P in zip(lin.a, lin.P, strict=True)]
         aQ = [a * Q for a, Q in zip(lin.a, lin.Q, strict=True)]
         b2 = [B * B for B in lin.barrier_b]
         lam = torch.tensor(lin.lam_eff, device=ref.device, dtype=ref.dtype)
         anat = torch.tensor(lin.anat_sqrt**2, device=ref.device, dtype=ref.dtype)
-        return mask_f.reshape(shape), aP, aQ, b2, lam, anat
+        return mask_f.reshape(shape), data_f.reshape(shape), aP, aQ, b2, lam, anat
 
-    def _bind(self, mask_f, aP, aQ, b2, lam, anat):
+    def _bind(self, mask_f, data_f, aP, aQ, b2, lam, anat):
         if self.own:
-            mask_f, lam, anat = mask_f.clone(), lam.clone(), anat.clone()
+            mask_f, data_f, lam, anat = mask_f.clone(), data_f.clone(), lam.clone(), anat.clone()
             aP, aQ, b2 = ([t.clone() for t in ts] for ts in (aP, aQ, b2))
         self.mask_f, self.aP, self.aQ, self.b2, self.lam = mask_f, aP, aQ, b2, lam
-        self.anat = anat
+        self.data_f, self.anat = data_f, anat
 
     def load(self, lin: _Linearization) -> None:
-        mask_f, aP, aQ, b2, lam, anat = self._derive(lin)
+        mask_f, data_f, aP, aQ, b2, lam, anat = self._derive(lin)
         if not self.own:
-            self._bind(mask_f, aP, aQ, b2, lam, anat)
+            self._bind(mask_f, data_f, aP, aQ, b2, lam, anat)
             return
         self.mask_f.copy_(mask_f)
+        self.data_f.copy_(data_f)
         self.lam.copy_(lam)
         self.anat.copy_(anat)
         for dst, src in zip([*self.aP, *self.aQ, *self.b2], [*aP, *aQ, *b2], strict=True):
@@ -1532,7 +1621,7 @@ class _NormalOperator:
         g = torch.zeros_like(dfield)
         back = {td: torch.zeros_like(dfield) for td in self.tdims}
         for s in range(n_scans):
-            w = self.mask_f * (dms[s] - dmean)
+            w = self.data_f * (dms[s] - dmean)
             if self.has_anat:  # uncentred: the anat target does not move with the field
                 w = w + (self.anat * self.mask_f) * dms[s]
             g = g + self.aP[s] * w
@@ -1665,7 +1754,17 @@ def _gn_direction_analytic(
     # queued before any.
     r0, cost = level_residual.residual(coeff, lam_eff, barrier_eff, anat_eff)
     lin = _linearize(
-        coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor, anat_eff
+        coeff,
+        basis,
+        scans,
+        mask_idx,
+        n_sm1,
+        lam_eff,
+        reg_mode,
+        barrier_eff,
+        jac_floor,
+        anat_eff,
+        level_residual.sqrt_w,
     )
 
     if solver is None:
@@ -1711,6 +1810,9 @@ def gn_solve_level(
     use_graph: bool = True,
     anat: _AnatTerm | None = None,
     anat_weight: float = 0.0,
+    robust: bool = False,
+    robust_c: float = 4.685,
+    robust_floor: float = 0.0,
 ) -> tuple[Tensor, float, LevelReport]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
@@ -1727,7 +1829,9 @@ def gn_solve_level(
     ``min_update_vox > 0`` ends the level once a step moves the displacement less than
     that (see :attr:`TopupConfig.min_update_vox`). ``anat`` with ``anat_weight > 0`` adds
     the anatomical rows (:class:`_AnatTerm`), its target refit at the start of every step;
-    the reported data cost and the ``ssqlambda`` scaling stay pair-only.
+    the reported data cost and the ``ssqlambda`` scaling stay pair-only. ``robust``
+    reweights the pair's data rows by :func:`robust_weights` (Tukey constant ``robust_c``),
+    recomputed at the start of every step and held fixed through it (IRLS).
     Returns ``(coefficients, cost, report)``.
     """
     mask_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
@@ -1737,6 +1841,7 @@ def gn_solve_level(
     guard = reject_folds and jac_penalty > 0
     if anat is None or anat_weight <= 0:
         anat, anat_weight = None, 0.0
+    sqrt_w = torch.ones(mask.shape, device=coeff.device, dtype=coeff.dtype) if robust else None
 
     def residual(c: Tensor, lam_eff: float, barrier_eff: float = 0.0) -> Tensor:
         return _residual_vector(
@@ -1751,6 +1856,7 @@ def gn_solve_level(
             jac_floor,
             anat,
             anat_weight,
+            sqrt_w,
         )
 
     def refit_anat(c: Tensor) -> None:
@@ -1772,6 +1878,7 @@ def gn_solve_level(
         jac_floor,
         analytic and use_graph and coeff.device.type == "cuda",
         anat,
+        sqrt_w,
     )
 
     def data_ssd(c: Tensor) -> float:
@@ -1809,6 +1916,10 @@ def gn_solve_level(
     iters = 0
     lam_eff = lam
     for _it in range(max_iter):
+        if sqrt_w is not None:
+            sqrt_w.copy_(
+                robust_weights(scans, basis.field(coeff), mask, robust_c, floor=robust_floor).sqrt()
+            )
         # ssq-scale both the smoothness (lam) and anti-fold (jac_penalty) weights by the
         # current data SSD so they are invariant to intensity scale and image size.
         dssd = data_ssd(coeff) if (ssqlambda and (lam > 0 or jac_penalty > 0)) else 1.0
@@ -2324,6 +2435,9 @@ def run_topup(
             use_graph=config.cuda_graphs,
             anat=level_anat,
             anat_weight=config.anat_weight,
+            robust=config.robust and wr <= config.robust_max_warpres,
+            robust_c=config.robust_c,
+            robust_floor=config.robust_floor,
         )
         reports.append(report)
         if recorder is not None:

@@ -386,6 +386,39 @@ def create_parser() -> argparse.ArgumentParser:
         "(-warpres etc.), or the first levels smooth it away.",
     )
 
+    rob = parser.add_argument_group("Robust data term (EXPERIMENTAL)")
+    rob.add_argument(
+        "-robust",
+        action="store_true",
+        help="Down-weight voxels where the corrected blips disagree far more than is typical "
+        "(Tukey bisquare on a robust scale, recomputed every Gauss-Newton step), on the fine "
+        "levels only. Signal the shared field cannot reconcile -- vessels, the falx, anything "
+        "that differs between the two acquisitions -- then stops steering the field locally, "
+        "instead of a global smoothness weight that also costs accuracy everywhere else.",
+    )
+    rob.add_argument(
+        "-robust_c",
+        type=float,
+        default=4.685,
+        help="Tukey constant in robust-scale units; lower rejects more.",
+    )
+    rob.add_argument(
+        "-robust_floor",
+        type=float,
+        default=0.0,
+        help="Lowest weight a voxel can get. Above 0, a rejected voxel still anchors its "
+        "field; at 0 it has no data term and, at the fine levels' tiny bending weight, its "
+        "field can run away.",
+    )
+    rob.add_argument(
+        "-robust_from",
+        type=float,
+        default=5.0,
+        metavar="MM",
+        help="Apply -robust only on levels whose knot spacing is at most this. Coarser, a "
+        "large disagreement is misalignment the fit still has to remove.",
+    )
+
     misc = parser.add_argument_group("Misc")
     misc.add_argument(
         "-precision",
@@ -804,6 +837,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     cfg.anat_weight = args.anat_weight
     cfg.anat_sigma_mm = args.anat_sigma
     cfg.anat_max_warpres = args.anat_from
+    cfg.robust = args.robust
+    cfg.robust_c = args.robust_c
+    cfg.robust_max_warpres = args.robust_from
+    cfg.robust_floor = args.robust_floor
     anat = None
     if args.anat:
         adata, aaff, _ = _load_volume(args.anat, args.collapse)

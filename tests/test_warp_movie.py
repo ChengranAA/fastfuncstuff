@@ -352,28 +352,28 @@ def test_blipflip_rows_follow_opposite_blips():
 
     # Tests are not a package, and importlib import mode does not put tests/ on the path.
     sys.path.insert(0, str(Path(__file__).parent))
-    from test_topup import _make_synthetic
+    from test_blipflip import _make_synthetic
 
-    from fastfuncstuff.processing import topup as T
+    from fastfuncstuff.processing import blipflip as T
 
     _, _, scans = _make_synthetic()
     shape = tuple(scans[0].data.shape)
     planes = build_slice_planes(shape, np.eye(4), "ax")
     rec = WarpMovieRecorder([s.data for s in scans], planes, max_frames=10, device=CPU)
-    cfg = T.TopupConfig(
+    cfg = T.BlipflipConfig(
         warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[4, 4], subsamp=[1, 1]
     )
-    res = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, recorder=rec)
+    res = T.run_blipflip(scans, (3.0, 2.5, 2.5), cfg, progress=False, recorder=rec)
     pinned = [f for f in rec._frames if f.pinned]
     assert [f.label.split()[0] for f in pinned] == ["start", "L1/2", "L2/2", "final"]
     # The final frame is the tool's own unwarped output, sampled at the planes.
     final = pinned[-1].values.float()
     py = torch.as_tensor(planes.points[:, 1])
     for row, unwarped, scan in zip(final, res.unwarped, scans, strict=True):
-        # Where the PE sample leaves the volume topup clamps and the movie pads zero.
+        # Where the PE sample leaves the volume blipflip clamps and the movie pads zero.
         shifted = py + (res.field_hz * scan.readout * scan.sign).reshape(-1)[planes.flat_indices()]
         inner = (py > 1) & (py < shape[1] - 2) & (shifted > 1) & (shifted < shape[1] - 2)
-        # run_topup works on copies rescaled to mean 100 and hands back native units.
+        # run_blipflip works on copies rescaled to mean 100 and hands back native units.
         ref = unwarped.float().reshape(-1)[planes.flat_indices()] * (
             100.0 / float(scan.data.mean())
         )

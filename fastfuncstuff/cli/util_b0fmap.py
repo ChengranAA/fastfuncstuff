@@ -618,7 +618,7 @@ def main(argv: list[str] | None = None) -> int:
         _save_zyx(f"{stem}_field_raw{ext}", field_raw, affine)
         _save_zyx(f"{stem}_mask{ext}", mask.float(), affine)
     if not args.no_jac:
-        from fastfuncstuff.processing.topup import _jacobian_pe
+        from fastfuncstuff.processing.blipflip import _jacobian_pe
 
         jac = _jacobian_pe(pull, pe_tdim)
         _save_zyx(f"{stem}_jac{ext}", jac, out_affine)

@@ -16,7 +16,7 @@ from fastfuncstuff.processing.b0fmap import (
     read_epi_geometry,
     synthesize_distorted,
 )
-from fastfuncstuff.processing.topup import _jacobian_pe
+from fastfuncstuff.processing.blipflip import _jacobian_pe
 
 
 def _smooth_field(shape=(12, 20, 20), amp=60.0):
@@ -197,7 +197,7 @@ class TestSynthesizeDistorted:
         assert float(pull.abs().max()) > 0.5, "test needs a non-trivial displacement"
 
         distorted = synthesize_distorted(img, inv, pe_tdim)
-        from fastfuncstuff.processing.topup import _resample_pe
+        from fastfuncstuff.processing.blipflip import _resample_pe
 
         back = _resample_pe(distorted, pull, pe_tdim)
 

@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.processing import topup as T
+from fastfuncstuff.processing import blipflip as T
 
 
 def _make_synthetic(nz=20, ny=32, nx=32, readout=0.5, device="cpu"):
@@ -43,10 +43,10 @@ def _make_synthetic(nz=20, ny=32, nx=32, readout=0.5, device="cpu"):
 
 def test_field_recovery():
     true, field, scans = _make_synthetic()
-    cfg = T.TopupConfig(
+    cfg = T.BlipflipConfig(
         warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
     )
-    res = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
+    res = T.run_blipflip(scans, (3.0, 2.5, 2.5), cfg, progress=False)
 
     m = torch.zeros_like(field, dtype=torch.bool)
     m[3:-3, 4:-4, 4:-4] = True
@@ -57,13 +57,13 @@ def test_field_recovery():
 
 def test_blips_agree_after_correction():
     _, _, scans = _make_synthetic()
-    cfg = T.TopupConfig(
+    cfg = T.BlipflipConfig(
         warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
     )
-    # caller's tensors must be untouched by run_topup
+    # caller's tensors must be untouched by run_blipflip
     before_data = scans[0].data.clone()
-    res = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
-    assert torch.allclose(scans[0].data, before_data), "run_topup mutated caller scans"
+    res = T.run_blipflip(scans, (3.0, 2.5, 2.5), cfg, progress=False)
+    assert torch.allclose(scans[0].data, before_data), "run_blipflip mutated caller scans"
 
     m = torch.zeros_like(scans[0].data, dtype=torch.bool)
     m[3:-3, 4:-4, 4:-4] = True
@@ -209,11 +209,15 @@ def test_antifold_barrier_removes_fold():
         subsamp=[1, 1, 1],
     )
 
-    off = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(jac_penalty=0.0, **kw), progress=False)
+    off = T.run_blipflip(
+        scans, (3.0, 2.5, 2.5), T.BlipflipConfig(jac_penalty=0.0, **kw), progress=False
+    )
     jac_off = T._jacobian_pe(off.field_hz * ro, pe_tdim)
     assert float(jac_off.min()) < 0.0, f"test setup did not fold (min {jac_off.min()})"
 
-    on = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(jac_penalty=5e-2, **kw), progress=False)
+    on = T.run_blipflip(
+        scans, (3.0, 2.5, 2.5), T.BlipflipConfig(jac_penalty=5e-2, **kw), progress=False
+    )
     jac_on = T._jacobian_pe(on.field_hz * ro, pe_tdim)
     assert float(jac_on.min()) > 0.0, f"barrier failed to remove fold (min {jac_on.min()})"
 
@@ -305,7 +309,7 @@ def test_air_term_flattens_the_field_where_there_is_no_signal():
     start = 40.0 * torch.sin(3 * math.pi * y).view(1, -1, 1).expand(shape).contiguous()
 
     def stretch_in_air(air_weight):
-        cfg = T.TopupConfig(
+        cfg = T.BlipflipConfig(
             warpres=[8.0],
             fwhm=[0.0],
             lam=[1e-9],
@@ -314,7 +318,7 @@ def test_air_term_flattens_the_field_where_there_is_no_signal():
             air_weight=air_weight,
             air_max_warpres=8.0,
         )
-        res = T.run_topup(
+        res = T.run_blipflip(
             [T.ScanSpec(s.data.clone(), s.pe_axis, s.sign, s.readout) for s in scans],
             (3.0, 2.5, 2.5),
             cfg,
@@ -348,11 +352,11 @@ def test_analytic_and_autograd_recover_same_field():
     # drift on the ill-conditioned normal equations forbids bit-identity).
     _, field, scans = _make_synthetic()
     kw = dict(warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[6, 6], subsamp=[1, 1])
-    res_a = T.run_topup(
-        scans, (3.0, 2.5, 2.5), T.TopupConfig(analytic_gn=True, **kw), progress=False
+    res_a = T.run_blipflip(
+        scans, (3.0, 2.5, 2.5), T.BlipflipConfig(analytic_gn=True, **kw), progress=False
     )
-    res_b = T.run_topup(
-        scans, (3.0, 2.5, 2.5), T.TopupConfig(analytic_gn=False, **kw), progress=False
+    res_b = T.run_blipflip(
+        scans, (3.0, 2.5, 2.5), T.BlipflipConfig(analytic_gn=False, **kw), progress=False
     )
     m = torch.zeros_like(field, dtype=torch.bool)
     m[3:-3, 4:-4, 4:-4] = True
@@ -371,7 +375,7 @@ def test_spline_field_shape_and_smoothness():
 
 
 def test_subsampled_schedule_is_rejected_until_handoffs_are_unit_correct():
-    cfg = T.TopupConfig(
+    cfg = T.BlipflipConfig(
         warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[2, 1]
     )
     with pytest.raises(ValueError, match="supports only 1"):
@@ -486,14 +490,16 @@ def test_motion_estimation_reconciles_moved_pair():
         down = T.ScanSpec(observed(true_moved, -1.0), pe_axis=1, sign=-1.0, readout=readout)
         return [up, down]
 
-    cfg = T.TopupConfig(
+    cfg = T.BlipflipConfig(
         warpres=[16, 10], fwhm=[4, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
     )
     m = torch.zeros_like(true, dtype=torch.bool)
     m[3:-3, 6:-6, 6:-6] = True
 
-    res_off = T.run_topup(make_scans(), (3.0, 2.5, 2.5), cfg, progress=False)
-    res_on = T.run_topup(make_scans(), (3.0, 2.5, 2.5), cfg, progress=False, estimate_motion=True)
+    res_off = T.run_blipflip(make_scans(), (3.0, 2.5, 2.5), cfg, progress=False)
+    res_on = T.run_blipflip(
+        make_scans(), (3.0, 2.5, 2.5), cfg, progress=False, estimate_motion=True
+    )
 
     resid_off = ((res_off.unwarped[0] - res_off.unwarped[1])[m]).pow(2).mean().sqrt()
     resid_on = ((res_on.unwarped[0] - res_on.unwarped[1])[m]).pow(2).mean().sqrt()
@@ -550,10 +556,10 @@ def test_wrap_padding_reconciles_blips_at_the_pe_edges():
     band[3:-3, -5:, 4:-4] = True
 
     def edge_disagreement(pad):
-        cfg = T.TopupConfig(
+        cfg = T.BlipflipConfig(
             warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
         )
-        r = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, wrap_pad=pad)
+        r = T.run_blipflip(scans, (3.0, 2.5, 2.5), cfg, progress=False, wrap_pad=pad)
         assert r.field_hz.shape == field.shape and r.unwarped[0].shape == field.shape
         return ((r.unwarped[0] - r.unwarped[1])[band]).pow(2).mean().sqrt().item()
 
@@ -596,12 +602,12 @@ def test_unwrap_recovers_the_field_where_only_one_blip_aliased():
         return out
 
     def cfg():
-        return T.TopupConfig(
+        return T.BlipflipConfig(
             warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
         )
 
     up, down = acquire(+1.0), acquire(-1.0)
-    ref = T.run_topup(
+    ref = T.run_blipflip(
         [T.ScanSpec(up, 1, 1.0, ro), T.ScanSpec(down, 1, -1.0, ro)],
         (3, 2.5, 2.5),
         cfg(),
@@ -612,7 +618,7 @@ def test_unwrap_recovers_the_field_where_only_one_blip_aliased():
     band[3:-3, :8, 4:-4] = True
 
     def err(**kw):
-        r = T.run_topup(scans, (3, 2.5, 2.5), cfg(), progress=False, **kw)
+        r = T.run_blipflip(scans, (3, 2.5, 2.5), cfg(), progress=False, **kw)
         assert r.field_hz.shape == (nz, n, nx)
         return (r.field_hz - ref.field_hz[:, lo : lo + n])[band].abs().mean().item()
 
@@ -722,11 +728,11 @@ def test_level_stops_when_the_field_stops_moving():
     _, _, scans = _make_synthetic()
 
     def run(min_update):
-        cfg = T.TopupConfig(
+        cfg = T.BlipflipConfig(
             warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[40, 40], subsamp=[1, 1]
         )
         cfg.min_update_vox = min_update
-        return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
+        return T.run_blipflip(scans, (3.0, 2.5, 2.5), cfg, progress=False)
 
     early, full = run(0.1), run(0.0)
     # The displacement stop fires when enabled, and only then.
@@ -887,9 +893,9 @@ def test_inverted_contrast_anat_does_not_hurt_recovery():
     # A T1 against a T2*-weighted EPI is roughly an inverted contrast: the local linear
     # map must absorb that (a negative slope), not fight the pair.
     true, field, scans = _make_exact_pair()
-    plain = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(**_ANAT_KW), progress=False)
-    cfg = T.TopupConfig(**_ANAT_KW, anat_weight=1.0, anat_sigma_mm=8.0)
-    with_anat = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=300.0 - true)
+    plain = T.run_blipflip(scans, (3.0, 2.5, 2.5), T.BlipflipConfig(**_ANAT_KW), progress=False)
+    cfg = T.BlipflipConfig(**_ANAT_KW, anat_weight=1.0, anat_sigma_mm=8.0)
+    with_anat = T.run_blipflip(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=300.0 - true)
     assert _field_rms_error(with_anat, field) <= 1.05 * _field_rms_error(plain, field)
 
 
@@ -944,9 +950,9 @@ def test_init_field_starts_the_first_level_from_it():
     # this pair is ~0.3 Hz off the truth either way.)
     _, field, scans = _make_exact_pair()
     kw = dict(warpres=[8], fwhm=[0], lam=[1e-4], miter=[1], subsamp=[1])
-    cold = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(**kw), progress=False)
-    warm = T.run_topup(
-        scans, (3.0, 2.5, 2.5), T.TopupConfig(**kw), progress=False, init_field=field
+    cold = T.run_blipflip(scans, (3.0, 2.5, 2.5), T.BlipflipConfig(**kw), progress=False)
+    warm = T.run_blipflip(
+        scans, (3.0, 2.5, 2.5), T.BlipflipConfig(**kw), progress=False, init_field=field
     )
     assert _field_rms_error(warm, field) < 0.5 * _field_rms_error(cold, field)
 
@@ -956,10 +962,10 @@ def test_anat_misaligned_along_pe_does_not_drag_the_field():
     # alignment error or a scanner-to-scanner scaling would be) needs both undistorted
     # blips to move the same way. A field moves them oppositely, so it must stay put.
     true, field, scans = _make_exact_pair()
-    plain = T.run_topup(scans, (3.0, 2.5, 2.5), T.TopupConfig(**_ANAT_KW), progress=False)
+    plain = T.run_blipflip(scans, (3.0, 2.5, 2.5), T.BlipflipConfig(**_ANAT_KW), progress=False)
     off = T._resample_pe(300.0 - true, torch.full_like(true, 1.5), 1)
-    cfg = T.TopupConfig(**_ANAT_KW, anat_weight=1.0, anat_sigma_mm=8.0)
-    shifted = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=off)
+    cfg = T.BlipflipConfig(**_ANAT_KW, anat_weight=1.0, anat_sigma_mm=8.0)
+    shifted = T.run_blipflip(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=off)
     m = torch.zeros_like(field, dtype=torch.bool)
     m[3:-3, 4:-4, 4:-4] = True
     moved = float((shifted.field_hz - plain.field_hz)[m].pow(2).mean().sqrt())
@@ -982,12 +988,12 @@ def test_cuda_graphed_cg_matches_eager(with_anat):
     anat = (300.0 - true).to(dev) if with_anat else None
 
     def run(graphs):
-        cfg = T.TopupConfig(
+        cfg = T.BlipflipConfig(
             warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[6, 6], subsamp=[1, 1]
         )
         cfg.cuda_graphs = graphs
         cfg.anat_max_warpres = 100.0
-        return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=anat)
+        return T.run_blipflip(scans, (3.0, 2.5, 2.5), cfg, progress=False, anat=anat)
 
     eager, graphed = run(False), run(True)
     assert [lv.iters for lv in eager.levels] == [lv.iters for lv in graphed.levels]

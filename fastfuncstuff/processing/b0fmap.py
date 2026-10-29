@@ -1,6 +1,6 @@
 """B0 fieldmap (dual-echo GRE) -> off-resonance field -> PE undistortion warp.
 
-The other half of susceptibility distortion correction from :mod:`.topup`
+The other half of susceptibility distortion correction from :mod:`.blipflip`
 (``ffs_blipflip``). There the field is *estimated* from two EPIs with opposing
 phase-encode polarity; here it is *measured* directly from the phase evolution
 between two gradient-echo acquisitions at different echo times::
@@ -53,7 +53,7 @@ from torch import Tensor
 
 from .cost import _separable_smooth_3d
 from .medic import PE_AXIS_MAP, field_to_displacement_pe, invert_displacement_pe
-from .topup import _NIFTI_AXIS_TO_TDIM
+from .blipflip import _NIFTI_AXIS_TO_TDIM
 
 __all__ = [
     "B0FieldResult",
@@ -437,7 +437,7 @@ def synthesize_distorted(vol: Tensor, inv_disp: Tensor, pe_tdim: int) -> Tensor:
     inverse from ``invert_displacement_pe``, which is exact where the warp is
     monotone and costs one fixed-point loop.
     """
-    from .topup import _resample_pe
+    from .blipflip import _resample_pe
 
     return _resample_pe(vol, inv_disp, pe_tdim)
 

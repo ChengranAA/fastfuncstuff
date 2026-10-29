@@ -6,14 +6,14 @@ import os
 
 # ONE CPU thread per test process, and the parallelism comes from xdist workers
 # instead (see addopts). Measured 2026-10-20: these tests barely thread-scale --
-# test_topup.py is 40 s on 4 threads and 50 s on 1 -- while `-n 4` with the old
+# test_blipflip.py is 40 s on 4 threads and 50 s on 1 -- while `-n 4` with the old
 # 4-thread cap put 16 threads on 6 cores and made the whole suite SLOWER than
 # serial (47 min vs 39 min). Four processes at one thread each beat one process
 # at four threads by far more than that 20%.
 #
 # One thread is also the only setting that makes the suite's floats reproducible:
 # parallel reductions sum in whatever order the pool finishes, which moves results
-# at ~1e-7 and is enough to flip a convergence branch. test_topup.py's
+# at ~1e-7 and is enough to flip a convergence branch. test_blipflip.py's
 # test_level_stops_when_the_field_stops_moving failed exactly that way under the
 # old cap (reported 'flat cost' one level early) and passed when run alone.
 #

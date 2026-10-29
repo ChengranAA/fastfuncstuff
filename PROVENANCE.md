@@ -63,7 +63,7 @@ not historical.
 
 | Module | Paper |
 |---|---|
-| `processing/topup.py`, `cli/blipflip.py` | Andersson, Skare & Ashburner (2003) *NeuroImage* 20:870-888 |
+| `processing/blipflip.py`, `cli/blipflip.py` | Andersson, Skare & Ashburner (2003) *NeuroImage* 20:870-888 |
 | `decomposition/model_order.py` | Minka (2000) NIPS 13:598-604; Marchenko & Pastur (1967); Worsley et al. (1992) |
 | `decomposition/varnorm.py` | Beckmann & Smith (2004) *IEEE TMI* 23(2):137-152 §II-B |
 | `decomposition/mixture.py` | Beckmann & Smith (2004) §II-E |
